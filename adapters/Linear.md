@@ -32,14 +32,11 @@ export it as `LINEAR_API_KEY`. Every operation is a single `curl` against
 `https://api.linear.app/graphql`:
 
 ```bash
-lin() { curl -sf https://api.linear.app/graphql \
-  -H "Authorization: $LINEAR_API_KEY" -H "Content-Type: application/json" \
-  -d "$1"; }
+lin() { curl -sf https://api.linear.app/graphql -H "Authorization: $LINEAR_API_KEY" -H "Content-Type: application/json" -d "$1" | jq -e 'if .errors then error(.errors[0].message) else . end'; }
 ```
 
 State/team/project names must be resolved to ids first (see the Operations table's
-lookup row). Non-2xx responses or a top-level `errors` array = failed operation →
-andon cord.
+lookup row). `jq -e` makes a GraphQL `errors` response a non-zero exit (andon cord).
 
 Relevant config: `LINEAR_DEFAULT_TEAM`, `LINEAR_DEFAULT_PROJECT`, `LINEAR_ACCESS`.
 
@@ -84,7 +81,7 @@ Linear Projects use states like Backlog / Planned / In Progress / Completed.
 
 | Generic operation | mcp | rest (GraphQL via `lin`) |
 |---|---|---|
-| Lookup ids (teams, states, projects) | (implicit in MCP tools) | `lin '{"query":"{ teams { nodes { id name states { nodes { id name } } projects { nodes { id name } } } }"}'` |
+| Lookup ids (teams, states, projects) | (implicit in MCP tools) | `lin '{"query":"{ teams { nodes { id name states { nodes { id name } } projects { nodes { id name } } } }"}'` — also look up project statuses: `lin '{"query":"{ projectStatuses { nodes { id name } } }"}'` (needed for `projectUpdate` `statusId`) |
 | Create `[feature]` | `create_project` | `lin '{"query":"mutation { projectCreate(input: {name: \"<name>\", teamIds: [\"<teamId>\"]}) { project { id } } }"}'` |
 | Create `[task]` under a feature | `create_issue` with `project` | `lin '{"query":"mutation { issueCreate(input: {title: \"<title>\", description: \"<md>\", teamId: \"<teamId>\", projectId: \"<featureId>\"}) { issue { id identifier } } }"}'` |
 | Read a `[task]` | `get_issue` | `lin '{"query":"{ issue(id: \"<taskId>\") { identifier title description state { name } assignee { name } comments { nodes { body createdAt } } } }"}'` |

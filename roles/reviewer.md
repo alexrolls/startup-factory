@@ -29,7 +29,7 @@ the [task] goes back to `[Active]`; the implementer fixes and re-requests.
 **Phase 3 — Verify.** On re-review: re-read every fixed file. Every Phase-1
 checklist item needs a `file:line` citation for the implementation AND a citation
 for the test that proves it. Compare the final file list against
-`git diff --name-only <feature-branch>...HEAD` in the worktree — they must match.
+`git diff --name-only <feature-branch>...HEAD` in the worktree (the worktree is `<TEAMWORK_ROOT>/<team>/worktrees/<assignee-role>-<taskId>`; the [task]'s assignee names the role) — they must match.
 Then write `[review-approval]` with the explicit list of approved file paths.
 
 ## Anti-rationalization — reject all of these

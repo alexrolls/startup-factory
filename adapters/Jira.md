@@ -104,6 +104,8 @@ The `jira()` and `adf()` helpers above must be defined in your shell before runn
 | Set `[task]` assignee | update assignee | `jira "/rest/api/3/issue/<taskId>/assignee" -X PUT -d '{"accountId":"<accountId>"}'` |
 | Add a comment to a `[task]` | add comment | `jira "/rest/api/3/issue/<taskId>/comment" -X POST -d '{"body":'"$(adf "<text>")"'}'` |
 
+> `parent` and `jql=parent=` work in team-managed (NextGen) projects. In company-managed (classic) projects, link Stories to the Epic via the Epic Link field (commonly `customfield_10014`) and query with `jql="Epic Link" = <featureId>`.
+
 ## Rules
 
 - ALL operations MUST use the active access mechanism (`JIRA_ACCESS`: MCP tools or the

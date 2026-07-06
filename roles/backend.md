@@ -37,6 +37,7 @@ if it isn't, that's a `[design-pushback]`-worthy planning defect — say so.
 
 - Write code before `[design-approved]`, or outside your worktree.
 - Merge, commit to the feature branch, or change any status except
-  `[Planned]→[Active]` (claim) and `[Active]→[Review]` (request review).
+  `[Planned]→[Active]` (claim), `[Active]→[Review]` (request review), and
+  `[Review]→[Active]` (rework — moving your own [task] back when `[review-findings]` require fixes).
 - Mark anything `[Completed]` — that is the integrator's atomic pair.
 - Work around a failure. Blocked or broken → `[andon]` + mailbox to `team-lead`.

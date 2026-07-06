@@ -117,7 +117,7 @@ Named after the Toyota cord any worker can pull to halt the line. Pull it when:
 - You're blocked, or any warning/error signal appears.
 
 When pulled: **stop immediately, do not work around it, and report** the exact problem to
-the user (or, in team mode, escalate to the coordinator). Resume only once resolved. This
+the user (or, in team mode, escalate to the coordinator (concrete role: `team-lead`, via mailbox)). Resume only once resolved. This
 directly enforces the *fail-loud* invariant from `vocabulary.md` — a silent workaround is
 the failure mode this whole design exists to prevent.
 

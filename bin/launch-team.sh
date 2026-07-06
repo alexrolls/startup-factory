@@ -81,6 +81,9 @@ launch_one() { # launch_one <team> <featureId> <role>
     echo "tmux" > "$dir/pids/$role.pid"
     echo "launched $role in tmux session team-$team"
   else
+    if [ -f "$dir/pids/$role.pid" ] && [ "$(cat "$dir/pids/$role.pid")" != "tmux" ] && kill -0 "$(cat "$dir/pids/$role.pid")" 2>/dev/null; then
+      kill "$(cat "$dir/pids/$role.pid")" 2>/dev/null || true
+    fi
     ( cd "$REPO_ROOT" && exec bash -c "$cmd" >"$dir/pids/$role.log" 2>&1 ) &
     echo $! > "$dir/pids/$role.pid"
     echo "launched $role in background (pid $(cat "$dir/pids/$role.pid"))"
@@ -106,7 +109,7 @@ case "${1:-}" in
     if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$role-$task"; then
       git -C "$REPO_ROOT" worktree add "$wt" "$role-$task" >/dev/null
     else
-      git -C "$REPO_ROOT" worktree add "$wt" -b "$role-$task" >/dev/null
+      git -C "$REPO_ROOT" worktree add "$wt" -b "$role-$task" "$team" >/dev/null
     fi
     echo "$wt"
     ;;

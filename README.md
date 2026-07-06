@@ -123,7 +123,7 @@ each agent potentially a *different* LLM/CLI.
 
 1. Configure your tracker as above, then edit `config/team.config.md`: one CLI
    command per role (`claude -p …`, `codex exec …`, `gemini …` — mix freely) and
-   your project's `VALIDATE_*` commands.
+   your project's `VALIDATE_*` commands, and set `TEAM_MODE=true` in `config/project-management.config.md`.
 2. Add `.teamwork/` to `.gitignore`.
 3. Ask your primary agent (as team-lead) to *"plan a feature and launch the team"*
    — or run `bin/launch-team.sh start <branch> <featureId> <roles...>` yourself.
@@ -138,6 +138,7 @@ The team-lead detects stuck/conflicting/crashed agents and unblocks them
 
 **First run without any tracker account:** set `PRODUCT_MANAGEMENT_TOOL=Markdown`
 and launch just `team-lead` + `backend` — a complete offline test of the protocol.
+In this two-agent setup the team-lead also acts as the principal-architect — it answers `[design-note]` comments itself, so the design gate doesn't deadlock.
 
 ---
 

@@ -36,6 +36,7 @@ still holds — it's about which transition, not how many humans/agents exist.
 | Transition | Sole owner | Pre-check before acting |
 |---|---|---|
 | create `[task]` `[Planned]` | Coordinator | planning approval from the Principal Architect exists (team mode — see `reference/orchestration.md`) |
+| `[feature]` `[Planned]` → `[Active]` | Implementer (on the feature's first claimed [task]) | only if the adapter tracks feature status explicitly |
 | `[Planned]` → `[Active]` | Implementer | verify `[task]` is `[Planned]` (not already claimed) |
 | `[Review]` → `[Active]` | Implementer | verify `[task]` is `[Review]` (rework requested) |
 | `[Review]` → `[Completed]` | Finalizer | verify `[task]` is `[Review]` **and** commit succeeded |

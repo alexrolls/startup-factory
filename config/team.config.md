@@ -13,18 +13,18 @@ The project-management tool itself is configured separately in
 ## Role → command map
 
 `{prompt_file}` is replaced by the launcher with the path to the composed startup
-prompt. The examples inline the file's content with `$(cat {prompt_file})` because these CLIs take the prompt as a string argument; a CLI that reads a prompt from a file can use `{prompt_file}` directly. Any agentic CLI works if it can read files, run shell commands, and use git.
+prompt. The examples inline the file's content with `$(cat '{prompt_file}')` because these CLIs take the prompt as a string argument; a CLI that reads a prompt from a file can use `{prompt_file}` directly. Any agentic CLI works if it can read files, run shell commands, and use git.
 Set a role to `null` to exclude it from launches (the team-lead composes the actual
 roster per [feature] — e.g. no frontend [tasks] → no frontend agent).
 
 ```
-TEAM_LEAD_CMD="claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits"
-PRINCIPAL_ARCHITECT_CMD="claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits"
-INTEGRATOR_CMD="claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits"
-BACKEND_CMD="codex exec --full-auto \"$(cat {prompt_file})\""
-FRONTEND_CMD="codex exec --full-auto \"$(cat {prompt_file})\""
+TEAM_LEAD_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
+PRINCIPAL_ARCHITECT_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
+INTEGRATOR_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
+BACKEND_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
+FRONTEND_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
 QA_CMD=null
-REVIEWER_CMD="gemini --yolo \"$(cat {prompt_file})\""
+REVIEWER_CMD="gemini --yolo \"$(cat '{prompt_file}')\""
 ```
 
 > Mixing LLMs is the design intent — e.g. Claude for team-lead/principal-architect,

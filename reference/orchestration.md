@@ -85,7 +85,7 @@ invent new ones, never misspell them.
 ## Claiming a [task]
 
 1. Read the [task] in full via the adapter (description, [subtasks], all comments).
-2. Verify status is `[Planned]` and it belongs to your track. If not → `[andon]`.
+2. Verify status is `[Planned]` and it belongs to your track. If not → `[andon]`. Also verify the previously integrated [task] on your track has no `[divergence]` comments still awaiting the principal-architect's sweep — if it does, wait or ask the PA by mailbox.
 3. Set assignee = your role name AND move `[Planned] → [Active]` (one adapter write
    where the tool allows, else assignee first).
 4. **Read back.** If the assignee is not you, another agent won — back off silently
@@ -147,7 +147,7 @@ even from the team-lead):
 5. Commit, capture the hash, then immediately move the [task] to `[Completed]`,
    citing the hash. Commit and completion are one atomic pair — never one without
    the other.
-6. When every [task] is `[Completed]`, tell the team-lead; the [feature] moves to
+6. When every [task] is `[Completed]`, tell the team-lead and principal-architect; the [feature] moves to
    `[Resolved]` only after the Lead's completion checklist passes.
 
 ## Supervision — the team-lead loop

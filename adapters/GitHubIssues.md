@@ -87,7 +87,7 @@ CLI column assumes `-R <GITHUB_REPO>` is appended when `GITHUB_REPO` is set.
 | Create `[task]` under a feature | `gh issue create --title "<t>" --body "<...>" --milestone "<featureId>" --label status:planned` |
 | Read a `[task]` | `gh issue view <taskId> --comments` |
 | List `[tasks]` in a feature | `gh issue list --milestone "<featureId>" --state all` |
-| Set `[task]` → `[Active]`/`[Review]` | `gh issue edit <taskId> --remove-label "status:*old*" --add-label "status:active"` |
+| Set `[task]` status | `gh issue edit <taskId> --remove-label "status:planned" --add-label "status:active"` (remove the label matching the [task]'s current status — read it first; globs do not work with `--remove-label`) |
 | Set `[task]` → `[Completed]` | `gh issue close <taskId>` |
 | Reopen (rework) | `gh issue reopen <taskId> --add-label status:active` |
 | Set `[feature]` → `[Resolved]` | `gh api -X PATCH repos/:owner/:repo/milestones/<n> -f state=closed` |

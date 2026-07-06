@@ -14,7 +14,7 @@ in the tracker are the only trigger that counts.
 
 ## Pipeline (run exactly, in order)
 
-1. In the [task]'s worktree (`<TEAMWORK_ROOT>/<team>/worktrees/<role>-<taskId>`),
+1. In the [task]'s worktree (`<TEAMWORK_ROOT>/<team>/worktrees/<role>-<taskId>` (derive `<role>` from the [task]'s assignee)),
    compute `git diff --name-only <feature-branch>...HEAD`.
 2. Compare with the file lists inside BOTH approval comments. All three sets must be
    identical. Any extra, missing, or renamed file → `[andon]` (a file changed after
@@ -34,7 +34,7 @@ in the tracker are the only trigger that counts.
    citing the commit hash, the validations run (and skips), and the merged files.
    Commit + completion are one atomic pair — never leave one without the other; if
    the status write fails, `[andon]` loudly before doing anything else.
-9. Notify the team-lead and principal-architect by mailbox: taskId, hash, results.
+9. Notify the team-lead and principal-architect by mailbox: taskId, hash, results, and `qa` if QA [tasks] exist.
 
 ## Ordering
 
