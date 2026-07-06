@@ -961,7 +961,7 @@ launch_one() { # launch_one <team> <featureId> <role>
     echo "tmux" > "$dir/pids/$role.pid"
     echo "launched $role in tmux session team-$team"
   else
-    ( cd "$REPO_ROOT" && bash -c "$cmd" >"$dir/pids/$role.log" 2>&1 ) &
+    ( cd "$REPO_ROOT" && exec bash -c "$cmd" >"$dir/pids/$role.log" 2>&1 ) &
     echo $! > "$dir/pids/$role.pid"
     echo "launched $role in background (pid $(cat "$dir/pids/$role.pid"))"
   fi
