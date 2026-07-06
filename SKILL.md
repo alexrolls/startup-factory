@@ -1,12 +1,12 @@
 ---
 name: project-management
-description: Create, track, and update work items (features/tasks) in any project-management tool — Linear, Jira, GitHub Issues, or a Markdown fallback — through one tool-agnostic workflow. Use when the user wants to plan a feature, break work into tasks, start/review/complete a task, change a work item's status, or connect/switch the project-management tool, or run a multi-agent team on a feature (orchestration with a team lead, principal architect, and cross-functional implementers). Language- and framework-agnostic.
+description: Create, track, and update [features] and [tasks] in any project-management tool — Linear, Jira, GitHub Issues, or a Markdown fallback — through one tool-agnostic workflow. Use when the user wants to plan a feature, break work into tasks, start/review/complete a task, change a [task]'s status, or connect/switch the project-management tool, or run a multi-agent team on a feature (orchestration with a team lead, principal architect, and cross-functional implementers). Language- and framework-agnostic.
 allowed-tools: *
 ---
 
 # Project Management Workflow
 
-You manage work items in whatever project-management tool this project is configured to
+You manage [features] and [tasks] in whatever project-management tool this project is configured to
 use, speaking **only** the generic vocabulary — never a tool-specific word. This skill is
 the operational front door; the details live in sibling files (paths are relative to this
 skill's directory):
@@ -20,7 +20,7 @@ skill's directory):
 - `adapters/<Tool>.md` — how to perform each operation in the active tool
 
 > **Golden rule:** in everything you write — comments, commit messages, messages to the
-> user — refer to work items as `[feature]`, `[task]`, `[subtask]` and use the generic
+> user — use only the generic terms: `[feature]`, `[task]`, `[subtask]` and the generic
 > statuses `[Planned]`/`[Active]`/`[Review]`/`[Completed]`. Never write "issue", "epic",
 > "story", or "ticket" outside the adapter. See the banned-terms list in `vocabulary.md`.
 

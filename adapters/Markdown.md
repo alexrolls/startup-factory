@@ -73,12 +73,16 @@ Status is literal bracket text at the end of the task's `##` header.
 
 ## 1 Add payment method form [Planned]
 
+**Assignee:** —
+
 Build the card-entry form and validation.
 
 - Card number + expiry + CVC fields
 - Client-side Luhn check
 
 ## 2 Wire charge endpoint [Planned]
+
+**Assignee:** —
 
 Call the billing charge endpoint on submit.
 
@@ -91,19 +95,22 @@ Call the billing charge endpoint on submit.
 | Generic operation | How |
 |---|---|
 | Create `[feature]` | Create `<MARKDOWN_ROOT>/<date>-<slug>/feature.md` with title line `# <name> [Planned]` and the Purpose/NOT included/Dependencies block |
-| Create `[task]` under a feature | Append a `## <n> <title> [Planned]` section (next sequential `n`) with description + `-` subtasks |
+| Create `[task]` under a feature | Append a `## <n> <title> [Planned]` section (next sequential `n`) with `**Assignee:** —`, description, and `-` subtasks |
 | Read a `[task]` | Read the file; locate the `## <taskId> ...` section |
 | List `[tasks]` in a feature | Read the file; every `##` section is a task |
 | Set `[task]` status | Edit that section's header, replacing the trailing `[Status]` |
+| Set `[task]` assignee | Edit the `**Assignee:**` line in that section; use the role name verbatim (e.g. `backend`) |
 | Set `[feature]` status | Edit the `#` title line's trailing `[Status]` |
-| Add a comment to a `[task]` | Append a `> note (yyyy-MM-dd): ...` line under the task section |
+| Add a comment to a `[task]` | Append a `> <marker> (yyyy-MM-dd): <content>` line under the task section, where `<marker>` is the exact orchestration marker (e.g. `[design-note]`, `[review-approval]`) or `note` for free-form comments |
 
 ## Rules
 
 - Task numbers are sequential within a file and never reused, even after completion.
 - Task headers always carry a number **and** a status: `## 3 Title [Active]`.
+- Every task section has exactly one `**Assignee:**` line (value: a role name or `—` for unclaimed).
 - `featureId` is a file path; `taskId` is a task number (`1`, `2`, `3`).
 - Change status only by editing the bracket text — keep exactly one status per header.
+- Comment markers must be exact (e.g. `[design-note]`, `[review-approval]`) — never paraphrase them.
 - Editing files can't "fail" the way an API can, but a missing folder/file is still an
   andon-cord stop: create the structure, don't silently write to the wrong place.
 
