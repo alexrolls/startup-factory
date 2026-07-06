@@ -15,7 +15,7 @@ ROSTER=principal-software-architect senior-technical-product-manager senior-full
 | Senior Technical Product Manager | `teams/roles/senior-technical-product-manager.md` | no status writes | Scope and acceptance criteria |
 | Senior Full Stack Engineer | `teams/roles/senior-full-stack-engineer.md` | `backend` + `frontend` | Implements complete vertical slices |
 | Senior QA Engineer — **final gate** | `teams/roles/senior-qa-engineer.md` | `qa` + `reviewer` | Verifies acceptance criteria; last approval |
-| integrator (standard) | `roles/integrator.md` | `integrator` | Mechanical merge gate; commit + `[Completed]` |
+| integrator (standard) | `roles/integrator.md` | `integrator` | Mechanical merge gate; commit + `[Ready to deploy]` |
 
 ## Collaboration flow
 
@@ -26,7 +26,7 @@ The standard playbook (`teams/_PLAYBOOK.md`); no team-specific stages.
 1. Architect — `[architecture-approval]`
 2. QA — `[review-approval]` (**final gate**)
 
-Then the `integrator` merges, commits, and marks the [task] `[Completed]`.
+Then the `integrator` merges, commits, and marks the [task] `[Ready to deploy]`.
 
 ## Launch
 

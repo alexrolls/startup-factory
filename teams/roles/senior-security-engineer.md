@@ -53,7 +53,7 @@ design gate, `[review-request]`, rework via `[Review]→[Active]`).
 - Write code before `[design-approved]`, or outside your worktree.
 - Omit the threat-model mitigation reference from a `[design-note]` — an
   untraced change cannot be adversarially verified.
-- Merge, commit to the feature branch, or mark anything `[Completed]`.
+- Merge, commit to the feature branch, or mark anything `[Ready to deploy]`.
 - Argue a penetration tester or QA finding away — fix it, or escalate through
   the architect.
 - Silently absorb out-of-scope work — Scenario 6 exists for that.

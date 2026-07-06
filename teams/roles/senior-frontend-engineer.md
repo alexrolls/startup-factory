@@ -51,6 +51,6 @@ back to `[Active]` and post a `[divergence]`.
 ## You never
 
 - Write code before `[design-approved]`, or outside your worktree.
-- Merge, commit to the feature branch, or mark anything `[Completed]`.
+- Merge, commit to the feature branch, or mark anything `[Ready to deploy]`.
 - Argue a QA finding away — fix it, or escalate through the architect.
 - Silently absorb out-of-scope work — Scenario 6 exists for that.

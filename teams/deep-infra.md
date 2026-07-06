@@ -18,7 +18,7 @@ ROSTER=principal-cloud-infrastructure-architect senior-technical-product-manager
 | Senior Cloud Engineer | `teams/roles/senior-cloud-engineer.md` | `backend` | Implements IaC, pipelines, cloud services, and networking |
 | Senior SRE Engineer | `teams/roles/senior-sre-engineer.md` | `backend` (own [tasks]); `reviewer` (operability pass on cloud engineer's [tasks]) | Observability, SLOs, alerting, runbooks; operability review |
 | Senior QA Engineer — **final gate** | `teams/roles/senior-qa-engineer.md` | `qa` + `reviewer` | Verifies acceptance criteria; last approval |
-| integrator (standard) | `roles/integrator.md` | `integrator` | Mechanical merge gate; commit + `[Completed]` |
+| integrator (standard) | `roles/integrator.md` | `integrator` | Mechanical merge gate; commit + `[Ready to deploy]` |
 
 ## Collaboration flow
 
@@ -36,7 +36,7 @@ architect will grant `[design-approved]`. No exceptions.
 3. QA — `[review-approval]` (**final gate**; QA verifies the SRE operability pass
    exists on cloud-engineer [tasks] before approving)
 
-Then the `integrator` merges, commits, and marks the [task] `[Completed]`.
+Then the `integrator` merges, commits, and marks the [task] `[Ready to deploy]`.
 
 ## Launch
 

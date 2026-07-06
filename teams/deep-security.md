@@ -18,7 +18,7 @@ ROSTER=principal-security-architect senior-technical-product-manager senior-secu
 | Senior Security Engineer | `teams/roles/senior-security-engineer.md` | `backend` | Implements security features, hardening, and vulnerability fixes |
 | Senior Penetration Tester | `teams/roles/senior-penetration-tester.md` | specialist reviewer (stage 5.2); `qa` for test-tooling [tasks] | Authorized adversarial verification of the team's own implemented changes |
 | Senior QA Engineer — **final gate** | `teams/roles/senior-qa-engineer.md` | `qa` + `reviewer` | Verifies acceptance criteria; confirms pentest pass exists; last approval |
-| integrator (standard) | `roles/integrator.md` | `integrator` | Mechanical merge gate; commit + `[Completed]` |
+| integrator (standard) | `roles/integrator.md` | `integrator` | Mechanical merge gate; commit + `[Ready to deploy]` |
 
 ## Collaboration flow
 
@@ -42,7 +42,7 @@ acceptance criteria so QA and the penetration tester can trace coverage.
 3. QA — `[review-approval]` (**final gate**; QA verifies the pentest pass comment
    exists before issuing its approval)
 
-Then the `integrator` merges, commits, and marks the [task] `[Completed]`.
+Then the `integrator` merges, commits, and marks the [task] `[Ready to deploy]`.
 
 ## Launch
 
