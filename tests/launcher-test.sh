@@ -17,17 +17,18 @@ git init -q repo && cd repo
 git commit -q --allow-empty -m init
 git checkout -q -b test-feature
 mkdir -p .claude/skills/pm
-cp -R "$SKILL_DIR/roles" "$SKILL_DIR/reference" "$SKILL_DIR/bin" .claude/skills/pm/
+cp -R "$SKILL_DIR/roles" "$SKILL_DIR/reference" "$SKILL_DIR/bin" "$SKILL_DIR/teams" .claude/skills/pm/
 mkdir -p .claude/skills/pm/config
 cat > .claude/skills/pm/config/team.config.md <<'EOF'
 ```
 TEAM_LEAD_CMD=null
 PRINCIPAL_ARCHITECT_CMD=null
-INTEGRATOR_CMD=null
 BACKEND_CMD="cat {prompt_file} > backend-received.txt"
 FRONTEND_CMD=null
-QA_CMD=null
 REVIEWER_CMD=null
+TEAM_DEFAULT_CMD="true"
+SENIOR_QA_ENGINEER_CMD="cat {prompt_file} > qa-received.txt"
+SENIOR_TECHNICAL_PRODUCT_MANAGER_CMD=null
 TEAMWORK_ROOT=.teamwork
 POLL_INTERVAL_SECONDS=1
 STUCK_AFTER_MINUTES=1
@@ -51,11 +52,22 @@ for i in $(seq 1 20); do [ -f backend-received.txt ] && break; sleep 0.1; done
 check "stub agent ran with prompt"  grep -q "Role: backend" backend-received.txt
 check "mailbox dir created"         test -d .teamwork/test-feature/mailbox/backend
 
-# -- start refuses a role with a null command ---------------------------------
-if TEAM_RUNNER=background "$LAUNCH" start test-feature FEAT-1 qa 2>/dev/null; then
-  echo "FAIL: null-command role should be refused"; FAILURES=$((FAILURES+1))
+# -- start refuses an unknown role (no brief anywhere) ------------------------
+if TEAM_RUNNER=background "$LAUNCH" start test-feature FEAT-1 no-such-role 2>/dev/null; then
+  echo "FAIL: unknown role should be refused"; FAILURES=$((FAILURES+1))
 else
-  echo "ok: null-command role refused"
+  echo "ok: unknown role refused"
+fi
+
+# -- role with no _CMD key of its own falls back to TEAM_DEFAULT_CMD ----------
+TEAM_RUNNER=background "$LAUNCH" start test-feature FEAT-1 qa
+check "absent-key role falls back to TEAM_DEFAULT_CMD" test -f .teamwork/test-feature/prompts/qa.md
+
+# -- explicit <ROLE>_CMD=null disables the role even when TEAM_DEFAULT_CMD is set --
+if TEAM_RUNNER=background "$LAUNCH" start test-feature FEAT-1 reviewer 2>/dev/null; then
+  echo "FAIL: explicit-null role should be refused"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: explicit-null role refused (no fallback)"
 fi
 
 # -- worktree subcommand -------------------------------------------------------
@@ -70,8 +82,28 @@ git worktree remove .teamwork/test-feature/worktrees/backend-T-42
 "$LAUNCH" worktree test-feature backend T-42
 check "worktree re-add with existing branch" test -d .teamwork/test-feature/worktrees/backend-T-42
 
+# -- team preset: launch a full roster from teams/full-stack.md ----------------
+TEAM_RUNNER=background "$LAUNCH" team full-stack test-feature FEAT-2
+check "preset composes fallback-role prompt" test -f .teamwork/test-feature/prompts/principal-software-architect.md
+check "preset brief resolved from teams/roles" grep -q "Role: principal-software-architect" .teamwork/test-feature/prompts/principal-software-architect.md
+check "preset prompt includes team file"     grep -q "Team: Full Stack" .teamwork/test-feature/prompts/principal-software-architect.md
+check "preset prompt includes playbook"      grep -q "Team Playbook" .teamwork/test-feature/prompts/principal-software-architect.md
+check "preset composes integrator (roles/)"  test -f .teamwork/test-feature/prompts/integrator.md
+check "preset skips explicit-null role"      test ! -f .teamwork/test-feature/prompts/senior-technical-product-manager.md
+for i in $(seq 1 20); do [ -f qa-received.txt ] && break; sleep 0.1; done
+check "preset per-role override ran"         grep -q "Role: senior-qa-engineer" qa-received.txt
+
+# -- team preset: unknown preset is refused ------------------------------------
+if TEAM_RUNNER=background "$LAUNCH" team nonesuch test-feature FEAT-2 2>/dev/null; then
+  echo "FAIL: unknown preset should be refused"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: unknown preset refused"
+fi
+
 # -- status + stop --------------------------------------------------------------
-"$LAUNCH" status test-feature | grep -q backend && echo "ok: status lists role" || { echo "FAIL: status"; FAILURES=$((FAILURES+1)); }
+# Capture first (grep -q closes the pipe early → SIGPIPE on the writer under pipefail).
+status_out="$("$LAUNCH" status test-feature)"
+echo "$status_out" | grep -q backend && echo "ok: status lists role" || { echo "FAIL: status"; FAILURES=$((FAILURES+1)); }
 "$LAUNCH" stop test-feature
 echo "---"
 [ "$FAILURES" -eq 0 ] && echo "ALL PASS" || { echo "$FAILURES FAILURE(S)"; exit 1; }

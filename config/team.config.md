@@ -25,10 +25,18 @@ BACKEND_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
 FRONTEND_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
 QA_CMD=null
 REVIEWER_CMD="gemini --yolo \"$(cat '{prompt_file}')\""
+TEAM_DEFAULT_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
 ```
 
 > Mixing LLMs is the design intent — e.g. Claude for team-lead/principal-architect,
 > Codex for implementers, Gemini for review diversity. Same-LLM teams work too.
+>
+> **Preset teams** (`teams/`) carry many specialized role names. Rather than a key
+> per role, an *absent* key falls back to `TEAM_DEFAULT_CMD`. Add a `<ROLE>_CMD`
+> line — e.g. `SENIOR_STAFF_ENGINEER_CMD` — only to pin a specific CLI to that
+> role, or set it explicitly to `null` to disable the role (a `team` launch skips
+> it; a direct `start`/`relaunch` of it is refused). Resolution per role:
+> explicit `null` → disabled; a set value → used; absent → `TEAM_DEFAULT_CMD`.
 
 ## Coordination
 
