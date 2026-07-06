@@ -77,6 +77,22 @@ Every existing workflow keeps working untouched.
 
 ---
 
+## Works with any agentic CLI
+
+| Harness | Install | Invoke |
+|---|---|---|
+| Claude Code | copy bundle to `.claude/skills/project-management/` | "plan a feature" / "launch the team" |
+| Codex CLI | copy anywhere, e.g. `.codex/pm/` | `codex exec "Read .codex/pm/SKILL.md and plan a feature …"` |
+| Aider | copy anywhere | `aider --read pm/SKILL.md`, then instruct |
+| Cursor / Windsurf / Cline | copy into the tool's rules dir | reference `SKILL.md` in chat |
+| Anything else | copy anywhere | point the agent at `SKILL.md` |
+
+Minimum host capabilities: file read/write, shell, git. Tracker access works via
+MCP **or** plain REST with an API key (see each adapter's *Access mechanisms*), so
+harnesses without MCP clients are first-class.
+
+---
+
 ## Add a brand-new tool (one file)
 
 1. Copy `adapters/_TEMPLATE.md` to `adapters/<YourTool>.md`.
@@ -85,6 +101,43 @@ Every existing workflow keeps working untouched.
 3. Set `PRODUCT_MANAGEMENT_TOOL=<YourTool>` in the config.
 
 That's the entire integration. Nothing else in the bundle changes.
+
+---
+
+## Run a cross-functional agent team (optional)
+
+The bundle includes an **LLM-agnostic orchestration layer**: seven fixed roles —
+team-lead, principal-architect (technical veto), integrator (sole committer),
+backend, frontend, qa, reviewer — that work one [feature]'s [tasks] in parallel,
+each agent potentially a *different* LLM/CLI.
+
+```
+          PM tool (Linear/Jira/…) = single source of truth
+   claims = status transitions · coordination = structured comments
+                       ▲ via the adapter port ▲
+ team-lead ── principal-architect ── integrator ── backend ── frontend ── qa ── reviewer
+   (process)      (technical veto)   (sole commits)  └── one git worktree each ──┘
+                       ▼ optional low-latency transport ▼
+        .teamwork/<team>/  mailboxes · heartbeats  (degrades to tracker polling)
+```
+
+1. Configure your tracker as above, then edit `config/team.config.md`: one CLI
+   command per role (`claude -p …`, `codex exec …`, `gemini …` — mix freely) and
+   your project's `VALIDATE_*` commands.
+2. Add `.teamwork/` to `.gitignore`.
+3. Ask your primary agent (as team-lead) to *"plan a feature and launch the team"*
+   — or run `bin/launch-team.sh start <branch> <featureId> <roles...>` yourself.
+4. Watch agents in tmux (`tmux attach -t team-<branch>`), progress in your tracker,
+   and escalations in `.teamwork/<branch>/ESCALATIONS.md`.
+
+Every [task] passes a **design gate** (principal-architect approves a design note
+before any code) and **dual review** (reviewer + architect, explicit file lists),
+and only the integrator merges + completes — commit and `[Completed]` are atomic.
+The team-lead detects stuck/conflicting/crashed agents and unblocks them
+(message → decide → reassign → relaunch), escalating to you only as a last resort.
+
+**First run without any tracker account:** set `PRODUCT_MANAGEMENT_TOOL=Markdown`
+and launch just `team-lead` + `backend` — a complete offline test of the protocol.
 
 ---
 
@@ -103,6 +156,10 @@ That's the entire integration. Nothing else in the bundle changes.
 | `adapters/Jira.md` | Jira via Atlassian MCP | — |
 | `adapters/GitHubIssues.md` | GitHub Issues via `gh` CLI or GitHub MCP | — |
 | `adapters/Markdown.md` | Local Markdown files — no network, no setup | — |
+| `reference/orchestration.md` | Multi-agent protocol: coordination, gates, unblocking | Rarely |
+| `roles/*.md` | Seven role briefs (team-lead, principal-architect, integrator, backend, frontend, qa, reviewer) | Rarely |
+| `config/team.config.md` | Role→CLI map + validation commands for your stack | **Yes, per project** |
+| `bin/launch-team.sh` | Launches/relaunches team agents, creates worktrees | — |
 
 ---
 

@@ -1,6 +1,6 @@
 ---
 name: project-management
-description: Create, track, and update work items (features/tasks) in any project-management tool — Linear, Jira, GitHub Issues, or a Markdown fallback — through one tool-agnostic workflow. Use when the user wants to plan a feature, break work into tasks, start/review/complete a task, change a work item's status, or connect/switch the project-management tool. Language- and framework-agnostic.
+description: Create, track, and update work items (features/tasks) in any project-management tool — Linear, Jira, GitHub Issues, or a Markdown fallback — through one tool-agnostic workflow. Use when the user wants to plan a feature, break work into tasks, start/review/complete a task, change a work item's status, or connect/switch the project-management tool, or run a multi-agent team on a feature (orchestration with a team lead, principal architect, and cross-functional implementers). Language- and framework-agnostic.
 allowed-tools: *
 ---
 
@@ -15,6 +15,8 @@ skill's directory):
 - `reference/vocabulary.md` — the generic contract (terms, statuses, IDs, banned words)
 - `reference/lifecycle.md` — the numbered scenarios you execute
 - `reference/team-roles.md` — status ownership (only if `TEAM_MODE=true`)
+- `reference/orchestration.md` — multi-agent protocol (mailboxes, gates, unblocking)
+- `roles/<role>.md` + `config/team.config.md` + `bin/launch-team.sh` — the agent team
 - `adapters/<Tool>.md` — how to perform each operation in the active tool
 
 > **Golden rule:** in everything you write — comments, commit messages, messages to the
@@ -31,7 +33,7 @@ skill's directory):
    your only source for concrete operations, terminology, status, and ID mappings. If the
    file doesn't exist, stop and tell the user to create it from `adapters/_TEMPLATE.md`.
 3. **Read `reference/vocabulary.md` and `reference/lifecycle.md`** if not already in
-   context. If `TEAM_MODE=true`, also read `reference/team-roles.md`.
+   context. If `TEAM_MODE=true`, also read `reference/team-roles.md` and `reference/orchestration.md`.
 4. **Initialize the tool** exactly as the adapter's *Initialization* section says (a cheap
    read proving access works). If it fails: **stop** and tell the user to fix the adapter's
    *MCP / CLI Setup* — do not proceed.
@@ -50,6 +52,7 @@ each generic operation through the adapter's *Operations* table:
 | Finish / close out a task | 5 — Complete a `[task]` |
 | File a bug / follow-up found mid-work | 6 — File newly-discovered work |
 | (anything wrong / blocked / failed) | 7 — Andon cord: stop & report |
+| Run an agent team on a feature ("launch the team") | Team: set `TEAM_MODE=true`, follow `reference/orchestration.md`; launch via `bin/launch-team.sh` |
 | Connect a new tool / switch tools | 8 — Connect / switch |
 
 ## Non-negotiables (the fail-loud contract)
