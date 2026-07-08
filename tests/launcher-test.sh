@@ -94,6 +94,24 @@ check "preset skips explicit-null role"      test ! -f .teamwork/test-feature/pr
 for i in $(seq 1 20); do [ -f qa-received.txt ] && break; sleep 0.1; done
 check "preset per-role override ran"         grep -q "Role: senior-qa-engineer" qa-received.txt
 
+# -- compose: emits the composed startup prompt without spawning (harness mode) --
+out="$("$LAUNCH" compose test-compose FEAT-3 backend)"
+check "compose prints an existing prompt path" test -f "$out"
+check "compose prompt contains role brief"     grep -q "Role: backend" "$out"
+check "compose prompt contains protocol"       grep -q "Orchestration — The Multi-Agent Protocol" "$out"
+check "compose spawns nothing"                 test ! -f .teamwork/test-compose/pids/backend.pid
+out2="$("$LAUNCH" compose test-compose FEAT-3 senior-qa-engineer full-stack)"
+check "compose with preset includes team file" grep -q "Team: Full Stack" "$out2"
+# compose is command-map-agnostic: a role with <ROLE>_CMD=null still composes
+# (harness mode spawns natively; the command map only gates CLI launches)
+out3="$("$LAUNCH" compose test-compose FEAT-3 reviewer)"
+check "compose works for CLI-disabled role"    grep -q "Role: reviewer" "$out3"
+if "$LAUNCH" compose test-compose FEAT-3 no-such-role 2>/dev/null; then
+  echo "FAIL: compose should refuse an unknown role"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: compose refuses unknown role"
+fi
+
 # -- team preset: unknown preset is refused ------------------------------------
 if TEAM_RUNNER=background "$LAUNCH" team nonesuch test-feature FEAT-2 2>/dev/null; then
   echo "FAIL: unknown preset should be refused"; FAILURES=$((FAILURES+1))

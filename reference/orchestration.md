@@ -28,16 +28,30 @@ Two principles rule everything:
 ├── heartbeats/<role>            # one line: <ISO-8601 UTC> | <taskId or -> | <state>
 ├── pids/<role>.pid              # process id when launched in background mode
 ├── worktrees/<role>-<taskId>/   # implementer working copies
+├── CONTRACTS.md                 # append-only registry of names plans export/consume (see "Contract registry")
+├── BASELINE.md                  # known state of the branch at creation: test counts, known failures, validation commands (see "Baseline manifest")
+├── review-ledger.md             # reviewers' one-line-per-ruling ledger of still-live conditions
+├── tasks.json                   # read-only [task] export for credential-less roles (adapter "export" operation)
 └── ESCALATIONS.md               # the Lead's log of everything escalated to the human
 ```
 
 ## Identity
 
-Exactly seven role names exist: `team-lead`, `principal-architect`, `integrator`,
-`backend`, `frontend`, `qa`, `reviewer`. Your role is stated at the top of your
-startup prompt. Use it verbatim as your tracker assignee name, your mailbox
-directory, your heartbeat file, and the signature line of every comment you write:
-`— <role>` (e.g. `— principal-architect`).
+Exactly seven **protocol roles** exist: `team-lead`, `principal-architect`,
+`integrator`, `backend`, `frontend`, `qa`, `reviewer` — the protocol's rules,
+gates, and status ownership are written against these. Preset teams (`teams/`)
+add **specialized role names** (`principal-software-architect`,
+`senior-qa-engineer`, …), each acting as one or more protocol roles per the
+*Protocol mapping* line in its brief.
+
+One signing rule: **use the role name at the top of your startup prompt,
+verbatim and only that name** — as your tracker assignee name, your mailbox
+directory, your heartbeat file, and the signature of every comment: `— <role>`.
+A specialized role signs its specialized name; when it writes a protocol-role
+marker and the mapping isn't already on the [task], it states the mapping once —
+e.g. `— principal-software-architect (as principal-architect)` — and plain
+`— <specialized-name>` thereafter. Never alternate between the two names within
+a run: signatures are grep keys.
 
 ## Mailboxes and heartbeats
 
@@ -61,6 +75,45 @@ directory, your heartbeat file, and the signature line of every comment you writ
   skip mailboxes and heartbeats entirely and poll the tracker for comments addressed
   to your role. State this degradation once in a comment on your current [task].
 
+## Report before idle — the delivery contract
+
+**You never go idle without first delivering your current structured artifact**
+(`[design-note]`, `[review-request]`, a review verdict, `[andon]`, …) to the
+tracker and notifying the team-lead. Finishing the work is half the job; the
+protocol only sees what was delivered. Idle with undelivered work is a protocol
+violation — the lead treats it as **Stuck** immediately.
+
+The launch handshake is the same contract from the lead's side:
+
+- **The spawn prompt is context, not a trigger.** After spawning or relaunching a
+  teammate, the lead always sends an explicit assignment message (mailbox or
+  harness message): the [task] or gate to act on, pointers to conditions, and the
+  expected artifact. Teammates act on assignment messages; a teammate that has a
+  startup prompt but no assignment asks the lead instead of guessing — or idling.
+- Every assignment names the artifact that ends it. When that artifact is
+  delivered, the loop closes; until then, the teammate is accountable for it.
+
+## Harness mode — teammates as in-session subagents
+
+Teams don't have to run as external CLI processes. When the orchestrating agent's
+harness can spawn subagents and message them directly, run the whole team inside
+it — same protocol, different transport:
+
+| CLI-process mechanism | Harness-mode equivalent |
+|---|---|
+| `launch-team.sh start/team` (spawn) | `launch-team.sh compose <team> <featureId> <role> [preset]` writes the identical startup prompt without spawning; the lead spawns the role natively with it |
+| Mailbox files | The harness's agent-to-agent messages. Same rule as mailboxes: transport, never truth — a decision is binding only once it lands as a tracker comment |
+| Heartbeats | The harness's lifecycle/idle notifications |
+| pid files, tmux, `status`/`stop` | Not applicable — the harness owns process supervision |
+| Filesystem-degradation statement | Not needed — the harness delivers messages |
+
+Everything else is unchanged: the tracker is still the single source of durable
+truth, markers and statuses are still the protocol, worktrees still come from
+`launch-team.sh worktree`, and the *Report before idle* contract applies with the
+harness's idle notification standing in for a stale heartbeat. The two modes mix
+freely — e.g. harness subagents for implementers, a CLI process for a long-lived
+reviewer.
+
 ## Structured comments — the coordination markers
 
 All coordination artifacts are comments on the [task], written through the adapter,
@@ -69,18 +122,74 @@ invent new ones, never misspell them.
 
 | Marker | Written by | Meaning / required content |
 |---|---|---|
-| `[design-note]` | implementer | Proposed approach before any code: approach, API/contract changes, data-model changes, affected components. Frontend must include `Architectural impact: yes/no — <why>`. |
+| `[design-note]` | implementer | Proposed approach before any code: approach, API/contract changes, data-model changes, affected components. Frontend must include `Architectural impact: yes/no — <why>`. Registers every name it exports in `CONTRACTS.md` and cites the registry line for every sibling export it consumes (see *Contract registry*). |
 | `[design-approved]` | principal-architect | Gate open. May carry conditions the implementation must honour. |
 | `[design-pushback]` | principal-architect | Gate closed. Lists required changes; implementer revises the `[design-note]` and re-pings. |
 | `[api-ready]` | backend | Contract available for frontend: endpoints, request/response shapes. Also sent by mailbox. |
 | `[divergence]` | implementer | What was done differently from the [task]/design note and why. Additive — **never edit the original [task] description.** |
-| `[review-request]` | implementer | Ready for review: what changed, list of changed files, validation commands run and their results. Written when moving to `[Review]`. |
+| `[review-request]` | implementer | Ready for review: what changed, list of changed files, validation commands run and their results (judged against `BASELINE.md`), and any index-only staging operation performed (e.g. untracking a file) — the one staging act an implementer may perform. Written when moving to `[Review]`. |
 | `[review-findings]` | reviewer / principal-architect | Numbered problems that must be fixed. Task goes back to `[Active]`. |
 | `[review-approval]` | reviewer | Approval with the **explicit list of approved file paths**. |
 | `[architecture-approval]` | principal-architect | Same, from the architecture review. |
+| `[product-approval]` | product owner role (e.g. `senior-technical-product-manager`; the team-lead where no product role exists) | Scope/acceptance sign-off: scope ruling, acceptance-criteria verdict, any conditions. |
+| `[product-pushback]` | product owner role (same) | Scope gate closed: what must change in scope or acceptance criteria before work proceeds. |
 | `[handoff]` | team-lead | Reassignment: summary of state so a fresh agent can resume. |
 | `[andon]` | any role | Stop-the-line report: what failed, exact error, what you did NOT do. |
 | `[escalation]` | team-lead | Needs the human: question + context + what was already tried. |
+
+## Contract registry — parallel plans share names, not assumptions
+
+When [tasks] are planned or implemented in parallel, the cheapest defect filter is
+a single place where cross-[task] names live. `<TEAMWORK_ROOT>/<team>/CONTRACTS.md`
+is an **append-only registry**:
+
+- Every `[design-note]` **registers what it exports** — schema/field names, event
+  constants, endpoint paths, enum values, anything a sibling [task] will spell —
+  one line each: `<taskId> exports <kind> <name> — <one-line shape>`.
+- Every plan that **consumes** a sibling's export cites the registry line instead
+  of restating the name from memory. No matching line yet? That's a sequencing
+  question for the principal-architect, not a guess.
+- The principal-architect's reviews (batch or per-[task]) **diff plans against
+  the registry** — two [tasks] spelling the same concept differently is a
+  `[design-pushback]` on the later one, caught before code exists.
+- Renames are new lines that supersede old ones (`supersedes: <line>`), never
+  edits — the history is the audit trail.
+
+## Baseline manifest — no oral tradition about branch state
+
+At feature-branch creation the team-lead records
+`<TEAMWORK_ROOT>/<team>/BASELINE.md`: current test counts, **known failures with
+their cause**, and the validation commands that exist right now. Every brief and
+review judges work against it: **the bar is "no new failures", not "all green"** —
+nobody restates known-failure lore in assignment messages, and nobody gets blamed
+for red that predates the branch. When a [task] changes the validation landscape
+(adds a linter, a suite, a build step), updating `BASELINE.md` is part of that
+[task]'s diff. The integrator cites `BASELINE.md` when recording skips or judging
+a validation run.
+
+## Tracker write modes
+
+`TRACKER_WRITERS` in `config/team.config.md` sets who physically writes to the
+tracker:
+
+- **`all` (default).** Every role performs its own adapter operations. Requires
+  every agent to hold tracker access.
+- **`lead` — single-writer ("scribe") mode.** Only the team-lead holds tracker
+  credentials. Roles compose their artifacts exactly as the protocol requires —
+  same markers, same content, signed `— <role>` — but deliver them to the lead
+  (mailbox or harness message) instead of posting. The lead posts each block
+  **verbatim**, appending `(posted by team-lead)` to the signature:
+  `— <role> (posted by team-lead)`. Status changes work the same way: the role
+  requests the move, the lead performs the write.
+
+  In `lead` mode, status ownership and marker authorship rules apply to the
+  **authoring** role, not the writing one — the lead is a scribe, never an
+  author, and gains no authority from holding the pen: it still cannot approve a
+  design, soften a finding, or override a veto, and it must not edit, summarize,
+  or reorder a block it posts. Trade-offs to accept knowingly: signatures no
+  longer prove authorship (acceptable inside one supervised team), and the lead
+  becomes a serialization point (which is also the point — no credential sprawl,
+  no write races, uniform formatting).
 
 ## Status routing
 
@@ -109,12 +218,14 @@ One implementer per [task], ever. Claiming is the lock.
 ```
 claim → [design-note] → wait for [design-approved]      (no code before the gate)
       → implement in your worktree                       ([divergence] comments as needed)
-      → self-validate (VALIDATE_* that apply to your change)
+      → self-validate (VALIDATE_SCRIPT or the VALIDATE_* that apply; bar =
+        no new failures vs BASELINE.md)
       → [review-request] + move to [Review]
       → reviewer three-phase review ∥ principal-architect architecture review
       → findings? → back to [Active], fix, [review-request] again
       → [review-approval] + [architecture-approval] (both, with file lists)
-      → integrator: verify lists == diff, stage explicitly, run VALIDATE_*,
+      → integrator: verify lists == diff, stage explicitly, validate
+        (VALIDATE_SCRIPT or VALIDATE_*, judged against BASELINE.md),
         merge to the feature branch, commit, move to [Ready to deploy] (atomic pair)
       → principal-architect divergence sweep updates upcoming [tasks]
 ```
@@ -148,12 +259,18 @@ The `integrator` is the **only** role that merges to the feature branch, commits
 marks `[Ready to deploy]`. Pipeline (all-or-nothing, zero tolerance, no overrides — not
 even from the team-lead):
 
-1. Verify both approval comments exist and their file lists are identical to
-   `git diff --name-only <feature-branch>...HEAD` (run from inside the [task]'s worktree).
-   Any mismatch → `[andon]`.
+1. Verify both approval comments exist and their file lists are identical to the
+   full changed-file set — `git diff --name-only <feature-branch>...HEAD` plus
+   `git status --porcelain -uall` for uncommitted work (always `-uall`: plain
+   porcelain hides the files inside a new directory), run from inside the
+   [task]'s worktree. Any mismatch → `[andon]`.
 2. Stage by explicit file list (never `add -A`), verify the staged set matches.
-3. Run `VALIDATE_BUILD`, `VALIDATE_TEST`, `VALIDATE_LINT` (skip `null` ones, record
-   skips). Any failure → `[andon]`, task back to `[Active]`.
+   Index-only operations (untracking a file) are the implementer's one sanctioned
+   staging exception — allowed only when named in the `[review-request]`.
+3. Validate — `VALIDATE_SCRIPT` with the changed-file list if set, else
+   `VALIDATE_BUILD`, `VALIDATE_TEST`, `VALIDATE_LINT` (skip `null` ones, record
+   skips). Judge against `BASELINE.md`: the bar is no NEW failures. Any new
+   failure → `[andon]`, task back to `[Active]`.
 4. Merge the task branch into the feature branch; remove the worktree.
 5. Commit, capture the hash, then immediately move the [task] to `[Ready to deploy]`,
    citing the hash. Commit and completion are one atomic pair — never one without
@@ -169,7 +286,9 @@ Detect:
 - **Stuck** — heartbeat older than `STUCK_AFTER_MINUTES`; an `[Active]` [task] with
   no new comment past the threshold; a `[design-note]`, question, or
   `[review-request]` that nobody answered (the principal-architect is on the hot
-  path — monitor it like anyone else).
+  path — monitor it like anyone else). **A teammate that goes idle while you are
+  still waiting on its artifact is Stuck immediately** — the delivery contract was
+  violated; do not wait out `STUCK_AFTER_MINUTES`, go straight to rung 1.
 - **Parked** — a [task] sitting in `[Blocked]` with no new comment past the threshold; the team-lead owns driving it out.
 - **Conflict** — two claimants on one [task]; contradictory `[divergence]` notes
   across [tasks]; a merge conflict reported by the integrator; a deadlock
@@ -191,6 +310,13 @@ Unblock ladder — in order, one rung at a time:
 The Lead never overrides an integrator validation failure or a principal-architect
 veto — the andon cord outranks the Lead. During autonomous operation the Lead never
 blocks the team on an interactive user prompt; escalation is the channel.
+
+**Idle-notification hygiene.** Heartbeats and harness idle pings are liveness
+signals, not events. Act on exactly two things: (a) an artifact arrived — process
+it; (b) idle **without** the artifact you are waiting for — Stuck, rung 1 now.
+Everything else (routine idle pings, repeated heartbeats, "still working" noise)
+gets no reply and no acknowledgment — answering it burns your turns and everyone
+else's context.
 
 ## Recovery
 
@@ -214,6 +340,7 @@ never fabricate a result, never claim a status you did not verify.
 | Shell + git | all; worktrees for implementers | — (hard requirement) |
 | Tracker access (adapter: MCP, REST + API key, CLI, or files) | all | use another mechanism from the adapter's *Access mechanisms*; never fabricate |
 | Shared filesystem with the team | mailbox/heartbeats | poll the tracker; say so once on your [task] |
+| Harness-native teammates (subagent spawn + messaging) | harness mode | launch CLI processes via `bin/launch-team.sh` (tmux / background) |
 | tmux | launcher niceness | background processes + pid files |
 | Long-running loop | team-lead, principal-architect, integrator | relaunch on a schedule; recovery makes restarts free |
 

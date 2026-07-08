@@ -45,7 +45,15 @@ TEAMWORK_ROOT=.teamwork          # Team workspace root (repo-relative). Add to .
 POLL_INTERVAL_SECONDS=120        # How often idle agents re-check mailbox + tracker
 STUCK_AFTER_MINUTES=15           # Lead treats silence longer than this as "stuck"
 ESCALATE_AFTER_ATTEMPTS=2        # Failed unblock attempts before the Lead escalates to the human
+TRACKER_WRITERS=all              # all = every role writes to the tracker itself;
+                                 # lead = single-writer mode: only the team-lead holds
+                                 # credentials and posts on the team's behalf
+                                 # (reference/orchestration.md → "Tracker write modes")
 ```
+
+Review depth (`REVIEW_MODE=sequential|parallel|tiered`) is a **per-team** choice
+and lives in the team file (`teams/<preset>.md`, next to `ROSTER=`), not here —
+see `teams/_PLAYBOOK.md` → *Review modes*.
 
 ## Validation commands (framework-agnostic Integrator)
 
@@ -57,7 +65,17 @@ its completion comment on the [task]).
 VALIDATE_BUILD=null              # e.g. "npm run build" / "dotnet build" / "cargo build"
 VALIDATE_TEST=null               # e.g. "npm test" / "pytest" / "go test ./..."
 VALIDATE_LINT=null               # e.g. "npm run lint" / "ruff check ."
+VALIDATE_SCRIPT=null             # alternative to the three above: a repo-relative script
+                                 # that receives the changed-file list as arguments and
+                                 # runs whatever applies (per-area suites, tools that only
+                                 # exist mid-feature). When set, it replaces VALIDATE_*.
 ```
+
+Validation **evolves during a feature**: the [task] that introduces a tool (a
+linter, a new suite) updates `VALIDATE_SCRIPT` (or these keys) *and* the team's
+`BASELINE.md` in the same diff, so every later [task] is judged by the new bar.
+Results are always judged against `<TEAMWORK_ROOT>/<team>/BASELINE.md` — the bar
+is "no new failures", not "all green".
 
 ## Rules
 

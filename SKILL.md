@@ -17,6 +17,7 @@ skill's directory):
 - `reference/team-roles.md` — status ownership (only if `TEAM_MODE=true`)
 - `reference/orchestration.md` — multi-agent protocol (mailboxes, gates, unblocking)
 - `roles/<role>.md` + `config/team.config.md` + `bin/launch-team.sh` — the agent team
+- `bin/tracker-ops.sh` — ergonomic CLI for recurring tracker operations (scriptable mechanisms)
 - `adapters/<Tool>.md` — how to perform each operation in the active tool
 
 > **Golden rule:** in everything you write — comments, commit messages, messages to the
@@ -52,8 +53,9 @@ each generic operation through the adapter's *Operations* table:
 | File a bug / follow-up found mid-work | 6 — File newly-discovered work |
 | Work is stuck / blocked / cannot proceed | 7 — Block a `[task]` |
 | (anything wrong / blocked / failed) | 8 — Andon cord: stop & report |
-| Run an agent team on a feature ("launch the team") | Team: set `TEAM_MODE=true`, follow `reference/orchestration.md`; launch via `bin/launch-team.sh` |
+| Run an agent team on a feature ("launch the team") | Team: set `TEAM_MODE=true`, follow `reference/orchestration.md`; launch via `bin/launch-team.sh` (CLI processes) or spawn harness subagents from `bin/launch-team.sh compose` prompts |
 | Connect a new tool / switch tools | 9 — Connect / switch |
+| Design/plan everything up front, sign off all designs before coding | 10 — Pre-flight design pass |
 
 ## Non-negotiables (the fail-loud contract)
 

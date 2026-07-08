@@ -48,3 +48,6 @@ Then write `[review-approval]` with the explicit list of approved file paths.
   integrator (via the tracker).
 - Approve with a file list you did not verify against the actual diff.
 - Start Phase 2 before Phase 1's checklist is written.
+- Go idle with your verdict unwritten. A finished review that never became a
+  `[review-findings]` / `[review-approval]` comment did not happen — deliver it
+  and notify the team-lead before idling (protocol: *Report before idle*).

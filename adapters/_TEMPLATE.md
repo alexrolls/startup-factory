@@ -75,6 +75,11 @@ MCP tool / CLI command / file edit.
 | Set `[task]` status | <...> |
 | Set `[feature]` status | <...> |
 | Add a comment to a `[task]` | <...> |
+| Export the `[tasks]` of a `[feature]` to a file | <how to dump id/title/status/assignee/description/comments as JSON — gives credential-less roles a read-only snapshot> |
+
+> If the tool has a scriptable (non-MCP) mechanism, consider adding a backend for it to
+> `bin/tracker-ops.sh` so `claim` / `state` / `comment` / `integrate` / `export` work
+> without hand-built API calls. The Operations table above remains the spec either way.
 
 ## Rules
 

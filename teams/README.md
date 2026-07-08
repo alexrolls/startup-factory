@@ -37,6 +37,14 @@ is the final review gate** before the standard `integrator` merges.
    Each member's startup prompt is composed from: its role brief + the team file
    + this directory's `_PLAYBOOK.md` + `reference/orchestration.md` + the team
    config. Watch agents in tmux (`tmux attach -t team-<feature-branch>`).
+
+   Running the team as subagents inside your own harness instead? Compose each
+   member's prompt without spawning and spawn natively (see
+   `reference/orchestration.md` → *Harness mode*):
+
+   ```bash
+   bin/launch-team.sh compose <feature-branch> <featureId> <role> <preset>
+   ```
 3. Relaunch a single member (keeps team context):
    `bin/launch-team.sh relaunch <feature-branch> <featureId> <role> <preset>`.
 
@@ -45,7 +53,12 @@ is the final review gate** before the standard `integrator` merges.
 - **New team:** copy an existing team file; keep the section shape — charter,
   `ROSTER=` line (space-separated role names the launcher resolves), roster
   table with protocol mappings, team-specific review stages, launch line.
-  Include `integrator` in every roster.
+  Include `integrator` in every roster. Optionally declare a review mode
+  (`REVIEW_MODE=sequential|parallel|tiered` — see `_PLAYBOOK.md` → *Review
+  modes*; absent = `sequential`).
+- **Identity:** specialized roles sign with their specialized name everywhere;
+  when writing a protocol-role marker they state the mapping once per [task] if
+  it isn't already on record (`reference/orchestration.md` → *Identity*).
 - **New role:** add `teams/roles/<kebab-name>.md` with the standard sections —
   identity, **Protocol mapping**, Responsibilities, Decision authority,
   Deliverables, Handoffs, You never. The launcher resolves any role name that

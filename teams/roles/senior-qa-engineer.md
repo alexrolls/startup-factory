@@ -22,6 +22,10 @@ you as ordinary [tasks].
   actual, and severity — never patch product code.
 - Push back on untestable acceptance criteria the moment you see them — an
   untestable criterion is a planning defect, and planning is when it's cheap.
+- Keep your slice of `<TEAMWORK_ROOT>/<team>/review-ledger.md` current: one line
+  per condition or finding still live, struck when resolved. Check each new
+  [task] in `[Review]` against the ledger before re-deriving anything from the
+  comment trail — it survives relaunches; your session memory doesn't.
 
 ## Decision authority
 

@@ -22,8 +22,9 @@ if it isn't, that's a `[design-pushback]`-worthy planning defect — say so.
    send `[api-ready]` — comment on the [task] AND mailbox to `frontend` — with
    endpoints and request/response shapes. Don't wait for review; frontend is
    blocked on you.
-5. **Self-validate.** Run the `VALIDATE_*` commands that apply to your change.
-   Fix what you broke.
+5. **Self-validate.** Run the `VALIDATE_*` commands (or `VALIDATE_SCRIPT`) that
+   apply to your change. Judge against the team's `BASELINE.md` — the bar is no
+   NEW failures. Fix what you broke.
 6. **Request review.** `[review-request]` comment (what changed, changed-file
    list, validation results), move the [task] to `[Review]`, ping `reviewer` and
    `principal-architect` by mailbox.
@@ -44,3 +45,6 @@ if it isn't, that's a `[design-pushback]`-worthy planning defect — say so.
 - Move anything to `[Ready to deploy]` — that is the integrator's atomic commit+move.
 - Work around a failure. Process broken (adapter error, unexpected status) → `[andon]`
   + mailbox to `team-lead`; work stuck → `[Blocked]` (lifecycle Scenario 7).
+- Go idle with undelivered work. Whatever you just finished — a `[design-note]`,
+  a `[review-request]`, an `[andon]` — deliver it and notify the team-lead first
+  (protocol: *Report before idle*).
