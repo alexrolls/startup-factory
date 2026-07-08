@@ -114,6 +114,12 @@ The `jira()` and `adf()` helpers above must be defined in your shell before runn
 | Set `[task]`/`[feature]` status | transition the item | `jira "/rest/api/3/issue/<taskId>/transitions" -X POST -d '{"transition":{"id":"<transitionId>"}}'` |
 | Set `[task]` assignee | update assignee | `jira "/rest/api/3/issue/<taskId>/assignee" -X PUT -d '{"accountId":"<accountId>"}'` |
 | Add a comment to a `[task]` | add comment | `jira "/rest/api/3/issue/<taskId>/comment" -X POST -d '{"body":'"$(adf "<text>")"'}'` |
+| Export the `[tasks]` of a `[feature]` to a file | read via search, write the JSON yourself | `bin/tracker-ops.sh export <featureId> <outfile>` |
+
+> **Helper script.** For the `rest` mechanism, `bin/tracker-ops.sh` wraps the recurring
+> operations — `claim`, `state` (resolves the transition id for you), `comment` (body from
+> a file or stdin — no ADF hand-assembly), `integrate <hash>`, `export`. This table remains
+> the spec; the script is the ergonomic path. MCP sessions call the MCP tools directly.
 
 > `parent` and `jql=parent=` work in team-managed (NextGen) projects. In company-managed (classic) projects, link Stories to the Epic via the Epic Link field (commonly `customfield_10014`) and query with `jql="Epic Link" = <featureId>`.
 

@@ -90,6 +90,13 @@ Call the billing charge endpoint on submit.
 | Set `[task]` assignee | Edit the `**Assignee:**` line in that section; use the role name verbatim (e.g. `backend`) |
 | Set `[feature]` status | Edit the `#` title line's trailing `[Status]` |
 | Add a comment to a `[task]` | Append a `> <marker> (yyyy-MM-dd): <content>` line under the task section, where `<marker>` is the exact orchestration marker (e.g. `[design-note]`, `[review-approval]`) or `note` for free-form comments |
+| Export the `[tasks]` of a `[feature]` to a file | `bin/tracker-ops.sh export <featureId> <outfile>` |
+
+> **Helper script.** `bin/tracker-ops.sh` performs these edits mechanically — `claim`,
+> `state`, `comment` (body from a file or stdin), `integrate <hash>`, `export`. When
+> using it, address a [task] as `<featureId>#<taskId>` (the feature file plus the task
+> number, e.g. `.workspace/task-manager/2026-07-06-payments/feature.md#2`), since a task
+> number alone doesn't name the file.
 
 ## Rules
 

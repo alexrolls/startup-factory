@@ -6,6 +6,7 @@
 #   launch-team.sh team          <preset> <team> <featureId>     # launch a preset roster (teams/<preset>.md)
 #   launch-team.sh start         <team> <featureId> <role>...
 #   launch-team.sh relaunch      <team> <featureId> <role> [preset]
+#   launch-team.sh compose       <team> <featureId> <role> [preset]  # write the composed startup prompt, print its path — no spawn (harness mode)
 #   launch-team.sh worktree      <team> <role> <taskId>
 #   launch-team.sh validate-board [config-path]                  # validate board config JSON
 #   launch-team.sh status        <team>
@@ -236,6 +237,13 @@ case "${1:-}" in
     [ $# -eq 4 ] || [ $# -eq 5 ] || die "usage: relaunch <team> <featureId> <role> [preset]"
     launch_one "$2" "$3" "$4" "${5:-}"
     ;;
+  compose)
+    # Harness mode: emit the exact same startup prompt `start` would use, without
+    # spawning anything, so any harness can spawn the role natively with it.
+    [ $# -eq 4 ] || [ $# -eq 5 ] || die "usage: compose <team> <featureId> <role> [preset]"
+    prompt="$(compose_prompt "$2" "$3" "$4" "${5:-}")"
+    echo "$prompt"
+    ;;
   worktree)
     [ $# -eq 4 ] || die "usage: worktree <team> <role> <taskId>"
     team="$2"; role="$3"; task="$4"
@@ -285,6 +293,6 @@ case "${1:-}" in
     validate_board "${2:-}"
     ;;
   *)
-    die "usage: launch-team.sh {team|start|relaunch|worktree|validate-board|status|stop} ..."
+    die "usage: launch-team.sh {team|start|relaunch|compose|worktree|validate-board|status|stop} ..."
     ;;
 esac

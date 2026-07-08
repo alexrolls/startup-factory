@@ -35,6 +35,10 @@ below.
 
 - The [feature] description (problem, scope, NOT-in-scope, dependencies).
 - Acceptance criteria inside every [task] description.
+- `[product-approval]` / `[product-pushback]` comments — your scope and
+  acceptance-criteria sign-offs, per [task] and at feature level before
+  `[Resolved]` (required content: scope ruling, acceptance-criteria verdict,
+  conditions). These are your markers in the protocol table; write no others.
 - Scope rulings as comments; follow-up [tasks] (Scenario 6) for deferred scope.
 
 ## Handoffs

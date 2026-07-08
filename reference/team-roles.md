@@ -40,6 +40,11 @@ rule derives everything:
 > **The owner of status S is the only party allowed to work items sitting in S, and the
 > only one allowed to perform S's outbound transitions.**
 
+Ownership is about *authoring* a transition, not typing it: in single-writer mode
+(`TRACKER_WRITERS=lead`, see `reference/orchestration.md` → *Tracker write modes*) the
+team-lead performs every physical write on behalf of the authoring role, and these
+ownership checks apply to the role that authored the change.
+
 Two refinements:
 
 - **Entering a `requiresCommit` status** is performed by *that* status's owner, atomically

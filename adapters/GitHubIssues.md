@@ -100,7 +100,13 @@ CLI column assumes `-R <GITHUB_REPO>` is appended when `GITHUB_REPO` is set.
 | Set `[task]` → `[Ready to deploy]` | `gh issue close <taskId>` |
 | Reopen (rework) | `gh issue reopen <taskId> --add-label status:active` |
 | Set `[feature]` → `[Resolved]` | `gh api -X PATCH repos/:owner/:repo/milestones/<n> -f state=closed` |
-| Add a comment to a `[task]` | `gh issue comment <taskId> --body "<...>"` |
+| Add a comment to a `[task]` | `gh issue comment <taskId> --body-file <file>` (or `--body-file -` for stdin — prefer files over `--body` to avoid shell-quoting) |
+| Export the `[tasks]` of a `[feature]` to a file | `bin/tracker-ops.sh export <featureId> <outfile>` (wraps `gh issue list --milestone ... --json ...`) |
+
+> **Helper script.** `bin/tracker-ops.sh` wraps the recurring operations over the `gh`
+> CLI — `claim`, `state` (does the label juggling and open/close for you), `comment`
+> (body from a file or stdin), `integrate <hash>`, `export`. This table remains the spec;
+> the script is the ergonomic path.
 
 ## Rules
 

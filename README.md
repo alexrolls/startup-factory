@@ -145,6 +145,15 @@ Command templates for common CLIs:
 **Mixing LLMs is the design intent** — e.g. Claude to lead and architect, Codex to
 implement, Gemini to review for diversity. Same-LLM teams work too.
 
+### Harness mode — teammates as subagents, no CLI processes
+
+If your harness can spawn subagents and message them (e.g. Claude Code's Agent
+tool), skip the command map entirely: compose each role's startup prompt with
+`bin/launch-team.sh compose <team> <featureId> <role> [preset]` and spawn the
+role natively with it. Harness messages replace mailboxes, harness idle
+notifications replace heartbeats, and the tracker stays the source of truth —
+see `reference/orchestration.md` → *Harness mode*.
+
 **Command resolution per role:** explicit `<ROLE>_CMD` value → used; `<ROLE>_CMD=null`
 → role disabled; **absent** → falls back to `TEAM_DEFAULT_CMD`. That fallback is
 why the many specialized preset-team roles need no per-role keys — set
@@ -215,8 +224,8 @@ needs nothing).
 | Section | Keys | Purpose |
 |---|---|---|
 | Role → command | `TEAM_LEAD_CMD`, `PRINCIPAL_ARCHITECT_CMD`, `INTEGRATOR_CMD`, `BACKEND_CMD`, `FRONTEND_CMD`, `QA_CMD`, `REVIEWER_CMD`, `TEAM_DEFAULT_CMD` | Which CLI runs each role ([see above](#multi-agent-teams--map-each-role-to-a-cli-command)) |
-| Coordination | `TEAMWORK_ROOT` (`.teamwork`), `POLL_INTERVAL_SECONDS` (120), `STUCK_AFTER_MINUTES` (15), `ESCALATE_AFTER_ATTEMPTS` (2) | Timing of the lead's supervision loop |
-| Validation | `VALIDATE_BUILD`, `VALIDATE_TEST`, `VALIDATE_LINT` | Your stack's commands; the integrator runs them before every merge (`null` = skip) |
+| Coordination | `TEAMWORK_ROOT` (`.teamwork`), `POLL_INTERVAL_SECONDS` (120), `STUCK_AFTER_MINUTES` (15), `ESCALATE_AFTER_ATTEMPTS` (2), `TRACKER_WRITERS` (`all`) | Timing of the lead's supervision loop; `TRACKER_WRITERS=lead` enables single-writer ("scribe") mode — only the lead holds tracker credentials and posts on the team's behalf |
+| Validation | `VALIDATE_BUILD`, `VALIDATE_TEST`, `VALIDATE_LINT`, `VALIDATE_SCRIPT` | Your stack's commands; the integrator runs them before every merge (`null` = skip). `VALIDATE_SCRIPT` replaces the three with one repo-owned script that receives the changed-file list |
 
 Point the `VALIDATE_*` commands at your real build/test/lint (e.g.
 `VALIDATE_TEST="pytest"`) — this is the only place the framework-agnostic
@@ -269,9 +278,16 @@ Just talk to your agent in the generic vocabulary:
 | `team <preset> <team> <featureId>` | Launch a whole preset roster |
 | `start <team> <featureId> <role>…` | Launch specific roles (custom teams) |
 | `relaunch <team> <featureId> <role> [preset]` | Restart one crashed/wedged agent |
+| `compose <team> <featureId> <role> [preset]` | Write a role's startup prompt **without spawning** — for running teammates as subagents inside your own harness (see `reference/orchestration.md` → *Harness mode*) |
 | `worktree <team> <role> <taskId>` | Create an implementer's isolated worktree |
 | `status <team>` | Show each agent's state + last heartbeat |
 | `stop <team>` | Stop the whole team |
+
+There is also `bin/tracker-ops.sh` — an ergonomic wrapper for the recurring
+tracker operations (`claim`, `state`, `comment` with the body from a file/stdin,
+`integrate <hash>`, `export`) over the scriptable access mechanisms (Linear/Jira
+REST, `gh`, Markdown files). The adapter docs remain the spec; MCP sessions use
+their native tools instead.
 
 **The flow every team follows:** the Principal Architect leads (plans with the
 Product Manager, gates each `[task]`'s design before any code, reviews
@@ -364,8 +380,11 @@ fast when agents share a machine and degrade to tracker polling when they don't.
 │   ├── README.md · _PLAYBOOK.md      how presets work + shared collaboration flow
 │   ├── full-stack.md · deep-backend.md · deep-frontend.md · deep-security.md · deep-infra.md
 │   └── roles/                        14 specialized role briefs
-├── bin/launch-team.sh                the team launcher
-└── tests/launcher-test.sh            offline smoke test (no LLM calls)
+├── bin/
+│   ├── launch-team.sh                the team launcher (spawn, compose, worktrees, board validation)
+│   └── tracker-ops.sh                ergonomic tracker CLI (claim/state/comment/integrate/export)
+└── tests/                            offline smoke tests (no LLM calls)
+    └── launcher-test.sh · tracker-ops-test.sh
 ```
 
 ---
@@ -397,7 +416,7 @@ exact protocol markers — never invent new ones.
 | A role won't launch in a preset | It's likely `<ROLE>_CMD=null` (explicitly disabled). Remove the line to fall back to `TEAM_DEFAULT_CMD` |
 | No `tmux` | Agents run as background processes automatically; use `status`/`stop` and read logs under `.teamwork/<team>/pids/` |
 | Team seems stuck | `bin/launch-team.sh status <team>` shows heartbeats; the lead auto-unblocks, and anything needing you is in `.teamwork/<team>/ESCALATIONS.md` |
-| Want to verify the plumbing | `bash tests/launcher-test.sh` → `ALL PASS` (uses a stub agent; no LLM, no cost) |
+| Want to verify the plumbing | `bash tests/launcher-test.sh && bash tests/tracker-ops-test.sh` → `ALL PASS` twice (stub agent + local files; no LLM, no cost) |
 
 ---
 

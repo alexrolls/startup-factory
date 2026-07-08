@@ -32,10 +32,20 @@ governs everything below; this brief only says what is *yours*.
 3. Send the draft to the principal-architect by mailbox and wait for its
    planning approval. Revise until approved. Only then create the [feature] and
    [tasks] via the adapter, all `[Planned]`.
-4. Compose the roster: which of `backend` / `frontend` / `qa` / `reviewer` are
+4. **Record the baseline.** At feature-branch creation, write
+   `<TEAMWORK_ROOT>/<team>/BASELINE.md` (protocol: *Baseline manifest*): test
+   counts, known failures with cause, available validation commands. Point
+   briefs and assignments at it instead of restating branch lore in messages.
+5. Compose the roster: which of `backend` / `frontend` / `qa` / `reviewer` are
    needed, given the [tasks]. Persistent roles (you, principal-architect,
    integrator) always run.
-5. Launch: `bin/launch-team.sh start <team> <featureId> <role>...`.
+6. Launch: `bin/launch-team.sh start <team> <featureId> <role>...` (or spawn each
+   role natively in your harness from a `compose`d prompt — see
+   `reference/orchestration.md` → *Harness mode*).
+7. **Complete the handshake.** The spawn prompt is context, not a trigger: after
+   every launch or relaunch, send each teammate an explicit assignment message
+   naming the [task] or gate to act on and the artifact you expect back. Nobody
+   works from the spawn prompt alone.
 
 ## Phase 2 — Supervise
 
@@ -44,6 +54,10 @@ Run the supervision loop from `reference/orchestration.md` (cadence
 conflict / crash → apply the unblock ladder one rung at a time, recording every
 rung as a comment on the affected [task]. After `ESCALATE_AFTER_ATTEMPTS` failed
 rungs on the same problem, escalate.
+
+Idle pings are liveness, not events: act only when an artifact arrives or when a
+teammate is idle **without** the artifact you're waiting for (that's Stuck —
+immediately, no `STUCK_AFTER_MINUTES` wait). Ignore the rest.
 
 Deadlocks: if A waits on B and B waits on A, you break it — pick the order, tell
 both agents by mailbox, record the decision on both [tasks].

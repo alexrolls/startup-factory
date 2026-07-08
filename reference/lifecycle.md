@@ -150,6 +150,36 @@ the failure mode this whole design exists to prevent.
 
 ---
 
+## Scenario 10 — Pre-flight design pass (batch the design gates)
+
+By default the design gate (Scenario 2 step 5) opens per-[task] at claim time.
+When the plan should be settled before any code — the user asks for all plans
+up front, or the [tasks] share contracts that must not fork — run the gates as
+one batch instead:
+
+1. **One `[design-note]` per [task]**, written against the real codebase (not the
+   [task] text alone), each registering its exports in the contract registry
+   (`reference/orchestration.md` → *Contract registry*, team mode).
+2. **Cross-[task] consistency review first.** The reviewer of the set (the
+   principal-architect in team mode; you, wearing that hat, in single-agent mode)
+   reads the **full set before verdicts**, checking sibling notes against each
+   other and the registry — contract forks between parallel plans are the
+   highest-value findings and are invisible note-by-note. Cross-cutting rulings
+   are binding and recorded once, referenced by each affected [task].
+3. **Per-[task] verdicts** — `[design-approved]` (with conditions) or
+   `[design-pushback]`, exactly as in the normal gate.
+4. **Scope sign-off per [task]** where a product owner exists —
+   `[product-approval]` / `[product-pushback]`.
+5. **Everything lands as comments** on the [tasks], like any gate.
+6. At claim time the gate is already open: the implementer re-reads the approved
+   note, its conditions, and any cross-cutting rulings, and proceeds — no second
+   approval needed unless a `[divergence]` or re-plan invalidated the note.
+
+The per-[task] gate is unchanged — this scenario only moves *when* it runs.
+[Tasks] added later (Scenario 6) go through the normal per-[task] gate.
+
+---
+
 ## Quick reference — status writes per scenario
 
 | Scenario | Writes |
@@ -162,3 +192,4 @@ the failure mode this whole design exists to prevent.
 | 6 New work | create `[task]` `[Planned]` |
 | 7 Block | comment + `[task]` → `[Blocked]`; owner routes it back when cleared |
 | 8 Andon | **no write** — stop and report |
+| 10 Pre-flight design pass | comments only — one `[design-note]` + verdict (+ scope sign-off) per [task] |
