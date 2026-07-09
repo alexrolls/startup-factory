@@ -48,8 +48,10 @@ next_mailbox_file() { # next_mailbox_file <mailbox-dir> -> path with next free N
 }
 
 adapter_default_unblock() {
-  local a; a="$(grep -m1 '^PRODUCT_MANAGEMENT_TOOL=' "$PM_CONFIG" | cut -d= -f2 | tr -d '"' || true)"
-  case "${TRACKER_ADAPTER:-$a}" in Linear|Jira) echo auto ;; *) echo suggest ;; esac
+  local a; a="$(grep -m1 '^PRODUCT_MANAGEMENT_TOOL=' "$PM_CONFIG" 2>/dev/null | cut -d= -f2 | tr -d '"' || true)"
+  local effective="${TRACKER_ADAPTER:-$a}"
+  [ -n "$effective" ] || die "cannot determine tracker adapter (PRODUCT_MANAGEMENT_TOOL in config/project-management.config.md or TRACKER_ADAPTER env)"
+  case "$effective" in Linear|Jira) echo auto ;; *) echo suggest ;; esac
 }
 
 dispatch_once() { # dispatch_once <team> <featureId> <dry:yes|no> <unblock>
@@ -84,13 +86,25 @@ for t in tasks:  # 1. auto-unblock candidates
     if t.get('status') == 'Blocked' and (t.get('blockedBy') or []) and blockers_terminal(t):
         acts.append(('unblock', str(t['taskId']), ''))
 
+# warn on unknown blockedBy references
+for t in tasks:
+    tid = str(t['taskId'])
+    for b in (t.get('blockedBy') or []):
+        if str(b) not in by_id:
+            print("dispatch: warning — %s blockedBy references unknown [task] '%s' "
+                  "(never auto-unblocked; check the tracker relation)" % (tid, b),
+                  file=sys.stderr)
+
 design_q = [str(t['taskId']) for t in tasks
             if last(t, 'design-note') > last(t, 'design-approved', 'design-pushback')]
-review_q, arch_q, merge_q = [], [], []
+review_q, arch_q, merge_q, anomalies = [], [], [], []
 for t in tasks:
     if t.get('status') != 'Review':
         continue
     tid, req = str(t['taskId']), last(t, 'review-request')
+    if req == -1:
+        anomalies.append(tid)
+        continue
     ra, aa = last(t, 'review-approval'), last(t, 'architecture-approval')
     if ra > req and aa > req:
         merge_q.append(tid)
@@ -120,11 +134,12 @@ if os.path.isdir(hb):
     now = time.time()
     stale = [f for f in os.listdir(hb)
              if now - os.path.getmtime(os.path.join(hb, f)) > stuck_min * 60]
-if planned or stale:
-    acts.append(('launch', 'team-lead',
-                 'Lead-actionable — dispatchable [Planned]: %s; stale heartbeats: %s. '
-                 'One supervision pass, then exit.'
-                 % (', '.join(planned) or 'none', ', '.join(stale) or 'none')))
+if planned or stale or anomalies:
+    detail = ('Lead-actionable — dispatchable [Planned]: %s; stale heartbeats: %s'
+              % (', '.join(planned) or 'none', ', '.join(stale) or 'none'))
+    if anomalies:
+        detail += '; anomalous [Review] without [review-request]: %s' % ', '.join(anomalies)
+    acts.append(('launch', 'team-lead', detail + '. One supervision pass, then exit.'))
 
 for a in acts:
     print('\t'.join(a))

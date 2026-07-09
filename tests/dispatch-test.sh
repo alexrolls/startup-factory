@@ -112,6 +112,27 @@ plan3="$(TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once --dry-run)"
 echo "$plan3" | grep -q "unblock $FID#2 — SUGGESTED" \
   && echo "ok: Markdown defaults to suggest-only" || { echo "FAIL: suggest default"; FAILURES=$((FAILURES+1)); }
 
+# real suggest pass: never writes the blocked task
+TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once
+check "suggest never writes blocked status" grep -q '^## 2 Blocked thing \[Blocked\]$' "$FID"
+
+# -- anomaly: [Review] task with no [review-request] routes to team-lead -------
+cat >> "$FID" <<'EOF'
+
+## 7 Anomalous review [Review]
+
+**Assignee:** backend
+
+Independent, no comments.
+EOF
+plan4="$(TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once --dry-run)"
+echo "$plan4" | grep -q "anomalous" \
+  && echo "ok: anomalous [Review] routed to team-lead" || { echo "FAIL: anomalous [Review] not in lead detail"; FAILURES=$((FAILURES+1)); }
+echo "$plan4" | grep "launch reviewer" | grep -q "#7" \
+  && { echo "FAIL: #7 incorrectly in reviewer queue"; FAILURES=$((FAILURES+1)); } || echo "ok: #7 not in reviewer queue"
+echo "$plan4" | grep "launch principal-architect" | grep -q "#7" \
+  && { echo "FAIL: #7 incorrectly in PA queue"; FAILURES=$((FAILURES+1)); } || echo "ok: #7 not in PA queue"
+
 # -- nothing actionable exits cleanly ------------------------------------------
 cat > feat/quiet.md <<'EOF'
 # Quiet [Active]
