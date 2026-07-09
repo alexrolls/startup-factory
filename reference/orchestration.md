@@ -245,8 +245,8 @@ pre-v2 comments count as round 0). WIP narration, setup chatter, and restated
 | `[api-ready]` | backend | Contract available for frontend: endpoints, request/response shapes. Also sent by mailbox. |
 | `[divergence]` | implementer | What was done differently from the [task]/design note and why. Additive — **never edit the original [task] description.** |
 | `[review-request]` | implementer | Ready for review: what changed, list of changed files, an **evidence record per validated command** (see *Evidence and re-execution*), an explicit `NOT validated:` section for anything not run (with reason), and any index-only staging operation performed. A claimed result without its evidence record **is** NOT validated. Written when moving to `[Review]`. |
-| `[review-findings]` | reviewer / principal-architect | Numbered problems that must be fixed. Task goes back to `[Active]`. |
-| `[review-approval]` | reviewer | Approval with the **explicit list of approved file paths**. |
+| `[review-findings]` | reviewer / qa / principal-architect | Numbered problems that must be fixed. Task goes back to `[Active]`. |
+| `[review-approval]` | reviewer / qa | Approval with the **explicit list of approved file paths**. |
 | `[architecture-approval]` | principal-architect | Same, from the architecture review. |
 | `[product-approval]` | product owner role (e.g. `senior-technical-product-manager`; the team-lead where no product role exists) | Scope/acceptance sign-off: scope ruling, acceptance-criteria verdict, any conditions. |
 | `[product-pushback]` | product owner role (same) | Scope gate closed: what must change in scope or acceptance criteria before work proceeds. |

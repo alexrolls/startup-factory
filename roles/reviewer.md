@@ -40,7 +40,7 @@ checklist item needs a `file:line` citation for the implementation AND a citatio
 for the test that proves it. Compare the final file list against the actual
 changed set in the implementer's working copy — in parallel execution that is
 `git diff --name-only <feature-branch>...HEAD` plus `git status --porcelain
--uall` inside `<TEAMWORK_ROOT>/<team>/worktrees/<assignee-role>-<taskId>` (the
+-uall` inside `<TEAMWORK_ROOT>/<team>/worktrees/<role>#<attempt>-<taskId>` (the
 [task]'s assignee names the role); in sequential execution it is
 `git status --porcelain -uall` on the feature-branch checkout — they must match.
 Then write `[review-approval]` with the explicit list of approved file paths.
