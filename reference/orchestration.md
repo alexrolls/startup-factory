@@ -301,13 +301,20 @@ one that performs its outbound transitions.
 ## Claiming a [task]
 
 1. Read the [task] in full via the adapter (description, [subtasks], all comments).
-2. Verify status is `[Planned]` and it belongs to your track. If not → `[andon]`. Also verify the sweep is not pending on your track: under `EXECUTION=sequential`,
-the previously integrated [task] has no `[divergence]` comments still awaiting
-the principal-architect's sweep; under `parallel`, the most recent [task] that
-entered `[Review]` on your track has the PA's sweep confirmation. If pending,
-wait or ask the PA by mailbox. Under `EXECUTION=sequential` — and under `parallel` whenever
-`MAX_ACTIVE_IMPLEMENTERS` is set — you claim only on the team-lead's
-assignment (never self-serve — see *Execution modes*), and before touching anything verify **the shared checkout is free**: no [task] anywhere is in flight (`[Active]` **or** `[Review]` — a [task] in review still owns the checkout until integrated), and `git status --porcelain -uall` on the feature-branch checkout is clean. Dirty checkout or an in-flight [task] → don't claim; tell the lead.
+2. Verify status is `[Planned]` and it belongs to your track. If not → `[andon]`.
+   Also verify the sweep is not pending on your track: under `EXECUTION=sequential`,
+   the previously integrated [task] has no `[divergence]` comments still awaiting
+   the principal-architect's sweep; under `parallel`, the most recent [task] that
+   entered `[Review]` on your track has the PA's sweep confirmation. If pending,
+   wait or ask the PA by mailbox. Under `EXECUTION=sequential` — and under
+   `parallel` whenever `MAX_ACTIVE_IMPLEMENTERS` is set — you claim only on the
+   team-lead's assignment (never self-serve — see *Execution modes*). Under
+   `sequential`, additionally verify before touching anything that
+   **the shared checkout is free**: no [task] anywhere is in flight
+   (`[Active]` **or** `[Review]` — a [task] in review still owns the checkout
+   until integrated), and `git status --porcelain -uall` on the feature-branch
+   checkout is clean. Dirty checkout or an in-flight [task] → don't claim;
+   tell the lead.
 3. Set assignee = your role name AND move `[Planned] → [Active]` (one adapter write
    where the tool allows, else assignee first).
 4. **Read back.** If the assignee is not you, another agent won — back off silently
