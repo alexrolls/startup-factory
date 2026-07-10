@@ -335,5 +335,38 @@ echo "$signer_plan" | grep -q "launch team-lead" \
   && echo "ok: generic reviewer: team-lead notified" \
   || { echo "FAIL: team-lead not in plan"; FAILURES=$((FAILURES+1)); }
 
+# -- read_key: inline comments stripped; quoted values with inner # untouched -----
+cat > feat/rk-test.md <<'EOF'
+# ReadKey Test [Active]
+
+## 1 In review [Review]
+
+**Assignee:** backend
+
+> [review-request] ready — backend
+EOF
+RK_FID="feat/rk-test.md"
+
+# Unquoted key with inline comment: Python int(STUCK_AFTER_MINUTES) must succeed
+sed -i '' 's/^STUCK_AFTER_MINUTES=.*/STUCK_AFTER_MINUTES=7   # inline comment/' .claude/skills/pm/config/team.config.md
+if TEAM_RUNNER=background "$DISPATCH" feat-rk-team "$RK_FID" --once --dry-run >/dev/null 2>&1; then
+  echo "ok: read_key: unquoted value with inline comment parses clean (int(7) ok)"
+else
+  echo "FAIL: read_key: inline comment not stripped — Python int() threw ValueError"; FAILURES=$((FAILURES+1))
+fi
+sed -i '' 's/^STUCK_AFTER_MINUTES=.*/STUCK_AFTER_MINUTES=15/' .claude/skills/pm/config/team.config.md
+
+# Quoted key with outer inline comment: CMD must still be executable (inner content preserved)
+sed -i '' 's|^TEAM_DEFAULT_CMD=.*|TEAM_DEFAULT_CMD="true"   # outer-comment|' .claude/skills/pm/config/team.config.md
+TEAM_RUNNER=background "$DISPATCH" feat-rk-team "$RK_FID" --once --unblock=off >/dev/null 2>&1 || true
+sleep 0.2
+if [ -f .teamwork/feat-rk-team/pids/reviewer.log ] && \
+   ! grep -q "command not found\|unexpected EOF\|not found" .teamwork/feat-rk-team/pids/reviewer.log 2>/dev/null; then
+  echo "ok: read_key: quoted CMD with outer inline comment ran cleanly (inner preserved)"
+else
+  echo "FAIL: read_key: quoted CMD broken by outer-comment stripping (or reviewer not launched)"; FAILURES=$((FAILURES+1))
+fi
+sed -i '' 's|^TEAM_DEFAULT_CMD=.*|TEAM_DEFAULT_CMD="true"|' .claude/skills/pm/config/team.config.md
+
 echo "---"
 [ "$FAILURES" -eq 0 ] && echo "ALL PASS" || { echo "$FAILURES FAILURE(S)"; exit 1; }

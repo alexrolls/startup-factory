@@ -21,9 +21,15 @@ key_is_null() { # key_is_null KEY -> 0 if the config sets KEY explicitly to null
   grep -qE "^$1=null[[:space:]]*(#.*)?$" "$CONFIG"
 }
 
-read_key() { # from team.config.md; quotes stripped; null -> empty
-  local line; line="$(grep -m1 "^$1=" "$CONFIG" || true)"
-  line="${line#*=}"; line="${line%\"}"; line="${line#\"}"
+read_key() { # from team.config.md; quotes stripped; null -> empty; inline # stripped on unquoted
+  local line _t; line="$(grep -m1 "^$1=" "$CONFIG" || true)"
+  line="${line#*=}"
+  if [ "${line#\"}" != "$line" ]; then
+    line="${line#\"}"; line="${line%%\"*}"
+  else
+    line="${line%%[[:space:]]#*}"
+    _t="${line##*[![:space:]]}"; line="${line%"$_t"}"
+  fi
   [ "$line" = "null" ] && line=""
   printf '%s' "$line"
 }

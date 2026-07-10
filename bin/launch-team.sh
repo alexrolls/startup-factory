@@ -23,10 +23,15 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 die() { echo "launch-team: $*" >&2; exit 1; }
 
 read_key() { # read_key KEY -> value with surrounding quotes stripped; empty if null/missing
-  local line
+  local line _t
   line="$(grep -m1 "^$1=" "$CONFIG" || true)"
   line="${line#*=}"
-  line="${line%\"}"; line="${line#\"}"
+  if [ "${line#\"}" != "$line" ]; then
+    line="${line#\"}"; line="${line%%\"*}"
+  else
+    line="${line%%[[:space:]]#*}"
+    _t="${line##*[![:space:]]}"; line="${line%"$_t"}"
+  fi
   [ "$line" = "null" ] && line=""
   printf '%s' "$line"
 }
