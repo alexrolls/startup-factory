@@ -52,8 +52,7 @@ cat > feat/feature.md <<'EOF'
 **Assignee:** backend
 **BlockedBy:** 1
 
-Blocked on 1.
-
+> blocked-by: 1
 > resume-status: Active
 
 ## 3 In review [Review]
@@ -180,6 +179,7 @@ Done.
 **Assignee:** backend
 **BlockedBy:** 1
 
+> blocked-by: 1
 > resume-status: Review
 
 ## 3 Needs Planned [Blocked]
@@ -187,6 +187,7 @@ Done.
 **Assignee:** backend
 **BlockedBy:** 1
 
+> blocked-by: 1
 > resume-status: Planned
 
 ## 4 No resume-status [Blocked]
@@ -194,13 +195,15 @@ Done.
 **Assignee:** backend
 **BlockedBy:** 1
 
-No resume-status here.
+> blocked-by: 1
+> reason: no resume-status here
 
 ## 5 Invalid resume-status [Blocked]
 
 **Assignee:** backend
 **BlockedBy:** 1
 
+> blocked-by: 1
 > resume-status: Nonesuch
 EOF
 RS_FID="feat/rs-test.md"
@@ -232,6 +235,73 @@ echo "$rs_sug" | grep -q "unblock $RS_FID#2 — SUGGESTED" \
   && echo "ok: suggest-only: valid-rs task shows SUGGESTED" \
   || { echo "FAIL: suggest-only: wrong message for valid-rs task"; FAILURES=$((FAILURES+1)); }
 check "suggest-only: no write for valid-rs task" grep -q '^## 2 Needs Review \[Blocked\]$' "$RS_FID"
+
+# -- D3.6: stale resume-status — only latest blocked-by comment governs --------
+cat > feat/stale-rs-test.md <<'EOF'
+# Stale RS Test [Active]
+
+## 1 Terminal [Ready to deploy]
+
+**Assignee:** backend
+
+Done.
+
+## 2 No RS in new block [Blocked]
+
+**Assignee:** backend
+**BlockedBy:** 1
+
+> blocked-by: 1
+> resume-status: Review
+
+> blocked-by: 1
+> reason: second block
+
+## 3 Invalid RS in new block [Blocked]
+
+**Assignee:** backend
+**BlockedBy:** 1
+
+> blocked-by: 1
+> resume-status: Review
+
+> blocked-by: 1
+> resume-status: Nonesuch
+
+## 4 Valid override — newest wins [Blocked]
+
+**Assignee:** backend
+**BlockedBy:** 1
+
+> blocked-by: 1
+> resume-status: Review
+
+> blocked-by: 1
+> resume-status: Active
+
+## 5 Multiline block [Blocked]
+
+**Assignee:** backend
+**BlockedBy:** 1
+
+> blocked-by: 1
+> resume-status: Review
+> reason: waiting
+> multiline test
+EOF
+SRS_FID="feat/stale-rs-test.md"
+TEAM_RUNNER=background "$DISPATCH" feat-team-stale "$SRS_FID" --once --unblock=auto
+check "stale RS #2: new no-RS block not moved"        grep -q '^## 2 No RS in new block \[Blocked\]$' "$SRS_FID"
+check "stale RS #3: invalid new RS not moved"         grep -q '^## 3 Invalid RS in new block \[Blocked\]$' "$SRS_FID"
+check "stale RS #4: valid new RS moved to Active"     grep -q '^## 4 Valid override — newest wins \[Active\]$' "$SRS_FID"
+check "stale RS #5: multiline block moved to Review"  grep -q '^## 5 Multiline block \[Review\]$' "$SRS_FID"
+srs_dry="$(TEAM_RUNNER=background "$DISPATCH" feat-team-stale2 "$SRS_FID" --once --dry-run --unblock=auto 2>&1)"
+echo "$srs_dry" | grep -q "invalid resume-status" \
+  && echo "ok: stale RS #3: invalid-rs warning printed" \
+  || { echo "FAIL: no invalid-rs warning for stale #3"; FAILURES=$((FAILURES+1)); }
+echo "$srs_dry" | grep -q "NO RESUME STATUS" \
+  && echo "ok: stale RS #2: no-rs suggestion printed (stale history not reused)" \
+  || { echo "FAIL: no NO RESUME STATUS for stale #2"; FAILURES=$((FAILURES+1)); }
 
 # -- D2.5: Linear+MCP → dispatch fails before tracker-ops ----------------------
 cat > .claude/skills/pm/config/project-management.config.md <<'EOF'

@@ -21,7 +21,7 @@ heartbeat files, then acts top to bottom:
 
 | State observed | Action |
 |---|---|
-| `[Blocked]` [task] whose `blockedBy` [tasks] are all terminal | Auto-move `Blocked → Active` + comment — no agent launch (adapter caveat below) |
+| `[Blocked]` [task] whose `blockedBy` [tasks] are all terminal | Auto-move `Blocked → <resume-status from block comment>` + comment — no agent launch (adapter caveat below) |
 | `[design-note]` with no later `[design-approved]`/`[design-pushback]` | Launch principal-architect with the **whole** pending-design queue |
 | [Task](s) in `[Review]` missing `[review-approval]` / `[architecture-approval]` since the last `[review-request]` | Launch reviewer / principal-architect with the **whole** review queue |
 | [Task](s) in `[Review]` holding both approvals | Launch integrator with the merge queue in dependency order |
@@ -44,10 +44,10 @@ heartbeat files, then acts top to bottom:
   `blockedBy` read is reliable (Linear, Jira). GitHubIssues and Markdown are
   **suggest-only** — the pass prints the suggestion and the team-lead
   confirms. Override per invocation with `--unblock=auto|suggest|off`.
-  Auto-unblock writes only when the latest block-era comment carries a legal
-  `resume-status: <Status>` line (see lifecycle Scenario 7); without one, the
-  pass prints a lead-actionable suggestion and routes to the team-lead instead
-  of writing any status.
+  Auto-unblock writes only when the latest comment containing `blocked-by:`
+  also carries a legal `resume-status: <Status>` line (see lifecycle Scenario 7);
+  without one the pass prints a lead-actionable suggestion and routes to the
+  team-lead.
 - **Policy stays where it was:** the pipelined dispatch rules (independence,
   sweep gate, freeze protocol — `reference/orchestration.md` → *Execution
   modes*) are decisions the **team-lead** makes during its pass. The

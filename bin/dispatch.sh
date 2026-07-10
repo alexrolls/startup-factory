@@ -142,20 +142,31 @@ def blockers_terminal(t):
     bb = t.get('blockedBy') or []
     return all(by_id.get(str(b), {}).get('status') in terminal for b in bb)
 
-def last_resume_status(t):  # latest 'resume-status: <value>' line across all comment bodies
+def current_block_body(t):
+    """Latest comment body containing a 'blocked-by:' line; None if none exists."""
     result = None
     for c in (t.get('comments') or []):
-        for line in (c.get('body') or '').splitlines():
-            if line.startswith('resume-status: '):
-                result = line[len('resume-status: '):].strip()
+        body = (c.get('body') or '')
+        if any(ln.strip().startswith('blocked-by:') for ln in body.splitlines()):
+            result = body
     return result
+
+def resume_status_from_block(t):
+    """resume-status from the latest block-shaped comment; None if absent or no block."""
+    body = current_block_body(t)
+    if body is None: return None
+    for ln in body.splitlines():
+        ls = ln.strip()
+        if ls.startswith('resume-status: '):
+            return ls[len('resume-status: '):].strip()
+    return None
 
 acts = []
 no_rs_blocks = []
 for t in tasks:  # 1. auto-unblock candidates
     if t.get('status') == 'Blocked' and (t.get('blockedBy') or []) and blockers_terminal(t):
         tid = str(t['taskId'])
-        rs = last_resume_status(t)
+        rs = resume_status_from_block(t)
         if rs is not None and rs in blocked_transitions:
             acts.append(('unblock', tid, rs))
         else:
