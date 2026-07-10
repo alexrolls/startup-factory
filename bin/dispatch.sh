@@ -189,7 +189,7 @@ for t in tasks:
     if ra > req and aa > req:
         if protocol_reviewer:
             ra_body = ((t.get('comments') or [])[ra]).get('body') or ''
-            sig = _re.search(r'—\s*([\w-]+)(?:\s*\(posted by[^)]*\))?\s*$', ra_body.strip())
+            sig = _re.search(r'—\s*([\w-]+)(?:\s*\((?:posted by[^)]*|as [^)]+)\))?\s*$', ra_body.strip())
             signer = sig.group(1) if sig else None
             if signer == protocol_reviewer:
                 merge_q.append(tid)

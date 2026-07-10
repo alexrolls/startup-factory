@@ -42,7 +42,9 @@ cat > feat/feature.md <<'EOF'
 **Assignee:** backend
 
 > [review-request] round 1
+
 > [review-approval] files ok — reviewer
+
 > [architecture-approval] files ok — principal-architect
 
 ## 2 Blocked thing [Blocked]
@@ -77,7 +79,9 @@ Independent.
 **Assignee:** backend
 
 > [review-request] round 1 — backend
+
 > [review-approval] files ok — reviewer
+
 > [architecture-approval] files ok — principal-architect
 EOF
 FID="feat/feature.md"
@@ -312,7 +316,9 @@ Done.
 **Assignee:** senior-full-stack-engineer
 
 > [review-request] ready — senior-full-stack-engineer
+
 > [review-approval] LGTM — reviewer
+
 > [architecture-approval] LGTM — principal-software-architect
 
 ## 3 Preset QA approved [Review]
@@ -320,7 +326,9 @@ Done.
 **Assignee:** senior-full-stack-engineer
 
 > [review-request] ready — senior-full-stack-engineer
+
 > [review-approval] LGTM — senior-qa-engineer
+
 > [architecture-approval] LGTM — principal-software-architect
 EOF
 SIG_FID="feat/signer-test.md"
@@ -348,6 +356,87 @@ echo "$signer_plan" | grep -q "launch integrator.*signer-test.*#3" \
 echo "$signer_plan" | grep -q "launch team-lead" \
   && echo "ok: generic reviewer: team-lead notified" \
   || { echo "FAIL: team-lead not in plan"; FAILURES=$((FAILURES+1)); }
+
+# -- D2.4: multiline [review-approval] with signer on last line ----------------
+cat > feat/ml-signer-test.md <<'EOF'
+# Multiline Signer Test [Active]
+
+## 1 Multiline QA approved [Review]
+
+**Assignee:** senior-full-stack-engineer
+
+> [review-request] ready — senior-full-stack-engineer
+
+> [review-approval] round 1
+> verdict: approved
+> — senior-qa-engineer
+
+> [architecture-approval] LGTM — principal-software-architect
+
+## 2 Multiline generic reviewer [Review]
+
+**Assignee:** senior-full-stack-engineer
+
+> [review-request] ready — senior-full-stack-engineer
+
+> [review-approval] round 1
+> verdict: approved
+> — reviewer
+
+> [architecture-approval] LGTM — principal-software-architect
+
+## 3 As-role suffix [Review]
+
+**Assignee:** senior-full-stack-engineer
+
+> [review-request] ready — senior-full-stack-engineer
+
+> [review-approval] round 1
+> verdict: approved
+> — senior-qa-engineer (as reviewer)
+
+> [architecture-approval] LGTM — principal-software-architect
+
+## 4 Posted-by suffix [Review]
+
+**Assignee:** senior-full-stack-engineer
+
+> [review-request] ready — senior-full-stack-engineer
+
+> [review-approval] round 1
+> verdict: approved
+> — senior-qa-engineer (posted by team-lead)
+
+> [architecture-approval] LGTM — principal-software-architect
+EOF
+ML_FID="feat/ml-signer-test.md"
+mkdir -p .teamwork/feat-ml-team
+cat > .teamwork/feat-ml-team/preset.env <<'EOF'
+PRESET=full-stack
+PROTOCOL_TEAM_LEAD=principal-software-architect
+PROTOCOL_PRINCIPAL_ARCHITECT=principal-software-architect
+PROTOCOL_REVIEWER=senior-qa-engineer
+PROTOCOL_QA=senior-qa-engineer
+PROTOCOL_INTEGRATOR=integrator
+PROTOCOL_BACKEND=senior-full-stack-engineer
+PROTOCOL_FRONTEND=senior-full-stack-engineer
+EOF
+ml_plan="$(TEAM_RUNNER=background "$DISPATCH" feat-ml-team "$ML_FID" --once --dry-run 2>&1)"
+echo "$ml_plan" | grep -q "launch integrator.*ml-signer.*#1" \
+  && echo "ok: multiline QA approval unlocks integrator" \
+  || { echo "FAIL: multiline QA approval did not unlock integrator; plan: $ml_plan"; FAILURES=$((FAILURES+1)); }
+echo "$ml_plan" | grep "launch integrator" | grep -q "ml-signer.*#2" \
+  && { echo "FAIL: multiline generic reviewer: task 2 incorrectly in merge queue"; FAILURES=$((FAILURES+1)); } \
+  || echo "ok: multiline generic reviewer: task 2 not in merge queue"
+echo "$ml_plan" | grep -q "signed by 'reviewer'.*expected preset final gate 'senior-qa-engineer'" \
+  && echo "ok: multiline generic reviewer: signer warning printed" \
+  || { echo "FAIL: no signer warning for multiline generic reviewer; plan: $ml_plan"; FAILURES=$((FAILURES+1)); }
+echo "$ml_plan" | grep -q "launch integrator.*ml-signer.*#3" \
+  && echo "ok: (as reviewer) suffix: signer accepted, integrator unlocked" \
+  || { echo "FAIL: (as reviewer) suffix not accepted; plan: $ml_plan"; FAILURES=$((FAILURES+1)); }
+echo "$ml_plan" | grep -q "launch integrator.*ml-signer.*#4" \
+  && echo "ok: (posted by team-lead) suffix: signer accepted, integrator unlocked" \
+  || { echo "FAIL: (posted by team-lead) suffix not accepted; plan: $ml_plan"; FAILURES=$((FAILURES+1)); }
 
 # -- read_key: inline comments stripped; quoted values with inner # untouched -----
 cat > feat/rk-test.md <<'EOF'

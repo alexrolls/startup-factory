@@ -416,8 +416,19 @@ class Markdown:
             bb = re.search(r'^\*\*BlockedBy:\*\* (.*)$', section, re.M)
             blocked_by = ['%s#%s' % (feature_id, n.strip().lstrip('#'))
                           for n in bb.group(1).split(',') if n.strip()] if bb else []
-            comments = [{'body': c.strip(), 'createdAt': None}
-                        for c in re.findall(r'^> (.*)$', section, re.M)]
+            _blocks, _cur = [], []
+            for _l in section.split('\n'):
+                _q = re.match(r'^> (.*)$', _l)
+                if _q:
+                    _cur.append(_q.group(1))
+                elif _cur:
+                    _b = '\n'.join(_cur).strip()
+                    if _b: _blocks.append(_b)
+                    _cur = []
+            if _cur:
+                _b = '\n'.join(_cur).strip()
+                if _b: _blocks.append(_b)
+            comments = [{'body': _b, 'createdAt': None} for _b in _blocks]
             tasks.append({'taskId': '%s#%s' % (feature_id, num), 'title': title,
                           'status': generic_of(raw), 'statusRaw': raw,
                           'assignee': (am.group(1).strip() if am and am.group(1).strip() != '—' else None),
