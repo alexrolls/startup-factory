@@ -74,6 +74,9 @@ import json, os, sys, time
 skill, workdir, stuck_min = sys.argv[1], sys.argv[2], int(sys.argv[3])
 board = json.load(open(os.path.join(skill, 'config', 'statuses.config.json')))
 terminal = {s['name'] for s in board['tasks']['statuses'] if s.get('terminal')}
+blocked_transitions = next(
+    (set(s['transitions']) for s in board['tasks']['statuses'] if s['name'] == 'Blocked'),
+    set())
 tasks = json.load(open(os.path.join(workdir, 'tasks.json')))['tasks']
 by_id = {str(t['taskId']): t for t in tasks}
 
@@ -89,10 +92,29 @@ def blockers_terminal(t):
     bb = t.get('blockedBy') or []
     return all(by_id.get(str(b), {}).get('status') in terminal for b in bb)
 
+def last_resume_status(t):  # latest 'resume-status: <value>' line across all comment bodies
+    result = None
+    for c in (t.get('comments') or []):
+        for line in (c.get('body') or '').splitlines():
+            if line.startswith('resume-status: '):
+                result = line[len('resume-status: '):].strip()
+    return result
+
 acts = []
+no_rs_blocks = []
 for t in tasks:  # 1. auto-unblock candidates
     if t.get('status') == 'Blocked' and (t.get('blockedBy') or []) and blockers_terminal(t):
-        acts.append(('unblock', str(t['taskId']), ''))
+        tid = str(t['taskId'])
+        rs = last_resume_status(t)
+        if rs is not None and rs in blocked_transitions:
+            acts.append(('unblock', tid, rs))
+        else:
+            if rs is not None:
+                print("dispatch: warning — %s has invalid resume-status '%s' "
+                      "(not a legal transition from Blocked; legal: %s)"
+                      % (tid, rs, ', '.join(sorted(blocked_transitions))), file=sys.stderr)
+            no_rs_blocks.append(tid)
+            acts.append(('unblock-no-rs', tid, rs or ''))
 
 # warn on unknown blockedBy references
 for t in tasks:
@@ -142,11 +164,14 @@ if os.path.isdir(hb):
     now = time.time()
     stale = [f for f in os.listdir(hb)
              if now - os.path.getmtime(os.path.join(hb, f)) > stuck_min * 60]
-if planned or stale or anomalies:
+if planned or stale or anomalies or no_rs_blocks:
     detail = ('Lead-actionable — dispatchable [Planned]: %s; stale heartbeats: %s'
               % (', '.join(planned) or 'none', ', '.join(stale) or 'none'))
     if anomalies:
         detail += '; anomalous [Review] without [review-request]: %s' % ', '.join(anomalies)
+    if no_rs_blocks:
+        detail += ('; blocked/terminal-but-no-resume-status (add resume-status: <Status>'
+                   ' to the block comment): %s' % ', '.join(no_rs_blocks))
     acts.append(('launch', 'team-lead', detail + '. One supervision pass, then exit.'))
 
 for a in acts:
@@ -162,14 +187,16 @@ PYEOF
           off)     echo "plan: unblock $arg — suppressed (--unblock=off)" ;;
           suggest) echo "plan: unblock $arg — SUGGESTED (confirm and move via the team-lead; see reference/dispatch.md)" ;;
           auto)
-            echo "plan: unblock $arg (all blockers terminal)"
+            echo "plan: unblock $arg → [$detail] (all blockers terminal)"
             if [ "$dry" != "yes" ]; then
-              "$SKILL_DIR/bin/tracker-ops.sh" state "$arg" Active
-              printf 'Auto-unblocked by dispatcher: every blocking [task] reached the terminal status.\n\n— dispatcher (on behalf of team-lead)\n' \
+              "$SKILL_DIR/bin/tracker-ops.sh" state "$arg" "$detail"
+              printf 'Auto-unblocked by dispatcher: every blocking [task] reached the terminal status. Resuming to [%s].\n\n— dispatcher (on behalf of team-lead)\n' "$detail" \
                 | "$SKILL_DIR/bin/tracker-ops.sh" comment "$arg" -
             fi ;;
           *) die "unknown --unblock mode '$unblock'" ;;
         esac ;;
+      unblock-no-rs)
+        echo "plan: unblock $arg — NO RESUME STATUS (lead must resume; add 'resume-status: <Status>' to the block comment)" ;;
       launch)
         local _ck; _ck="$(role_cmd_key "$arg")"
         if key_is_null "$_ck"; then

@@ -44,6 +44,10 @@ heartbeat files, then acts top to bottom:
   `blockedBy` read is reliable (Linear, Jira). GitHubIssues and Markdown are
   **suggest-only** — the pass prints the suggestion and the team-lead
   confirms. Override per invocation with `--unblock=auto|suggest|off`.
+  Auto-unblock writes only when the latest block-era comment carries a legal
+  `resume-status: <Status>` line (see lifecycle Scenario 7); without one, the
+  pass prints a lead-actionable suggestion and routes to the team-lead instead
+  of writing any status.
 - **Policy stays where it was:** the pipelined dispatch rules (independence,
   sweep gate, freeze protocol — `reference/orchestration.md` → *Execution
   modes*) are decisions the **team-lead** makes during its pass. The

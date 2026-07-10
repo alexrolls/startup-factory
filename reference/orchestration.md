@@ -171,7 +171,10 @@ nothing else: markers, gates, reviews, and statuses are identical in both modes.
     (park N+1 at a clean point — its WIP is safe in its own worktree — switch
     to N's worktree, deliver the rework and a fresh `[review-request]` before
     idling), moves N+1 `Active → Blocked` with the comment
-    `Parked (pipelined): preempted by rework on <N>. Resume on <N> re-entering [Review].`,
+    `Parked (pipelined): preempted by rework on <N>. Resume on <N> re-entering [Review].`
+    (this parked comment deliberately carries **no** `resume-status:` — the lead
+    owns the resume assignment and performs the `Blocked → Active` move directly
+    when N re-enters `[Review]`; the dispatcher must not auto-resume a parked task),
     and when N re-enters `[Review]`, moves N+1 `Blocked → Active` with a
     fresh resume assignment. Oldest [task] first, always; one implementer
     never holds two [tasks] hot at once. A parked [task] reads as **Parked**

@@ -116,7 +116,16 @@ edge case, a follow-up):
 When the *work* cannot proceed — missing dependency, unanswered question, broken
 external service — and it isn't a process failure (that's the andon cord, Scenario 8):
 
-1. **Add a comment** stating what is blocking, what was tried, and what would unblock.
+1. **Add a comment** with the required shape:
+   ```
+   blocked-by: <taskId or external-ref>
+   resume-status: <Status>
+   reason: <one line — what is blocking and what would unblock>
+   ```
+   `resume-status` is required and must name a legal transition from `Blocked` in
+   `config/statuses.config.json` (default board: `Planned`, `Active`, or `Review`).
+   The dispatcher reads this line to know where to resume the task when blockers clear;
+   without it, the dispatcher cannot auto-unblock and routes to the team-lead instead.
 2. **Move the [task] to `[Blocked]`** via the adapter. The board's owner of `[Blocked]`
    (default: team-lead) now owns resolving it.
 3. The `[Blocked]` owner works the blocker and, once cleared, **moves the [task] back**

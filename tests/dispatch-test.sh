@@ -52,6 +52,8 @@ cat > feat/feature.md <<'EOF'
 
 Blocked on 1.
 
+> resume-status: Active
+
 ## 3 In review [Review]
 
 **Assignee:** backend
@@ -158,6 +160,74 @@ check "null-CMD: reviewer.pid not created" test ! -f .teamwork/feat-team/pids/re
 check "null-CMD: reviewer mailbox not written" test ! -d .teamwork/feat-team/mailbox/reviewer
 # Remove the injected line to leave the config clean for any future assertions.
 sed -i '' '/^REVIEWER_CMD=null$/d' .claude/skills/pm/config/team.config.md
+
+# -- resume-status: auto-unblock routes to the correct phase ------------------
+cat > feat/rs-test.md <<'EOF'
+# RS Test [Active]
+
+## 1 Terminal [Ready to deploy]
+
+**Assignee:** backend
+
+Done.
+
+## 2 Needs Review [Blocked]
+
+**Assignee:** backend
+**BlockedBy:** 1
+
+> resume-status: Review
+
+## 3 Needs Planned [Blocked]
+
+**Assignee:** backend
+**BlockedBy:** 1
+
+> resume-status: Planned
+
+## 4 No resume-status [Blocked]
+
+**Assignee:** backend
+**BlockedBy:** 1
+
+No resume-status here.
+
+## 5 Invalid resume-status [Blocked]
+
+**Assignee:** backend
+**BlockedBy:** 1
+
+> resume-status: Nonesuch
+EOF
+RS_FID="feat/rs-test.md"
+
+# real auto pass — tasks 2 and 3 should be moved; 4 and 5 must not be touched
+TEAM_RUNNER=background "$DISPATCH" feat-team-rs "$RS_FID" --once --unblock=auto
+check "resume-status Review: moved to [Review]"  grep -q '^## 2 Needs Review \[Review\]$'  "$RS_FID"
+check "resume-status Planned: moved to [Planned]" grep -q '^## 3 Needs Planned \[Planned\]$' "$RS_FID"
+check "no-rs: not moved (still Blocked)"          grep -q '^## 4 No resume-status \[Blocked\]$' "$RS_FID"
+check "invalid-rs: not moved (still Blocked)"     grep -q '^## 5 Invalid resume-status \[Blocked\]$' "$RS_FID"
+
+# auto comments on moved tasks name the chosen resume status
+check "Review unblock comment present"  grep -rq 'Resuming to \[Review\]'  "$RS_FID"
+check "Planned unblock comment present" grep -rq 'Resuming to \[Planned\]' "$RS_FID"
+
+# dry-run captures the no-rs suggestion and the invalid-rs warning
+rs_dry="$(TEAM_RUNNER=background "$DISPATCH" feat-team-rs2 "$RS_FID" --once --dry-run --unblock=auto 2>&1)"
+echo "$rs_dry" | grep -q "NO RESUME STATUS" \
+  && echo "ok: no-rs: lead-actionable suggestion printed" \
+  || { echo "FAIL: no-rs: suggestion not printed"; FAILURES=$((FAILURES+1)); }
+echo "$rs_dry" | grep -q "invalid resume-status" \
+  && echo "ok: invalid-rs: warning printed" \
+  || { echo "FAIL: invalid-rs: no warning"; FAILURES=$((FAILURES+1)); }
+
+# under Markdown suggest-only default: no write even for a task with a valid resume-status
+sed -i '' 's/^## 2 Needs Review \[Review\]$/## 2 Needs Review [Blocked]/' "$RS_FID"
+rs_sug="$(TEAM_RUNNER=background "$DISPATCH" feat-team-rs3 "$RS_FID" --once --dry-run 2>&1)"
+echo "$rs_sug" | grep -q "unblock $RS_FID#2 — SUGGESTED" \
+  && echo "ok: suggest-only: valid-rs task shows SUGGESTED" \
+  || { echo "FAIL: suggest-only: wrong message for valid-rs task"; FAILURES=$((FAILURES+1)); }
+check "suggest-only: no write for valid-rs task" grep -q '^## 2 Needs Review \[Blocked\]$' "$RS_FID"
 
 echo "---"
 [ "$FAILURES" -eq 0 ] && echo "ALL PASS" || { echo "$FAILURES FAILURE(S)"; exit 1; }
