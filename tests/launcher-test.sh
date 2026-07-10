@@ -248,6 +248,36 @@ STATUS_CONFIG=config/statuses.config.json
 ```
 EOF
 
+# -- tmux liveness: pid file removed on agent exit; dead pane never blocks relaunch ----
+if command -v tmux >/dev/null 2>&1; then
+  TL_TEAM="tmux-liveness"
+  tmux kill-session -t "team-$TL_TEAM" 2>/dev/null || true
+  rm -rf ".teamwork/$TL_TEAM"
+  # Launch backend via tmux (no TEAM_RUNNER override → auto picks tmux when available)
+  "$LAUNCH" start "$TL_TEAM" FEAT-T backend
+  check "tmux: pid file written on launch" test -f ".teamwork/$TL_TEAM/pids/backend.pid"
+  # Poll up to 10 s for pid file removal (agent command exits → rm -f in pane → sleep)
+  _tl_done=no
+  for _tl_i in $(seq 1 50); do
+    [ ! -f ".teamwork/$TL_TEAM/pids/backend.pid" ] && _tl_done=yes && break
+    sleep 0.2
+  done
+  if [ "$_tl_done" = "yes" ]; then
+    echo "ok: tmux: pid file removed after agent exit"
+  else
+    echo "FAIL: tmux: pid file still present after 10 s — rm -f not running in pane"
+    FAILURES=$((FAILURES+1))
+  fi
+  # A re-start must succeed (role is not live — pid absent); new pid file written
+  relaunch_out="$("$LAUNCH" start "$TL_TEAM" FEAT-T backend 2>&1)"
+  echo "$relaunch_out" | grep -q "launched backend in tmux" \
+    && echo "ok: tmux: relaunch succeeds (not considered live)" \
+    || { echo "FAIL: tmux: relaunch did not say launched — output: $relaunch_out"; FAILURES=$((FAILURES+1)); }
+  tmux kill-session -t "team-$TL_TEAM" 2>/dev/null || true
+else
+  echo "skip: tmux tests (tmux unavailable)"
+fi
+
 # -- status + stop --------------------------------------------------------------
 # Capture first (grep -q closes the pipe early → SIGPIPE on the writer under pipefail).
 status_out="$("$LAUNCH" status test-feature)"

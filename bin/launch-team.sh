@@ -259,7 +259,7 @@ launch_one() { # launch_one <team> <featureId> <role> [preset]
     tmux has-session -t "team-$team" 2>/dev/null || tmux new-session -d -s "team-$team" -n _hub
     tmux kill-window -t "team-$team:$role" 2>/dev/null || true
     tmux new-window -t "team-$team" -n "$role" \
-      "cd '$REPO_ROOT' && $cmd; echo '[launch-team] $role exited'; sleep 86400"
+      "cd '$REPO_ROOT' && { $cmd; rc=\$?; }; echo '[launch-team] $role exited ('\$rc')'; rm -f '$dir/pids/$role.pid'; sleep 86400"
     echo "tmux" > "$dir/pids/$role.pid"
     echo "launched $role in tmux session team-$team"
   else
