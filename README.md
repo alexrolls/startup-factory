@@ -1,29 +1,70 @@
 # Agent Squad PM
 
-**AI project-management & team orchestration for agentic LLMs.**
+**Ship faster with an AI engineering squad you can see, steer, and trust.**
 
-Turn any agentic LLM into a disciplined engineering team that plans, builds,
-reviews, and ships work through **your** project tracker — Linear, Jira, GitHub
-Issues, or offline Markdown — without hard-coding a single tool or model.
+Agent Squad PM turns Linear, Jira, GitHub Issues, or local Markdown into the
+control plane for agentic development. Give the squad a feature and it plans,
+designs, implements, reviews, validates, and integrates the work while your
+project-management tool remains the single source of truth.
+
+You get the speed of task-level parallelism without giving up control. Safe work
+runs concurrently; architecture, QA, and integration stay behind explicit
+gates. Plans, ownership, progress, decisions, evidence, blockers, and delivery
+state remain visible where your team already manages the project.
 
 ![Agent Squad PM demo](exports/execmatchai-issues-57s-70s.gif)
 
-It has three layers you can adopt one at a time:
+```text
+[feature] -> design gate -> safe parallel [tasks] -> review -> QA -> validated integration -> [Ready to deploy]
+```
+
+## Why Agent Squad PM
+
+| Advantage | What it gives you |
+|---|---|
+| **Move fast without merge chaos** | A deterministic dispatcher launches only design-approved, dependency-ready, resource-safe work. Each attempt gets its own task branch and worktree; integration stays serialized. |
+| **See the whole delivery, not just agent output** | One live `[progress]` record per `[task]` and one `[digest]` per `[feature]` show tracker status, execution stage, actor, and attempt in your project-management tool. |
+| **Use the right model for each job** | Mix Claude, Codex, Gemini, or any file-reading CLI by role, then route individual tasks to fast, standard, or strong model profiles. |
+| **Keep quality gates explicit** | Architecture approval precedes implementation. Review uses an exact package, QA re-runs required checks, and the integrator runs your build, test, and lint commands before merging. |
+| **Recover instead of restarting** | Immutable task packets, durable events, checkpoint branches, an idempotent outbox, and attempt-aware relaunches make interrupted work inspectable and recoverable. |
+| **Keep your stack and your tracker** | The same workflow runs across languages, frameworks, LLMs, and project-management tools. Start offline with Markdown and switch adapters without rewriting the process. |
+
+## Full transparency in your tracker
+
+Agent Squad PM treats the tracker as the durable collaboration surface, not a
+status board updated after the real work happened. The local runtime makes
+coordination fast, but the information a human needs to supervise delivery is
+projected back into the configured tool.
+
+| You can inspect | How it stays visible |
+|---|---|
+| Scope and execution order | `[features]`, `[tasks]`, dependencies, resource declarations, and legal board transitions |
+| Design decisions | Structured design notes, pushback, approvals, conditions, and numbered architecture checklists |
+| Live progress | A mechanically updated `[progress]` record on every task and a compact `[digest]` across the feature |
+| Validation and review | Evidence records, changed-file lists, review findings, exact artifact paths, and explicit `NOT validated` declarations |
+| Blockers and human decisions | Proven `blocked-by` relationships plus escalations with a question, options, and a default if you are unavailable |
+| Delivery | The integrated commit, completed validation gates, and the final move to `[Ready to deploy]` |
+
+Use as much of the system as your project needs:
 
 | Layer | What it gives you | Where |
 |---|---|---|
 | **1. PM port** | One AI agent creates/tracks/completes `[features]` and `[tasks]` in any tracker through one tool-agnostic workflow. | `SKILL.md`, `reference/`, `adapters/` |
-| **2. Orchestration** | A cross-functional team of agents (possibly *different* LLMs) works one feature in parallel — a lead unblocks, an architect gates design, an integrator commits. | `reference/orchestration.md`, `roles/`, `bin/launch-team.sh` |
-| **3. Preset teams** | Five ready-made rosters (Full Stack, Deep Backend, Frontend, Security, Infra) — launch a whole team with one command. | `teams/` |
+| **2. Governed squad** | A lead coordinates, an architect gates design, specialists implement, QA verifies, and an integrator alone writes the feature branch. | `reference/orchestration.md`, `roles/` |
+| **3. Task-driven runtime** | Event-driven dispatch, bounded parallel waves, model routing, exact review packages, durable handoffs, and recoverable integration. | `bin/dispatch.sh`, `bin/runtime-state.py`, `bin/integrate-task.sh` |
+| **4. Preset teams** | Five ready-made rosters for full-stack, backend, frontend, security, and infrastructure work, launchable with one command. | `teams/`, `bin/launch-team.sh` |
 
-Everything is plain Markdown + one Bash launcher. It's **language-, framework-,
-tracker-, and LLM-agnostic**: it manages *work*, not *code*, and assumes nothing
-about your stack beyond files, a shell, and git.
+Everything is inspectable: plain Markdown, shell scripts, small Python utilities,
+and git. There is no coordinator service or database to host. The system is
+**language-, framework-, tracker-, and LLM-agnostic** because it manages the
+delivery contract around the code rather than assuming anything about the stack.
 
 ---
 
 ## Table of contents
 
+- [Why Agent Squad PM](#why-agent-squad-pm)
+- [Full transparency in your tracker](#full-transparency-in-your-tracker)
 - [Requirements](#requirements)
 - [Quick Start (2 minutes, no accounts)](#quick-start-2-minutes-no-accounts)
 - [Install into your repository](#install-into-your-repository)
