@@ -96,6 +96,26 @@ printf '[review-request]\nFiles: a.py\n' > delivery.txt
 "$OPS" comment-once "$T#1" delivery-123 delivery.txt
 check "comment-once retry keeps one delivery" test "$(grep -c 'delivery-id: delivery-123' "$T")" -eq 1
 
+# -- record-denial: guardrail DENY becomes idempotent ticket-level evidence -----
+printf 'deploy.apply argv: terraform destroy -auto-approve (production)\n' > denied.txt
+"$OPS" record-denial "$T#1" --actor deep-infra/devops --reason "infrastructure destroy is forbidden" denied.txt
+check "denial marker recorded literally"   grep -q '^> \[DENIED ACTION\]$' "$T"
+check "denial records the actor"           grep -q '^> actor: deep-infra/devops$' "$T"
+check "denial records the attempt"         grep -q 'terraform destroy -auto-approve' "$T"
+check "denial records the reason"          grep -q '^> Denial reason: infrastructure destroy is forbidden$' "$T"
+check "denial states prevention"           grep -q 'was blocked by the fail-closed policy gate and was not executed' "$T"
+check "denial carries an id"               grep -q '^> denial-id: denial-' "$T"
+check "denial retry is idempotent" bash -c \
+  "'$OPS' record-denial '$T#1' --actor deep-infra/devops --reason 'infrastructure destroy is forbidden' denied.txt \
+   && [ \"\$(grep -c 'denial-id: ' '$T')\" -eq 1 ]"
+printf 'curl 169.254.169.254 \x01\x02with control bytes\n' | "$OPS" record-denial "$T#1" \
+  --actor full-stack/backend --reason "metadata credential access is forbidden" --denial-id denial-ctrl-0001 -
+check "denial strips control bytes" bash -c "grep -q 'curl 169.254.169.254 *with control bytes' '$T' && ! grep -q \$'\x01' '$T'"
+refuse "denial without actor refused"   "requires --actor and --reason" bash -c "printf 'x\n' | '$OPS' record-denial '$T#1' --reason r -"
+refuse "denial without reason refused"  "requires --actor and --reason" bash -c "printf 'x\n' | '$OPS' record-denial '$T#1' --actor a -"
+refuse "denial with empty body refused" "empty comment body"            bash -c "printf '' | '$OPS' record-denial '$T#1' --actor a --reason r -"
+refuse "denial with bad id refused"     "invalid denial id"             bash -c "printf 'x\n' | '$OPS' record-denial '$T#1' --actor a --reason r --denial-id 'no spaces!' -"
+
 # -- state: legal generic status names only --------------------------------------
 "$OPS" state "$T#1" Review
 "$OPS" state "$T#1" Review

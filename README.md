@@ -18,6 +18,46 @@ state remain visible where your team already manages the project.
 [feature] -> design gate -> safe parallel [tasks] -> review -> QA -> validated integration -> [Ready to deploy]
 ```
 
+## The security gateway for AI builders
+
+Autonomous agents are only as useful as the boundaries around them. If you are
+building with AI teams, Startup Factory's strongest argument is not the speed —
+it is the **fail-closed security gateway** that stands between every agent and
+anything destructive:
+
+- **A code-owned policy gate.** `bin/policy-check.py` screens every privileged
+  structured command and release plan before a subprocess starts. Its deny
+  baseline — shell composition, privilege escalation, filesystem/database/
+  infrastructure destruction, secret dumping, metadata-credential access,
+  encoded-command bypasses — is owned by the code: project configuration can
+  **add** denials, never remove one.
+- **A three-tier authority model.** Every action resolves to **DENY**,
+  **REQUIRE HUMAN APPROVAL**, or **ALLOW** (`reference/guardrails.md`).
+  Approvals bind exact digests, environments, targets, expirations, and one-use
+  nonces. Silence never approves; unknown anything is denied.
+- **A ticket-level audit trail for blocked actions.** When an agentic team or a
+  dedicated agent attempts a denied action, the enforcing component documents
+  it on the ticket as an idempotent `[DENIED ACTION]` comment
+  (`bin/tracker-ops.sh record-denial`): which agent acted, a full sanitized
+  description of what it tried to do, why the policy gate refused, and the
+  explicit statement that the action was prevented and never executed. Your
+  tracker shows not only what agents did — but what they were stopped from doing.
+- **Least-privilege agent sandboxes.** LLM processes start under `env -i` with a
+  positive environment allowlist; secrets, cloud credentials, deploy tokens, and
+  metadata endpoints are refused. In broker mode no LLM — including the team
+  lead — ever holds tracker credentials.
+- **Contained workspaces.** Every implementer is isolated in its own git
+  worktree; tracker file paths are symlink-safe and confined to their configured
+  root; integration and terminal transitions are serialized, verified by
+  read-back, and reserved to dedicated components.
+- **Automation that is off by default.** The portfolio supervisor is
+  deterministic (not an LLM), disabled until explicitly enabled, and stops the
+  pass rather than fabricating state when anything is malformed.
+
+The result: you can hand real delivery work to AI agents and still answer, from
+your own tracker, the questions an auditor would ask — who did what, who
+approved what, and what was denied.
+
 ## Why Startup Factory
 
 | Advantage | What it gives you |
@@ -43,6 +83,7 @@ projected back into the configured tool.
 | Live progress | A mechanically updated `[progress]` record on every task and a compact `[digest]` across the feature |
 | Validation and review | Evidence records, changed-file lists, review findings, exact artifact paths, and explicit `NOT validated` declarations |
 | Blockers and human decisions | Proven `blocked-by` relationships plus escalations with a question, options, and a default if you are unavailable |
+| Denied actions | Idempotent `[DENIED ACTION]` audit comments: which agent attempted a forbidden action, what it tried to do, why the policy gate refused, and that it was never executed |
 | Delivery | The integrated commit, completed validation gates, and the final move to `[Ready to deploy]` |
 
 Use as much of the system as your project needs:
@@ -63,6 +104,7 @@ delivery contract around the code rather than assuming anything about the stack.
 
 ## Table of contents
 
+- [The security gateway for AI builders](#the-security-gateway-for-ai-builders)
 - [Why Startup Factory](#why-startup-factory)
 - [Full transparency in your tracker](#full-transparency-in-your-tracker)
 - [Requirements](#requirements)
@@ -392,7 +434,8 @@ Just talk to your agent in the generic vocabulary:
 
 There is also `bin/tracker-ops.sh` — an ergonomic wrapper for the recurring
 tracker operations (`claim`, `state`, `comment` with the body from a file/stdin,
-`update-comment <id> <file>`, `upsert-progress`, `upsert-digest`, `integrate
+`update-comment <id> <file>`, `upsert-progress`, `upsert-digest`,
+`record-denial` (idempotent `[DENIED ACTION]` audit records), `integrate
 <hash>`, `export`) over the scriptable access mechanisms (Linear/Jira REST,
 `gh`, Markdown files). The adapter docs remain the spec; MCP sessions use their
 native tools instead.

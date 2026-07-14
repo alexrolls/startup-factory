@@ -15,6 +15,8 @@
 #   tracker-ops.sh upsert-progress <taskId> [bodyfile]                       # create/update the task's single [progress] artifact
 #   tracker-ops.sh upsert-digest   <featureId> [bodyfile]                    # create/update the feature's single [digest] artifact
 #   tracker-ops.sh claim          <taskId> <role> [--to <Status>]           # claim: initial→working status + claim comment
+#   tracker-ops.sh record-denial  <taskId> --actor <agent> --reason <text> [--denial-id <id>] [bodyfile]
+#                                                                            # idempotent [DENIED ACTION] audit comment
 #   tracker-ops.sh integrate      <taskId> <hash> [bodyfile]                # terminal move + completion comment citing <hash>
 #   tracker-ops.sh export         <featureId> <outfile>                     # read-side: dump the [feature]'s [tasks] as JSON
 #   tracker-ops.sh scan           <outfile> --status <Status>...            # board-wide normalized discovery
@@ -130,6 +132,13 @@ def read_body(path):
     if not body:
         die("empty comment body")
     return body
+
+def sanitize_untrusted(text, limit):
+    """Bound untrusted agent-supplied text before it becomes tracker evidence."""
+    text = ''.join(ch if ch in '\n\t' or ord(ch) >= 32 else ' ' for ch in text).strip()
+    if len(text) > limit:
+        text = text[:limit].rstrip() + '\n… [truncated for the tracker; the full record stays in protected local logs]'
+    return text
 
 def replace_managed_block(text, key, body):
     """Replace one generated block while preserving all user-authored text."""
@@ -806,9 +815,15 @@ class Markdown:
         marker = marker_m.group(1) if marker_m else 'note'
         content = body[len(marker):].lstrip(' :') if marker_m else body
         lines = content.split('\n')
-        quoted = '> %s (%s): %s' % (marker, date.today().isoformat(), lines[0])
-        for extra in lines[1:]:
-            quoted += '\n> %s' % extra
+        if body.startswith('[DENIED ACTION]'):
+            # A denied-action audit record keeps its marker literal. Preserve the
+            # envelope byte-for-byte (apart from Markdown quote prefixes) instead
+            # of folding its first field into the legacy dated first line.
+            quoted = '\n'.join('> %s' % line for line in body.split('\n'))
+        else:
+            quoted = '> %s (%s): %s' % (marker, date.today().isoformat(), lines[0])
+            for extra in lines[1:]:
+                quoted += '\n> %s' % extra
         rest = text[m.end():]
         nxt = re.search(r'^## ', rest, re.M)
         insert_at = m.end() + (nxt.start() if nxt else len(rest))
@@ -1080,6 +1095,47 @@ def op_claim(args):
         die("claim write did not read back as [%s] (observed: %s) — no launch" % (to, observed))
     print("%s claimed by %s → [%s] (claim-id: %s)" % (task_id, role, to, claim_id))
 
+def op_record_denial(args):
+    # A guardrail DENY encountered while an agentic team or dedicated agent acts
+    # on a [task] must become ticket-level evidence: what was attempted, by whom,
+    # and that the action was prevented. Documentation only — never authorization.
+    actor = reason = denial_id = None
+    for flag in ('--actor', '--reason', '--denial-id'):
+        if flag in args:
+            i = args.index(flag)
+            value = args[i + 1] if i + 1 < len(args) else die("%s needs a value" % flag)
+            args = args[:i] + args[i + 2:]
+            if flag == '--actor': actor = value
+            elif flag == '--reason': reason = value
+            else: denial_id = value
+    if len(args) not in (1, 2):
+        die("usage: record-denial <taskId> --actor <agent> --reason <text> [--denial-id <id>] [bodyfile]")
+    task_id = args[0]
+    if not actor or not reason:
+        die("record-denial requires --actor and --reason")
+    actor = sanitize_untrusted(actor.replace('\n', ' '), 128)
+    reason = sanitize_untrusted(reason.replace('\n', '; '), 500)
+    if not actor or not reason:
+        die("record-denial actor/reason must not be empty after sanitization")
+    attempted = sanitize_untrusted(read_body(args[1] if len(args) == 2 else None), 1800)
+    if not attempted:
+        die("record-denial requires a non-empty attempted-action description")
+    denial_id = denial_id or ('denial-' + hashlib.sha256(
+        ('%s\0%s\0%s\0%s' % (task_id, actor, reason, attempted)).encode()).hexdigest()[:24])
+    if not re.fullmatch(r'[A-Za-z0-9._:-]{8,128}', denial_id):
+        die("invalid denial id '%s'" % denial_id)
+    token = "denial-id: %s" % denial_id
+    if backend.comment_exists(task_id, token):
+        print("%s denial %s already recorded" % (task_id, denial_id))
+        return
+    body = ("[DENIED ACTION]\n%s\nactor: %s\ndecision: DENY\n\n"
+            "Attempted action:\n%s\n\n"
+            "Denial reason: %s\n\n"
+            "This action was blocked by the fail-closed policy gate and was not executed.\n\n"
+            "— policy gate" % (token, actor, attempted, reason))
+    backend.comment(task_id, body)
+    print("%s denial recorded (denial-id: %s)" % (task_id, denial_id))
+
 def op_integrate(args):
     if len(args) not in (2, 3):
         die("usage: integrate <taskId> <commit-hash> [bodyfile]")
@@ -1159,8 +1215,9 @@ def op_scan(args):
 OPS = {'state': op_state, 'comment': op_comment, 'comment-once': op_comment_once, 'update-comment': op_update_comment,
        'upsert-progress': op_upsert_progress, 'upsert-digest': op_upsert_digest,
        'upsert-deployment': op_upsert_deployment, 'feature-state': op_feature_state,
-       'claim': op_claim, 'integrate': op_integrate, 'export': op_export, 'scan': op_scan}
+       'claim': op_claim, 'record-denial': op_record_denial, 'integrate': op_integrate,
+       'export': op_export, 'scan': op_scan}
 if not ARGS or ARGS[0] not in OPS:
-    die("usage: tracker-ops.sh {state|feature-state|comment|comment-once|update-comment|upsert-progress|upsert-digest|upsert-deployment|claim|integrate|export|scan} ...")
+    die("usage: tracker-ops.sh {state|feature-state|comment|comment-once|update-comment|upsert-progress|upsert-digest|upsert-deployment|claim|record-denial|integrate|export|scan} ...")
 OPS[ARGS[0]](ARGS[1:])
 PYEOF

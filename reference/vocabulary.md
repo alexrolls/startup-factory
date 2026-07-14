@@ -107,6 +107,7 @@ Markers are the machine-readable protocol prefixes that begin every coordination
 | `[digest]` | One per [feature], mechanically upserted from the tracker snapshot: one line per [task] for the human's whole view. |
 | `[andon]` | Stop-the-line report: what failed, exact error, what was not done. |
 | `[escalation]` | Needs the human: question, options, default-if-silent. |
+| `[DENIED ACTION]` | Policy gate blocked an agent's attempted action: actor, what was attempted, why it was denied, and that it was never executed. Audit evidence only — grants nothing. |
 
 ---
 

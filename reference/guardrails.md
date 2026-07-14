@@ -17,6 +17,26 @@ Use three decisions, in this order:
 Silence never approves. An `[escalation]` involving a sensitive action must use
 `default-if-silent: do not execute; remain blocked`.
 
+## Denied-action documentation
+
+Every **DENY** hit while an agentic team or a dedicated agent acts on behalf of a
+[task] must be documented at the ticket level. The enforcing component (supervisor,
+dispatcher, or release executor — never the denied agent itself) posts one
+idempotent `[DENIED ACTION]` comment via `bin/tracker-ops.sh record-denial`,
+carrying:
+
+- `denial-id` — the idempotency token, so retries never duplicate the record;
+- `actor` — which agent or team role attempted the action;
+- a full, sanitized description of what the agent tried to do (bounded and
+  control-character-stripped; raw command output stays in protected local logs);
+- the denial reason from the policy gate;
+- the explicit statement that the action was blocked and **was not executed**.
+
+This record is audit evidence, not a workflow signal: it never changes the
+[task] status, never grants authority, and never softens the denial. Failing to
+post it is an andon for the enforcing component, but the denial stands whether
+or not the comment lands.
+
 ## Always denied to autonomous agents
 
 - **Filesystem:** recursive or bulk deletion outside an explicitly disposable

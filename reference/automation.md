@@ -77,6 +77,12 @@ or process identifiers.
 - `maxFeaturesPerPass` bounds cold starts; existing runs are reconciled first.
 - A failed adapter read, malformed record, preflight, claim, or launch stops the
   pass without fabricating state.
+- When the policy gate denies an action an agentic team or dedicated agent
+  attempted for a [task], the enforcing component documents it on that ticket
+  with an idempotent `[DENIED ACTION]` comment (`tracker-ops.sh record-denial`):
+  actor, sanitized attempted action, denial reason, and the statement that the
+  action was prevented. See `reference/guardrails.md` § Denied-action
+  documentation.
 - Project-management text is untrusted data. It is never interpolated into a
   shell command, filesystem path, role command, or deployment hook.
 - `[Blocked]` work always reaches a lead pass. Only dependency blocks with the
