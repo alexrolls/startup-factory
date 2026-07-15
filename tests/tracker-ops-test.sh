@@ -22,6 +22,103 @@ refuse() { # refuse <desc> <needle> <cmd...>
   fi
 }
 
+# -- project-owned custom backend delegation -----------------------------------
+CUSTOM_SKILL="$TMP/custom-skill"
+mkdir -p "$CUSTOM_SKILL/bin" "$CUSTOM_SKILL/config" "$CUSTOM_SKILL/extensions/tracker-backends"
+cp "$SKILL_DIR/bin/tracker-ops.sh" "$CUSTOM_SKILL/bin/"
+cp "$SKILL_DIR/config/statuses.config.json" "$CUSTOM_SKILL/config/"
+cat > "$CUSTOM_SKILL/config/project-management.config.md" <<'EOF'
+```
+PRODUCT_MANAGEMENT_TOOL=Acme
+STATUS_CONFIG=config/statuses.config.json
+```
+EOF
+cat > "$CUSTOM_SKILL/extensions/tracker-backends/Acme.py" <<'PY'
+import json
+import os
+
+
+class Backend:
+    def __init__(self, context):
+        self.context = context
+
+    def current_status(self, task_id):
+        return os.environ.get('ACME_STATUS', 'Planned')
+
+    def current_labels(self, task_id):
+        return json.loads(os.environ.get('ACME_LABELS', '[]'))
+
+    def current_feature_status(self, feature_id):
+        return 'Planned'
+
+    def _mutation(self, name):
+        path = os.environ.get('CUSTOM_MUTATION_OUT')
+        if path:
+            with open(path, 'a') as handle:
+                handle.write(name + '\n')
+
+    def set_state(self, task_id, target): self._mutation('set_state')
+    def set_assignee(self, task_id, role): self._mutation('set_assignee')
+    def set_feature_state(self, feature_id, target): self._mutation('set_feature_state')
+
+    def comment(self, task_id, body):
+        with open(os.environ['CUSTOM_BACKEND_OUT'], 'w') as handle:
+            handle.write('root=%s\n' % self.context['skill_dir'])
+            handle.write('adapter=%s\n' % self.context['adapter'])
+            handle.write('task=%s\n' % task_id)
+            handle.write('body=%s\n' % body)
+        return 'custom-comment-id'
+
+    def comment_exists(self, task_id, token): return False
+    def integration_comment_exists(self, task_id, commit): return False
+    def update_comment(self, task_id, comment_id, body): self._mutation('update_comment')
+    def upsert_progress(self, task_id, body): self._mutation('upsert_progress')
+    def upsert_digest(self, feature_id, body): self._mutation('upsert_digest')
+    def upsert_deployment(self, feature_id, body): self._mutation('upsert_deployment')
+    def export(self, feature_id): return []
+    def scan(self, statuses): return []
+PY
+CUSTOM_OPS="$CUSTOM_SKILL/bin/tracker-ops.sh"
+printf 'custom body\n' | CUSTOM_BACKEND_OUT="$TMP/custom-backend.out" \
+  "$CUSTOM_OPS" comment ACME-1 -
+check "custom backend receives the absolute skill root" \
+  grep -qx "root=$CUSTOM_SKILL" "$TMP/custom-backend.out"
+check "custom backend receives the selected adapter" \
+  grep -qx 'adapter=Acme' "$TMP/custom-backend.out"
+check "custom backend receives the task primitive" \
+  grep -qx 'task=ACME-1' "$TMP/custom-backend.out"
+check "custom backend receives the core-validated body" \
+  grep -qx 'body=custom body' "$TMP/custom-backend.out"
+
+ln -s Acme.py "$CUSTOM_SKILL/extensions/tracker-backends/AcmeLink.py"
+cat > "$CUSTOM_SKILL/config/project-management.config.md" <<'EOF'
+```
+PRODUCT_MANAGEMENT_TOOL=AcmeLink
+STATUS_CONFIG=config/statuses.config.json
+```
+EOF
+refuse "symlinked custom backend is refused" "contains a symlink" \
+  "$CUSTOM_OPS" scan "$TMP/unused.json" --status Planned
+
+cat > "$CUSTOM_SKILL/extensions/tracker-backends/Incomplete.py" <<'PY'
+class Backend:
+    def __init__(self, context):
+        self.context = context
+PY
+refuse "incomplete custom backend contract is refused" "missing methods" \
+  env TRACKER_ADAPTER=Incomplete "$CUSTOM_OPS" scan "$TMP/unused.json" --status Planned
+
+refuse "custom backend cannot bypass human-only Blocked exit" "human-only" \
+  env TRACKER_ADAPTER=Acme ACME_STATUS=Blocked CUSTOM_MUTATION_OUT="$TMP/custom-mutations" \
+    "$CUSTOM_OPS" state ACME-1 Planned
+refuse "custom backend cannot bypass human-work claim fence" "labeled for human work" \
+  env TRACKER_ADAPTER=Acme ACME_STATUS=Planned ACME_LABELS='["human-work"]' \
+    STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='["human-work"]' \
+    CUSTOM_MUTATION_OUT="$TMP/custom-mutations" \
+    "$CUSTOM_OPS" claim ACME-1 backend
+check "refused custom operations never reach mutation primitives" \
+  test ! -e "$TMP/custom-mutations"
+
 # -- fixture: a skill copy configured for the Markdown adapter ------------------
 cd "$TMP"
 mkdir -p skill/config skill/bin

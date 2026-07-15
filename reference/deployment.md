@@ -231,9 +231,14 @@ Only configured hooks need a `trustedHookDigests` entry; `plan`, `apply`,
 `status`, and `verify` are required. `verifyApproval` is required in
 `approval-required`; `verifyDelivery` is required in `automatic`. The sixteen
 `trustedCodeDigests` keys above are exact and all are required whenever delivery
-is enabled. Hash the installed reviewed bytes (for example, `shasum -a 256
-<file>`) and store each value with the `sha256:` prefix. Any code/config update
-requires operator review and pin rotation in the protected external config.
+is enabled with a shipped adapter. A custom adapter adds exactly one required
+entry, `"tracker-backend.<AdapterName>.py": "sha256:<64 lowercase hex>"`, for
+`extensions/tracker-backends/<AdapterName>.py`. Hash the installed reviewed
+bytes (for example, `shasum -a 256 <file>`) and store each value with the
+`sha256:` prefix. Any code/config update requires operator review and pin
+rotation in the protected external config. The PM supervisor and release
+executor independently capture the pinned custom backend into their protected
+snapshots.
 
 There are four positive environment boundaries:
 

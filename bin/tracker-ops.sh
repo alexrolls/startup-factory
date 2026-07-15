@@ -38,8 +38,10 @@ set -euo pipefail
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 exec 4<&0
 exec python3 - "$SKILL_DIR" "$@" <<'PYEOF'
-import hashlib, json, os, re, stat, subprocess, sys, time, urllib.request, urllib.error, urllib.parse
+import hashlib, importlib.util, json, os, re, stat, subprocess, sys, time, urllib.request, urllib.error, urllib.parse
 from datetime import date, datetime, timezone
+
+sys.dont_write_bytecode = True
 
 try:
     sys.stdin = os.fdopen(4)
@@ -73,6 +75,7 @@ PM_CONFIG = read_config_keys(os.path.join(SKILL_DIR, 'config', 'project-manageme
 ADAPTER = os.environ.get('TRACKER_ADAPTER') or PM_CONFIG.get('PRODUCT_MANAGEMENT_TOOL')
 if not ADAPTER:
     die("no adapter: set PRODUCT_MANAGEMENT_TOOL in config/project-management.config.md")
+
 try:
     OPERATION_TIMEOUT = int(os.environ.get('TRACKER_OPERATION_TIMEOUT_SECONDS', '60'))
 except ValueError:
@@ -1812,9 +1815,58 @@ class Markdown:
         return items
 
 BACKENDS = {'Linear': Linear, 'Jira': Jira, 'GitHubIssues': GitHubIssues, 'Markdown': Markdown}
-if ADAPTER not in BACKENDS:
-    die("adapter '%s' has no tracker-ops backend — use the adapter doc's Operations table directly" % ADAPTER)
-backend = BACKENDS[ADAPTER]()
+if ADAPTER in BACKENDS:
+    backend = BACKENDS[ADAPTER]()
+else:
+    if not re.match(r'^[A-Za-z][A-Za-z0-9_-]{0,63}$', ADAPTER):
+        die("custom adapter name must match [A-Za-z][A-Za-z0-9_-]{0,63}")
+    backend_root = os.path.join(SKILL_DIR, 'extensions', 'tracker-backends')
+    custom_backend = os.path.join(backend_root, ADAPTER + '.py')
+    for component in (
+            os.path.join(SKILL_DIR, 'extensions'),
+            backend_root,
+            custom_backend):
+        if os.path.islink(component):
+            die("custom tracker backend path contains a symlink: %s" % component)
+    try:
+        backend_stat = os.stat(custom_backend)
+    except OSError as e:
+        die("adapter '%s' has no tracker-ops backend; expected extensions/tracker-backends/%s.py: %s"
+            % (ADAPTER, ADAPTER, e))
+    if not stat.S_ISREG(backend_stat.st_mode):
+        die("custom tracker backend must be a regular Python file: %s" % custom_backend)
+    spec = importlib.util.spec_from_file_location(
+        'startup_factory_tracker_backend_' + hashlib.sha256(ADAPTER.encode()).hexdigest(),
+        custom_backend,
+    )
+    if spec is None or spec.loader is None:
+        die("cannot load custom tracker backend: %s" % custom_backend)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        backend = module.Backend({
+            'adapter': ADAPTER,
+            'feature_statuses': FEATURE_STATUSES,
+            'operation_timeout_seconds': OPERATION_TIMEOUT,
+            'pm_config': dict(PM_CONFIG),
+            'skill_dir': SKILL_DIR,
+            'task_statuses': TASK_STATUSES,
+        })
+    except Exception as e:
+        die("cannot initialize custom tracker backend %s: %s" % (custom_backend, e))
+    required_backend_methods = {
+        'comment', 'comment_exists', 'current_feature_status', 'current_labels',
+        'current_status', 'export', 'integration_comment_exists', 'scan',
+        'set_assignee', 'set_feature_state', 'set_state', 'update_comment',
+        'upsert_deployment', 'upsert_digest', 'upsert_progress',
+    }
+    missing_methods = sorted(
+        name for name in required_backend_methods
+        if not callable(getattr(backend, name, None))
+    )
+    if missing_methods:
+        die("custom tracker backend is incomplete; missing methods: %s" %
+            ', '.join(missing_methods))
 
 def assert_task_not_ignored(task_id):
     ignored = ignored_task_labels_from_environment()

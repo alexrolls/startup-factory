@@ -46,6 +46,31 @@ Todo -> route team -> design -> implement -> review -> QA -> integrate -> approv
 > release requires protected external configuration, hooks, identities, and
 > verification.
 
+## Table of contents
+
+- [Layered safety boundaries for AI builders](#layered-safety-boundaries-for-ai-builders)
+- [Why Startup Factory](#why-startup-factory)
+- [Full transparency in your tracker](#full-transparency-in-your-tracker)
+- [Choose your operating mode](#choose-your-operating-mode)
+- [Requirements](#requirements)
+- [Quick Start (2 minutes, no accounts)](#quick-start-2-minutes-no-accounts)
+- [Install into your repository](#install-into-your-repository)
+- [Connect your LLM](#connect-your-llm)
+- [Connect your tracker](#connect-your-tracker)
+- [Configure](#configure)
+- [Use it](#use-it)
+- [Automate the board and production delivery](#automate-the-board-and-production-delivery)
+- [The five preset teams](#the-five-preset-teams)
+- [How it works](#how-it-works)
+- [Documentation map](#documentation-map)
+- [Directory map](#directory-map)
+- [Extend it](#extend-it)
+- [Troubleshooting](#troubleshooting)
+- [Credits](#credits)
+- [License](#license)
+
+---
+
 ## Layered safety boundaries for AI builders
 
 Autonomous agents are only as useful as the boundaries around them. Startup
@@ -163,34 +188,13 @@ history.
 
 ---
 
-## Table of contents
-
-- [Layered safety boundaries for AI builders](#layered-safety-boundaries-for-ai-builders)
-- [Why Startup Factory](#why-startup-factory)
-- [Full transparency in your tracker](#full-transparency-in-your-tracker)
-- [Choose your operating mode](#choose-your-operating-mode)
-- [Requirements](#requirements)
-- [Quick Start (2 minutes, no accounts)](#quick-start-2-minutes-no-accounts)
-- [Install into your repository](#install-into-your-repository)
-- [Connect your LLM](#connect-your-llm)
-- [Connect your tracker](#connect-your-tracker)
-- [Configure](#configure)
-- [Use it](#use-it)
-- [Automate the board and production delivery](#automate-the-board-and-production-delivery)
-- [The five preset teams](#the-five-preset-teams)
-- [How it works](#how-it-works)
-- [Documentation map](#documentation-map)
-- [Directory map](#directory-map)
-- [Extend it](#extend-it)
-- [Troubleshooting](#troubleshooting)
-
----
-
 ## Requirements
 
 **Minimum (single agent):** a git repository, a POSIX shell, and any agentic LLM
 CLI or IDE that can read files (Claude Code, Codex CLI, Gemini CLI, Aider,
-Cursor, Windsurf, Cline, …).
+Cursor, Windsurf, Cline, …). The recommended first-install path additionally
+uses `curl`, `git`, and `rsync`; it does not require Homebrew, a global package,
+or a permanently installed Node.js CLI.
 
 **For multi-agent teams, additionally:** the launcher (`bin/launch-team.sh`) needs
 `bash` + `git`; every implementation task uses a task branch and isolated
@@ -228,15 +232,27 @@ for that tool.
 ## Quick Start (2 minutes, no accounts)
 
 The fastest win: one AI agent managing work in local Markdown files. No tracker
-account, no API key, no config changes — `Markdown` is the default.
+account, API key, Homebrew formula, or global package is required—`Markdown` is
+the default.
 
-1. **Copy this bundle into your repo** (Claude Code's natural home shown; any
-   agent can read it from any path):
+1. **From your project root, download the auditable installer/updater and install
+   the full bundle.** Codex uses the shared Agent Skills project directory:
 
    ```bash
-   mkdir -p .claude/skills
-   cp -R /path/to/this/bundle .claude/skills/startup-factory
+   (
+     set -eu
+     installer="$(mktemp "${TMPDIR:-/tmp}/startup-factory-install.XXXXXX")"
+     trap 'rm -f "$installer"' EXIT
+     curl -fsSLo "$installer" \
+       https://raw.githubusercontent.com/alexrolls/startup-factory/main/bin/update-installed-skill.sh
+     bash "$installer" --install-dir .agents/skills/startup-factory
+   )
    ```
+
+   For Claude Code, replace the final path with
+   `.claude/skills/startup-factory`. The block downloads to a unique file rather
+   than piping network content into a shell; insert `less "$installer"` between
+   `curl` and `bash` when you want a manual audit before execution.
 
 2. **Ask your agent, in plain language:**
 
@@ -257,43 +273,85 @@ That's the whole loop — plan → start → review → complete — in generic 
 that works identically on every tracker. When you're ready for a real tracker or
 a full team, keep reading.
 
-> **Sanity-check the runtime** (no LLM calls, no cost):
-> `bash tests/run-all.sh` should finish with `ALL TESTS PASS`.
+> **Sanity-check the runtime** (no LLM calls, no cost): from the installed
+> skill directory, `bash tests/run-all.sh` should finish with
+> `ALL TESTS PASS`.
 
 ---
 
 ## Install into your repository
 
-The bundle is just files. Put it wherever your agent looks for skills/rules, or
-anywhere and point the agent at `SKILL.md`.
+Use a **project-scoped** copy. Startup Factory contains mutable tracker, team,
+automation, deployment, and guardrail configuration, so one global copy should
+not be shared across unrelated projects. Homebrew would still need a second
+project-initialization step and is intentionally not part of the current
+distribution.
 
-| Harness | Install location | How the agent picks it up |
+Choose the project path your agent supports:
+
+| Agent | Project install directory | Discovery |
 |---|---|---|
-| **Claude Code** | `.claude/skills/startup-factory/` | Auto-loaded by the skill's description; just ask in natural language |
-| **Codex CLI** | anywhere, e.g. `.codex/pm/` | `codex exec "Read .codex/pm/SKILL.md and plan a feature …"` |
-| **Aider** | anywhere | `aider --read pm/SKILL.md`, then instruct |
-| **Cursor / Windsurf / Cline** | the tool's rules dir | reference `SKILL.md` in chat |
-| **Anything else** | anywhere | point the agent at `SKILL.md` |
+| **Codex** | `.agents/skills/startup-factory` | Native project skill path |
+| **Claude Code** | `.claude/skills/startup-factory` | Native project skill path |
+| **Aider** | `.agents/skills/startup-factory` | Start with `aider --read .agents/skills/startup-factory/SKILL.md` |
+| **Other agents** | Their native project skill directory | Use native discovery or point the agent at `SKILL.md` |
 
-### Update an installed copy
-
-From any repository where the skill is installed in Claude Code's default
-location, run:
+Set that path on the first line and run one copy-paste block. The unique
+temporary file is removed automatically, and a failed download cannot execute a
+stale installer:
 
 ```bash
-bash .claude/skills/startup-factory/bin/update-installed-skill.sh
+SF_INSTALL_DIR=.agents/skills/startup-factory
+(
+  set -eu
+  installer="$(mktemp "${TMPDIR:-/tmp}/startup-factory-install.XXXXXX")"
+  trap 'rm -f "$installer"' EXIT
+  curl -fsSLo "$installer" \
+    https://raw.githubusercontent.com/alexrolls/startup-factory/main/bin/update-installed-skill.sh
+  bash "$installer" --install-dir "$SF_INSTALL_DIR"
+)
 ```
 
-Or ask Claude:
+If you already cloned or downloaded Startup Factory, skip `curl` and run its
+local `bin/update-installed-skill.sh` with the same `--install-dir` argument.
+The script fetches the complete repository bundle—not just `SKILL.md`.
+
+> **Why the README does not currently use `npx skills add`:** the open
+> [Skills CLI](https://www.skills.sh/docs/cli) is the right long-term
+> direction and correctly discovers this repository. However, its current
+> remote repository-root installation path copies only the root `SKILL.md`.
+> Startup Factory also requires `bin/`, `config/`, `adapters/`, `extensions/`,
+> `reference/`, `roles/`, and `teams/`; an end-to-end installation without them
+> is broken.
+> Until a lean nested distribution is published, do not use `npx skills add`
+> or `npx skills update` for Startup Factory.
+
+### Safe updates
+
+Run the updater from the installed skill. It recognizes project installs under
+both `.agents/skills/` and `.claude/skills/` and updates that same directory:
+
+```bash
+bash .agents/skills/startup-factory/bin/update-installed-skill.sh --dry-run
+bash .agents/skills/startup-factory/bin/update-installed-skill.sh
+```
+
+For Claude Code, use the corresponding `.claude/skills/...` path. You can also
+ask your agent:
 
 ```
 Fetch latest Startup Factory skill.
 ```
 
-The updater fetches `main` from
-`https://github.com/alexrolls/startup-factory.git`, syncs the bundle into
-`.claude/skills/startup-factory`, and preserves existing project config files by
-default:
+Existing project configuration remains byte-for-byte untouched by default,
+while newly introduced config files are installed. Destination-only files under
+the documented `adapters/`, `extensions/`, and `teams/` extension points are
+also preserved. A generated ownership manifest lets later updates delete an
+upstream extension that has been retired without mistaking project-owned files
+for upstream files. A legacy installation without a manifest is migrated
+conservatively: destination-only extension files are kept. If a later upstream
+release introduces a file at a project-owned extension path, the update fails
+before mutation instead of overwriting it:
 
 - `config/project-management.config.md`
 - `config/team.config.md`
@@ -302,35 +360,44 @@ default:
 - `config/deployment.config.json`
 - `config/guardrails.config.json`
 
-To replace those config files with upstream defaults too:
+To intentionally replace those files with upstream defaults too:
 
 ```bash
-bash .claude/skills/startup-factory/bin/update-installed-skill.sh --overwrite-config
+bash .agents/skills/startup-factory/bin/update-installed-skill.sh --overwrite-config
 ```
 
-To install or update a non-default location:
+To install or update any explicit location:
 
 ```bash
-bash /path/to/startup-factory/bin/update-installed-skill.sh --install-dir .codex/pm
+bash /path/to/startup-factory/bin/update-installed-skill.sh \
+  --install-dir /absolute/path/to/startup-factory
 ```
 
-The updater requires `git` and `rsync`. Its full operator options are:
+The updater requires `git` and `rsync`. Its operator options are:
 
 | Option | Purpose |
 |---|---|
 | `--install-dir PATH` | Override installation autodetection. |
 | `--remote-url URL` | Fetch a different reviewed upstream (`STARTUP_FACTORY_REMOTE_URL`). |
-| `--ref REF` | Select a branch or tag (`STARTUP_FACTORY_REF`, default `main`). |
+| `--ref REF` | Select a branch, tag, or exact commit (`STARTUP_FACTORY_REF`, default `main`). |
 | `--overwrite-config` | Replace all six preserved project configuration files. |
 | `--dry-run` | Show the `rsync` change set without writing it. |
 
 `STARTUP_FACTORY_SKILL_NAME` overrides the installation directory name used for
-autodetection.
+autodetection. Prefer a reviewed tag or commit through `--ref` for controlled
+environments; `main` is the convenience default.
+
+Before synchronizing, the installer verifies the fetched bundle and refuses
+filesystem root, the home directory, a Git repository root, symlink targets,
+and unrelated non-empty directories. `--dry-run` never creates a missing
+destination.
 
 Multi-agent teams require the **target project** to be a git repository because
 every implementation attempt receives a task branch and git worktree. The skill
 bundle may live inside that repository for interactive/manual use; autonomous
-automation instead requires a protected external installation. Add `.teamwork/`
+automation instead requires a reviewed, protected external installation. Use
+the same installer with an absolute operator-owned destination outside the
+checkout and every agent mount. Add `.teamwork/`
 and `.workspace/` to the target repository's root `.gitignore`—ignore rules
 inside a nested skill installation do not cover project-root runtime paths.
 
@@ -637,8 +704,16 @@ Just talk to your agent in the generic vocabulary:
 
 ### A whole team
 
-1. Set `TEAM_MODE=true`, configure role commands, `WORKTREE_SETUP`, and at least
-   one real `VALIDATE_*` command in `config/team.config.md`. Add `.teamwork/` and
+1. Set the bundle path for your installation, then set `TEAM_MODE=true`,
+   configure role commands, `WORKTREE_SETUP`, and at least one real `VALIDATE_*`
+   command in `$SF_HOME/config/team.config.md`:
+
+   ```bash
+   SF_HOME=.agents/skills/startup-factory        # Codex / shared Agent Skills
+   # SF_HOME=.claude/skills/startup-factory      # Claude Code
+   ```
+
+   Add `.teamwork/` and
    `.workspace/` to the target repository's root `.gitignore`. Provision the
    protected external mode-0700 `BROKER_LIFECYCLE_ROOT` for this
    dispatcher-driven path; it supplies authoritative liveness, prevents
@@ -651,21 +726,21 @@ Just talk to your agent in the generic vocabulary:
 3. Launch the preset's persistent supervision and gate roles:
 
    ```bash
-   bin/launch-team.sh gate-team deep-backend payments-revamp ENG-100
-   #                             └ preset      └ branch/team    └ featureId
+   "$SF_HOME/bin/launch-team.sh" gate-team deep-backend payments-revamp ENG-100
+   #                                        └ preset      └ branch/team    └ featureId
    ```
 4. Start the deterministic dispatcher in its own persistent shell. This process
    owns task claims and launches fresh task-scoped workers:
 
    ```bash
-   bin/dispatch.sh payments-revamp ENG-100 --watch
+   "$SF_HOME/bin/dispatch.sh" payments-revamp ENG-100 --watch
    ```
 
 5. Watch the team:
 
    ```bash
    tmux attach -t team-payments-revamp         # live agent windows, when tmux is used
-   bin/launch-team.sh status payments-revamp   # protected process state + heartbeat
+   "$SF_HOME/bin/launch-team.sh" status payments-revamp  # protected process state + heartbeat
    ```
 
    Progress lands in your tracker; anything needing you lands in
@@ -673,15 +748,15 @@ Just talk to your agent in the generic vocabulary:
 6. Stop the dispatcher with `Ctrl-C`, then stop the managed team:
 
    ```bash
-   bin/launch-team.sh stop payments-revamp
+   "$SF_HOME/bin/launch-team.sh" stop payments-revamp
    ```
 
    If you intentionally experiment with unmanaged direct launches instead, do
    not rely on dispatcher liveness, `status`, or `stop`; supervise the
    tmux/background processes yourself.
 
-> The launcher path is relative to where you installed the bundle — e.g.
-> `.claude/skills/startup-factory/bin/launch-team.sh`.
+> Keep `SF_HOME` set in every shell that runs a launcher or dispatcher. For a
+> protected external automation installation, set it to that absolute path.
 
 **`bin/launch-team.sh` subcommands:**
 
@@ -1076,6 +1151,7 @@ when `TRACKER_WRITERS=broker`; polling remains the distributed fallback.
 | [`reference/guardrails.md`](reference/guardrails.md) | Which actions are denied, approval-only, or autonomously allowed, and where are those boundaries enforced? |
 | [`reference/deployment.md`](reference/deployment.md) | What are the provider-neutral hook schemas, trust requirements, approvals, transaction phases, and rollback rules? |
 | [`teams/README.md`](teams/README.md) and [`teams/_PLAYBOOK.md`](teams/_PLAYBOOK.md) | Which preset should you choose and how does its shared delivery protocol operate? |
+| [`extensions/tracker-backends/README.md`](extensions/tracker-backends/README.md) | Where does a project-owned backend module for a custom tracker live? |
 
 | Tracker guide | Scriptable unattended access | Interactive access |
 |---|---|---|
@@ -1105,6 +1181,7 @@ when `TRACKER_WRITERS=broker`; polling remains the distributed fallback.
 ├── adapters/
 │   ├── Markdown.md · Linear.md · Jira.md · GitHubIssues.md
 │   └── _TEMPLATE.md                  scaffold for a new tracker
+├── extensions/tracker-backends/      project-owned custom tracker modules
 ├── roles/                            the 7 base protocol roles
 │   └── team-lead · principal-architect · integrator · backend · frontend · qa · reviewer
 ├── teams/
@@ -1133,11 +1210,13 @@ when `TRACKER_WRITERS=broker`; polling remains the distributed fallback.
 ## Extend it
 
 Team and role extensions are one file. A new tracker needs its adapter contract plus a
-scriptable `tracker-ops.sh` backend before deterministic dispatch/automation can use it.
+scriptable backend before deterministic dispatch/automation can use it.
 
 - **New tracker:** copy `adapters/_TEMPLATE.md` → `adapters/<YourTool>.md`, fill the
-  tables, add its normalized operations backend, then set
-  `PRODUCT_MANAGEMENT_TOOL=<YourTool>`.
+  tables, add the normalized primitive backend class at
+  `extensions/tracker-backends/<YourTool>.py`, then set
+  `PRODUCT_MANAGEMENT_TOOL=<YourTool>`. Do not edit the upstream-owned
+  `bin/tracker-ops.sh`; see [`extensions/tracker-backends/README.md`](extensions/tracker-backends/README.md).
 - **New team:** copy any `teams/<preset>.md`, edit the charter, `ROSTER=` line, and
   review order. Include `integrator` in the roster.
 - **New role:** add `teams/roles/<kebab-name>.md` with the standard sections

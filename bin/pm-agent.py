@@ -55,6 +55,7 @@ RELEASE_SNAPSHOT_FILES = {
     "team.config.md": Path("config/team.config.md"),
     "project-management.config.md": Path("config/project-management.config.md"),
 }
+BUILTIN_TRACKER_ADAPTERS = {"Linear", "Jira", "GitHubIssues", "Markdown"}
 
 
 class MonitorError(RuntimeError):
@@ -1046,13 +1047,28 @@ def validate_release_handoff(
         raise MonitorError(
             "STARTUP_FACTORY_RELEASE_FEATURE must name bin/release-feature.py in the external skill install"
         )
+    release_env = minimal_release_environment(config)
+    snapshot_files = dict(RELEASE_SNAPSHOT_FILES)
+    pm_values = read_key_values(source_root / "config" / "project-management.config.md")
+    tracker_adapter = release_env.get("TRACKER_ADAPTER") or pm_values.get(
+        "PRODUCT_MANAGEMENT_TOOL"
+    )
+    if not isinstance(tracker_adapter, str) or not re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9_-]{0,63}", tracker_adapter
+    ):
+        raise MonitorError("release snapshot requires a valid configured tracker adapter")
+    if tracker_adapter not in BUILTIN_TRACKER_ADAPTERS:
+        snapshot_files[f"tracker-backend.{tracker_adapter}.py"] = Path(
+            "extensions", "tracker-backends", f"{tracker_adapter}.py"
+        )
+
     configured = config.get("trustedCodeDigests")
-    if not isinstance(configured, dict) or set(configured) != set(RELEASE_SNAPSHOT_FILES):
+    if not isinstance(configured, dict) or set(configured) != set(snapshot_files):
         raise MonitorError(
             "trustedCodeDigests must contain the exact protected release helper set"
         )
     captured: dict[str, tuple[bytes, str]] = {}
-    for name, relative in RELEASE_SNAPSHOT_FILES.items():
+    for name, relative in snapshot_files.items():
         expected_digest = configured.get(name)
         if not isinstance(expected_digest, str) or not re.fullmatch(
             r"sha256:[0-9a-f]{64}", expected_digest
@@ -1068,7 +1084,7 @@ def validate_release_handoff(
         return (
             isolated_release_command(resolved.parent, resolved),
             str(config_path.resolve()),
-            minimal_release_environment(config),
+            release_env,
         )
 
     state_root = private_directory(state_root_path, "stateRoot")
@@ -1079,9 +1095,12 @@ def validate_release_handoff(
         snapshot_parent / config_digest.removeprefix("sha256:"),
         "authenticated release snapshot",
     )
-    for directory in (snapshot / "bin", snapshot / "config"):
+    snapshot_directories = {
+        (snapshot / relative).parent for relative in snapshot_files.values()
+    }
+    for directory in sorted(snapshot_directories, key=lambda item: (len(item.parts), str(item))):
         private_directory(directory, "authenticated release snapshot directory")
-    for name, relative in RELEASE_SNAPSHOT_FILES.items():
+    for name, relative in snapshot_files.items():
         value, digest = captured[name]
         executable = relative.suffix == ".sh" or name == "release-feature.py"
         install_protected_snapshot(
@@ -1105,7 +1124,7 @@ def validate_release_handoff(
             snapshot / RELEASE_SNAPSHOT_FILES["release-feature.py"],
         ),
         str(snapshot_config),
-        minimal_release_environment(config),
+        release_env,
     )
 
 

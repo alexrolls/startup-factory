@@ -86,12 +86,15 @@ MCP tool / CLI command / file edit.
 | Integrate a `[task]` once | <terminal transition plus exact commit comment, with read-back and duplicate suppression> |
 | Set/read `[feature]` status | <how `feature-state` resolves, transitions, and reads back the generic feature status> |
 
-> Unattended automation requires a registered deterministic backend in
-> `bin/tracker-ops.sh`; the prose adapter alone is not executable. Implement the
-> full port: `claim`, `state`, `feature-state`, `comment`, `comment-once`,
-> `update-comment` (or an explicit fail-closed refusal), `upsert-progress`,
-> `upsert-digest`, `upsert-deployment`, `record-denial`, `integrate`, `export`,
-> and `scan`, without hand-built API calls. Every mutation must be idempotent
+> Unattended automation requires a deterministic backend module at
+> `extensions/tracker-backends/<ToolName>.py`; the prose adapter alone is not
+> executable. Do not edit the upstream-owned `bin/tracker-ops.sh` to register a
+> custom tool. Export the lower-level `Backend` class documented in
+> `extensions/tracker-backends/README.md`. The common broker keeps ownership of
+> operation parsing, legal transitions, `[Blocked]`/`human-work` fences,
+> idempotency gates, and status read-back. Implement every required primitive,
+> including exhaustive `export` and `scan`, without bypassing that layer or
+> making hand-built calls elsewhere. Every backend mutation must be idempotent
 > where the port says it is and must read back the resulting state. The
 > Operations table above remains the spec either way.
 

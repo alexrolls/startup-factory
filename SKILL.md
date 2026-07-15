@@ -21,7 +21,8 @@ skill's directory):
 - `reference/deployment.md` + `config/deployment.config.json` + `bin/release-feature.py` — recoverable provider-neutral production delivery
 - `roles/<role>.md` + `config/team.config.md` + `bin/launch-team.sh` — the agent team
 - `bin/tracker-ops.sh` — ergonomic CLI for recurring tracker operations (scriptable mechanisms)
-- `bin/update-installed-skill.sh` — fetch the latest upstream skill bundle into the current repository
+- `extensions/tracker-backends/<Tool>.py` — project-owned primitive port for a custom tracker
+- `bin/update-installed-skill.sh` — install or refresh the complete upstream bundle while preserving project config
 - `bin/runtime-state.py` + `bin/task-packet.sh` — durable events, PM projections,
   and minimal task-local context
 - `bin/task-hold.py` — task-scoped `[Blocked]` holds, communication snapshots,
@@ -42,18 +43,28 @@ If the user asks to "fetch latest Startup Factory", "update startup-factory skil
 "sync this skill from upstream", or equivalent, do this before the normal mandatory
 preparation:
 
-1. From the target repository, run:
+1. Run the updater from this installed skill's own `bin/` directory. It updates
+   the containing project/global skill directory when that directory is not a
+   standalone Startup Factory source checkout. Common project paths are:
 
    ```bash
+   bash .agents/skills/startup-factory/bin/update-installed-skill.sh
    bash .claude/skills/startup-factory/bin/update-installed-skill.sh
    ```
 
-   If this skill is installed somewhere else, run the same script from this skill's
-   `bin/` directory with `--install-dir <path-to-installed-skill>`.
+   If this skill is installed somewhere else, run the same script with
+   `--install-dir <path-to-installed-skill>`.
 2. Keep the default config-preserving behavior unless the user explicitly asks to
    replace project config. Existing project-management, team, statuses, automation,
-   deployment, and guardrails config files under `config/` are preserved.
-3. Report the script's target path and git status/diff summary. Do not commit unless
+   deployment, and guardrails config files under `config/` are preserved, as are
+   project-owned files under the documented `adapters/`, `extensions/`, and
+   `teams/` extension points. An installed ownership manifest distinguishes
+   custom files from retired upstream files. The updater validates the source
+   and destination before synchronization.
+3. Do not substitute `npx skills update`: the generic updater does not preserve
+   Startup Factory's project-specific config, and current repository-root installs
+   omit the required sibling bundle directories.
+4. Report the script's target path and git status/diff summary. Do not commit unless
    the user asks.
 
 ## Mandatory Preparation (every invocation)

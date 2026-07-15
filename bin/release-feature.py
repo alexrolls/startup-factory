@@ -54,6 +54,7 @@ DANGEROUS_ENVIRONMENT_PREFIXES = (
 )
 MAX_CREDENTIAL_FILE_BYTES = 1024 * 1024
 MAX_PROTECTED_CONFIG_BYTES = 16 * 1024 * 1024
+BUILTIN_TRACKER_ADAPTERS = {"Linear", "Jira", "GitHubIssues", "Markdown"}
 os.umask(0o077)
 
 
@@ -750,7 +751,7 @@ def validate_trusted_file(path: Path, expected_digest: object, label: str, *, al
 
 
 def trusted_file_specs() -> dict[str, tuple[Path, Path]]:
-    return {
+    specs = {
         "release-feature.py": (Path(__file__).resolve(), Path("bin/release-feature.py")),
         "policy-check.py": ((SKILL_DIR / "bin" / "policy-check.py").resolve(), Path("bin/policy-check.py")),
         "tracker-ops.sh": ((SKILL_DIR / "bin" / "tracker-ops.sh").resolve(), Path("bin/tracker-ops.sh")),
@@ -768,6 +769,32 @@ def trusted_file_specs() -> dict[str, tuple[Path, Path]]:
         "team.config.md": ((SKILL_DIR / "config" / "team.config.md").resolve(), Path("config/team.config.md")),
         "project-management.config.md": ((SKILL_DIR / "config" / "project-management.config.md").resolve(), Path("config/project-management.config.md")),
     }
+    pm_config_path = SKILL_DIR / "config" / "project-management.config.md"
+    try:
+        pm_config_text = pm_config_path.read_text()
+    except OSError as exc:
+        raise ReleaseError(f"cannot read project-management config: {exc}") from exc
+    pm_values: dict[str, str | None] = {}
+    for match in re.finditer(r"^([A-Z_]+)=(.*)$", pm_config_text, re.MULTILINE):
+        name = match.group(1)
+        if name in pm_values:
+            raise ReleaseError(f"duplicate project-management setting {name}")
+        value = match.group(2).split("#", 1)[0].strip().strip('"')
+        pm_values[name] = None if value == "null" else value
+    tracker_adapter = os.environ.get("TRACKER_ADAPTER") or pm_values.get(
+        "PRODUCT_MANAGEMENT_TOOL"
+    )
+    if not isinstance(tracker_adapter, str) or not re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9_-]{0,63}", tracker_adapter
+    ):
+        raise ReleaseError("trusted code requires a valid configured tracker adapter")
+    if tracker_adapter not in BUILTIN_TRACKER_ADAPTERS:
+        relative = Path("extensions", "tracker-backends", f"{tracker_adapter}.py")
+        specs[f"tracker-backend.{tracker_adapter}.py"] = (
+            SKILL_DIR / relative,
+            relative,
+        )
+    return specs
 
 
 def skill_path(relative: str) -> Path:
@@ -1196,14 +1223,19 @@ def materialize_trusted_code(
     """
 
     bundle = state_root / "trusted-code" / config_digest.removeprefix("sha256:")
-    for directory in (state_root / "trusted-code", bundle, bundle / "bin", bundle / "config"):
+    specs = trusted_file_specs()
+    trusted_directories = {
+        state_root / "trusted-code",
+        bundle,
+        *((bundle / relative).parent for _, relative in specs.values()),
+    }
+    for directory in sorted(trusted_directories, key=lambda item: (len(item.parts), str(item))):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         info = directory.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise ReleaseError(f"trusted code directory is unsafe: {directory}")
         if info.st_uid not in {0, os.geteuid()} or stat.S_IMODE(info.st_mode) & 0o077:
             raise ReleaseError(f"trusted code directory must be private and executor-owned: {directory}")
-    specs = trusted_file_specs()
     for name, (_, relative) in specs.items():
         destination = bundle / relative
         expected = configured_digests[name]

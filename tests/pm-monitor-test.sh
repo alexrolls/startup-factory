@@ -488,6 +488,13 @@ for name, relative in module.RELEASE_SNAPSHOT_FILES.items():
     shutil.copy2(source / relative, destination)
     destination.chmod(0o600)
     digests[name] = "sha256:" + hashlib.sha256(destination.read_bytes()).hexdigest()
+custom_backend = external / "extensions/tracker-backends/Fake.py"
+custom_backend.parent.mkdir(parents=True, exist_ok=True)
+custom_backend.write_text("class Backend:\n    pass\n")
+custom_backend.chmod(0o600)
+digests["tracker-backend.Fake.py"] = (
+    "sha256:" + hashlib.sha256(custom_backend.read_bytes()).hexdigest()
+)
 config = fixture / "deployment.json"
 enabled_config = {
     "schemaVersion": 1,
@@ -558,6 +565,8 @@ assert command and Path(command[0]).resolve() == Path(sys.executable).resolve()
 assert "-I" in command and "-S" in command and "-E" in command
 snapshot_entrypoint = Path(command[-1])
 assert snapshot_entrypoint.is_file() and state.resolve() in snapshot_entrypoint.parents
+snapshot_backend = snapshot_entrypoint.parent.parent / "extensions/tracker-backends/Fake.py"
+assert snapshot_backend.read_bytes() == custom_backend.read_bytes()
 assert Path(protected_config).read_bytes() == config.read_bytes()
 assert child["TRACKER_ADAPTER"] == "Fake"
 assert "AWS_SECRET_ACCESS_KEY" not in child
