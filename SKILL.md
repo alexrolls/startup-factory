@@ -166,8 +166,9 @@ each generic operation through the adapter's *Operations* table:
   authenticated `[resume-review]`. Re-read the complete description, comments,
   communication history, and normalized attachment metadata; never reuse the
   old worker's context. Changed requirements additionally require a
-  later `[resume-plan]` and `[design-approved]`; a dirty prior worktree keeps the
-  hold closed. A cleared hold launches a fresh attempt. Human movement directly
+  later `[resume-plan]`, `[design-approved]`, and
+  `[sceptical-design-approved]`; a dirty prior worktree keeps the hold closed. A
+  cleared hold launches a fresh attempt. Human movement directly
   to working/review means manual takeover, never automatic resumption.
 - **When `STRICT_STATUS=true`, verify the current status before writing** and that the
   intended move is in its `transitions` list. If not, pull the andon cord instead of
@@ -200,9 +201,9 @@ each generic operation through the adapter's *Operations* table:
   ambiguous, missing, or later-pushed-back evidence waits and routes the product
   role. This workflow marker still grants no production authority by itself.
 - **Code review is package-bound.** Review requests bind the exact merge-base,
-  task-branch HEAD, and generated package digest. Both independent approvals
-  bind that request digest; any branch movement forces a new request and new
-  approvals before integration.
+  task-branch HEAD, and generated package digest. Reviewer, principal architect,
+  and sceptical architect approvals independently bind that request digest; any
+  branch movement forces a new request and all new approvals before integration.
 - **Only the release executor closes a [feature].** Disabled, waiting, denied,
   failed, or rolled-back production delivery remains non-terminal and visible.
 - **No LLM owns time.** Cron/service timers call one bounded, protected external

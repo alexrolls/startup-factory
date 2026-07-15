@@ -20,6 +20,7 @@ roster per [feature] — e.g. no frontend [tasks] → no frontend agent).
 ```
 TEAM_LEAD_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
 PRINCIPAL_ARCHITECT_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
+SCEPTICAL_ARCHITECT_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
 INTEGRATOR_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
 BACKEND_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
 FRONTEND_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
@@ -33,7 +34,10 @@ TASK_STRONG_CMD=null             # Optional override for security/schema/concurr
 ```
 
 > Mixing LLMs is the design intent — e.g. Claude for team-lead/principal-architect,
-> Codex for implementers, Gemini for review diversity. Same-LLM teams work too.
+> Codex for the sceptical-architect and implementers, Gemini for review diversity.
+> Use a different model family or provider for the two architect roles when
+> possible; role separation without model diversity reduces authority bias but
+> does less to reduce correlated reasoning errors. Same-LLM teams still work.
 >
 > **Preset teams** (`teams/`) carry many specialized role names. Rather than a key
 > per role, an *absent* key falls back to `TEAM_DEFAULT_CMD`. Add a `<ROLE>_CMD`

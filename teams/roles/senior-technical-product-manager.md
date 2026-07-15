@@ -28,8 +28,9 @@ below.
 - **Decides:** scope, priority order of [tasks], acceptance criteria, what ships
   now versus what becomes a follow-up [task].
 - **Consults:** the architect on feasibility and cost; QA on testability.
-- **Never decides:** technical design, architecture, tooling — the architect's
-  ruling is final there.
+- **Never decides:** technical design, architecture, or tooling. The two
+  architects own those positions; unresolved material disagreement follows the
+  conflict-aware escalation protocol.
 
 ## Deliverables
 

@@ -25,6 +25,7 @@ bind_review() {
   printf '[review-request] exact package review\nFiles: %s\n\n- backend\n' "$files" > "$prefix.request"
   printf '[review-approval] exact package approved\nFiles: %s\n\n- reviewer\n' "$files" > "$prefix.review"
   printf '[architecture-approval] exact package approved\nFiles: %s\n\n- principal-architect\n' "$files" > "$prefix.architecture"
+  printf '[sceptical-architecture-approval] exact package approved\nFiles: %s\n\n- sceptical-architect\n' "$files" > "$prefix.sceptical"
   .agent-squad/bin/review_evidence.py bind-request \
     "$prefix.request" "$base" "$head" "$package_digest" "$prefix.request.bound"
   .agent-squad/bin/tracker-ops.sh comment "$task" "$prefix.request.bound"
@@ -33,8 +34,11 @@ bind_review() {
     "$prefix.review" "$snapshot" "$task" "$prefix.review.bound"
   .agent-squad/bin/review_evidence.py bind-approval \
     "$prefix.architecture" "$snapshot" "$task" "$prefix.architecture.bound"
+  .agent-squad/bin/review_evidence.py bind-approval \
+    "$prefix.sceptical" "$snapshot" "$task" "$prefix.sceptical.bound"
   .agent-squad/bin/tracker-ops.sh comment "$task" "$prefix.review.bound"
   .agent-squad/bin/tracker-ops.sh comment "$task" "$prefix.architecture.bound"
+  .agent-squad/bin/tracker-ops.sh comment "$task" "$prefix.sceptical.bound"
   .agent-squad/bin/tracker-ops.sh export "$FID" "$snapshot"
 }
 
@@ -406,7 +410,7 @@ check "late invalidation returns tracker task to active rework" grep -q '^## 2 B
 check "superseded canonical transaction is retired" test ! -e "$tx2"
 
 # Rework proceeds from the preserved history: a new attempt adds a fix, receives
-# a new request/dual approval after the finding, and integrates normally.
+# a new request/triple approval after the finding, and integrates normally.
 $LAUNCH worktree-remove feature-integration backend "$TID2" 1 >/dev/null
 wt2="$($LAUNCH worktree feature-integration backend "$TID2" 2)"
 .agent-squad/bin/task-packet.sh feature-integration "$FID" "$TID2" backend 2 "$wt2" "agent-task/feature-integration/$(python3 .agent-squad/bin/runtime-state.py key "$TID2")" >/dev/null

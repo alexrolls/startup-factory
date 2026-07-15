@@ -629,7 +629,7 @@ gate_roster_of() { # gate_roster_of <preset> -> explicit supervision/review/inte
   validate_preset_id "$preset"
   roster="$(roster_of "$preset")"
   mapped="$(
-    grep -E '^PROTOCOL_(TEAM_LEAD|PRINCIPAL_ARCHITECT|REVIEWER|QA|INTEGRATOR|COORDINATOR|PRODUCT_MANAGER)=' \
+    grep -E '^PROTOCOL_(TEAM_LEAD|PRINCIPAL_ARCHITECT|SCEPTICAL_ARCHITECT|REVIEWER|QA|INTEGRATOR|COORDINATOR|PRODUCT_MANAGER)=' \
       "$SKILL_DIR/teams/$preset.md" | cut -d= -f2 || true
   )"
   for role in $mapped; do

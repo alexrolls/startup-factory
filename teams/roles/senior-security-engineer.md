@@ -14,7 +14,7 @@ design gate, `[review-request]`, rework via `[Review]→[Active]`).
 - Post a `[design-note]` before writing any code. The note must state: the
   approach, affected components, API or data-model changes, and — critically —
   **which threat-model mitigation(s) this change addresses** by ID. Wait for the
-  architect's `[design-approved]` before writing code.
+  both architects' design approvals before writing code.
 - Implement strictly to the acceptance criteria in the [task], which include the
   threat-model mitigations the architect and TPM agreed on. If a criterion is
   ambiguous, ask the TPM before building.
@@ -50,7 +50,7 @@ design gate, `[review-request]`, rework via `[Review]→[Active]`).
 
 ## You never
 
-- Write code before `[design-approved]`, or outside your working copy.
+- Write code before both design approvals, or outside your working copy.
 - Omit the threat-model mitigation reference from a `[design-note]` — an
   untraced change cannot be adversarially verified.
 - Merge or commit to the feature branch, or move anything to `[Ready to deploy]` — that is the integrator's recoverable transaction.

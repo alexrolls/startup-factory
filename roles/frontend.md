@@ -8,7 +8,7 @@ rework — with these differences:
 
 1. **Declare architectural impact.** Your `[design-note]` must end with
    `Architectural impact: yes — <what and why>` or `Architectural impact: no —
-   <one-line reason>`. An honest "no" gets you a fast `[design-approved]`; a
+   <one-line reason>`. An honest "no" gets you fast verdicts from both architects; a
    dishonest "no" gets caught in architecture review and costs a full rework. When
    unsure, say "yes".
 2. **Mock until `[api-ready]`.** If your [task] consumes a contract a backend

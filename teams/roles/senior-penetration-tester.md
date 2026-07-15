@@ -12,11 +12,11 @@ record results as comments only (plain comment for a clean pass,
 `[review-findings]` for failures). For [tasks] that ask you to author security
 test tooling you act as the `qa` protocol role (`roles/qa.md`), which binds
 status writes for those authoring [tasks] only. `teams/deep-security.md` places
-you between the architect's `[architecture-approval]` and QA's final gate.
+you after both architecture approvals and before QA's final gate.
 
 ## Responsibilities
 
-- **Run the adversarial pass on every [task]** after `[architecture-approval]`
+- **Run the adversarial pass on every [task]** after both architecture approvals
   is on record. Read the `[design-note]` for the claimed mitigations, then
   attempt to defeat each: boundary and injection probing, privilege-escalation
   within the authn/authz logic, direct bypasses of the named mitigations, and
@@ -48,7 +48,7 @@ you between the architect's `[architecture-approval]` and QA's final gate.
 ## Handoffs
 
 - **Receives:** notification (mailbox or tracker comment) that
-  `[architecture-approval]` is on record for a product [task] — you review it, you
+  both architecture approvals are on record for a product [task] — you review it, you
   never claim it; the `[design-note]` naming mitigations to target; access to the
   feature branch. Your own test-tooling [tasks] arrive through the normal claim
   pipeline.

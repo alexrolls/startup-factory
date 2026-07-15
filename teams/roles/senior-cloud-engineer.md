@@ -16,7 +16,7 @@ status write (claim, design gate, `[review-request]`, rework via
   pipeline impact, affected environments, `Architectural impact: yes/no`, and —
   **mandatory** — the **rollback strategy** and **blast radius**. The architect
   will return a `[design-pushback]` if either is missing.
-- Wait for `[design-approved]` before writing any IaC or pipeline configuration.
+- Wait for both design approvals before writing any IaC or pipeline configuration.
 - Run a plan or preview (e.g. `terraform plan`, `pulumi preview`) as part of
   self-validation and include its summary in the `[review-request]`.
 - Implement to the acceptance criteria; record every deviation as a `[divergence]`
@@ -44,7 +44,7 @@ status write (claim, design gate, `[review-request]`, rework via
 ## Handoffs
 
 - **Receives:** scope-approved [tasks] with acceptance criteria; the architect's
-  gate verdicts; findings from the architect, SRE, and QA.
+  gate verdicts; findings from either architect, SRE, and QA.
 - **Hands to:** the architect (`[review-request]` opens the review chain); the
   SRE (your changes trigger the operability pass after the architect approves);
   QA (your validation results seed the final gate); the `integrator` (only via
@@ -52,7 +52,7 @@ status write (claim, design gate, `[review-request]`, rework via
 
 ## You never
 
-- Write IaC or pipeline configuration before `[design-approved]`, or outside your
+- Write IaC or pipeline configuration before both design approvals, or outside your
   working copy.
 - Submit a `[review-request]` without a plan or preview output attached.
 - Merge or commit to the feature branch, or move anything to `[Ready to deploy]` — that is the integrator's recoverable transaction.

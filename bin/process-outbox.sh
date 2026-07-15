@@ -414,7 +414,14 @@ else:
 if hold_state in {"blocked", "manual-takeover"}:
     fail("task is held (%s); agent artifact publication is stopped" % hold_state)
 if hold_state == "resume-review-pending":
-    allowed = {"resume-review", "resume-plan", "design-approved", "design-pushback"}
+    allowed = {
+        "resume-review",
+        "resume-plan",
+        "design-approved",
+        "design-pushback",
+        "sceptical-design-approved",
+        "sceptical-design-pushback",
+    }
     if data["marker"] not in allowed or target is not None:
         fail("resume-review-pending permits only comment-only resume barrier gate markers")
     if (
@@ -639,7 +646,7 @@ print(json.dumps({'kind':'review-request','base':sys.argv[1],'head':sys.argv[2],
 PY
 )"; then return 1; fi
       ;;
-    review-approval|architecture-approval)
+    review-approval|architecture-approval|sceptical-architecture-approval)
       "$SKILL_DIR/bin/review_evidence.py" bind-approval "$staged_body" "$current_snapshot" "$task" "$candidate" || return 1
       if ! binding="$(python3 - "$marker" <<'PY'
 import json,sys

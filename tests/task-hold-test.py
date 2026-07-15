@@ -517,14 +517,16 @@ class TaskHoldTest(unittest.TestCase):
         )
         self.assertEqual(json.loads(history.read_text()), claim)
 
-    def test_requirements_changed_needs_later_design_approval(self) -> None:
+    def test_requirements_changed_needs_both_later_design_approvals(self) -> None:
         lead_role = "principal-team-lead"
         architect_role = "principal-architect-concrete"
+        sceptical_role = "sceptical-architect-concrete"
         (self.workspace / "preset.env").write_text(
             "PROTOCOL_TEAM_LEAD=%s\nPROTOCOL_PRINCIPAL_ARCHITECT=%s\n"
-            % (lead_role, architect_role)
+            "PROTOCOL_SCEPTICAL_ARCHITECT=%s\n"
+            % (lead_role, architect_role, sceptical_role)
         )
-        for role in (lead_role, architect_role):
+        for role in (lead_role, architect_role, sceptical_role):
             self.capabilities[role] = mint(
                 str(self.base),
                 str(self.workspace),
@@ -573,6 +575,14 @@ class TaskHoldTest(unittest.TestCase):
                 "design-approved",
                 ["summary: Approved updated design"],
                 actor=architect_role,
+            )
+        )
+        queued["comments"].append(
+            self.marker_comment(
+                "sceptical-approval",
+                "sceptical-design-approved",
+                ["summary: Independent challenge cleared"],
+                actor=sceptical_role,
             )
         )
 

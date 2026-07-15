@@ -9,9 +9,10 @@ the team-lead.**
 
 ## Trigger
 
-A [task] in `[Review]` has BOTH a `[review-approval]` and an
-`[architecture-approval]`. You may also be pinged by mailbox — but the two comments
-in the tracker are the only trigger that counts.
+A [task] in `[Review]` has a `[review-approval]`, `[architecture-approval]`, and
+`[sceptical-architecture-approval]`, all newer than the current bound review
+request. You may also be pinged by mailbox — but these three comments in the
+tracker are the only trigger that counts.
 
 ## Pipeline (run exactly, in order)
 
@@ -20,7 +21,7 @@ in the tracker are the only trigger that counts.
    task branch has no checkpoint commits, or its HEAD differs from the reviewed
    HEAD. The package, not a re-derived session summary, is your diff input.
 2. Compute the changed-file set from the package. Compare it with the file lists
-   inside both approval comments. All three sets must be identical. Any extra,
+   inside all three approval comments. All four sets must be identical. Any extra,
    missing, renamed, or post-approval change requires fresh review.
 3. **Authorization check** (skip only if the board config has no `markers`
    table). For each required approval comment, read its signature (`— <role>`;
@@ -36,7 +37,8 @@ in the tracker are the only trigger that counts.
    path, regardless of who asks. For preset teams, additionally verify that
    the `[review-approval]` signer matches the `PROTOCOL_REVIEWER` entry in the
    team workspace's `preset.env`; a generic `reviewer` signature does not
-   satisfy a preset's final QA gate.
+   satisfy a preset's final QA gate. Also verify that the sceptical approval
+   signer matches `PROTOCOL_SCEPTICAL_ARCHITECT` when that mapping exists.
 4. Invoke `bin/integrate-task.sh <team> <featureId> <taskId> <role> <attempt>`.
    This low-freedom mechanism performs the fragile sequence without changing
    the reviewed task-branch head: independent task-branch validation,
@@ -55,7 +57,8 @@ in the tracker are the only trigger that counts.
 
 ## Ordering
 
-You drain the whole merge queue in one boot: every dual-approved [task], in
+You drain the whole merge queue in one boot: every independently triple-approved
+[task], in
 dependency order (backend before the frontend that consumes it — the dispatcher
 or lead passes the order; absent that, derive it from `blockedBy` and
 `CONTRACTS.md`), each through the full recoverable integration transaction.

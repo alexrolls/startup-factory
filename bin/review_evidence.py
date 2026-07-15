@@ -123,8 +123,12 @@ def latest_review_request(snapshot: dict, task_id: str) -> str:
 
 
 def bind_approval(body: str, request_body: str) -> str:
-    if marker(body) not in {"review-approval", "architecture-approval"}:
-        raise EvidenceError("only review/architecture approvals can be bound as approvals")
+    if marker(body) not in {
+        "review-approval",
+        "architecture-approval",
+        "sceptical-architecture-approval",
+    }:
+        raise EvidenceError("only required review/architecture approvals can be bound as approvals")
     binding = request_binding(request_body)
     return insert_fields(body, [
         f"Review-Request-SHA256: {binding['requestDigest']}",
@@ -133,7 +137,9 @@ def bind_approval(body: str, request_body: str) -> str:
     ])
 
 
-def review_records(snapshot: dict, task_id: str, review_statuses: set[str]) -> tuple[dict, int, int, int]:
+def review_records(
+    snapshot: dict, task_id: str, review_statuses: set[str]
+) -> tuple[dict, int, int, int, int]:
     task = next(
         (item for item in snapshot.get("tasks") or [] if str(item.get("taskId")) == task_id),
         None,
@@ -151,10 +157,19 @@ def review_records(snapshot: dict, task_id: str, review_statuses: set[str]) -> t
     request = positions.get("review-request", -1)
     review = positions.get("review-approval", -1)
     architecture = positions.get("architecture-approval", -1)
+    sceptical_architecture = positions.get("sceptical-architecture-approval", -1)
     findings = positions.get("review-findings", -1)
-    if request < 0 or review <= request or architecture <= request or findings > request:
-        raise EvidenceError(f"task {task_id} does not have a current dual-approved review request")
-    return task, request, review, architecture
+    if (
+        request < 0
+        or review <= request
+        or architecture <= request
+        or sceptical_architecture <= request
+        or findings > request
+    ):
+        raise EvidenceError(
+            f"task {task_id} does not have a current independently triple-approved review request"
+        )
+    return task, request, review, architecture, sceptical_architecture
 
 
 def validate(
@@ -166,7 +181,7 @@ def validate(
     package: str,
     review_statuses: set[str] | None = None,
 ) -> str:
-    task, request_index, review_index, architecture_index = review_records(
+    task, request_index, review_index, architecture_index, sceptical_index = review_records(
         snapshot, task_id, review_statuses or set()
     )
     comments = task.get("comments") or []
@@ -174,7 +189,11 @@ def validate(
     binding = request_binding(request_body)
     if (binding["base"], binding["head"], binding["package"]) != (base, head, package):
         raise EvidenceError("review request is not bound to the exact current base/head/package")
-    for index, name in ((review_index, "review-approval"), (architecture_index, "architecture-approval")):
+    for index, name in (
+        (review_index, "review-approval"),
+        (architecture_index, "architecture-approval"),
+        (sceptical_index, "sceptical-architecture-approval"),
+    ):
         approval_body = normalize(comments[index].get("body"))
         values = fields(approval_body, APPROVAL_FIELDS)
         expected = {
@@ -198,7 +217,7 @@ def validate(
         }
 
     evidence = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "taskId": task_id,
         "reviewBaseCommit": base,
         "taskBranchHead": head,
@@ -206,6 +225,9 @@ def validate(
         "request": record("review-request", request_index),
         "reviewApproval": record("review-approval", review_index),
         "architectureApproval": record("architecture-approval", architecture_index),
+        "scepticalArchitectureApproval": record(
+            "sceptical-architecture-approval", sceptical_index
+        ),
     }
     canonical = json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return "sha256:" + hashlib.sha256(canonical).hexdigest()

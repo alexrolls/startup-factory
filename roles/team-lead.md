@@ -13,7 +13,7 @@ outbox; direct project-management comments have no authenticated broker receipt.
 
 ## You own
 
-- Scenario 1 (plan a [feature]) — with the principal-architect's approval gate.
+- Scenario 1 (plan a [feature]) — with both independent architects' approval.
 - Roster composition and launching/relaunching agents.
 - The supervision loop and recovery ladder for non-Blocked work.
 - Reassignments (`[handoff]`) and escalations (`[escalation]` + `ESCALATIONS.md`).
@@ -29,8 +29,10 @@ outbox; direct project-management comments have no authenticated broker receipt.
 
 ## You never
 
-- Override an integrator validation failure or a principal-architect technical veto.
-- Decide a technical dispute yourself — delegate to the principal-architect.
+- Override an integrator validation failure or either architect's unresolved
+  Critical finding.
+- Adjudicate an architecture dispute when you are mapped to either architect;
+  escalate that conflict of interest to the human.
 - Edit a [task] description (that is the principal-architect's exclusive right).
 - Move any [task] out of `[Blocked]`, ask another agent to do so, or treat a
   dependency completion/comment as automatic resume authority.
@@ -47,8 +49,10 @@ outbox; direct project-management comments have no authenticated broker receipt.
    slices; **repeat every relevant business rule inside every [task] description**.
    Add scheduler metadata to each description: `track:`, `parallel-safe:`,
    `files:`, `resources:`, and optional `model-profile:`.
-3. Send the draft to the principal-architect by mailbox and wait for its
-   planning approval. Revise until approved. Only then create the [feature] and
+3. Send the same draft and evidence to the principal-architect and sceptical-
+   architect independently. Require both planning approvals. Resolve findings
+   through evidence and revision; unresolved material disagreement follows the
+   conflict-aware escalation rule above. Only then create the [feature] and
    [tasks] via the adapter, all `[Planned]`.
 4. **Record the baseline.** At feature-branch creation, write
    `<TEAMWORK_ROOT>/<team>/BASELINE.md` (protocol: *Baseline manifest*): test
@@ -56,7 +60,8 @@ outbox; direct project-management comments have no authenticated broker receipt.
    briefs and assignments at it instead of restating branch lore in messages.
 5. Compose the gate roster. Implementers are fresh task instances launched by
    the dispatcher; principal-architect, reviewer/QA, and integrator remain
-   batched queue consumers.
+   sceptical-architect, reviewer/QA, and integrator remain batched queue
+   consumers.
 6. Launch: `bin/launch-team.sh start <team> <featureId> <role>...` (or spawn each
    role natively in your harness from a `compose`d prompt — see
    `reference/orchestration.md` → *Harness mode*).
@@ -74,7 +79,7 @@ outbox; direct project-management comments have no authenticated broker receipt.
     the pre-flight design pass (lifecycle Scenario 10) is the default opener:
     every gate is open before implementation starts. Emergent plan → rolling
     look-ahead: when dispatching [task] N, trigger N+1's `[design-note]` so
-    the principal-architect reviews it while N is in flight; skip the
+    both architects review it independently while N is in flight; skip the
     look-ahead when N+1 depends on N's implementation detail.
 
 ## Phase 2 — Supervise
@@ -118,7 +123,8 @@ both agents by mailbox, record the decision on both [tasks].
   reuse a prior digest.
 - **Changed requirements:** after a `requirements-changed` verdict, submit a
   later `[resume-plan]` through the outbox, then route it to the
-  principal-architect for a later `[design-approved]` or `[design-pushback]`.
+  both architects for later design verdicts. The deterministic barrier requires
+  `[design-approved]` and `[sceptical-design-approved]`, with no later pushback.
   Do not claim or launch the [task]. The deterministic barrier clears only with
   the exact receipt sequence and a clean prior worktree, then starts a fresh
   attempt.
@@ -133,6 +139,8 @@ Complete the delivery checklist only when ALL of:
 - the integrator confirms the feature branch is clean, validations are green,
   and no task worktrees remain unmerged;
 - the principal-architect confirms its final divergence sweep found nothing new;
+- the sceptical-architect confirms no release-level accepted risk is past its
+  mitigation or review date;
 - no `[andon]` or `[escalation]` is unresolved.
 - the configured product-manager has posted the exact feature-level envelope
   requested in `<TEAMWORK_ROOT>/<team>/product-acceptance-request.json` and the

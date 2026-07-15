@@ -359,7 +359,7 @@ def files(body,marker):
 raw=subprocess.run(["git","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false","diff","--name-only","-z",
                     data["reviewBaseCommit"]+".."+data["taskBranchHead"]],cwd=repo,capture_output=True,env=env,check=True).stdout
 actual={item.decode("utf-8","surrogateescape") for item in raw.split(b"\0") if item}
-for marker in ("review-request","review-approval","architecture-approval"):
+for marker in ("review-request","review-approval","architecture-approval","sceptical-architecture-approval"):
     if files(str(comments[positions[marker]].get("body") or ""),marker)!=actual: fail("[%s] Files evidence mismatch"%marker)
 snapshot_digest="sha256:"+hashlib.sha256(snapshot.read_bytes()).hexdigest()
 # This second read is intentionally adjacent to the authorization journal
@@ -893,9 +893,10 @@ if snapshot_raw:
     request = positions.get("review-request", -1)
     review = positions.get("review-approval", -1)
     architecture = positions.get("architecture-approval", -1)
+    sceptical = positions.get("sceptical-architecture-approval", -1)
     findings = positions.get("review-findings", -1)
-    if request < 0 or review <= request or architecture <= request or findings > request:
-        fail("fresh tracker state is no longer dual-approved")
+    if request < 0 or review <= request or architecture <= request or sceptical <= request or findings > request:
+        fail("fresh tracker state is no longer independently triple-approved")
     try:
         evidence_digest = validate_review_evidence(
             payload,
@@ -936,7 +937,7 @@ if snapshot_raw:
             fail("completed transaction lacks its broker-owned durable event")
 
     # The existing protocol exposes Files: lists on the request and approvals.
-    # Bind all three to the exact base..reviewed-head Git file set.
+    # Bind the request and all three approvals to the exact reviewed Git file set.
     def file_list(body, marker):
         match = re.search(r"(?mi)^\s*Files:\s*([^\n]+)$", body)
         if not match:
@@ -952,7 +953,12 @@ if snapshot_raw:
     if actual_raw.returncode:
         fail("cannot calculate exact reviewed file set")
     actual_files = {item.decode("utf-8", "surrogateescape") for item in actual_raw.stdout.split(b"\0") if item}
-    for marker, index in (("review-request", request), ("review-approval", review), ("architecture-approval", architecture)):
+    for marker, index in (
+        ("review-request", request),
+        ("review-approval", review),
+        ("architecture-approval", architecture),
+        ("sceptical-architecture-approval", sceptical),
+    ):
         if file_list(str(comments[index].get("body") or ""), marker) != actual_files:
             fail("[%s] Files: evidence does not equal the exact reviewed Git file set" % marker)
 
@@ -962,6 +968,7 @@ if snapshot_raw:
         for protocol_name, marker_name, marker_index in (
             ("REVIEWER", "review-approval", review),
             ("PRINCIPAL_ARCHITECT", "architecture-approval", architecture),
+            ("SCEPTICAL_ARCHITECT", "sceptical-architecture-approval", sceptical),
         ):
             match = re.search(r"^PROTOCOL_%s=(.+)$" % protocol_name, preset_text, re.M)
             if not match:

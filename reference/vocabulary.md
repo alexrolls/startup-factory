@@ -105,15 +105,18 @@ comment. The full workflow-role rules and required content live in
 | `[design-note]` | Implementer's proposed approach before any code. |
 | `[design-approved]` | Principal-architect gate open; carries architecture checklist. |
 | `[design-pushback]` | Principal-architect gate closed; lists required changes. |
+| `[sceptical-design-approved]` | Independent architecture challenge cleared; records assumptions and risk controls. |
+| `[sceptical-design-pushback]` | Independent design gate closed; records material risk and feasible resolution. |
 | `[dependency-hold]` | Team-lead verdict bound to exact direct Blocked sources and current graph digest. Receipt-backed `blocked` may authorize a queued or in-flight dependent to enter `[Blocked]`; other verdicts clear only that graph for claim/continuation. |
 | `[resume-review]` | Team-lead verdict over the full blocked/current communication diff, bound to an exact hold and current digest after a human returns the [task] to queued. |
-| `[resume-plan]` | Team-lead revised plan after changed requirements; requires a later principal-architect design verdict. |
+| `[resume-plan]` | Team-lead revised plan after changed requirements; requires both later architect design verdicts. |
 | `[api-ready]` | Backend contract available for frontend. |
 | `[divergence]` | What was done differently from the plan, and why. |
 | `[review-request]` | Implementation complete; ready for review. |
 | `[review-findings]` | Numbered problems to fix; task returns to `[Active]`. |
 | `[review-approval]` | Reviewer sign-off with explicit list of approved file paths. |
 | `[architecture-approval]` | Principal-architect sign-off. |
+| `[sceptical-architecture-approval]` | Independent release-bound architecture sign-off. |
 | `[product-approval]` | Product owner scope/acceptance sign-off. |
 | `[product-pushback]` | Product owner scope gate closed. |
 | `[handoff]` | Team-lead reassignment summary for a fresh agent. |

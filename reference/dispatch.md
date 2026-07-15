@@ -26,9 +26,10 @@ heartbeat files, then acts top to bottom:
 | Human moved a held [task] to the queued status | Snapshot and diff all communication, route the authenticated `[resume-review]` barrier to the team-lead, and launch no worker until it clears. |
 | Queued/`[Active]`/`[Review]` [task] directly `blockedBy` a currently `[Blocked]` [task] | Route a graph-digest-bound dependency-impact review to the team-lead; enter `[Blocked]` only after an authenticated `blocked` verdict survives fresh graph validation. A partial/independent verdict gives only that exact graph a scheduling clearance. |
 | `[design-note]` with no later `[design-approved]`/`[design-pushback]` | Launch principal-architect with the **whole** pending-design queue |
-| [Task](s) in `[Review]` missing `[review-approval]` / `[architecture-approval]` since the last `[review-request]` | Launch reviewer / principal-architect with the **whole** review queue |
-| [Task](s) in `[Review]` holding both approvals | Launch integrator with the merge queue in dependency order |
-| Dispatchable `[Planned]` [tasks] (not held, design approved, every blocker terminal or carrying a fresh partial/independent clearance for its current Blocked graph, slot/resource-safe) | Atomically claim and launch one fresh task instance per ready-wave member |
+| `[design-note]` with no later `[sceptical-design-approved]`/`[sceptical-design-pushback]` | Launch sceptical-architect with the **whole** independent-design queue |
+| [Task](s) in `[Review]` missing `[review-approval]` / `[architecture-approval]` / `[sceptical-architecture-approval]` since the last `[review-request]` | Launch reviewer / principal-architect / sceptical-architect with their **whole** review queues |
+| [Task](s) in `[Review]` holding all three approvals | Launch integrator with the merge queue in dependency order |
+| Dispatchable `[Planned]` [tasks] (not held, both design approvals current, every blocker terminal or carrying a fresh partial/independent clearance for its current Blocked graph, slot/resource-safe) | Atomically claim and launch one fresh task instance per ready-wave member |
 | Valid `product-acceptance-request.json` after all integrations | Launch the configured product-manager role with the exact feature-level acceptance request; use team-lead only when no product role is mapped |
 | `[Planned]` task missing metadata/gate, resource conflict, stale/artifact-less-idle teammate | Launch team-lead with the whole exception queue |
 | Nothing actionable | Exit cleanly, print "nothing actionable" |
@@ -75,7 +76,7 @@ heartbeat files, then acts top to bottom:
 - **Human resume is a new attempt:** only a human `[Blocked]` → queued move opens
   the resume barrier. The team-lead compares complete blocked/current snapshots
   and publishes a receipt-backed `[resume-review]`. Changed requirements also
-  need a later `[resume-plan]` and `[design-approved]`; a dirty prior worktree
+  need a later `[resume-plan]` and both architect design approvals; a dirty prior worktree
   remains held. A cleared barrier archives the old claim and launches a fresh
   attempt. Human movement directly to working/review is manual takeover.
 - **Policy stays where it was:** the pipelined dispatch rules (independence,
@@ -90,7 +91,7 @@ heartbeat files, then acts top to bottom:
 - **PM projection:** every non-dry pass idempotently upserts one `[progress]`
   artifact per task and one `[digest]` per feature. No agent is trusted to keep
   the human view current manually.
-- **Preset rosters:** the script launches the seven protocol roles. Where a
+- **Preset rosters:** the script launches the eight protocol roles. Where a
   preset maps a queue to a specialized role (e.g. `senior-qa-engineer` as
   reviewer), the launched team-lead routes the queue; the reviewer launch is
   skipped if its `_CMD` is null.

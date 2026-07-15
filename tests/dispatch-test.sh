@@ -54,6 +54,8 @@ cat > feat/feature.md <<'EOF'
 
 > [architecture-approval] files ok — principal-architect
 
+> [sceptical-architecture-approval] files ok — sceptical-architect
+
 ## 2 Blocked thing [Blocked]
 
 **Assignee:** backend
@@ -90,6 +92,8 @@ Independent.
 > [review-approval] files ok — reviewer
 
 > [architecture-approval] files ok — principal-architect
+
+> [sceptical-architecture-approval] files ok — sceptical-architect
 EOF
 FID="feat/feature.md"
 
@@ -100,6 +104,7 @@ echo "$plan" | grep -q "keep $FID#2 \[Blocked\].*human-held" \
   || { echo "FAIL: blocked task was not held: $plan"; FAILURES=$((FAILURES+1)); }
 echo "$plan" | grep -q "launch reviewer" && echo "ok: plans reviewer queue" || { echo "FAIL: reviewer queue"; FAILURES=$((FAILURES+1)); }
 echo "$plan" | grep -q "launch principal-architect" && echo "ok: plans PA queue" || { echo "FAIL: PA queue"; FAILURES=$((FAILURES+1)); }
+echo "$plan" | grep -q "launch sceptical-architect" && echo "ok: plans independent architecture queue" || { echo "FAIL: sceptical queue"; FAILURES=$((FAILURES+1)); }
 echo "$plan" | grep -q "launch team-lead" && echo "ok: plans lead (Planned #5)" || { echo "FAIL: lead launch"; FAILURES=$((FAILURES+1)); }
 echo "$plan" | grep -q "launch integrator" && echo "ok: plans integrator merge queue (#6)" || { echo "FAIL: integrator queue"; FAILURES=$((FAILURES+1)); }
 check "dry-run does not move status" grep -q '^## 2 Blocked thing \[Blocked\]$' "$FID"
@@ -123,6 +128,9 @@ files: src/manual.py
 >
 > [design-approved] round 1
 > - principal-architect
+>
+> [sceptical-design-approved] round 1
+> - sceptical-architect
 
 ## 2 Automatic implementation [Planned]
 
@@ -137,6 +145,9 @@ files: src/automatic.py
 >
 > [design-approved] round 1
 > - principal-architect
+>
+> [sceptical-design-approved] round 1
+> - sceptical-architect
 EOF
 HUMAN_FID="feat/human-work.md"
 human_plan="$(STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='["human-work"]' TEAM_RUNNER=background "$DISPATCH" feat-human-team "$HUMAN_FID" --once --dry-run)"
@@ -159,6 +170,7 @@ else
 fi
 check "reviewer queue in mailbox"    grep -rq "$FID#3" .teamwork/feat-team/mailbox/reviewer/
 check "PA queue in mailbox"          grep -rq "$FID#4" .teamwork/feat-team/mailbox/principal-architect/
+check "sceptical queue in mailbox"   grep -rq "$FID#4" .teamwork/feat-team/mailbox/sceptical-architect/
 check "reviewer launched"            test -f .teamwork/feat-team/pids/reviewer.pid
 
 # -- agent-writable PID text is not a liveness authority -----------------------
@@ -309,6 +321,8 @@ track: backend
 
 > [design-approved] approved — principal-architect
 
+> [sceptical-design-approved] approved — sceptical-architect
+
 ## 4 Potential dependent [Planned]
 
 **Assignee:** —
@@ -319,6 +333,8 @@ track: backend
 > [design-note] ready — backend
 
 > [design-approved] approved — principal-architect
+
+> [sceptical-design-approved] approved — sceptical-architect
 EOF
 HELD_FID="feat/human-held.md"
 held_plan="$(TEAM_RUNNER=background "$DISPATCH" feat-human-held "$HELD_FID" --once --dry-run)"
@@ -396,6 +412,7 @@ cat > .teamwork/feat-preset-team/preset.env <<'EOF'
 PRESET=full-stack
 PROTOCOL_TEAM_LEAD=principal-software-architect
 PROTOCOL_PRINCIPAL_ARCHITECT=principal-software-architect
+PROTOCOL_SCEPTICAL_ARCHITECT=sceptical-architect
 PROTOCOL_REVIEWER=senior-qa-engineer
 PROTOCOL_QA=senior-qa-engineer
 PROTOCOL_INTEGRATOR=integrator
@@ -431,6 +448,8 @@ Done.
 
 > [architecture-approval] LGTM — principal-software-architect
 
+> [sceptical-architecture-approval] LGTM — sceptical-architect
+
 ## 3 Preset QA approved [Review]
 
 **Assignee:** senior-full-stack-engineer
@@ -440,6 +459,8 @@ Done.
 > [review-approval] LGTM — senior-qa-engineer
 
 > [architecture-approval] LGTM — principal-software-architect
+
+> [sceptical-architecture-approval] LGTM — sceptical-architect
 EOF
 SIG_FID="feat/signer-test.md"
 mkdir -p .teamwork/feat-signer-team
@@ -447,6 +468,7 @@ cat > .teamwork/feat-signer-team/preset.env <<'EOF'
 PRESET=full-stack
 PROTOCOL_TEAM_LEAD=principal-software-architect
 PROTOCOL_PRINCIPAL_ARCHITECT=principal-software-architect
+PROTOCOL_SCEPTICAL_ARCHITECT=sceptical-architect
 PROTOCOL_REVIEWER=senior-qa-engineer
 PROTOCOL_QA=senior-qa-engineer
 PROTOCOL_INTEGRATOR=integrator
@@ -483,6 +505,8 @@ cat > feat/ml-signer-test.md <<'EOF'
 
 > [architecture-approval] LGTM — principal-software-architect
 
+> [sceptical-architecture-approval] LGTM — sceptical-architect
+
 ## 2 Multiline generic reviewer [Review]
 
 **Assignee:** senior-full-stack-engineer
@@ -494,6 +518,8 @@ cat > feat/ml-signer-test.md <<'EOF'
 > — reviewer
 
 > [architecture-approval] LGTM — principal-software-architect
+
+> [sceptical-architecture-approval] LGTM — sceptical-architect
 
 ## 3 As-role suffix [Review]
 
@@ -507,6 +533,8 @@ cat > feat/ml-signer-test.md <<'EOF'
 
 > [architecture-approval] LGTM — principal-software-architect
 
+> [sceptical-architecture-approval] LGTM — sceptical-architect
+
 ## 4 Posted-by suffix [Review]
 
 **Assignee:** senior-full-stack-engineer
@@ -518,6 +546,8 @@ cat > feat/ml-signer-test.md <<'EOF'
 > — senior-qa-engineer (posted by team-lead)
 
 > [architecture-approval] LGTM — principal-software-architect
+
+> [sceptical-architecture-approval] LGTM — sceptical-architect
 EOF
 ML_FID="feat/ml-signer-test.md"
 mkdir -p .teamwork/feat-ml-team
@@ -525,6 +555,7 @@ cat > .teamwork/feat-ml-team/preset.env <<'EOF'
 PRESET=full-stack
 PROTOCOL_TEAM_LEAD=principal-software-architect
 PROTOCOL_PRINCIPAL_ARCHITECT=principal-software-architect
+PROTOCOL_SCEPTICAL_ARCHITECT=sceptical-architect
 PROTOCOL_REVIEWER=senior-qa-engineer
 PROTOCOL_QA=senior-qa-engineer
 PROTOCOL_INTEGRATOR=integrator
@@ -566,6 +597,9 @@ resources: schema:a
 >
 > [design-approved] round 1
 > - principal-architect
+>
+> [sceptical-design-approved] round 1
+> - sceptical-architect
 
 ## 2 Backend B [Planned]
 
@@ -581,6 +615,9 @@ resources: schema:b
 >
 > [design-approved] round 1
 > - principal-architect
+>
+> [sceptical-design-approved] round 1
+> - sceptical-architect
 
 ## 3 Conflicts with A [Planned]
 
@@ -596,6 +633,9 @@ resources: schema:c
 >
 > [design-approved] round 1
 > - principal-architect
+>
+> [sceptical-design-approved] round 1
+> - sceptical-architect
 EOF
 PAR_FID=feat/parallel-test.md
 sed -i '' 's/^EXECUTION=sequential$/EXECUTION=parallel/' .claude/skills/pm/config/team.config.md
@@ -621,6 +661,9 @@ parallel-safe: false
 >
 > [design-approved] round 1
 > - principal-architect
+>
+> [sceptical-design-approved] round 1
+> - sceptical-architect
 
 ## 2 Otherwise parallel safe [Planned]
 
@@ -635,6 +678,9 @@ files: src/safe.py
 >
 > [design-approved] round 1
 > - principal-architect
+>
+> [sceptical-design-approved] round 1
+> - sceptical-architect
 EOF
 UNSAFE_FID=feat/unsafe-test.md
 unsafe_plan="$(TEAM_RUNNER=background "$DISPATCH" feat-unsafe-team "$UNSAFE_FID" --once --dry-run)"
@@ -678,6 +724,9 @@ files: src/activation.py
 >
 > [design-approved] round 1
 > - principal-architect
+>
+> [sceptical-design-approved] round 1
+> - sceptical-architect
 EOF
 ACT_FID=feat/activation-test.md
 git branch feat-activation-team

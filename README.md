@@ -161,7 +161,7 @@ Use as much of the system as your project needs:
 | Layer | What it gives you | Where |
 |---|---|---|
 | **1. PM port** | One AI agent creates/tracks/completes `[features]` and `[tasks]` in any configured tracker through one tool-agnostic workflow. | `SKILL.md`, `reference/`, `adapters/` |
-| **2. Governed squad** | A lead coordinates, an architect gates design, specialists implement, QA verifies, and an integrator alone writes the feature branch. | `reference/orchestration.md`, `roles/` |
+| **2. Governed squad** | A lead coordinates, two independent architects gate design and release evidence, specialists implement, QA verifies, and an integrator alone writes the feature branch. | `reference/orchestration.md`, `roles/` |
 | **3. Task-driven runtime** | Event-driven dispatch, bounded parallel waves, model routing, exact review packages, durable handoffs, and recoverable integration. | `bin/dispatch.sh`, `bin/runtime-state.py`, `bin/integrate-task.sh` |
 | **4. Preset teams** | Five ready-made rosters for full-stack, backend, frontend, security, and infrastructure work, all resolved through the same team launcher. | `teams/`, `bin/launch-team.sh` |
 | **5. Portfolio automation** | One bounded cron/service pass observes generic queued/blocked statuses, bootstraps only queued feature runs, and reconciles comments, task holds, and team actions. | `bin/pm-agent.py`, `reference/automation.md` |
@@ -494,6 +494,8 @@ prompt into a file and substitutes its path for `{prompt_file}`.
 
 ```
 TEAM_LEAD_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
+PRINCIPAL_ARCHITECT_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
+SCEPTICAL_ARCHITECT_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
 BACKEND_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
 REVIEWER_CMD="gemini --yolo \"$(cat '{prompt_file}')\""
 TEAM_DEFAULT_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
@@ -508,8 +510,10 @@ Command templates for common CLIs:
 | Gemini CLI | `gemini --yolo "$(cat '{prompt_file}')"` |
 | Any file-reading CLI | `yourcli --prompt-file {prompt_file}` |
 
-**Mixing LLMs is the design intent** — e.g. Claude to lead and architect, Codex to
-implement, Gemini to review for diversity. Same-LLM teams work too.
+**Mixing LLMs is the design intent** — e.g. Claude to lead and own the primary
+architecture position, Codex to challenge it independently and implement, and
+Gemini to review. Use different model families for the two architects when
+possible to reduce correlated reasoning errors. Same-LLM teams still work.
 
 Optional `TASK_FAST_CMD`, `TASK_STANDARD_CMD`, and `TASK_STRONG_CMD` overrides
 route individual task packets by explicit `model-profile:`, conservative risk
@@ -610,7 +614,7 @@ feature status `Resolved`; disabled or unverified delivery remains non-terminal.
 
 | Section | Keys | Purpose |
 |---|---|---|
-| Role → command | `TEAM_LEAD_CMD`, `PRINCIPAL_ARCHITECT_CMD`, `INTEGRATOR_CMD`, `BACKEND_CMD`, `FRONTEND_CMD`, `QA_CMD`, `REVIEWER_CMD`, `TEAM_DEFAULT_CMD` | Which CLI runs each role ([see above](#multi-agent-teams--map-each-role-to-a-cli-command)) |
+| Role → command | `TEAM_LEAD_CMD`, `PRINCIPAL_ARCHITECT_CMD`, `SCEPTICAL_ARCHITECT_CMD`, `INTEGRATOR_CMD`, `BACKEND_CMD`, `FRONTEND_CMD`, `QA_CMD`, `REVIEWER_CMD`, `TEAM_DEFAULT_CMD` | Which CLI runs each role ([see above](#multi-agent-teams--map-each-role-to-a-cli-command)) |
 | Task model routing | `TASK_FAST_CMD`, `TASK_STANDARD_CMD`, `TASK_STRONG_CMD` | Optional task-level command overrides selected from packet metadata and conservative risk classification; each falls back to the role command |
 | Coordination | `TEAMWORK_ROOT` (`.teamwork`), `AGENT_ENV_ALLOWLIST` (non-secret minimum), `POLL_INTERVAL_SECONDS` (120), `STUCK_AFTER_MINUTES` (15), `ESCALATE_AFTER_ATTEMPTS` (2), `TRACKER_WRITERS` (`broker`), `EXECUTION` (`sequential`), `MAX_ACTIVE_IMPLEMENTERS` (`null`) | Canonical symlink-free workspace paths; LLMs start with `env -i`; deterministic broker keeps tracker credentials out of every LLM role; event-driven supervision with polling fallback; bounded sequential/parallel scheduling |
 | Worktree provisioning | `WORKTREE_SETUP` | Non-empty setup command run once inside every fresh task worktree through the same sandbox boundary; autonomous mode rejects null/no-op provisioning. |
@@ -884,9 +888,10 @@ These commands use Linear/Jira REST, the `gh` CLI, or Markdown files. The
 adapter docs remain the operation contract; interactive MCP sessions use their
 native tools instead. Comment bodies are never shell arguments.
 
-**The flow every team follows:** the Principal Architect leads (plans with the
-Product Manager, gates each `[task]`'s design before any code, reviews
-architecture) → the dispatcher creates immutable task packets and isolated
+**The flow every team follows:** the Principal Architect leads and owns the
+primary architecture position; the Sceptical Architect independently challenges
+planning and every `[task]` design before code, then supplies a release-bound
+architecture approval → the dispatcher creates immutable task packets and isolated
 worktrees → specialists checkpoint their task branches → the **Senior QA
 Engineer is the final review gate** over an exact review package → the
 integrator validates and merges one task at a time, then idempotently marks it
@@ -969,7 +974,7 @@ diffs title, description, every stable comment (including edits/deletions), and
 adapter-provided normalized attachment metadata, and asks the team-lead for an
 authenticated `[resume-review]` bound to the hold and communication digest.
 `unchanged` may clear the barrier; `requirements-changed` additionally requires
-a later `[resume-plan]` and principal-architect `[design-approved]`;
+a later `[resume-plan]` plus both architect design approvals;
 `needs-human` keeps it closed. The prior worktree must also be clean—dirty work
 is preserved for explicit salvage or quarantine, never discarded. Clearing the
 barrier archives the old claim and starts a fresh numbered attempt from the new
@@ -1152,13 +1157,14 @@ those directories and rechecks their identity plus feature HEAD at apply.
 
 | Preset | Roster | Use when |
 |---|---|---|
-| `full-stack` | Principal Software Architect · Senior Technical PM · Senior Full Stack Engineer · Senior QA | Features cutting through schema, API, and UI — the default |
-| `deep-backend` | Principal Backend Architect · TPM · Senior Staff Engineer · Senior QA | Domain logic, data models, APIs, performance |
-| `deep-frontend` | Principal Frontend Architect · TPM · Senior Frontend Engineer · Senior QA | UI architecture, client state, design systems, a11y |
-| `deep-security` | Principal Security Architect · TPM · Senior Security Engineer · Senior Penetration Tester · Senior QA | Security features & hardening on your own codebase |
-| `deep-infra` | Principal Cloud & Infrastructure Architect · TPM · Senior Cloud Engineer · Senior SRE · Senior QA | Cloud infra, IaC, delivery pipelines, reliability |
+| `full-stack` | Principal Software Architect · Sceptical Architect · Senior Technical PM · Senior Full Stack Engineer · Senior QA | Features cutting through schema, API, and UI — the default |
+| `deep-backend` | Principal Backend Architect · Sceptical Architect · TPM · Senior Staff Engineer · Senior QA | Domain logic, data models, APIs, performance |
+| `deep-frontend` | Principal Frontend Architect · Sceptical Architect · TPM · Senior Frontend Engineer · Senior QA | UI architecture, client state, design systems, a11y |
+| `deep-security` | Principal Security Architect · Sceptical Architect · TPM · Senior Security Engineer · Senior Penetration Tester · Senior QA | Security features & hardening on your own codebase |
+| `deep-infra` | Principal Cloud & Infrastructure Architect · Sceptical Architect · TPM · Senior Cloud Engineer · Senior SRE · Senior QA | Cloud infra, IaC, delivery pipelines, reliability |
 
-Every preset: the **Principal Architect leads**, the **Senior QA Engineer is the
+Every preset: the **Principal Architect leads**, the **Sceptical Architect is an
+independent design and release-evidence gate**, the **Senior QA Engineer is the
 final gate**, and a standard integrator owns serialized feature-branch commits
 and recoverable tracker finalization. Details in
 [`teams/README.md`](teams/README.md).
@@ -1179,9 +1185,9 @@ flowchart LR
     State{"Task state?"}
     Hold["Task-scoped human hold<br/>stop worker · revoke capability"]
     Route{"Opt-in and preset<br/>valid?"}
-    Gates["Lead · Product · Architect<br/>scope and design gates"]
+    Gates["Lead · Product · Two architects<br/>scope and independent design gates"]
     Work["Task-scoped agents<br/>isolated Git worktrees"]
-    Review["Independent review · QA<br/>exact evidence"]
+    Review["Triple independent review · QA<br/>exact bound evidence"]
     Integrate["Integrator<br/>serialized feature branch"]
     Policy{"Release policy and<br/>exact authority pass?"}
     Release["Credential-isolated<br/>release executor"]
@@ -1261,8 +1267,8 @@ package metadata and CLI source, but not repository-only release automation.
 │   ├── Markdown.md · Linear.md · Jira.md · GitHubIssues.md
 │   └── _TEMPLATE.md                  scaffold for a new tracker
 ├── extensions/tracker-backends/      project-owned custom tracker modules
-├── roles/                            the 7 base protocol roles
-│   └── team-lead · principal-architect · integrator · backend · frontend · qa · reviewer
+├── roles/                            the 8 base protocol roles
+│   └── team-lead · principal-architect · sceptical-architect · integrator · backend · frontend · qa · reviewer
 ├── teams/
 │   ├── README.md · _PLAYBOOK.md      how presets work + shared collaboration flow
 │   ├── full-stack.md · deep-backend.md · deep-frontend.md · deep-security.md · deep-infra.md
@@ -1319,7 +1325,7 @@ exact protocol markers — never invent new ones.
 | `status` says lifecycle supervision is disabled | Provision `BROKER_LIFECYCLE_ROOT` as documented in `config/team.config.md`; unmanaged manual mode deliberately refuses `stop` rather than trusting workspace PID text |
 | Team seems stuck | With protected lifecycle state configured, `bin/launch-team.sh status <team>` shows authoritative process state plus heartbeats; the lead applies the recovery ladder, and anything needing you is in `.teamwork/<team>/ESCALATIONS.md`. A `[Blocked]` task is intentionally human-held and never changed outbound by automation. |
 | An eligible queued task never launches | Confirm automation is enabled and scheduled, the scriptable adapter has an exact scope, the task does not carry an `ignoredTaskLabels` value such as `human-work`, and `team-preset` is absent or exactly one allowed preset. If `requireMetadataOptIn` is true, also confirm the latest metadata says `automation: enabled`; conflicting or unordered metadata deliberately pauses. |
-| A human moved `[Blocked]` to queued but no fresh attempt starts | Inspect the generated resume-review request. A broker-authenticated `[resume-review]` must bind its exact hold and communication digest; changed requirements also need a later `[resume-plan]` and `[design-approved]`, and the prior worktree must be clean. |
+| A human moved `[Blocked]` to queued but no fresh attempt starts | Inspect the generated resume-review request. A broker-authenticated `[resume-review]` must bind its exact hold and communication digest; changed requirements also need a later `[resume-plan]` and both architect design approvals, and the prior worktree must be clean. |
 | `--print-cron` rejects the scan interval | Conventional cron output supports minute divisors of 60 and whole-hour divisors of 24. Use a service timer or hosted scheduler for cadences such as seven minutes |
 | `another live pass owns the monitor lease` | One healthy pass is already running on this host. Do not start a second scheduler; multi-host operation needs a distributed lock or adapter-native compare-and-set |
 | Release waits for product acceptance | Publish a current feature-scope `[product-approval]` bound to the exact final feature HEAD and integration-evidence digest; stale or ambiguous evidence cannot release |

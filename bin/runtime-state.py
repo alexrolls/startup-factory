@@ -28,12 +28,15 @@ CURRENT_MARKERS = {
     "design-note",
     "design-approved",
     "design-pushback",
+    "sceptical-design-approved",
+    "sceptical-design-pushback",
     "product-approval",
     "product-pushback",
     "review-request",
     "review-findings",
     "review-approval",
     "architecture-approval",
+    "sceptical-architecture-approval",
     "handoff",
     "andon",
     "escalation",
@@ -109,8 +112,13 @@ def derive_stage(task: dict, terminal: set[str]) -> tuple[str, str]:
     design_note = markers.get("design-note", -1)
     design_approved = markers.get("design-approved", -1)
     design_pushback = markers.get("design-pushback", -1)
+    sceptical_design_approved = markers.get("sceptical-design-approved", -1)
+    sceptical_design_pushback = markers.get("sceptical-design-pushback", -1)
     review_approved = markers.get("review-approval", -1)
     architecture_approved = markers.get("architecture-approval", -1)
+    sceptical_architecture_approved = markers.get(
+        "sceptical-architecture-approval", -1
+    )
 
     if status in terminal:
         return "integrated", "committed and terminal"
@@ -119,15 +127,24 @@ def derive_stage(task: dict, terminal: set[str]) -> tuple[str, str]:
     if status == "Planned":
         if design_note < 0:
             return "planned", "awaiting design note"
-        if design_pushback > design_approved:
+        if (
+            design_pushback > design_approved
+            or sceptical_design_pushback > sceptical_design_approved
+        ):
             return "design-rework", "design pushback open"
-        if design_approved > design_note:
-            return "ready", "design approved; ready for dispatch"
+        if design_approved > design_note and sceptical_design_approved > design_note:
+            return "ready", "independent design approvals present; ready for dispatch"
         return "design-review", "design note awaiting verdict"
     if status == "Active":
-        if design_pushback > design_approved:
+        if (
+            design_pushback > design_approved
+            or sceptical_design_pushback > sceptical_design_approved
+        ):
             return "design-rework", "design pushback open"
-        if design_note >= 0 and design_approved <= design_note:
+        if design_note >= 0 and (
+            design_approved <= design_note
+            or sceptical_design_approved <= design_note
+        ):
             return "design-review", "design note awaiting verdict"
         if findings > request:
             return "rework", "review findings require a new review request"
@@ -135,13 +152,19 @@ def derive_stage(task: dict, terminal: set[str]) -> tuple[str, str]:
     if status == "Review":
         if request < 0:
             return "review-anomaly", "Review status has no review request"
-        if review_approved > request and architecture_approved > request:
+        if (
+            review_approved > request
+            and architecture_approved > request
+            and sceptical_architecture_approved > request
+        ):
             return "integrating", "all approvals present"
         waiting = []
         if review_approved <= request:
             waiting.append("QA/reviewer")
         if architecture_approved <= request:
             waiting.append("architecture")
+        if sceptical_architecture_approved <= request:
+            waiting.append("independent architecture challenge")
         return "review", "waiting for " + " and ".join(waiting)
     return status.lower().replace(" ", "-"), "tracker status: %s" % status
 

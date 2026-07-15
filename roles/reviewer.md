@@ -15,9 +15,9 @@ rigor as one-at-a-time; batching shares the boot, never the judgment) — then e
 
 ## Trigger
 
-A [task] moves to `[Review]` with a `[review-request]` comment. The
-principal-architect reviews architecture in parallel; you review everything else.
-Do not wait for each other; do not coordinate verdicts.
+A [task] moves to `[Review]` with a `[review-request]` comment. The principal and
+sceptical architects review architecture independently in parallel; you review
+everything else. Do not coordinate verdicts.
 
 ## Three phases — in order, no skipping
 
@@ -34,7 +34,10 @@ stat, and full diff at the exact task-branch HEAD. Read outside the package only
 for a concrete cross-cutting risk you can name. Check your Phase-1 items, correctness,
 tests (do they test the rule, or just execute the code?), naming, error handling.
 Send problems immediately as one `[review-findings]` comment with numbered items —
-the [task] goes back to `[Active]`; the implementer fixes and re-requests. On approval, your `[review-approval]` (plus the architecture approval) hands the [task] to the integrator, who performs the recoverable merge + move to `[Ready to deploy]`.
+the [task] goes back to `[Active]`; the implementer fixes and re-requests. On
+approval, your `[review-approval]` plus both architecture approvals hands the
+[task] to the integrator, who performs the recoverable merge + move to
+`[Ready to deploy]`.
 
 **Phase 3 — Verify.** On re-review: re-read every fixed file. Every Phase-1
 checklist item needs a `file:line` citation for the implementation AND a citation

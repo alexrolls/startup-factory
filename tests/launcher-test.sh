@@ -327,6 +327,8 @@ check "attempt 2 gets a fresh tree on the same branch" test -d ".teamwork/test-f
 # -- team preset: launch a full roster from teams/full-stack.md ----------------
 SKIP_PREFLIGHT=1 TEAM_RUNNER=background "$LAUNCH" team full-stack test-feature FEAT-2
 check "preset composes fallback-role prompt" test -f .teamwork/test-feature/prompts/principal-software-architect.md
+check "preset composes sceptical gate prompt" test -f .teamwork/test-feature/prompts/sceptical-architect.md
+check "sceptical prompt contains blind-first protocol" grep -q "blind-first" .teamwork/test-feature/prompts/sceptical-architect.md
 check "preset brief resolved from teams/roles" grep -q "Role: principal-software-architect" .teamwork/test-feature/prompts/principal-software-architect.md
 check "preset prompt includes team file"     grep -q "Team: Full Stack" .teamwork/test-feature/prompts/principal-software-architect.md
 check "preset prompt includes playbook"      grep -q "Team Playbook" .teamwork/test-feature/prompts/principal-software-architect.md

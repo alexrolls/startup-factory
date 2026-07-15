@@ -16,7 +16,7 @@ The scenarios in `lifecycle.md` don't change — only *who* performs each write 
 
 ## Roles
 
-When running an actual agent team (`reference/orchestration.md`), the abstract roles map to concrete role names: Coordinator = `team-lead`, Implementer = `backend` / `frontend` / `qa`, Reviewer = `reviewer`, Finalizer = `integrator`, plus `principal-architect` (technical authority). Actionable instructions (mailboxes, escalation) always use the concrete names.
+When running an actual agent team (`reference/orchestration.md`), the abstract roles map to concrete role names: Coordinator = `team-lead`, Implementer = `backend` / `frontend` / `qa`, Reviewer = `reviewer`, Finalizer = `integrator`, plus `principal-architect` (primary architecture) and `sceptical-architect` (independent challenge). Actionable instructions (mailboxes, escalation) always use the concrete names.
 
 | Role | Owns |
 |---|---|
@@ -24,8 +24,9 @@ When running an actual agent team (`reference/orchestration.md`), the abstract r
 | **Implementer** | Picks up a [task], writes the code, records divergences. |
 | **Reviewer** | Reviews an implementer's work, approves or sends it back. Never modifies code. |
 | **Finalizer** | Runs final validation, writes the feature-branch integration commit, and moves [tasks] to `[Ready to deploy]`. The **single** role allowed to perform the `requiresCommit` move. |
-| **Principal Architect** | Technical authority: planning approval, per-[task] design gate, architecture half of every review, sole editor of upcoming [task] descriptions. Never writes code. |
-| **Team Lead** | Process authority: plans, launches, supervises task holds, reassigns, and escalates. May authorize entering `[Blocked]` and publish receipt-backed dependency/resume analysis, but never moves `[Blocked]` outbound. Never writes code or overrides Finalizer/Integrator or Principal Architect. |
+| **Principal Architect** | Primary architecture position: planning approval, per-[task] design gate, architecture review, and sole editor of upcoming [task] descriptions. Never writes code. |
+| **Sceptical Architect** | Independent blind-first challenge: planning/design peer review and release-bound architecture approval. Never writes code. |
+| **Team Lead** | Process authority: plans, launches, supervises task holds, reassigns, and escalates. It may adjudicate an architecture trade-off only when independent of both architects; otherwise the human decides. Never writes code or overrides the Finalizer/Integrator or unresolved Critical risk. |
 | **Release Executor** | Deterministic, credential-separated production transaction. It alone performs the terminal [feature] transition after independent production verification; it is not an LLM role. |
 
 Small teams collapse roles (one agent can be Reviewer + Finalizer). The ownership *table*
@@ -56,7 +57,7 @@ Refinements:
   after the integration commit succeeds (on the default board: the integrator
   commits and records an immutable transaction; the dispatcher independently
   validates it and idempotently writes `[Review]` → `[Ready to deploy]` after
-  both approvals exist).
+  all three review approvals exist).
 - **Routing:** when an item enters a status, the mover notifies the new owner's mailbox
   (`reference/orchestration.md` → *Status routing*). A `{"team": ...}` owner is reached
   via that team's lead, who dispatches internally.
@@ -132,7 +133,7 @@ single adapter, and swap tools without touching a single role.
 ## Running an actual team
 
 This file defines *ownership*. The full multi-agent mechanics — mailboxes,
-heartbeats, claiming, the design gate, dual review, the recovery ladder, task holds, launching
+heartbeats, claiming, the two-person design gate, independent triple review, the recovery ladder, task holds, launching
 heterogeneous LLM agents — live in `reference/orchestration.md` with one brief per
 role in `roles/`. Configure the team in `config/team.config.md` and launch with
 `bin/launch-team.sh`.

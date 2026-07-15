@@ -31,7 +31,8 @@ export STARTUP_FACTORY_LIFECYCLE_STATE_ROOT="$LIFECYCLE_ROOT"
 mkdir -p .agent-squad/{bin,config,roles,reference} feat
 cp "$SKILL_DIR"/bin/*.sh "$SKILL_DIR"/bin/*.py .agent-squad/bin/
 cp "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/config/automation.config.json" .agent-squad/config/
-cp "$SKILL_DIR/roles/backend.md" "$SKILL_DIR/roles/reviewer.md" .agent-squad/roles/
+cp "$SKILL_DIR/roles/backend.md" "$SKILL_DIR/roles/reviewer.md" \
+  "$SKILL_DIR/roles/sceptical-architect.md" .agent-squad/roles/
 cp "$SKILL_DIR/teams/roles/principal-software-architect.md" \
   "$SKILL_DIR/teams/roles/senior-technical-product-manager.md" .agent-squad/roles/
 cp "$SKILL_DIR/reference/guardrails.md" "$SKILL_DIR/reference/orchestration.md" .agent-squad/reference/
@@ -85,6 +86,11 @@ Implement the endpoint with tests.
 > 1. Endpoint behavior is tested.
 >
 > - principal-architect
+
+> [sceptical-design-approved] round: 1
+> assumptions: fixture scope and rollback are explicit.
+>
+> - sceptical-architect
 EOF
 
 LAUNCH=.agent-squad/bin/launch-team.sh
@@ -315,6 +321,7 @@ check "outbox retry keeps target status" grep -q '^## 1 Implement endpoint \[Rev
 cat > .teamwork/feature-runtime/preset.env <<'EOF'
 PROTOCOL_TEAM_LEAD=principal-software-architect
 PROTOCOL_PRINCIPAL_ARCHITECT=principal-software-architect
+PROTOCOL_SCEPTICAL_ARCHITECT=sceptical-architect
 PROTOCOL_REVIEWER=reviewer
 EOF
 cat > gate-submit-probe.sh <<'EOF'
@@ -482,6 +489,14 @@ refuse "broker rejects a cross-role gate capability" "claimed actor does not mat
 
 architecture_entry="$(launch_gate_submission principal-software-architect architecture-approval architecture-verdict.md architecture.path)"
 .agent-squad/bin/process-outbox.sh feature-runtime "$FID" "$architecture_entry" >/dev/null
+cat > sceptical-architecture-verdict.md <<'EOF'
+[sceptical-architecture-approval]
+Independent challenge found no unresolved material risk.
+
+- sceptical-architect
+EOF
+sceptical_entry="$(launch_gate_submission sceptical-architect sceptical-architecture-approval sceptical-architecture-verdict.md sceptical.path)"
+.agent-squad/bin/process-outbox.sh feature-runtime "$FID" "$sceptical_entry" >/dev/null
 cat > review-verdict.md <<'EOF'
 [review-approval]
 Focused tests and changed files reviewed.
@@ -497,7 +512,7 @@ payload=json.load(open(sys.argv[1])); task=payload['tasks'][0]
 comments=[str(c.get('body') or '') for c in task['comments']]
 request=next(body for body in reversed(comments) if body.startswith('[review-request]'))
 expected='sha256:'+hashlib.sha256(request.encode()).hexdigest()
-for marker in ('[architecture-approval]', '[review-approval]'):
+for marker in ('[architecture-approval]', '[sceptical-architecture-approval]', '[review-approval]'):
     body=next(body for body in reversed(comments) if body.startswith(marker))
     assert re.search(r'(?m)^Review-Request-SHA256: '+re.escape(expected)+r'$', body)
     assert re.search(r'(?m)^Task-Branch-Head: [0-9a-f]{40}$', body)
@@ -509,6 +524,7 @@ PY
 cat > .teamwork/feature-runtime/preset.env <<'EOF'
 PROTOCOL_TEAM_LEAD=principal-software-architect
 PROTOCOL_PRINCIPAL_ARCHITECT=principal-software-architect
+PROTOCOL_SCEPTICAL_ARCHITECT=sceptical-architect
 PROTOCOL_REVIEWER=reviewer
 PROTOCOL_PRODUCT_MANAGER=senior-technical-product-manager
 EOF

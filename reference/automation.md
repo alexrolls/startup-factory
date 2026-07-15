@@ -286,8 +286,9 @@ excluded from the communication digest, so publishing a verdict does not create
 a self-invalidating snapshot.
 
 `unchanged` may clear the barrier. `requirements-changed` requires a later
-broker-authenticated `[resume-plan]`, followed by a later principal-architect
-`[design-approved]` with no newer pushback. `needs-human` remains held. In every
+broker-authenticated `[resume-plan]`, followed by later `[design-approved]` and
+`[sceptical-design-approved]` markers with no newer pushback from either
+architect. `needs-human` remains held. In every
 case the previous attempt worktree must be clean; dirty work stays preserved
 until explicitly salvaged or quarantined and is never silently deleted. Once
 clear, the old claim is archived and the dispatcher starts attempt N+1 with a

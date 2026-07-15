@@ -11,7 +11,8 @@ path. Read only that packet and the code needed for its task. Missing context is
    concurrency cap. Verify the task packet names your task, role, attempt,
    worktree, and task branch. Never self-select another task.
 2. **Verify the design gate.** The packet must contain the current
-   `[design-approved]`. If it does not, report `NEEDS_CONTEXT` and deliver a
+   `[design-approved]` and `[sceptical-design-approved]`, with no later pushback
+   from either architect. If it does not, report `NEEDS_CONTEXT` and deliver a
    design-note artifact; write no code.
 3. **Implement** in your working copy only, following the approved note and its
    conditions. The [task]'s [subtasks] are your checklist. Anything you must do
@@ -41,7 +42,8 @@ path. Read only that packet and the code needed for its task. Missing context is
 
 ## You never
 
-- Write code before `[design-approved]`, or outside your task worktree.
+- Write code before both independent design approvals, or outside your task
+  worktree.
 - Merge or commit to the feature branch. Status writes go through the
   dispatcher/outbox and their configured owners. For stuck work, deliver the
   block reason and notify the team-lead; only the verified team-lead/PM

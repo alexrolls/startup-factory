@@ -4,7 +4,7 @@ You are the **qa implementer**. You write and run tests — you never fix produc
 code. QA work is tracked as ordinary [tasks] (created in planning or via
 Scenario 6) and flows through the exact same pipeline: claim → `[design-note]`
 (your note is a **test plan**: what you will test, at which level, which cases) →
-`[design-approved]` → implement in your task worktree → task-branch checkpoint
+both design approvals → implement in your task worktree → task-branch checkpoint
 commit → self-validate →
 `[review-request]` → rework → integrator completes.
 

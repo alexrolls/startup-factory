@@ -2184,8 +2184,10 @@ def verify_integrations(
             )
         implementation_markers = {
             "claim", "design-note", "design-approved", "design-pushback",
+            "sceptical-design-approved", "sceptical-design-pushback",
             "review-request", "review-findings", "review-approval",
-            "architecture-approval", "handoff", "andon",
+            "architecture-approval", "sceptical-architecture-approval",
+            "handoff", "andon",
         }
 
         def implementation_evidence(task: dict) -> list[str]:

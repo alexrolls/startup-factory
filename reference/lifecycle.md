@@ -49,8 +49,8 @@ Turn an idea into a tracked feature with a task breakdown.
    `[Active]` (do this only if the adapter tracks feature status explicitly).
 5. **Team mode only (`TEAM_MODE=true`): pass the design gate.** Post a `[design-note]`
    comment (approach, contract/data-model changes, affected components) and exit;
-   the dispatcher/harness relaunches you when the principal-architect's
-   `[design-approved]` arrives — see `reference/orchestration.md`. Single-agent mode
+   the dispatcher/harness relaunches you when both architects' design approvals
+   arrive — see `reference/orchestration.md`. Single-agent mode
    skips this step.
 6. The dispatcher claims the task and launches a fresh task instance with an
    immutable packet, task branch, attempt worktree, and report path. Implement
@@ -217,16 +217,20 @@ emergent plans.
    **writing** the note — when notes are produced by parallel planners, the
    registry is the only shared surface between them, so a note that defers
    registration defeats the pass.
-2. **Cross-[task] consistency review first.** The reviewer of the set (the
-   principal-architect in team mode; you, wearing that hat, in single-agent mode)
-   reads the **full set before verdicts**, checking sibling notes against each
+2. **Cross-[task] consistency and independent challenge first.** In team mode the
+   principal-architect checks the full set and registry while the sceptical-
+   architect independently tests assumptions, cross-task risks, and simpler
+   alternatives; in single-agent mode, you perform both passes separately. Read
+   the **full set before verdicts**, checking sibling notes against each
    other and the registry — contract forks between parallel plans are the
    highest-value findings and are invisible note-by-note. Cross-cutting rulings
    are binding and recorded once, referenced by each affected [task].
    **Gate condition:** no plan is approved while its exports are unregistered or
    a consumed sibling name lacks a registry citation.
-3. **Per-[task] verdicts** — `[design-approved]` (with conditions) or
-   `[design-pushback]`, exactly as in the normal gate.
+3. **Per-[task] verdicts** — both the principal
+   `[design-approved]`/`[design-pushback]` and independent
+   `[sceptical-design-approved]`/`[sceptical-design-pushback]`, exactly as in the
+   normal gate.
 4. **Scope sign-off per [task]** where a product owner exists —
    `[product-approval]` / `[product-pushback]`.
 5. **Everything lands as comments** on the [tasks], like any gate.

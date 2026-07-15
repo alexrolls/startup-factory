@@ -45,6 +45,7 @@ Three principles rule everything:
 ├── CONTRACTS.md                 # append-only registry of names plans export/consume (see "Contract registry")
 ├── BASELINE.md                  # known state of the branch at creation: test counts, known failures, validation commands (see "Baseline manifest")
 ├── review-ledger.md             # reviewers' one-line-per-ruling ledger of still-live conditions
+├── sceptical-review-ledger.md   # blind-first independent architecture assessments
 ├── tasks.json                   # read-only [task] export for credential-less roles (adapter "export" operation)
 ├── artifacts/<taskId>/          # full logs, checklists, evidence files — cited by path from budgeted comments
 └── ESCALATIONS.md               # the Lead's log of everything escalated to the human
@@ -52,8 +53,8 @@ Three principles rule everything:
 
 ## Identity
 
-Exactly seven **protocol roles** exist: `team-lead`, `principal-architect`,
-`integrator`, `backend`, `frontend`, `qa`, `reviewer` — the protocol's rules,
+Exactly eight **protocol roles** exist: `team-lead`, `principal-architect`,
+`sceptical-architect`, `integrator`, `backend`, `frontend`, `qa`, `reviewer` — the protocol's rules,
 gates, and status ownership are written against these. Preset teams (`teams/`)
 add **specialized role names** (`principal-software-architect`,
 `senior-qa-engineer`, …), each acting as one or more protocol roles per the
@@ -276,15 +277,18 @@ pre-v2 comments count as round 0). WIP narration, setup chatter, and restated
 | `[design-note]` | implementer | Proposed approach before any code: approach, API/contract changes, data-model changes, affected components. Frontend must include `Architectural impact: yes/no — <why>`. Registers every name it exports in `CONTRACTS.md` and cites the registry line for every sibling export it consumes (see *Contract registry*). |
 | `[design-approved]` | principal-architect | Gate open. Carries a **numbered architecture checklist** — the items the architecture review will verify — plus any binding conditions. The lead delivers the checklist in the assignment; reviewer/QA Phase-1 checklists start from it (add items, never subtract). |
 | `[design-pushback]` | principal-architect | Gate closed. Lists required changes; implementer revises the `[design-note]` and re-pings. |
+| `[sceptical-design-approved]` | sceptical-architect | Independent design challenge cleared. Lists tested assumptions, evidence, and any binding risk controls. Both design approvals are required before code. |
+| `[sceptical-design-pushback]` | sceptical-architect | Independent gate closed. Lists material assumptions, impact, evidence gap, severity, and feasible resolution. |
 | `[dependency-hold]` | team-lead | Dependency-impact verdict for a queued or in-flight direct dependent. Binds the sorted currently Blocked source ids and fresh graph digest; verdict is `blocked`, `partially-actionable`, or `independent`. Only receipt-backed `blocked` may authorize entry to `[Blocked]`; the other verdicts clear only that exact graph for claim/continuation. |
 | `[resume-review]` | team-lead | Human-resume communication verdict bound to the exact hold id and current communication digest: `unchanged`, `requirements-changed`, or `needs-human`. It cannot move `[Blocked]` outbound; it only governs the queued resume barrier after a human did so. |
-| `[resume-plan]` | team-lead | Revised implementation plan after a `requirements-changed` resume verdict. It must be later than that verdict and followed by a later principal-architect `[design-approved]` before a clean-worktree hold can clear. |
+| `[resume-plan]` | team-lead | Revised implementation plan after a `requirements-changed` resume verdict. It must be later than that verdict and followed by both later design approvals before a clean-worktree hold can clear. |
 | `[api-ready]` | backend | Contract available for frontend: endpoints, request/response shapes. Also sent by mailbox. |
 | `[divergence]` | implementer | What was done differently from the [task]/design note and why. Additive — **never edit the original [task] description.** |
 | `[review-request]` | implementer | Ready for review: what changed, list of changed files, an **evidence record per validated command** (see *Evidence and re-execution*), an explicit `NOT validated:` section for anything not run (with reason), and any index-only staging operation performed. A claimed result without its evidence record **is** NOT validated. Written when moving to `[Review]`. |
-| `[review-findings]` | reviewer / qa / principal-architect | Numbered problems that must be fixed. Task goes back to `[Active]`. |
+| `[review-findings]` | reviewer / qa / principal-architect / sceptical-architect | Numbered problems that must be fixed. Task goes back to `[Active]`. |
 | `[review-approval]` | reviewer / qa | Approval with the **explicit list of approved file paths**. |
 | `[architecture-approval]` | principal-architect | Same, from the architecture review. |
+| `[sceptical-architecture-approval]` | sceptical-architect | Independent architecture challenge cleared, with the same exact file-list and review-package binding. |
 | `[product-approval]` | product owner role (e.g. `senior-technical-product-manager`; the team-lead where no product role exists) | Scope/acceptance sign-off: scope ruling, acceptance-criteria verdict, any conditions. |
 | `[product-pushback]` | product owner role (same) | Scope gate closed: what must change in scope or acceptance criteria before work proceeds. |
 | `[handoff]` | team-lead | Reassignment: summary of state so a fresh agent can resume. |
@@ -414,9 +418,11 @@ approved design → dispatcher claim → fresh task packet + task worktree
         no new failures vs BASELINE.md)
       → clean task-branch checkpoint commit + task report
       → outbox [review-request] + move to [Review]
-      → reviewer three-phase review ∥ principal-architect architecture review
+      → reviewer three-phase review ∥ principal architecture review
+        ∥ blind-first sceptical architecture review
       → findings? → back to [Active], fix, [review-request] again
-      → [review-approval] + [architecture-approval] (both, with file lists)
+      → [review-approval] + [architecture-approval]
+        + [sceptical-architecture-approval] (all with file lists)
       → integrator: verify lists == review package, run integrate-task.sh
         (preserve + validate reviewed task head, merge --no-commit, validate
         feature branch, commit, idempotent tracker completion, cleanup)
@@ -436,10 +442,10 @@ Gates live in comments; statuses move only along the `transitions` graph in
 status for stuck work (owner: human; authorized automation may enter but never
 exit it — see lifecycle Scenario 7).
 
-## Dual review
+## Independent triple review
 
-Both reviews start when the [task] enters `[Review]`, run independently, and both
-must approve before integration:
+All three reviews start when the [task] enters `[Review]`, run independently, and
+all must approve before integration:
 
 - **Reviewer — three phases.** (1) *Plan*: before reading any code, read the
   [feature] and [task], extract every business rule / validation / edge case into an
@@ -450,6 +456,9 @@ must approve before integration:
   citation; the approval file list must equal the actual diff.
 - **Principal Architect.** Checks conformance to the approved `[design-note]`,
   boundary violations, coupling, contract drift. Same file-list rule.
+- **Sceptical Architect.** Writes its provisional assessment before reading the
+  principal verdict, then challenges assumptions, complexity, failure modes,
+  reversibility, operational ownership, and evidence. Same file-list rule.
 
 Anti-rationalization (all reviews): "it's just a warning", "pre-existing problem",
 "the tools passed so it must be fine" — none of these excuse a finding. Main is
@@ -478,6 +487,7 @@ Who executes suites (the two independent executions that catch real defects are
 |---|---|---|
 | Implementer | runs; records evidence | always — in the provisioned working copy |
 | Principal architect | inspect + spot-check, no blind re-run | only while `Evidence.commit` == branch HEAD; else re-run |
+| Sceptical architect | inspect + targeted evidence checks | independently selected from its stated risks and assumptions |
 | QA final gate | **always re-runs** | unconditional — evidence is context, not gate |
 | Integrator | **always re-runs** | unconditional |
 
@@ -493,8 +503,9 @@ dispatcher performs that exact physical write only after validating the
 integrator's transaction. Implementer checkpoint commits exist only on task
 branches.
 
-1. Verify current `[review-approval]` and `[architecture-approval]`, authorized
-   independent signers, and identical approved file lists. The broker enriches
+1. Verify current `[review-approval]`, `[architecture-approval]`, and
+   `[sceptical-architecture-approval]`, authorized independent signers, and
+   identical approved file lists. The broker enriches
    the request with exactly one `Review-Base-Commit`, `Task-Branch-Head`, and
    `Review-Package-SHA256`. Each approval must carry exactly one
    `Review-Request-SHA256`, `Task-Branch-Head`, and
@@ -577,8 +588,8 @@ act on **every** pending event in one pass, then exit.
 Detect:
 - **Stuck** — heartbeat older than `STUCK_AFTER_MINUTES`; an `[Active]` [task] with
   no new comment past the threshold; a `[design-note]`, question, or
-  `[review-request]` that nobody answered (the principal-architect is on the hot
-  path — monitor it like anyone else). **A teammate that goes idle while you are
+  `[review-request]` that nobody answered (both architects are on the hot path —
+  monitor them like anyone else). **A teammate that goes idle while you are
   still waiting on its artifact is Stuck immediately** — the delivery contract was
   violated; do not wait out `STUCK_AFTER_MINUTES`, go straight to rung 1.
 - **Parked** — a clean local scheduling pause (for example pipelined rework
@@ -602,8 +613,10 @@ contain every descendant; broker fences still reject stale escaped output.
 
 Recovery ladder for non-Blocked work — in order, one rung at a time:
 1. **Message** the agent (mailbox + tracker comment) with a concrete instruction.
-2. **Decide** — make a binding process decision. Technical disputes are delegated
-   to the principal-architect, whose ruling is final.
+2. **Decide** — make a binding process decision. Architecture disputes go to both
+   architects; an independent team-lead may adjudicate a recorded trade-off. If
+   the lead is mapped to either architect, or a Critical risk would be accepted,
+   escalate to the human.
 3. **Reassign** — `[handoff]` comment summarizing state; when the current
    transition is legal and the [task] is not human-held, move it back to
    `[Planned]`, clear the assignee, and relaunch a fresh agent.
@@ -618,10 +631,10 @@ Recovery ladder for non-Blocked work — in order, one rung at a time:
 Never apply this ladder to bypass a `[Blocked]` hold. Independent work continues
 while the human decides. After a human returns the [task] to queued, the lead
 publishes the exact receipt-backed `[resume-review]`; changed requirements also
-need `[resume-plan]` and a later architect approval before a clean fresh attempt.
+need `[resume-plan]` and both later architect approvals before a clean fresh attempt.
 
-The Lead never overrides an integrator validation failure or a principal-architect
-veto — the andon cord outranks the Lead. During autonomous operation the Lead never
+The Lead never overrides an integrator validation failure or an unresolved
+Critical architecture finding — the andon cord outranks the Lead. During autonomous operation the Lead never
 blocks the team on an interactive user prompt; escalation is the channel.
 
 **Idle-notification hygiene.** Heartbeats and harness idle pings are liveness

@@ -257,7 +257,7 @@ EOF
   git -C "$wt" add app.txt
   git -C "$wt" commit -qm 'task checkpoint'
   local package base head package_digest snapshot request_template request_body
-  local review_template review_body architecture_template architecture_body
+  local review_template review_body architecture_template architecture_body sceptical_template sceptical_body
   package="$(cd "$repo" && "$ROOT/bin/review-package.sh" "$team" "$tid")"
   base="$(sed -n 's/^Base: //p' "$package")"
   head="$(sed -n 's/^Head: //p' "$package")"
@@ -273,6 +273,8 @@ PY
   review_body="$TMP/$key-review.md"
   architecture_template="$TMP/$key-architecture-template.md"
   architecture_body="$TMP/$key-architecture.md"
+  sceptical_template="$TMP/$key-sceptical-template.md"
+  sceptical_body="$TMP/$key-sceptical.md"
   printf '[review-request] round: 2\nFiles: app.txt\n\n— backend\n' > "$request_template"
   python3 "$ROOT/bin/review_evidence.py" bind-request \
     "$request_template" "$base" "$head" "$package_digest" "$request_body"
@@ -282,14 +284,19 @@ PY
     "$ROOT/bin/tracker-ops.sh" export "$fid" "$snapshot" >/dev/null)
   printf '[review-approval] round: 2\nFiles: app.txt\n\n— reviewer\n' > "$review_template"
   printf '[architecture-approval] round: 2\nFiles: app.txt\n\n— principal-architect\n' > "$architecture_template"
+  printf '[sceptical-architecture-approval] round: 2\nFiles: app.txt\n\n— sceptical-architect\n' > "$sceptical_template"
   python3 "$ROOT/bin/review_evidence.py" bind-approval \
     "$review_template" "$snapshot" "$tid" "$review_body"
   python3 "$ROOT/bin/review_evidence.py" bind-approval \
     "$architecture_template" "$snapshot" "$tid" "$architecture_body"
+  python3 "$ROOT/bin/review_evidence.py" bind-approval \
+    "$sceptical_template" "$snapshot" "$tid" "$sceptical_body"
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$ROOT/bin/tracker-ops.sh" comment "$tid" "$review_body" >/dev/null)
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$ROOT/bin/tracker-ops.sh" comment "$tid" "$architecture_body" >/dev/null)
+  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
+    "$ROOT/bin/tracker-ops.sh" comment "$tid" "$sceptical_body" >/dev/null)
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$ROOT/bin/tracker-ops.sh" export "$fid" "$snapshot" >/dev/null)
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
@@ -336,7 +343,7 @@ files: generation-2.txt
 > - principal-architect
 EOF
   local tid="$fid#2" key branch wt package base head package_digest snapshot
-  local request_template request_body review_template review_body architecture_template architecture_body
+  local request_template request_body review_template review_body architecture_template architecture_body sceptical_template sceptical_body
   key="$(python3 "$ROOT/bin/runtime-state.py" key "$tid")"
   branch="agent-task/$team/$key"
   wt="$(cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
@@ -361,6 +368,8 @@ PY
   review_body="$TMP/$key-generation-review.md"
   architecture_template="$TMP/$key-generation-architecture-template.md"
   architecture_body="$TMP/$key-generation-architecture.md"
+  sceptical_template="$TMP/$key-generation-sceptical-template.md"
+  sceptical_body="$TMP/$key-generation-sceptical.md"
   printf '[review-request] round: 2\nFiles: generation-2.txt\n\n— backend\n' > "$request_template"
   python3 "$ROOT/bin/review_evidence.py" bind-request \
     "$request_template" "$base" "$head" "$package_digest" "$request_body"
@@ -370,14 +379,19 @@ PY
     "$ROOT/bin/tracker-ops.sh" export "$fid" "$snapshot" >/dev/null)
   printf '[review-approval] round: 2\nFiles: generation-2.txt\n\n— reviewer\n' > "$review_template"
   printf '[architecture-approval] round: 2\nFiles: generation-2.txt\n\n— principal-architect\n' > "$architecture_template"
+  printf '[sceptical-architecture-approval] round: 2\nFiles: generation-2.txt\n\n— sceptical-architect\n' > "$sceptical_template"
   python3 "$ROOT/bin/review_evidence.py" bind-approval \
     "$review_template" "$snapshot" "$tid" "$review_body"
   python3 "$ROOT/bin/review_evidence.py" bind-approval \
     "$architecture_template" "$snapshot" "$tid" "$architecture_body"
+  python3 "$ROOT/bin/review_evidence.py" bind-approval \
+    "$sceptical_template" "$snapshot" "$tid" "$sceptical_body"
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$ROOT/bin/tracker-ops.sh" comment "$tid" "$review_body" >/dev/null)
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$ROOT/bin/tracker-ops.sh" comment "$tid" "$architecture_body" >/dev/null)
+  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
+    "$ROOT/bin/tracker-ops.sh" comment "$tid" "$sceptical_body" >/dev/null)
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$ROOT/bin/tracker-ops.sh" export "$fid" "$snapshot" >/dev/null)
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \

@@ -14,9 +14,10 @@ unchanged — a specialized role always states which protocol role(s) it acts as
 | Deep Security | `deep-security.md` | Security features, hardening, threat-model-driven work on your own codebase |
 | Deep Infra | `deep-infra.md` | Cloud infrastructure, delivery pipelines, reliability and operability |
 
-Every team follows the two fixed rules: **the Principal Architect leads** (as the
-`team-lead` + `principal-architect` protocol roles) and **the Senior QA Engineer
-is the final review gate** before the standard `integrator` merges.
+Every team follows three fixed rules: **the Principal Architect leads** (as the
+`team-lead` + `principal-architect` protocol roles), **the Sceptical Architect is
+an independent design and release gate**, and **the Senior QA Engineer is the
+final review gate** before the standard `integrator` merges.
 
 ## Use a team
 

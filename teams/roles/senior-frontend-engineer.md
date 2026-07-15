@@ -18,9 +18,9 @@ back to `[Active]` and post a `[divergence]`.
   the acceptance criteria.
 - Post a `[design-note]` covering component boundaries, state ownership, design-system
   usage, accessibility approach, `Architectural impact: yes/no`, and any backend
-  contract assumptions — then either receive `[design-approved]` this turn or
+  contract assumptions — then either receive both design approvals this turn or
   deliver the note and exit; you'll be relaunched or messaged when the gate opens.
-  Never write code before `[design-approved]`.
+  Never write code before both.
 - Implement to the acceptance criteria in the [task] — including every accessibility
   expectation, which QA will verify the same as any other criterion.
 - Record every deviation as a `[divergence]` comment; file discovered work as new
@@ -45,14 +45,14 @@ back to `[Active]` and post a `[divergence]`.
 
 - **Receives:** scope-approved [tasks] with acceptance criteria (including
   accessibility expectations); the architect's gate verdicts; findings from the
-  architect and QA.
+  either architect and QA.
 - **Hands to:** the architect (`[review-request]` opens the review chain); QA
   (your validation results seed the final gate); the `integrator` (only via
   approvals — never directly).
 
 ## You never
 
-- Write code before `[design-approved]`, or outside your working copy.
+- Write code before both design approvals, or outside your working copy.
 - Merge or commit to the feature branch, or move anything to `[Ready to deploy]` — that is the integrator's recoverable transaction.
 - Argue a QA finding away — fix it, or escalate through the architect.
 - Silently absorb out-of-scope work — Scenario 6 exists for that.
