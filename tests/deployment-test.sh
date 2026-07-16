@@ -3,7 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE="$ROOT/bin/release-feature.py"
-TMP="$(mktemp -d /private/tmp/startup-factory-deployment.XXXXXX)"
+TMP_PARENT="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+TMP="$(mktemp -d "${TMP_PARENT%/}/startup-factory-deployment.XXXXXX")"
 cleanup() {
   if [ "${KEEP_DEPLOYMENT_TMP:-0}" = "1" ]; then
     echo "kept deployment fixture: $TMP" >&2
