@@ -56,6 +56,10 @@ TASK_STRONG_CMD=null             # Optional override for security/schema/concurr
 > two seats. Resolution for
 > other roles: explicit `null` → disabled; a set value → used; absent →
 > `TEAM_DEFAULT_CMD`.
+>
+> Deep LLM routes `track: llm` through `PROTOCOL_LLM=senior-llm-engineer`.
+> Pin that specialist with `SENIOR_LLM_ENGINEER_CMD`; its backend, product, QA,
+> architecture, and security peers follow the same concrete-role key rule.
 
 ## Coordination
 

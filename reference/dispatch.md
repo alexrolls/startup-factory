@@ -91,9 +91,11 @@ heartbeat files, then acts top to bottom:
 - **PM projection:** every non-dry pass idempotently upserts one `[progress]`
   artifact per task and one `[digest]` per feature. No agent is trusted to keep
   the human view current manually.
-- **Preset rosters:** the script resolves nine protocol lanes and any optional
-  specialists. The four review-board mappings must resolve to distinct concrete
-  roles; the launch fails closed otherwise.
+- **Preset rosters:** the script resolves nine status-owning protocol lanes,
+  any optional specialists, and explicitly mapped specialist dispatch lanes
+  such as Deep LLM's `track: llm` → `PROTOCOL_LLM`. An unmapped specialist
+  track safely falls back to `backend`. The four review-board mappings must
+  resolve to distinct concrete roles; the launch fails closed otherwise.
 - **Long features (harness):** past ~20 [tasks] the orchestrator should
   compress processed-event state between turns (its context is the loop
   state); the tracker remains the source of truth for anything dropped.

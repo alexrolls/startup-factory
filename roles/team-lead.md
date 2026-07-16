@@ -64,7 +64,9 @@ comments have no authenticated broker receipt.
    draft the [feature] description and the [task] breakdown (complete vertical
    slices; **repeat every relevant business rule inside every [task] description**.
    Add scheduler metadata to each description: `track:`, `parallel-safe:`,
-   `files:`, `resources:`, and optional `model-profile:`.
+   `files:`, `resources:`, and optional `model-profile:`. Use the preset's
+   declared tracks; the base tracks are `backend`, `frontend`, and `qa`, and a
+   specialist preset may add an explicit lane such as Deep LLM's `llm`.
 4. Send the same draft and evidence to the principal-architect and sceptical-
    architect independently. Require both planning approvals. Resolve findings
    through evidence and revision; unresolved material disagreement follows the

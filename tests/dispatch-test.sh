@@ -476,6 +476,52 @@ TEAM_RUNNER=background "$DISPATCH" feat-preset-team "$PT_FID" --once
 check "preset: concrete role pid written"   test -f .teamwork/feat-preset-team/pids/principal-software-architect.pid
 check "preset: generic protocol pid absent" test ! -f .teamwork/feat-preset-team/pids/principal-architect.pid
 
+# D3.8.1: specialist LLM track routes to the concrete Senior LLM Engineer
+cat > feat/llm-track-test.md <<'EOF'
+# LLM Track Test [Active]
+
+## 1 Evaluate retrieval behavior [Planned]
+
+**Assignee:** —
+
+track: llm
+parallel-safe: true
+files: evals/retrieval.py
+resources: eval-set:retrieval-v1
+
+> [design-note] frozen evaluation contract
+> - senior-llm-engineer
+>
+> [design-approved] approved
+> - principal-llm-architect
+>
+> [sceptical-design-approved] approved
+> - sceptical-principal-llm-architect
+EOF
+LLM_FID="feat/llm-track-test.md"
+mkdir -p .teamwork/feat-llm-track-team
+cat > .teamwork/feat-llm-track-team/preset.env <<'EOF'
+PRESET=deep-llm
+PROTOCOL_TEAM_LEAD=team-lead
+PROTOCOL_PRINCIPAL_ARCHITECT=principal-llm-architect
+PROTOCOL_SCEPTICAL_ARCHITECT=sceptical-principal-llm-architect
+PROTOCOL_SECURITY_REVIEWER=senior-llm-security-engineer
+PROTOCOL_PRODUCT_MANAGER=senior-technical-product-manager
+PROTOCOL_QA=senior-llm-qa-engineer
+PROTOCOL_INTEGRATOR=integrator
+PROTOCOL_LLM=senior-llm-engineer
+PROTOCOL_BACKEND=senior-staff-backend-engineer
+PROTOCOL_FRONTEND=senior-llm-full-stack-engineer
+EOF
+llm_track_plan="$(TEAM_RUNNER=background "$DISPATCH" feat-llm-track-team "$LLM_FID" --once --dry-run 2>&1)"
+echo "$llm_track_plan" | grep -q "claim $LLM_FID#1 for senior-llm-engineer" \
+  && echo "ok: deep-llm specialist track routes to Senior LLM Engineer" \
+  || { echo "FAIL: llm track routing wrong; plan: $llm_track_plan"; FAILURES=$((FAILURES+1)); }
+llm_fallback_plan="$(TEAM_RUNNER=background "$DISPATCH" feat-llm-fallback-team "$LLM_FID" --once --dry-run 2>&1)"
+echo "$llm_fallback_plan" | grep -q "claim $LLM_FID#1 for backend" \
+  && echo "ok: llm track without an explicit preset mapping safely falls back to backend" \
+  || { echo "FAIL: unmapped llm track did not fall back safely; plan: $llm_fallback_plan"; FAILURES=$((FAILURES+1)); }
+
 # D3.8.2+3: signer check
 cat > feat/signer-test.md <<'EOF'
 # Signer Test [Active]

@@ -349,6 +349,7 @@ def main() -> None:
     protocol_sceptical_architect = "sceptical-architect"
     protocol_security_reviewer = "senior-security-engineer"
     protocol_product_manager = None
+    specialist_dispatch_tracks: set[str] = set()
     try:
         preset_text = read_regular_at(workdir_fd, "preset.env", "team preset", 1024 * 1024)
     except FileNotFoundError:
@@ -383,6 +384,20 @@ def main() -> None:
         protocol_security_reviewer = resolved_protocol_roles["SECURITY_REVIEWER"]
         match = re.search(r"^PROTOCOL_PRODUCT_MANAGER=(.+)$", preset_text, re.M)
         protocol_product_manager = match.group(1) if match and match.group(1) != "null" else None
+        llm_matches = re.findall(r"^PROTOCOL_LLM=([^\r\n]+)$", preset_text, re.M)
+        if len(llm_matches) > 1:
+            raise RuntimeError("team preset must not duplicate PROTOCOL_LLM")
+        if llm_matches:
+            llm_role = llm_matches[0].strip()
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,79}", llm_role):
+                raise RuntimeError("team preset has an invalid PROTOCOL_LLM")
+            role_brief_exists = any(
+                os.path.isfile(os.path.join(args.skill, root, llm_role + ".md"))
+                for root in ("roles", os.path.join("teams", "roles"))
+            )
+            if not role_brief_exists:
+                raise RuntimeError("team preset PROTOCOL_LLM role has no role brief")
+            specialist_dispatch_tracks.add("llm")
 
     def blockers_terminal(task: dict) -> bool:
         blockers = [str(blocker) for blocker in (task.get("blockedBy") or [])]
@@ -739,7 +754,11 @@ def main() -> None:
             elif claims_conflict(claims, held | selected_resources):
                 constrained.append(task_id)
                 continue
-        role = data["track"] if data["track"] in {"backend", "frontend", "qa"} else "backend"
+        role = (
+            data["track"]
+            if data["track"] in {"backend", "frontend", "qa"} | specialist_dispatch_tracks
+            else "backend"
+        )
         attempt = 1
         resumed = (hold_entry(task_id) or {}).get("state") == "resumed"
         rework = (

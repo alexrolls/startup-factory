@@ -1,6 +1,6 @@
 # Preset Teams
 
-Five ready-to-launch engineering teams. Each team is a roster of specialized
+Six ready-to-launch engineering teams. Each team is a roster of specialized
 roles (`teams/roles/`) + the shared collaboration flow (`_PLAYBOOK.md`) + the
 orchestration protocol (`reference/orchestration.md`). Team files are *data*:
 the protocol's claiming, markers, statuses, and integration rules apply
@@ -13,6 +13,7 @@ unchanged — a specialized role always states which protocol role(s) it acts as
 | Deep Frontend | `deep-frontend.md` | UI architecture, complex client state, design-system work |
 | Deep Security | `deep-security.md` | Security features, hardening, threat-model-driven work on your own codebase |
 | Deep Infra | `deep-infra.md` | Cloud infrastructure, delivery pipelines, reliability and operability |
+| Deep LLM | `deep-llm.md` | LLM systems, data science, RAG, evaluation, serving, and LLM product work |
 
 Every team carries four distinct mandatory review-board agents: **Team Lead**,
 **Principal Architect**, **Sceptical Principal Architect**, and **Senior

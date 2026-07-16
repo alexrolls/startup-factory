@@ -177,7 +177,7 @@ Put initial adapter-neutral metadata in a [task] description:
 
 ```text
 automation: enabled|disabled
-team-preset: full-stack|deep-backend|deep-frontend|deep-infra|deep-security
+team-preset: full-stack|deep-backend|deep-frontend|deep-infra|deep-security|deep-llm
 ```
 
 Descriptions are baseline metadata because a tracker record's general

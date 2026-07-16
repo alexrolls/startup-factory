@@ -73,5 +73,6 @@ assert planner.metadata(
 ) == parsed
 assert parse_task_metadata("", "Browser component")["track"] == "frontend"
 assert parse_task_metadata("", "Database worker")["track"] == "backend"
+assert parse_task_metadata("track: llm", "Evaluate retrieval quality")["track"] == "llm"
 print("ALL PASS")
 PY

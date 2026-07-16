@@ -64,7 +64,7 @@ ToDo -> In Progress -> In Review -> Ready for production -> deploy -> Live
 - [Configure](#configure)
 - [Use it](#use-it)
 - [Automate the board and production delivery](#automate-the-board-and-production-delivery)
-- [The five preset teams](#the-five-preset-teams)
+- [The six preset teams](#the-six-preset-teams)
 - [How it works](#how-it-works)
 - [Documentation map](#documentation-map)
 - [Directory map](#directory-map)
@@ -434,7 +434,7 @@ Use as much of the system as your project needs:
 | **1. PM port** | One AI agent creates/tracks/completes `[features]` and `[tasks]` in any configured tracker through one tool-agnostic workflow. | `SKILL.md`, `reference/`, `adapters/` |
 | **2. Governed squad** | A lead coordinates, two independent architects gate design, specialists implement, and four distinct agents—the Team Lead, both architects, and Senior Security Engineer—must approve the exact review package before the integrator alone writes the feature branch. | `reference/orchestration.md`, `roles/` |
 | **3. Task-driven runtime** | Event-driven dispatch, bounded parallel waves, model routing, exact review packages, durable handoffs, and recoverable integration. | `bin/dispatch.sh`, `bin/runtime-state.py`, `bin/integrate-task.sh` |
-| **4. Preset teams** | Five ready-made rosters for full-stack, backend, frontend, security, and infrastructure work, all resolved through the same team launcher. | `teams/`, `bin/launch-team.sh` |
+| **4. Preset teams** | Six ready-made rosters for full-stack, backend, frontend, security, infrastructure, and LLM/data-science work, all resolved through the same team launcher. | `teams/`, `bin/launch-team.sh` |
 | **5. Portfolio automation** | One bounded cron/service pass observes generic queued/blocked statuses, bootstraps only queued feature runs, and reconciles comments, task holds, and team actions. | `bin/pm-agent.py`, `reference/automation.md` |
 | **6. Safe production delivery** | Structured provider-neutral plan/apply/status/verify hooks, hard guardrails, isolated credentials, crash recovery, and bounded rollback. | `bin/release-feature.py`, `bin/policy-check.py`, `reference/deployment.md` |
 
@@ -975,7 +975,7 @@ protected external storage before enabling it. The scheduler reads these keys:
 | `branchPrefix` | `factory-` | Prefix for generated feature branches. External IDs are hashed before use in paths or refs. |
 | `workspaceRoot` | `.teamwork/pm-agent` | Repository-relative supervisor workspace and registry root. |
 | `defaultTeamPreset` | `full-stack` | Team used when eligible metadata contains no explicit preset. |
-| `allowedTeamPresets` | all five shipped presets | Exact routing allowlist. Unknown or changed routing pauses the run. |
+| `allowedTeamPresets` | all six shipped presets | Exact routing allowlist. Unknown or changed routing pauses the run. |
 | `requireMetadataOptIn` | `false` | When `false`, every non-ignored queued task is eligible by default. Set `true` to additionally require an explicit latest `automation: enabled` marker. |
 | `metadata.optInKey` | `automation` | Adapter-neutral description/comment key for enablement. |
 | `metadata.teamPresetKey` | `team-preset` | Adapter-neutral description/comment key for specialist-team routing. |
@@ -1498,7 +1498,7 @@ those directories and rechecks their identity plus feature HEAD at apply.
 
 ---
 
-## The five preset teams
+## The six preset teams
 
 | Preset | Roster | Use when |
 |---|---|---|
@@ -1507,6 +1507,7 @@ those directories and rechecks their identity plus feature HEAD at apply.
 | `deep-frontend` | Team Lead · Principal Frontend Architect · Sceptical Architect · Senior Security Engineer · TPM · Senior Frontend Engineer · Senior QA | UI architecture, client state, design systems, a11y |
 | `deep-security` | Team Lead · Principal Security Architect · Sceptical Architect · Senior Security Engineer · TPM · Senior Security Implementation Engineer · Senior Penetration Tester · Senior QA | Security features & hardening on your own codebase |
 | `deep-infra` | Team Lead · Principal Cloud & Infrastructure Architect · Sceptical Architect · Senior Security Engineer · TPM · Senior Cloud Engineer · Senior SRE · Senior QA | Cloud infra, IaC, delivery pipelines, reliability |
+| `deep-llm` | Team Lead · Principal LLM Architect · Sceptical Principal LLM Architect · Senior LLM Security Engineer · TPM · Senior LLM Engineer · Senior Staff Backend Engineer · Senior Full Stack Engineer · Senior QA | LLM systems, data science, RAG, evaluation, inference services, and LLM product UX |
 
 Every preset launches four distinct mandatory review-board agents: **Team
 Lead**, **Principal Architect**, **Sceptical Principal Architect**, and
@@ -1626,8 +1627,8 @@ package metadata and CLI source, but not repository-only release automation.
 │   └── team-lead · principal-architect · sceptical-architect · senior-security-engineer · integrator · backend · frontend · qa · reviewer
 ├── teams/
 │   ├── README.md · _PLAYBOOK.md      how presets work + shared collaboration flow
-│   ├── full-stack.md · deep-backend.md · deep-frontend.md · deep-security.md · deep-infra.md
-│   └── roles/                        14 specialized role briefs
+│   ├── full-stack.md · deep-backend.md · deep-frontend.md · deep-security.md · deep-infra.md · deep-llm.md
+│   └── roles/                        21 specialized role briefs
 ├── bin/
 │   ├── launch-team.sh                role and task-instance launcher
 │   ├── superpowers-planning.py       Claude plugin preflight + planning handoff

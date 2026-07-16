@@ -32,7 +32,8 @@
     "deep-backend",
     "deep-frontend",
     "deep-infra",
-    "deep-security"
+    "deep-security",
+    "deep-llm"
   ],
   "requireMetadataOptIn": false,
   "metadata": {

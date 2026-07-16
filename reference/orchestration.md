@@ -62,6 +62,11 @@ add **specialized role names** (`principal-software-architect`,
 `senior-qa-engineer`, …), each acting as one or more protocol roles per the
 *Protocol mapping* line in its brief.
 
+Presets may also add a specialist **dispatch lane** without creating a new
+status-owning protocol role. Deep LLM uses `track: llm` plus
+`PROTOCOL_LLM=<concrete-role>` to route model/data-science implementation tasks;
+that concrete role still follows the standard backend implementer mechanics.
+
 The Team Lead, Principal Architect, Sceptical Principal Architect, and
 `security-reviewer` mappings are mandatory cross-functional-team invariants,
 not optional specialists. Every preset must map and roster one launchable,

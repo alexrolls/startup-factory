@@ -575,6 +575,23 @@ check "preset skips explicit-null role"      test ! -f .teamwork/test-feature/pr
 for i in $(seq 1 20); do [ -f qa-received.txt ] && break; sleep 0.1; done
 check "preset per-role override ran"         grep -q "Role: senior-qa-engineer" qa-received.txt
 
+# -- Deep LLM preset: specialized prompts and independent gates ----------------
+llm_arch_prompt="$("$LAUNCH" compose llm-compose FEAT-LLM principal-llm-architect deep-llm)"
+llm_sceptical_prompt="$("$LAUNCH" compose llm-compose FEAT-LLM sceptical-principal-llm-architect deep-llm)"
+llm_engineer_prompt="$("$LAUNCH" compose llm-compose FEAT-LLM senior-llm-engineer deep-llm)"
+llm_backend_prompt="$("$LAUNCH" compose llm-compose FEAT-LLM senior-staff-backend-engineer deep-llm)"
+llm_full_stack_prompt="$("$LAUNCH" compose llm-compose FEAT-LLM senior-llm-full-stack-engineer deep-llm)"
+llm_qa_prompt="$("$LAUNCH" compose llm-compose FEAT-LLM senior-llm-qa-engineer deep-llm)"
+llm_security_prompt="$("$LAUNCH" compose llm-compose FEAT-LLM senior-llm-security-engineer deep-llm)"
+check "deep-llm prompt includes team evidence contract" grep -q "LLM evidence contract" "$llm_arch_prompt"
+check "deep-llm principal prompt requires frozen holdout" grep -q "frozen holdout" "$llm_arch_prompt"
+check "deep-llm sceptical prompt tests no-LLM alternative" grep -q "no-LLM" "$llm_sceptical_prompt"
+check "deep-llm engineer prompt enforces split discipline" grep -q "frozen holdout" "$llm_engineer_prompt"
+check "deep-llm backend prompt covers inference gateway" grep -q "inference gateway" "$llm_backend_prompt"
+check "deep-llm full-stack prompt covers streaming state" grep -q "streaming as a state machine" "$llm_full_stack_prompt"
+check "deep-llm QA prompt rejects sole LLM judge" grep -q "never the sole oracle" "$llm_qa_prompt"
+check "deep-llm security prompt covers prompt injection" grep -q "prompt injection" "$llm_security_prompt"
+
 # -- compose: emits the composed startup prompt without spawning (harness mode) --
 out="$("$LAUNCH" compose test-compose FEAT-3 backend)"
 check "compose prints an existing prompt path" test -f "$out"
