@@ -56,38 +56,42 @@ comments have no authenticated broker receipt.
 ## Phase 1 — Plan and launch
 
 1. Run the Mandatory Preparation from `SKILL.md` (config, adapter, port files).
-2. Execute Scenario 1 up to — but not including — creating anything in the tracker:
+2. If `<TEAMWORK_ROOT>/<team>/planning/superpowers-handoff.json` exists,
+   validate it with `bin/superpowers-planning.py`, then read the exact bound
+   specification and plan. Use them as planning evidence; do not invoke
+   Superpowers execution, worktree, subagent, or branch-finishing skills.
+3. Execute Scenario 1 up to — but not including — creating anything in the tracker:
    draft the [feature] description and the [task] breakdown (complete vertical
    slices; **repeat every relevant business rule inside every [task] description**.
    Add scheduler metadata to each description: `track:`, `parallel-safe:`,
    `files:`, `resources:`, and optional `model-profile:`.
-3. Send the same draft and evidence to the principal-architect and sceptical-
+4. Send the same draft and evidence to the principal-architect and sceptical-
    architect independently. Require both planning approvals. Resolve findings
    through evidence and revision; unresolved material disagreement follows the
    conflict-aware escalation rule above. Only then create the [feature] and
    [tasks] via the adapter, all `[Planned]`.
-4. **Record the baseline.** At feature-branch creation, write
+5. **Record the baseline.** At feature-branch creation, write
    `<TEAMWORK_ROOT>/<team>/BASELINE.md` (protocol: *Baseline manifest*): test
    counts, known failures with cause, available validation commands. Point
    briefs and assignments at it instead of restating branch lore in messages.
-5. Compose the gate roster. Implementers are fresh task instances launched by
+6. Compose the gate roster. Implementers are fresh task instances launched by
    the dispatcher; Team Lead, Principal Architect, Sceptical Architect, Senior
    Security Engineer, optional reviewer/QA specialists, and integrator remain
    batched queue consumers.
-6. Launch: `bin/launch-team.sh start <team> <featureId> <role>...` (or spawn each
+7. Launch: `bin/launch-team.sh start <team> <featureId> <role>...` (or spawn each
    role natively in your harness from a `compose`d prompt — see
    `reference/orchestration.md` → *Harness mode*).
-7. **Let machinery claim.** `dispatch.sh` owns the claim lock, concurrency cap,
+8. **Let machinery claim.** `dispatch.sh` owns the claim lock, concurrency cap,
    dependency checks, resource collision checks, task packet, worktree, and
    fresh worker launch. You handle only tasks it reports as missing a design
    gate, unsafe to parallelize, anomalous, or blocked.
-8. `EXECUTION=sequential` means one task worker at a time. `parallel` means a
+9. `EXECUTION=sequential` means one task worker at a time. `parallel` means a
    bounded ready wave; null `MAX_ACTIVE_IMPLEMENTERS` defaults conservatively
    to two. Both modes use task branches and worktrees, so review/integration can
    overlap without contaminating the feature checkout.
-9. Rework on an older task outranks new claims. Use the existing freeze protocol
+10. Rework on an older task outranks new claims. Use the existing freeze protocol
    when a later active task consumes its contracts or resources.
-10. **Keep the design gate ahead of the dispatch (any mode).** Settled plan →
+11. **Keep the design gate ahead of the dispatch (any mode).** Settled plan →
     the pre-flight design pass (lifecycle Scenario 10) is the default opener:
     every gate is open before implementation starts. Emergent plan → rolling
     look-ahead: when dispatching [task] N, trigger N+1's `[design-note]` so

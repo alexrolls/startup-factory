@@ -36,6 +36,7 @@
     "adapters/_TEMPLATE.md",
     "bin/dispatch.sh",
     "bin/launch-team.sh",
+    "bin/superpowers-planning.py",
     "bin/pm-agent.py",
     "bin/policy-check.py",
     "bin/release-feature.py",
@@ -43,6 +44,7 @@
     "bin/tracker-ops.sh",
     "bin/update-installed-skill.sh",
     "config/project-management.config.md",
+    "config/planning.config.md",
     "config/team.config.md",
     "config/statuses.config.json",
     "config/automation.config.json",
@@ -52,6 +54,7 @@
     "reference/automation.md",
     "reference/deployment.md",
     "reference/guardrails.md",
+    "reference/superpowers-planning.md",
     "roles/team-lead.md",
     "teams/_PLAYBOOK.md",
     "tests/run-all.sh"
@@ -60,6 +63,7 @@
     "version": 1,
     "preservedConfigFiles": [
       "config/project-management.config.md",
+      "config/planning.config.md",
       "config/team.config.md",
       "config/statuses.config.json",
       "config/automation.config.json",

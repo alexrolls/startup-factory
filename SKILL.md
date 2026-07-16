@@ -11,6 +11,8 @@ the operational front door; the details live in sibling files (paths are relativ
 skill's directory):
 
 - `config/project-management.config.md` — selects the active tool + settings
+- `config/planning.config.md` + `reference/superpowers-planning.md` +
+  `bin/superpowers-planning.py` — optional Claude/Superpowers planning intake
 - `reference/vocabulary.md` — the generic contract (terms, statuses, IDs, banned words)
 - `reference/lifecycle.md` — the numbered scenarios you execute
 - `reference/team-roles.md` — status ownership (only if `TEAM_MODE=true`)
@@ -73,8 +75,8 @@ preparation:
    If this skill is installed somewhere else, run the same script with
    `--install-dir <path-to-installed-skill>`.
 3. Keep the default config-preserving behavior unless the user explicitly asks to
-   replace project config. Existing project-management, team, statuses, automation,
-   deployment, and guardrails config files under `config/` are preserved, as are
+   replace project config. Existing project-management, planning, team, statuses,
+   automation, deployment, and guardrails config files under `config/` are preserved, as are
    project-owned files under the documented `adapters/`, `extensions/`, and
    `teams/` extension points. An installed ownership manifest distinguishes
    custom files from retired upstream files. The updater validates the source
@@ -88,9 +90,10 @@ preparation:
 
 ## Mandatory Preparation (every invocation)
 
-1. **Read the config** (`config/project-management.config.md`). Note
+1. **Read the configs** (`config/project-management.config.md` and
+   `config/planning.config.md`). Note
    `PRODUCT_MANAGEMENT_TOOL`, the per-tool settings block, and the flags `TEAM_MODE` /
-   `STRICT_STATUS`.
+   `STRICT_STATUS` / `USE_SUPERPOWERS`.
 2. **Load the adapter** for that tool: `adapters/<PRODUCT_MANAGEMENT_TOOL>.md`. This is
    your only source for concrete operations, terminology, status, and ID mappings. If the
    file doesn't exist, stop and tell the user to create it from `adapters/_TEMPLATE.md`.
@@ -99,7 +102,15 @@ preparation:
    For autonomous monitoring or production delivery, also read
    `reference/automation.md`, `reference/guardrails.md`, and
    `reference/deployment.md` before enabling anything.
-4. **Initialize the tool** — steps depend on your execution mode:
+4. **Select the planning intake.** For Scenario 1 or 10, when
+   `USE_SUPERPOWERS=true` and the current runtime is Claude Code, read
+   `reference/superpowers-planning.md`, run its plugin preflight, and use
+   `superpowers:brainstorming` plus `superpowers:writing-plans` to produce the
+   approved specification and plan. Then create the digest-bound handoff and
+   continue with Startup Factory's own team. When disabled or running in another
+   runtime, use the native lifecycle. Never hand execution, worktrees, dispatch,
+   review, integration, or release to Superpowers.
+5. **Initialize the tool** — steps depend on your execution mode:
    - **Single-agent** (`TEAM_MODE` unset or false): run the adapter's *Initialization*
      section probe (a cheap read proving access works). If it fails, stop and tell the
      user to fix the *MCP / CLI Setup* — do not proceed.

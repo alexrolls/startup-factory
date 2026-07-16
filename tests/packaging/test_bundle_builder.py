@@ -27,6 +27,7 @@ MODULE_SPEC.loader.exec_module(builder)
 
 PRESERVED_CONFIGS = [
     "config/project-management.config.md",
+    "config/planning.config.md",
     "config/team.config.md",
     "config/statuses.config.json",
     "config/automation.config.json",

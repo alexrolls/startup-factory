@@ -38,7 +38,10 @@ is context, not a trigger.
 
 1. **Intake.** The TPM turns the ask into a [feature] draft: problem statement,
    scope, explicit NOT-in-scope, dependencies, and per-[task] **acceptance
-   criteria** — testable, implementation-free statements.
+   criteria** — testable, implementation-free statements. When a validated
+   Claude/Superpowers planning handoff exists, the TPM and architects read its
+   exact specification and plan as intake evidence. The handoff does not approve
+   scope or authorize execution.
 2. **Planning.** The architect breaks the [feature] into [tasks] (complete
    vertical slices) with the TPM. The TPM must approve scope and acceptance
    criteria **before anything is created in the tracker** — the architect cannot
@@ -46,7 +49,8 @@ is context, not a trigger.
    sign-off is a `[product-approval]` comment (or `[product-pushback]` with the
    required changes) once the [tasks] exist to carry it. Before creation, the
    sceptical-architect independently challenges the plan and both architects
-   must approve it.
+   must approve it. Startup Factory launches and owns the team after this point;
+   no Superpowers execution/worktree/subagent workflow runs alongside it.
 3. **Design gate — every [task].** The implementer posts a `[design-note]` that
    registers its exports in the contract registry
    (`reference/orchestration.md` → *Contract registry*); the principal architect

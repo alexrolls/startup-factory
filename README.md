@@ -389,6 +389,7 @@ release introduces a file at a project-owned extension path, the update fails
 before mutation instead of overwriting it:
 
 - `config/project-management.config.md`
+- `config/planning.config.md`
 - `config/team.config.md`
 - `config/statuses.config.json`
 - `config/automation.config.json`
@@ -418,7 +419,7 @@ installation into a partial one. Its main operator options are:
 | `--project PATH` | Resolve the agent directory relative to another project. |
 | `--install-dir PATH` | Override the mapped installation directory. |
 | `--bundle PATH` | For install/update, use an explicitly supplied local canonical archive. |
-| `--overwrite-config` | For install/update, replace all six preserved project configuration files. |
+| `--overwrite-config` | For install/update, replace all seven preserved project configuration files. |
 | `--dry-run` | For install/update, print the plan without writing the destination or lock. |
 | `--json` | Emit machine-readable output for operator automation. |
 
@@ -477,6 +478,23 @@ task-branch/worktree isolation: **`sequential`** runs one task worker at a time;
 `MAX_ACTIVE_IMPLEMENTERS` (default 2 when unset). Gate roles and integration
 remain serialized where required.
 
+### Optional Claude planning with obra/superpowers
+
+`config/planning.config.md` defaults `USE_SUPERPOWERS=true`. This means Claude
+Code is eligible to use Superpowers; it does not activate Superpowers for every
+model. When the current runtime is Claude Code, Startup Factory uses
+[`obra/superpowers`](https://github.com/obra/superpowers) for
+`brainstorming` and `writing-plans`, then binds the committed specification and
+plan into a digest-checked handoff. Startup Factory still owns its own planning
+review, team, task packets, worktrees, dispatch, implementation, four-party
+review, integration, and production release.
+
+Set `USE_SUPERPOWERS=false` for a complete opt-out. Non-Claude runtimes use the
+native workflow automatically and do not receive the Superpowers planning
+reference or Claude worker-method instructions. The integration deliberately
+does not call Superpowers' worktree, subagent execution, plan execution, or
+branch-finishing skills, avoiding two execution orchestrators on one [feature].
+
 ---
 
 ## Connect your LLM
@@ -518,6 +536,13 @@ Command templates for common CLIs:
 | Gemini CLI | `gemini --yolo "$(cat '{prompt_file}')"` |
 | Any file-reading CLI | `yourcli --prompt-file {prompt_file}` |
 
+Direct `claude` commands are detected automatically. If Claude is behind a
+wrapper, mark only that command template so mixed-model teams remain precise:
+
+```bash
+FRONTEND_CMD="STARTUP_FACTORY_LLM_RUNTIME=claude /path/to/claude-wrapper {prompt_file}"
+```
+
 **Mixing LLMs is the design intent** — e.g. Claude to lead and own the primary
 architecture position, Codex to challenge it independently and implement, and
 Gemini to review. Use different model families for the two architects when
@@ -537,6 +562,16 @@ tool), skip the command map entirely: compose each role's startup prompt with
 role natively with it. Harness messages replace mailboxes, harness idle
 notifications replace heartbeats, and the tracker stays the source of truth —
 see `reference/orchestration.md` → *Harness mode*.
+
+When the harness runtime is Claude Code, declare it while composing so the
+default-on Superpowers integration is included:
+
+```bash
+STARTUP_FACTORY_LLM_RUNTIME=claude \
+  bin/launch-team.sh compose <team> <featureId> <role> [preset]
+```
+
+Omit the variable for Codex, Gemini, and other runtimes.
 
 **Command resolution per role:** explicit `<ROLE>_CMD` value → used; `<ROLE>_CMD=null`
 → role disabled; **absent** → falls back to `TEAM_DEFAULT_CMD`. That fallback is
@@ -587,7 +622,7 @@ by name. A new tool also needs its adapter contract and deterministic
 
 ## Configure
 
-Core team operation uses two files. Autonomous operation adds three fail-closed
+Core operation uses three files. Autonomous operation adds three fail-closed
 JSON templates. Project policy stays versioned; an enabled deployment config is
 instead copied to operator-protected storage outside agent mounts.
 
@@ -601,6 +636,22 @@ instead copied to operator-protected storage outside agent mounts.
 | `STRICT_STATUS` | `true` = refuse an action if a `[task]` isn't in the expected status (the "andon cord") | `true` |
 
 > Set **`TEAM_MODE=true`** before running a team.
+
+### `config/planning.config.md` — optional Claude planning intake
+
+| Key | Meaning | Default |
+|---|---|---|
+| `USE_SUPERPOWERS` | Make Claude Code eligible for `obra/superpowers` brainstorming and plan-writing; non-Claude runtimes stay native | `true` |
+| `SUPERPOWERS_PLUGIN_ID` | Required Claude Code plugin id checked by the planning preflight | `superpowers@claude-plugins-official` |
+| `SUPERPOWERS_SPEC_ROOT` | Repository-relative root for approved specifications | `docs/superpowers/specs` |
+| `SUPERPOWERS_PLAN_ROOT` | Repository-relative root for approved implementation plans | `docs/superpowers/plans` |
+
+Run `python3 bin/superpowers-planning.py preflight --runtime claude` before the
+Claude planning stages, then
+`bin/launch-team.sh planning-handoff <team> <spec-path> <plan-path>` before
+launching the Startup Factory team. Set `USE_SUPERPOWERS=false` to remove all
+Superpowers-specific prompt wiring. With the default `true`, only commands
+classified as Claude receive that wiring.
 
 ### Configure your board
 
@@ -855,6 +906,7 @@ Just talk to your agent in the generic vocabulary:
 |---|---|
 | `team <preset> <team> <featureId>` | Launch a whole preset roster |
 | `gate-team <preset> <team> <featureId>` | Launch only persistent supervision/review/integration gates; automation uses this and starts implementers per task |
+| `planning-handoff <team> <spec-path> <plan-path>` | Bind committed Claude/Superpowers specification and plan inputs to this Startup Factory team |
 | `preflight <team> <featureId>` | Verify adapter access, workspace writability, and UTC pin — run once before any CLI team launch |
 | `start <team> <featureId> <role>…` | Launch specific roles (custom teams) |
 | `relaunch <team> <featureId> <role> [preset]` | Restart one crashed/wedged agent |
@@ -1293,6 +1345,7 @@ package metadata and CLI source, but not repository-only release automation.
 ├── .github/workflows/                release repository only: package/release CI
 ├── config/
 │   ├── project-management.config.md  ← EDIT: pick tracker, TEAM_MODE, STRICT_STATUS
+│   ├── planning.config.md            ← EDIT: Claude/Superpowers planning on/off
 │   ├── team.config.md                ← EDIT (teams): role→CLI, timings, VALIDATE_*
 │   └── statuses · automation · deployment · guardrails configs
 ├── reference/
@@ -1300,7 +1353,7 @@ package metadata and CLI source, but not repository-only release automation.
 │   ├── lifecycle.md                  the scenarios: plan → work → review → complete
 │   ├── team-roles.md                 status ownership across roles
 │   ├── orchestration.md              the multi-agent protocol
-│   └── automation · deployment · guardrails
+│   └── superpowers-planning · automation · deployment · guardrails
 ├── adapters/
 │   ├── Markdown.md · Linear.md · Jira.md · GitHubIssues.md
 │   └── _TEMPLATE.md                  scaffold for a new tracker
@@ -1313,6 +1366,7 @@ package metadata and CLI source, but not repository-only release automation.
 │   └── roles/                        14 specialized role briefs
 ├── bin/
 │   ├── launch-team.sh                role and task-instance launcher
+│   ├── superpowers-planning.py       Claude plugin preflight + planning handoff
 │   ├── process-lifecycle.py          authenticated external process/tmux authority
 │   ├── update-installed-skill.sh     legacy/source compatibility updater
 │   ├── dispatch.sh · dispatch-plan.py deterministic bounded scheduler

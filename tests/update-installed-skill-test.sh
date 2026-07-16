@@ -46,6 +46,7 @@ for required_file in \
   adapters/_TEMPLATE.md \
   bin/dispatch.sh \
   bin/launch-team.sh \
+  bin/superpowers-planning.py \
   bin/pm-agent.py \
   bin/policy-check.py \
   bin/release-feature.py \
@@ -55,6 +56,7 @@ for required_file in \
   reference/automation.md \
   reference/deployment.md \
   reference/guardrails.md \
+  reference/superpowers-planning.md \
   roles/senior-security-engineer.md \
   roles/team-lead.md \
   teams/_PLAYBOOK.md
@@ -67,6 +69,7 @@ done
 
 CONFIG_FILES=(
   project-management.config.md
+  planning.config.md
   team.config.md
   statuses.config.json
   automation.config.json
@@ -112,7 +115,7 @@ printf 'custom-backend\n' > "$INSTALL/extensions/tracker-backends/Acme.py"
 printf 'custom-team\n' > "$INSTALL/teams/acme.md"
 printf 'custom-role\n' > "$INSTALL/teams/roles/acme-specialist.md"
 printf 'custom-command\n' > "$INSTALL/teams/commands/acme-command.md"
-for name in project-management.config.md team.config.md statuses.config.json deployment.config.json guardrails.config.json; do
+for name in project-management.config.md planning.config.md team.config.md statuses.config.json deployment.config.json guardrails.config.json; do
   printf 'project-owned:%s\n' "$name" > "$INSTALL/config/$name"
 done
 
@@ -131,7 +134,7 @@ check "custom team survives synchronization" grep -qx 'custom-team' "$INSTALL/te
 check "custom team role survives synchronization" grep -qx 'custom-role' "$INSTALL/teams/roles/acme-specialist.md"
 check "custom team command survives synchronization" grep -qx 'custom-command' "$INSTALL/teams/commands/acme-command.md"
 
-for name in project-management.config.md team.config.md statuses.config.json deployment.config.json guardrails.config.json; do
+for name in project-management.config.md planning.config.md team.config.md statuses.config.json deployment.config.json guardrails.config.json; do
   check "existing $name is preserved" \
     grep -qx "project-owned:$name" "$INSTALL/config/$name"
 done

@@ -22,6 +22,7 @@ from startup_factory_cli import cli, installer  # noqa: E402
 
 CONFIG_PATHS = (
     "config/project-management.config.md",
+    "config/planning.config.md",
     "config/team.config.md",
     "config/statuses.config.json",
     "config/automation.config.json",
@@ -196,6 +197,7 @@ class CliInstallerTest(unittest.TestCase):
         self.assertRegex(provenance["archiveSha256"], r"^[0-9a-f]{64}$")
         owned = set((target / ".startup-factory-owned-files").read_text().splitlines())
         self.assertIn("config/automation.config.json", owned)
+        self.assertIn("config/planning.config.md", owned)
 
         (target / "config/automation.config.json").write_text("project-owned\n")
         code, output, error = run_cli(
@@ -210,6 +212,7 @@ class CliInstallerTest(unittest.TestCase):
         verified = json.loads(output)
         self.assertEqual(verified["action"], "verify")
         self.assertIn("config/automation.config.json", verified["preservedConfigs"])
+        self.assertIn("config/planning.config.md", verified["preservedConfigs"])
 
         (target / "bin/runtime.sh").write_text("tampered\n")
         code, _, error = run_cli(

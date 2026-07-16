@@ -51,7 +51,7 @@ def _mutation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--overwrite-config",
         action="store_true",
-        help="replace the six project configuration files with bundled defaults",
+        help="replace the seven project configuration files with bundled defaults",
     )
 
 

@@ -25,6 +25,7 @@ DEFAULT_SPEC_PATH = "packaging/bundle-spec.json"
 REGULAR_GIT_MODES = {"100644": 0o644, "100755": 0o755}
 EXPECTED_PRESERVED_CONFIGS = {
     "config/project-management.config.md",
+    "config/planning.config.md",
     "config/team.config.md",
     "config/statuses.config.json",
     "config/automation.config.json",
@@ -254,7 +255,7 @@ def _load_spec(repo: Path, entries: dict[str, GitEntry], spec_path: str) -> dict
         preservation["preservedConfigFiles"], label="preservedConfigFiles"
     )
     if set(preserved_configs) != EXPECTED_PRESERVED_CONFIGS:
-        raise BundleError("preservedConfigFiles must contain the six supported project configs")
+        raise BundleError("preservedConfigFiles must contain the seven supported project configs")
     extension_roots = _string_list(preservation["extensionRoots"], label="extensionRoots")
     if not extension_roots:
         raise BundleError("extensionRoots must not be empty")

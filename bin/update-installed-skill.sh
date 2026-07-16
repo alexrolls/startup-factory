@@ -187,6 +187,7 @@ for required_file in \
   adapters/_TEMPLATE.md \
   bin/dispatch.sh \
   bin/launch-team.sh \
+  bin/superpowers-planning.py \
   bin/pm-agent.py \
   bin/policy-check.py \
   bin/release-feature.py \
@@ -194,6 +195,7 @@ for required_file in \
   bin/tracker-ops.sh \
   bin/update-installed-skill.sh \
   config/project-management.config.md \
+  config/planning.config.md \
   config/team.config.md \
   config/statuses.config.json \
   config/automation.config.json \
@@ -203,6 +205,7 @@ for required_file in \
   reference/automation.md \
   reference/deployment.md \
   reference/guardrails.md \
+  reference/superpowers-planning.md \
   roles/senior-security-engineer.md \
   roles/team-lead.md \
   teams/_PLAYBOOK.md
@@ -232,6 +235,7 @@ rsync_args=(-a --checksum --delete --exclude .git --exclude "/$OWNERSHIP_MANIFES
 if ! $overwrite_config; then
   for file in \
     config/project-management.config.md \
+    config/planning.config.md \
     config/team.config.md \
     config/statuses.config.json \
     config/automation.config.json \

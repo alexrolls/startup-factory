@@ -38,13 +38,15 @@ python3 "$SKILL_DIR/bin/process-lifecycle.py" init --root "$PROTECTED_FORGERY_RO
 export STARTUP_FACTORY_LIFECYCLE_STATE_ROOT="$LIFECYCLE_ROOT"
 mkdir -p .agent-squad/{bin,config,roles,reference} feat
 cp "$SKILL_DIR"/bin/*.sh "$SKILL_DIR"/bin/*.py .agent-squad/bin/
-cp "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/config/automation.config.json" .agent-squad/config/
+cp "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/config/automation.config.json" \
+  "$SKILL_DIR/config/planning.config.md" .agent-squad/config/
 cp "$SKILL_DIR/roles/backend.md" "$SKILL_DIR/roles/reviewer.md" \
   "$SKILL_DIR/roles/sceptical-architect.md" "$SKILL_DIR/roles/team-lead.md" \
   "$SKILL_DIR/roles/senior-security-engineer.md" .agent-squad/roles/
 cp "$SKILL_DIR/teams/roles/principal-software-architect.md" \
   "$SKILL_DIR/teams/roles/senior-technical-product-manager.md" .agent-squad/roles/
-cp "$SKILL_DIR/reference/guardrails.md" "$SKILL_DIR/reference/orchestration.md" .agent-squad/reference/
+cp "$SKILL_DIR/reference/guardrails.md" "$SKILL_DIR/reference/orchestration.md" \
+  "$SKILL_DIR/reference/superpowers-planning.md" .agent-squad/reference/
 cat > .agent-squad/config/project-management.config.md <<'EOF'
 ```
 PRODUCT_MANAGEMENT_TOOL=Markdown
@@ -183,6 +185,25 @@ check "task branch is generation/team namespaced" test "$(git -C "$wt" branch --
 prompt="$($LAUNCH compose-task feature-runtime "$FID" backend "$TID" 1)"
 check "lean task prompt exists" test -f "$prompt"
 check "lean prompt points to task packet" grep -q 'Task packet:' "$prompt"
+check "non-Claude task command is classified as other" grep -q 'LLM runtime family: other' "$prompt"
+if grep -q 'Claude Superpowers task method' "$prompt"; then
+  echo "FAIL: non-Claude task prompt received Superpowers worker methods"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: non-Claude task prompt excludes Superpowers worker methods"
+fi
+claude_prompt="$(STARTUP_FACTORY_LLM_RUNTIME=claude "$LAUNCH" compose-task feature-runtime "$FID" backend "$TID" 1)"
+check "Claude task harness receives Superpowers worker methods" \
+  grep -q 'Claude Superpowers task method' "$claude_prompt"
+PLANNING_CFG=.agent-squad/config/planning.config.md
+sed_i 's/^USE_SUPERPOWERS=true$/USE_SUPERPOWERS=false/' "$PLANNING_CFG"
+disabled_claude_prompt="$(STARTUP_FACTORY_LLM_RUNTIME=claude "$LAUNCH" compose-task feature-runtime "$FID" backend "$TID" 1)"
+if grep -q 'Claude Superpowers task method' "$disabled_claude_prompt"; then
+  echo "FAIL: disabled planning left Claude task worker methods enabled"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: disabled planning removes Claude task worker methods"
+fi
+sed_i 's/^USE_SUPERPOWERS=false$/USE_SUPERPOWERS=true/' "$PLANNING_CFG"
+"$LAUNCH" compose-task feature-runtime "$FID" backend "$TID" 1 >/dev/null
 if grep -q 'The Multi-Agent Protocol' "$prompt"; then
   echo "FAIL: lean prompt inlined full protocol"; FAILURES=$((FAILURES+1))
 else
@@ -202,9 +223,30 @@ printf '[handoff]\nThis arrives after packet creation.\n' | "$OPS" comment "$TID
 "$LAUNCH" compose-task feature-runtime "$FID" backend "$TID" 1 >/dev/null
 check "same attempt reuses immutable packet" test "$(cksum "$packet_md")" = "$packet_checksum"
 
+cat > "$TMP/claude" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cp "$1" claude-task-prompt.txt
+EOF
+chmod +x "$TMP/claude"
+sed_i "s|^TASK_FAST_CMD=.*|TASK_FAST_CMD=\"$TMP/claude {prompt_file}\"|" "$CFG"
+TEAM_RUNNER=background "$LAUNCH" start-task feature-runtime "$FID" backend "$TID" 1
+for _i in $(seq 1 30); do [ -f "$wt/claude-task-prompt.txt" ] && break; sleep 0.1; done
+check "direct Claude task command is classified as Claude" \
+  grep -q 'LLM runtime family: claude' "$wt/claude-task-prompt.txt"
+check "direct Claude task command receives Superpowers worker methods" \
+  grep -q 'Claude Superpowers task method' "$wt/claude-task-prompt.txt"
+rm -f "$wt/claude-task-prompt.txt"
+sed_i 's|^TASK_FAST_CMD=.*|TASK_FAST_CMD="cat {prompt_file} > task-fast-prompt.txt"|' "$CFG"
+
 TEAM_RUNNER=background "$LAUNCH" start-task feature-runtime "$FID" backend "$TID" 1
 for _i in $(seq 1 30); do [ -f "$wt/task-fast-prompt.txt" ] && break; sleep 0.1; done
 check "task-specific model command ran" test -f "$wt/task-fast-prompt.txt"
+if grep -q 'Claude Superpowers task method' "$wt/task-fast-prompt.txt"; then
+  echo "FAIL: non-Claude launched task received Superpowers worker methods"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: non-Claude launched task excludes Superpowers worker methods"
+fi
 check "task pid uses task instance directory" test -d .teamwork/feature-runtime/pids/tasks
 
 "$OPS" claim "$TID" backend >/dev/null

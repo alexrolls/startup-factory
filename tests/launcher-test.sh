@@ -50,7 +50,7 @@ git checkout -q -b test-feature
 mkdir -p .claude/skills/pm
 cp -R "$SKILL_DIR/roles" "$SKILL_DIR/reference" "$SKILL_DIR/bin" "$SKILL_DIR/teams" .claude/skills/pm/
 mkdir -p .claude/skills/pm/config
-cp "$SKILL_DIR/config/statuses.config.json" .claude/skills/pm/config/
+cp "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/config/planning.config.md" .claude/skills/pm/config/
 cat > .claude/skills/pm/config/team.config.md <<'EOF'
 ```
 TEAM_LEAD_CMD="true"
@@ -144,6 +144,12 @@ check "prompt contains protocol"    grep -q "Orchestration — The Multi-Agent P
 check "prompt contains safety policy" grep -q "Autonomous safety guardrails" .teamwork/test-feature/prompts/backend.md
 check "prompt contains featureId"   grep -q "FEAT-1" .teamwork/test-feature/prompts/backend.md
 check "prompt contains team config" grep -q "POLL_INTERVAL_SECONDS" .teamwork/test-feature/prompts/backend.md
+check "non-Claude command is classified as other" grep -q "LLM runtime family: other" .teamwork/test-feature/prompts/backend.md
+if grep -q "Claude + obra/superpowers planning" .teamwork/test-feature/prompts/backend.md; then
+  echo "FAIL: non-Claude command received Superpowers planning instructions"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: non-Claude command excludes Superpowers planning instructions"
+fi
 check "pid file written"            test -f .teamwork/test-feature/pids/backend.pid
 check "workspace process marker contains no PID" grep -qx managed .teamwork/test-feature/pids/backend.pid
 for i in $(seq 1 20); do
@@ -153,6 +159,127 @@ done
 check "enforced gate launch uses protected runner argv" grep -Fq "$PWD|/usr/bin/env|-i" "$SANDBOX_RUNNER_LOG"
 check "stub agent ran with prompt"  grep -q "Role: backend" backend-received.txt
 check "mailbox dir created"         test -d .teamwork/test-feature/mailbox/backend
+
+# -- Superpowers prompt wiring is Claude-only --------------------------------
+cat > claude <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > codex <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > gemini <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > custom-wrapper <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x claude codex gemini custom-wrapper
+
+sed_i 's|^FRONTEND_CMD=.*|FRONTEND_CMD="./claude {prompt_file}"|' "$CFG_SANDBOX"
+unmarked_harness_prompt="$("$LAUNCH" compose native-harness FEAT-NATIVE-HARNESS frontend)"
+check "unmarked harness defaults to non-Claude" grep -q "LLM runtime family: other" "$unmarked_harness_prompt"
+if grep -q "Claude + obra/superpowers planning" "$unmarked_harness_prompt"; then
+  echo "FAIL: unmarked harness inferred Claude from the unused command map"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: unmarked harness excludes Superpowers despite a Claude CLI command"
+fi
+
+sed_i 's|^FRONTEND_CMD=.*|FRONTEND_CMD="./codex {prompt_file}"|' "$CFG_SANDBOX"
+TEAM_RUNNER=background "$LAUNCH" start codex-planning FEAT-CODEX frontend
+codex_prompt=.teamwork/codex-planning/prompts/frontend.md
+check "Codex CLI command is classified as non-Claude" grep -q "LLM runtime family: other" "$codex_prompt"
+if grep -q "Claude + obra/superpowers planning" "$codex_prompt"; then
+  echo "FAIL: Codex CLI command received Superpowers planning instructions"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: Codex CLI command excludes Superpowers planning instructions"
+fi
+
+sed_i 's|^FRONTEND_CMD=.*|FRONTEND_CMD="./gemini {prompt_file}"|' "$CFG_SANDBOX"
+TEAM_RUNNER=background "$LAUNCH" start gemini-planning FEAT-GEMINI frontend
+gemini_prompt=.teamwork/gemini-planning/prompts/frontend.md
+check "Gemini CLI command is classified as non-Claude" grep -q "LLM runtime family: other" "$gemini_prompt"
+if grep -q "Claude + obra/superpowers planning" "$gemini_prompt"; then
+  echo "FAIL: Gemini CLI command received Superpowers planning instructions"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: Gemini CLI command excludes Superpowers planning instructions"
+fi
+
+sed_i 's|^FRONTEND_CMD=.*|FRONTEND_CMD="./custom-wrapper {prompt_file}"|' "$CFG_SANDBOX"
+TEAM_RUNNER=background "$LAUNCH" start unmarked-wrapper FEAT-UNMARKED frontend
+unmarked_wrapper_prompt=.teamwork/unmarked-wrapper/prompts/frontend.md
+check "unmarked wrapper is classified as non-Claude" grep -q "LLM runtime family: other" "$unmarked_wrapper_prompt"
+if grep -q "Claude + obra/superpowers planning" "$unmarked_wrapper_prompt"; then
+  echo "FAIL: unmarked wrapper received Superpowers planning instructions"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: unmarked wrapper excludes Superpowers planning instructions"
+fi
+
+sed_i 's|^FRONTEND_CMD=.*|FRONTEND_CMD="./claude {prompt_file}"|' "$CFG_SANDBOX"
+TEAM_RUNNER=background "$LAUNCH" start claude-planning FEAT-CLAUDE frontend
+claude_prompt=.teamwork/claude-planning/prompts/frontend.md
+check "direct Claude command is classified as Claude" grep -q "LLM runtime family: claude" "$claude_prompt"
+check "direct Claude command receives Superpowers planning boundary" \
+  grep -q "Claude + obra/superpowers planning" "$claude_prompt"
+
+sed_i 's|^FRONTEND_CMD=.*|FRONTEND_CMD="STARTUP_FACTORY_LLM_RUNTIME=claude ./custom-wrapper {prompt_file}"|' "$CFG_SANDBOX"
+TEAM_RUNNER=background "$LAUNCH" start wrapper-planning FEAT-WRAPPER frontend
+wrapper_prompt=.teamwork/wrapper-planning/prompts/frontend.md
+check "explicit Claude wrapper marker is classified as Claude" grep -q "LLM runtime family: claude" "$wrapper_prompt"
+check "explicit Claude wrapper receives Superpowers planning boundary" \
+  grep -q "Claude + obra/superpowers planning" "$wrapper_prompt"
+sed_i 's|^FRONTEND_CMD=.*|FRONTEND_CMD=null|' "$CFG_SANDBOX"
+
+harness_prompt="$(STARTUP_FACTORY_LLM_RUNTIME=claude "$LAUNCH" compose harness-planning FEAT-HARNESS reviewer)"
+check "Claude harness override is classified as Claude" grep -q "LLM runtime family: claude" "$harness_prompt"
+check "Claude harness override receives Superpowers planning boundary" \
+  grep -q "Claude + obra/superpowers planning" "$harness_prompt"
+if STARTUP_FACTORY_LLM_RUNTIME=gemini "$LAUNCH" compose invalid-runtime FEAT-INVALID reviewer >/dev/null 2>&1; then
+  echo "FAIL: invalid harness runtime override accepted"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: invalid harness runtime override refused"
+fi
+
+# -- global planning opt-out removes all Superpowers prompt wiring -------------
+PLANNING_CFG=.claude/skills/pm/config/planning.config.md
+sed_i 's/^USE_SUPERPOWERS=true$/USE_SUPERPOWERS=false/' "$PLANNING_CFG"
+native_prompt="$(STARTUP_FACTORY_LLM_RUNTIME=claude "$LAUNCH" compose native-planning FEAT-NATIVE backend)"
+if grep -q "Claude + obra/superpowers planning\\|Claude Superpowers task method" "$native_prompt"; then
+  echo "FAIL: USE_SUPERPOWERS=false left Superpowers prompt wiring"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: USE_SUPERPOWERS=false removes Superpowers prompt wiring"
+fi
+if "$LAUNCH" planning-handoff native-planning docs/superpowers/specs/missing.md docs/superpowers/plans/missing.md >/dev/null 2>&1; then
+  echo "FAIL: disabled planning accepted a handoff"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: disabled planning refuses a handoff"
+fi
+sed_i 's/^USE_SUPERPOWERS=false$/USE_SUPERPOWERS=true/' "$PLANNING_CFG"
+
+# -- committed planning inputs become a digest-bound team handoff --------------
+mkdir -p docs/superpowers/specs docs/superpowers/plans
+printf '# Approved design\n' > docs/superpowers/specs/launcher.md
+printf '# Approved implementation plan\n' > docs/superpowers/plans/launcher.md
+git add docs/superpowers/specs/launcher.md docs/superpowers/plans/launcher.md
+git commit -qm 'planning inputs'
+handoff="$("$LAUNCH" planning-handoff planning-team docs/superpowers/specs/launcher.md docs/superpowers/plans/launcher.md)"
+check "planning-handoff creates a manifest" test -f "$handoff"
+check "planning-handoff assigns execution to Startup Factory" \
+  python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["executionOwner"] == "startup-factory"' "$handoff"
+planning_prompt="$("$LAUNCH" compose planning-team FEAT-PLAN team-lead)"
+check "team prompt carries validated planning handoff" grep -q "Planning handoff:" "$planning_prompt"
+check "team prompt carries exact approved specification" grep -q "docs/superpowers/specs/launcher.md" "$planning_prompt"
+if grep -q "Claude + obra/superpowers planning" "$planning_prompt"; then
+  echo "FAIL: non-Claude handoff consumer received Superpowers instructions"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: non-Claude handoff consumer keeps model-neutral planning inputs"
+fi
+claude_planning_prompt="$(STARTUP_FACTORY_LLM_RUNTIME=claude "$LAUNCH" compose planning-team FEAT-PLAN team-lead)"
+check "Claude handoff consumer receives Superpowers planning boundary" \
+  grep -q "Claude + obra/superpowers planning" "$claude_planning_prompt"
 
 # -- agent child environment strips tracker/cloud/host credentials ------------
 cat > env-probe.sh <<'EOF'

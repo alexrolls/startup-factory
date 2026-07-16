@@ -46,6 +46,7 @@ MAX_FILES = 20_000
 
 PRESERVED_CONFIG_FILES = (
     "config/project-management.config.md",
+    "config/planning.config.md",
     "config/team.config.md",
     "config/statuses.config.json",
     "config/automation.config.json",
@@ -269,7 +270,7 @@ def parse_manifest(data: bytes) -> BundleManifest:
     if len(set(normalized_extensions)) != len(normalized_extensions):
         raise InstallerError("extensionRoots contains duplicates")
     if set(normalized_preserved) != set(PRESERVED_CONFIG_FILES):
-        raise InstallerError("bundle preservation policy does not name the six supported config files")
+        raise InstallerError("bundle preservation policy does not name the seven supported config files")
     if set(normalized_extensions) != set(EXTENSION_ROOTS):
         raise InstallerError("bundle preservation policy has unsupported extension roots")
 

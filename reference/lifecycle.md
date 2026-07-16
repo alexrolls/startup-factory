@@ -16,6 +16,14 @@ the adapter doesn't define.
 
 Turn an idea into a tracked feature with a task breakdown.
 
+Before step 1, select the configured planning intake. If
+`USE_SUPERPOWERS=true` and the current runtime is Claude Code, follow
+`reference/superpowers-planning.md`: use Superpowers for brainstorming and
+writing the committed specification/plan, then create the Startup Factory
+planning handoff. Treat those documents as reviewed inputs to the steps below,
+not as authority to launch Superpowers execution. If the flag is false or the
+runtime is not Claude Code, begin directly with the native workflow.
+
 1. **Understand the goal.** Clarify scope with the user: what ships, what's explicitly out,
    and any dependencies. Research the codebase enough to size the work realistically.
 2. **Create the [feature]** via the adapter, status `[Planned]`. Record its `featureId`.
@@ -213,6 +221,10 @@ one batch instead:
 For preset teams this batch is the **default opener** (`teams/_PLAYBOOK.md`
 stage 3); per-[task] gates at claim time are the opt-out for genuinely
 emergent plans.
+
+An approved Claude/Superpowers planning handoff may seed these notes, but it
+does not replace the cross-[task] consistency pass, independent architectural
+challenge, per-[task] verdicts, product scope sign-off, or tracker comments.
 
 1. **One `[design-note]` per [task]**, written against the real codebase (not the
    [task] text alone). Registering exports in the contract registry

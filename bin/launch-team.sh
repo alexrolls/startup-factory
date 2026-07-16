@@ -11,6 +11,7 @@
 #   launch-team.sh relaunch      <team> <featureId> <role> [preset]
 #   launch-team.sh compose       <team> <featureId> <role> [preset]  # write the composed startup prompt, print its path — no spawn (harness mode)
 #   launch-team.sh compose-task  <team> <featureId> <role> <taskId> [attempt] [preset]
+#   launch-team.sh planning-handoff <team> <spec-path> <plan-path>  # bind Claude/Superpowers planning inputs
 #   launch-team.sh worktree      <team> <role> <taskId> [attempt]
 #   launch-team.sh worktree-remove <team> <role> <taskId> [attempt]
 #   launch-team.sh validate-board [config-path]                  # validate board config JSON
@@ -23,6 +24,7 @@ umask 077
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="$SKILL_DIR/config/team.config.md"
 PM_CONFIG="$SKILL_DIR/config/project-management.config.md"
+PLANNING_CONFIG="$SKILL_DIR/config/planning.config.md"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
 # Populated immediately before each process launch.  These values are launcher
@@ -42,6 +44,7 @@ LAUNCH_BARRIER_DIR=""
 LAUNCH_BARRIER_FIFO=""
 LAUNCH_GROUP_FILE=""
 LAUNCH_TMUX_WRAPPER=""
+SUPERPOWERS_ENABLED=""
 
 die() { echo "launch-team: $*" >&2; exit 1; }
 
@@ -578,6 +581,100 @@ role_cmd_key() { # backend -> BACKEND_CMD ; principal-architect -> PRINCIPAL_ARC
   printf '%s_CMD' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"
 }
 
+classify_command_runtime() { # command template -> claude|other; never executes the template
+  python3 - "$1" <<'PY'
+import os
+import re
+import shlex
+import sys
+
+assignment = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*\Z")
+explicit_runtime = None
+
+
+def record_assignment(token):
+    global explicit_runtime
+    if not assignment.fullmatch(token):
+        return
+    key, value = token.split("=", 1)
+    if key == "STARTUP_FACTORY_LLM_RUNTIME" and value in {"claude", "other"}:
+        explicit_runtime = value
+
+
+try:
+    tokens = shlex.split(sys.argv[1], posix=True)
+except ValueError:
+    print("other")
+    raise SystemExit
+
+index = 0
+while index < len(tokens) and assignment.fullmatch(tokens[index]):
+    record_assignment(tokens[index])
+    index += 1
+
+if index < len(tokens) and os.path.basename(tokens[index]) == "env":
+    index += 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if token in {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}:
+            index += 2
+            continue
+        if assignment.fullmatch(token):
+            record_assignment(token)
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        break
+
+while index < len(tokens) and assignment.fullmatch(tokens[index]):
+    record_assignment(tokens[index])
+    index += 1
+while index < len(tokens) and os.path.basename(tokens[index]) in {
+    "command",
+    "exec",
+    "nohup",
+}:
+    index += 1
+
+runtime = explicit_runtime or (
+    "claude"
+    if index < len(tokens) and os.path.basename(tokens[index]) == "claude"
+    else "other"
+)
+print(runtime)
+PY
+}
+
+role_command_template() { # role -> configured command or empty when disabled/unconfigured
+  local key command
+  key="$(role_cmd_key "$1")"
+  key_is_null "$key" && return 0
+  command="$(read_key "$key")"
+  [ -n "$command" ] || command="$(read_key TEAM_DEFAULT_CMD)"
+  printf '%s' "$command"
+}
+
+task_command_template() { # role profile -> selected task command or empty
+  local role="$1" profile="$2" task_cmd_key command
+  task_cmd_key="TASK_$(printf '%s' "$profile" | tr 'a-z-' 'A-Z_')_CMD"
+  command="$(read_key "$task_cmd_key")"
+  [ -n "$command" ] || command="$(role_command_template "$role")"
+  printf '%s' "$command"
+}
+
+harness_runtime() { # explicit harness runtime or fail-safe non-Claude default
+  case "${STARTUP_FACTORY_LLM_RUNTIME:-}" in
+    '') printf '%s' other ;;
+    claude|other) printf '%s' "$STARTUP_FACTORY_LLM_RUNTIME" ;;
+    *) die "STARTUP_FACTORY_LLM_RUNTIME must be exactly claude or other" ;;
+  esac
+}
+
 task_key() { python3 "$SKILL_DIR/bin/runtime-state.py" key "$1"; }
 
 task_branch() { # task_branch <team> <taskId>; generation/team namespace prevents reopened-ID reuse
@@ -592,11 +689,22 @@ key_is_null() { # key_is_null KEY -> 0 if the config sets KEY explicitly to null
   grep -qE "^$1=null[[:space:]]*(#.*)?$" "$CONFIG"
 }
 
+validate_planning_config() {
+  local planning_json
+  planning_json="$(python3 "$SKILL_DIR/bin/superpowers-planning.py" \
+    --config "$PLANNING_CONFIG" show-config)" \
+    || die "invalid config/planning.config.md"
+  SUPERPOWERS_ENABLED="$(printf '%s' "$planning_json" | python3 -c \
+    'import json,sys; print("true" if json.load(sys.stdin)["enabled"] else "false")')" \
+    || die "could not read config/planning.config.md"
+}
+
 validate_config() { # MAX_ACTIVE_IMPLEMENTERS is a parallel-only knob (spec: throughput levers)
   local exec_mode max_active
   validate_agent_env_allowlist
   validate_sandbox_runner_config
   configure_lifecycle_state
+  validate_planning_config
   exec_mode="$(read_key EXECUTION)"
   max_active="$(read_key MAX_ACTIVE_IMPLEMENTERS)"
   [ -z "$max_active" ] && return 0
@@ -845,17 +953,25 @@ PYEOF
 
 preflight() { # preflight <team> <featureId> — fail before five agents do
   local team="$1" fid="$2"
-  local dir preflight_dir write_test utc_file tool_prefix
+  local dir preflight_dir write_test utc_file tool_prefix planning_handoff
   dir="$(teamroot "$team")" || die "unsafe team workspace"
   preflight_dir="$(team_path "$dir" preflight)" || die "unsafe preflight path"
   write_test="$(team_path "$dir" preflight/.write-test)" || die "unsafe preflight path"
   utc_file="$(team_path "$dir" preflight/utc.txt)" || die "unsafe preflight path"
   tool_prefix="$(team_path "$dir" preflight/tool-prefix.txt)" || die "unsafe preflight path"
+  planning_handoff="$(team_path "$dir" planning/superpowers-handoff.json)" || die "unsafe planning handoff path"
   validate_board >/dev/null
   mkdir -p "$preflight_dir" 2>/dev/null || die "preflight: cannot create workspace $dir"
   ( : > "$write_test" && rm "$write_test" ) \
     || die "preflight: workspace not writable: $dir"
   date -u +%Y-%m-%dT%H:%M:%SZ > "$utc_file"
+  if [ "$SUPERPOWERS_ENABLED" = true ] \
+      && { [ -e "$planning_handoff" ] || [ -L "$planning_handoff" ]; }; then
+    python3 "$SKILL_DIR/bin/superpowers-planning.py" \
+      --config "$PLANNING_CONFIG" validate-handoff \
+      --repo "$REPO_ROOT" --handoff "$planning_handoff" --team "$team" >/dev/null \
+      || die "preflight FAILED — the Claude/Superpowers planning handoff is stale or invalid"
+  fi
   local _a; _a="$(grep -m1 '^PRODUCT_MANAGEMENT_TOOL=' "$PM_CONFIG" | cut -d= -f2 | tr -d '"' || true)"
   local _adapter="${TRACKER_ADAPTER:-$_a}"
   if is_mcp_only "$_adapter"; then
@@ -895,15 +1011,17 @@ team_path() { # team_path <absolute-workspace> <relative-path>
     --repo "$REPO_ROOT" --workspace "$1" --relative "$2"
 }
 
-compose_prompt() { # compose_prompt <team> <featureId> <role> [preset] -> prompt file path
-  local team="$1" fid="$2" role="$3" preset="${4:-}"
+compose_prompt() { # compose_prompt <team> <featureId> <role> [preset] [runtime] -> prompt file path
+  local team="$1" fid="$2" role="$3" preset="${4:-}" runtime="${5:-other}"
   validate_team_id "$team"; validate_role_id "$role"
+  case "$runtime" in claude|other) ;; *) die "internal launch error: invalid runtime '$runtime'" ;; esac
   if [ -n "$preset" ]; then
     validate_mandatory_sceptical_architect "$preset"
     validate_mandatory_security_reviewer "$preset"
     validate_review_board_independence "$preset"
   fi
-  local dir out prompts mailbox heartbeats pids utc_file tool_prefix
+  local dir out prompts mailbox heartbeats pids utc_file tool_prefix planning_handoff
+  local planning_json="" planning_spec="" planning_plan=""
   dir="$(teamroot "$team")" || die "unsafe team workspace"
   prompts="$(team_path "$dir" prompts)" || die "unsafe prompts path"
   mailbox="$(team_path "$dir" "mailbox/$role")" || die "unsafe mailbox path"
@@ -912,6 +1030,16 @@ compose_prompt() { # compose_prompt <team> <featureId> <role> [preset] -> prompt
   out="$(team_path "$dir" "prompts/$role.md")" || die "unsafe prompt path"
   utc_file="$(team_path "$dir" preflight/utc.txt)" || die "unsafe preflight path"
   tool_prefix="$(team_path "$dir" preflight/tool-prefix.txt)" || die "unsafe preflight path"
+  planning_handoff="$(team_path "$dir" planning/superpowers-handoff.json)" || die "unsafe planning handoff path"
+  if [ "$SUPERPOWERS_ENABLED" = true ] \
+      && { [ -e "$planning_handoff" ] || [ -L "$planning_handoff" ]; }; then
+    planning_json="$(python3 "$SKILL_DIR/bin/superpowers-planning.py" \
+      --config "$PLANNING_CONFIG" validate-handoff \
+      --repo "$REPO_ROOT" --handoff "$planning_handoff" --team "$team")" \
+      || die "the Claude/Superpowers planning handoff is stale or invalid"
+    planning_spec="$(printf '%s' "$planning_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["spec"]["path"])')"
+    planning_plan="$(printf '%s' "$planning_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["plan"]["path"])')"
+  fi
   local brief; brief="$(role_brief "$role")"
   [ -n "$brief" ] || die "unknown role: $role (no brief in roles/ or teams/roles/)"
   mkdir -p "$prompts" "$mailbox" "$heartbeats" "$pids"
@@ -925,11 +1053,16 @@ compose_prompt() { # compose_prompt <team> <featureId> <role> [preset] -> prompt
     echo "- Repository root: $REPO_ROOT"
     echo "- Skill directory: $SKILL_DIR (adapter + PM config live here)"
     echo "- Team workspace: $dir"
+    echo "- LLM runtime family: $runtime"
     if [ -s "$utc_file" ]; then
       echo "- Preflight UTC pin: $(cat "$utc_file") — generate every timestamp with: date -u +%Y-%m-%dT%H:%M:%SZ"
     fi
     if [ -s "$tool_prefix" ]; then
       echo "- Verified tracker tool prefix: $(cat "$tool_prefix") (preflight-verified — use it verbatim; do not re-derive from adapter docs)"
+    fi
+    if [ -n "$planning_json" ]; then
+      echo "- Planning handoff: $planning_handoff"
+      echo "- Approved planning inputs: $planning_spec and $planning_plan"
     fi
     echo
     echo "Begin by running the Mandatory Preparation in $SKILL_DIR/SKILL.md, then act"
@@ -955,6 +1088,11 @@ compose_prompt() { # compose_prompt <team> <featureId> <role> [preset] -> prompt
     echo
     echo "---"
     cat "$CONFIG"
+    if [ "$SUPERPOWERS_ENABLED" = true ] && [ "$runtime" = claude ]; then
+      echo
+      echo "---"
+      cat "$SKILL_DIR/reference/superpowers-planning.md"
+    fi
     if [ -f "$SKILL_DIR/config/statuses.config.json" ]; then
       echo
       echo "---"
@@ -965,8 +1103,8 @@ compose_prompt() { # compose_prompt <team> <featureId> <role> [preset] -> prompt
   printf '%s' "$out"
 }
 
-compose_task_prompt() { # compose_task_prompt <team> <featureId> <role> <taskId> <attempt> [preset]
-  local team="$1" fid="$2" role="$3" task="$4" attempt="$5" preset="${6:-}"
+compose_task_prompt() { # compose_task_prompt <team> <featureId> <role> <taskId> <attempt> [preset] [mode]
+  local team="$1" fid="$2" role="$3" task="$4" attempt="$5" preset="${6:-}" mode="${7:-launch}"
   validate_team_id "$team"; validate_role_id "$role"
   local dir; dir="$(teamroot "$team")" || die "unsafe team workspace"
   local instance; instance="$(task_instance "$role" "$task" "$attempt")"
@@ -976,10 +1114,18 @@ compose_task_prompt() { # compose_task_prompt <team> <featureId> <role> <taskId>
   local branch; branch="$(task_branch "$team" "$task")"
   [ -d "$wt" ] || die "task worktree does not exist: $wt"
   local execution; execution="$("$SKILL_DIR/bin/task-packet.sh" "$team" "$fid" "$task" "$role" "$attempt" "$wt" "$branch")"
-  local packet report profile
+  local packet report profile command runtime
   packet="$(printf '%s' "$execution" | python3 -c 'import json,sys; print(json.load(sys.stdin)["packetPath"])')"
   report="$(printf '%s' "$execution" | python3 -c 'import json,sys; print(json.load(sys.stdin)["reportPath"])')"
   profile="$(printf '%s' "$execution" | python3 -c 'import json,sys; print(json.load(sys.stdin)["modelProfile"])')"
+  case "$mode" in
+    launch)
+      command="$(task_command_template "$role" "$profile")"
+      runtime="$(classify_command_runtime "$command")"
+      ;;
+    harness) runtime="$(harness_runtime)" ;;
+    *) die "internal launch error: invalid prompt mode '$mode'" ;;
+  esac
   local out prompts_tasks pids_tasks heartbeats
   out="$(team_path "$dir" "prompts/tasks/$instance.md")" || die "unsafe task prompt path"
   prompts_tasks="$(team_path "$dir" prompts/tasks)" || die "unsafe task prompt path"
@@ -995,6 +1141,7 @@ compose_task_prompt() { # compose_task_prompt <team> <featureId> <role> <taskId>
     echo "- taskId: $task"
     echo "- Attempt: $attempt"
     echo "- Model profile: $profile"
+    echo "- LLM runtime family: $runtime"
     echo "- Working copy: $wt"
     echo "- Task branch: $branch"
     echo "- Task packet: $packet"
@@ -1019,6 +1166,16 @@ compose_task_prompt() { # compose_task_prompt <team> <featureId> <role> <taskId>
     echo
     echo "Start by emitting task.started / implementing. End by submitting a [review-request], [andon],"
     echo "or context request artifact before exiting. The artifact, not process exit, closes the assignment."
+    if [ "$SUPERPOWERS_ENABLED" = true ] && [ "$runtime" = claude ]; then
+      echo
+      echo "## Claude Superpowers task method"
+      echo
+      echo "If and only if this task is running in Claude Code, you may use the focused"
+      echo "Superpowers skills for test-driven development, systematic debugging,"
+      echo "receiving code review, and verification before completion."
+      echo "Never invoke Superpowers worktree, subagent execution, plan execution, or"
+      echo "branch-finishing skills. Startup Factory owns those execution boundaries."
+    fi
     echo
     echo "---"
     cat "$SKILL_DIR/reference/guardrails.md"
@@ -1046,7 +1203,8 @@ launch_one() { # launch_one <team> <featureId> <role> [preset]
   local cmd_tpl; cmd_tpl="$(read_key "$key")"
   [ -n "$cmd_tpl" ] || cmd_tpl="$(read_key TEAM_DEFAULT_CMD)"
   [ -n "$cmd_tpl" ] || die "no command for role '$role' ($key absent and TEAM_DEFAULT_CMD is null)"
-  local prompt; prompt="$(compose_prompt "$team" "$fid" "$role" "$preset")"
+  local runtime; runtime="$(classify_command_runtime "$cmd_tpl")"
+  local prompt; prompt="$(compose_prompt "$team" "$fid" "$role" "$preset" "$runtime")"
   local cmd="${cmd_tpl//\{prompt_file\}/$prompt}"
   local dir pidfile logfile env_cmd rc quoted_workdir quoted_marker
   dir="$(teamroot "$team")" || die "unsafe team workspace"
@@ -1142,7 +1300,7 @@ launch_task() { # launch_task <team> <featureId> <role> <taskId> <attempt> [pres
     fi
   fi
   local wt; wt="$("$0" worktree "$team" "$role" "$task" "$attempt")"
-  local prompt; prompt="$(compose_task_prompt "$team" "$fid" "$role" "$task" "$attempt" "$preset")"
+  local prompt; prompt="$(compose_task_prompt "$team" "$fid" "$role" "$task" "$attempt" "$preset" launch)"
   local execution profile task_cmd_key cmd_tpl
   execution="$(team_path "$dir" "executions/$(task_key "$task").json")" || die "unsafe execution path"
   profile="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["modelProfile"])' "$execution")"
@@ -1196,9 +1354,31 @@ launch_task() { # launch_task <team> <featureId> <role> <taskId> <attempt> [pres
   fi
 }
 
-case "${1:-}" in validate-board|'') ;; *) validate_config ;; esac
+case "${1:-}" in
+  validate-board|'') ;;
+  planning-handoff) validate_planning_config ;;
+  *) validate_config ;;
+esac
 
 case "${1:-}" in
+  planning-handoff)
+    [ $# -eq 4 ] || die "usage: planning-handoff <team> <spec-path> <plan-path>"
+    validate_team_id "$2"
+    [ "$SUPERPOWERS_ENABLED" = true ] \
+      || die "Superpowers planning is disabled by USE_SUPERPOWERS=false"
+    dir="$(teamroot "$2")" || die "unsafe team workspace"
+    handoff="$(team_path "$dir" planning/superpowers-handoff.json)" || die "unsafe planning handoff path"
+    mkdir -p "$(dirname "$handoff")"
+    python3 "$SKILL_DIR/bin/superpowers-planning.py" \
+      --config "$PLANNING_CONFIG" create-handoff \
+      --repo "$REPO_ROOT" --team "$2" --spec "$3" --plan "$4" --output "$handoff" >/dev/null \
+      || die "could not create the Claude/Superpowers planning handoff"
+    python3 "$SKILL_DIR/bin/superpowers-planning.py" \
+      --config "$PLANNING_CONFIG" validate-handoff \
+      --repo "$REPO_ROOT" --handoff "$handoff" --team "$2" --require-head >/dev/null \
+      || die "created planning handoff did not validate"
+    echo "$handoff"
+    ;;
   team)
     [ $# -eq 4 ] || die "usage: team <preset> <team> <featureId>"
     preset="$2"; team="$3"; fid="$4"
@@ -1262,13 +1442,14 @@ case "${1:-}" in
     # Harness mode: emit the exact same startup prompt `start` would use, without
     # spawning anything, so any harness can spawn the role natively with it.
     [ $# -eq 4 ] || [ $# -eq 5 ] || die "usage: compose <team> <featureId> <role> [preset]"
-    prompt="$(compose_prompt "$2" "$3" "$4" "${5:-}")"
+    runtime="$(harness_runtime)"
+    prompt="$(compose_prompt "$2" "$3" "$4" "${5:-}" "$runtime")"
     echo "$prompt"
     ;;
   compose-task)
     [ $# -ge 5 ] && [ $# -le 7 ] || die "usage: compose-task <team> <featureId> <role> <taskId> [attempt] [preset]"
     "$0" worktree "$2" "$4" "$5" "${6:-1}" >/dev/null
-    prompt="$(compose_task_prompt "$2" "$3" "$4" "$5" "${6:-1}" "${7:-}")"
+    prompt="$(compose_task_prompt "$2" "$3" "$4" "$5" "${6:-1}" "${7:-}" harness)"
     echo "$prompt"
     ;;
   worktree)
@@ -1508,6 +1689,6 @@ PY
     validate_board "${2:-}"
     ;;
   *)
-    die "usage: launch-team.sh {team|gate-team|preflight|start|start-task|relaunch|compose|compose-task|worktree|worktree-remove|validate-board|status|stop|stop-task} ..."
+    die "usage: launch-team.sh {planning-handoff|team|gate-team|preflight|start|start-task|relaunch|compose|compose-task|worktree|worktree-remove|validate-board|status|stop|stop-task} ..."
     ;;
 esac
