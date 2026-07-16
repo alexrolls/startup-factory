@@ -38,7 +38,8 @@ jobs:
           set -euo pipefail
           runtime_tmp="$RUNNER_TEMP/startup-factory-runtime"
           install -d -m 700 "$runtime_tmp"
-          TMPDIR="$runtime_tmp" bash tests/run-all.sh
+          /usr/bin/python3 -c 'import sys; assert sys.version_info >= (3, 10)'
+          PATH="/usr/bin:/bin" TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh
 
       - name: Run packaging unit tests
         run: python -m unittest discover -s tests/packaging -p "test_*.py" -v
