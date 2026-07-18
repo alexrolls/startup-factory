@@ -318,6 +318,7 @@ jobs:
       - name: Reconcile a draft release, verify bytes, then publish
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
           VERSION: ${{ needs.build.outputs.version }}
         shell: bash

@@ -166,6 +166,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         self.assertNotIn("        run: bash tests/run-all.sh", workflow)
 
+    def test_github_release_commands_have_explicit_repository_context(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("          GH_REPO: ${{ github.repository }}", workflow)
+
 
 class SdistCanonicalizationTests(unittest.TestCase):
     def _write_sdist(self, path: Path, *, mtime: int, uid: int) -> None:
