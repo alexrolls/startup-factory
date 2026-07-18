@@ -2,9 +2,10 @@
 
 How work is created, tracked, and closed out. Every scenario is written in the generic
 vocabulary (`reference/vocabulary.md`); the active adapter (`adapters/<Tool>.md`) supplies
-the concrete verb for each operation. These playbooks are **single-agent by default** —
-one agent drives the whole flow. If `TEAM_MODE=true`, transition *ownership* splits across
-roles per `reference/team-roles.md`, but the scenarios themselves are identical.
+the concrete verb for each operation. The shipped skill enables **team mode by default**:
+transition *ownership* splits across roles per `reference/team-roles.md`, while the
+scenarios themselves remain identical. Set `TEAM_MODE=false` explicitly when one agent
+should drive the whole flow.
 
 Throughout: **an "operation"** (create feature, set status, add comment…) means "do the
 thing described in the active adapter's *Operations* section." Never invent an operation

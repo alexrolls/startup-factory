@@ -39,8 +39,8 @@ or delivery decision needs judgment.
 Automation is fail-closed by default. Install the reviewed skill outside the
 target checkout and every agent mount; the supervisor, Python interpreter,
 automation/team/project-management configs, runner, and broker scripts must be
-owned by the scheduler identity or root and not group/world writable. Set
-`TEAM_MODE=true`, configure the scriptable adapter, copy
+owned by the scheduler identity or root and not group/world writable. Keep the
+shipped `TEAM_MODE=true` setting, configure the scriptable adapter, copy
 `config/automation.config.json` to that protected installation, set `enabled`,
 and verify a dry run from the target checkout:
 

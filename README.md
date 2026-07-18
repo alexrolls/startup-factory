@@ -522,6 +522,10 @@ the default.
    > The `uvx` path requires the first `v0.1.0` package release. Before that tag
    > is published, use the [auditable shell compatibility path](#shell-compatibility-path).
 
+   This quick start demonstrates the one-agent workflow. Set `TEAM_MODE=false`
+   in the installed `config/project-management.config.md` before continuing;
+   fresh installations otherwise use the team workflow by default.
+
 2. **Ask your agent, in plain language:**
 
    ```
@@ -884,10 +888,11 @@ instead copied to operator-protected storage outside agent mounts.
 |---|---|---|
 | `PRODUCT_MANAGEMENT_TOOL` | Active tracker (matches an `adapters/<Name>.md`) | `Markdown` |
 | per-tool block | Access mode + defaults for the active tracker (see above) | — |
-| `TEAM_MODE` | `true` enables the multi-agent status-ownership model | `false` |
+| `TEAM_MODE` | `true` enables the multi-agent status-ownership model; set `false` for the single-agent workflow | `true` |
 | `STRICT_STATUS` | `true` = refuse an action if a `[task]` isn't in the expected status (the "andon cord") | `true` |
 
-> Set **`TEAM_MODE=true`** before running a team.
+> Team mode is enabled in new installations. Set **`TEAM_MODE=false`** to opt
+> into the single-agent workflow.
 
 ### `config/planning.config.md` — optional Claude planning intake
 
@@ -1088,7 +1093,8 @@ every agent mount, for authenticated PID/start-time/tmux lifecycle authority.
 
 ### One agent
 
-Just talk to your agent in the generic vocabulary:
+Set `TEAM_MODE=false` in `config/project-management.config.md`, then talk to
+your agent in the generic vocabulary:
 
 - *"Plan a feature: …"* → creates a `[feature]` + `[tasks]`
 - *"Start task ENG-142"* → generic `[Active]` / shipped `In Progress`, then implements
@@ -1100,9 +1106,9 @@ Just talk to your agent in the generic vocabulary:
 
 ### A whole team
 
-1. Set the bundle path for your installation, then set `TEAM_MODE=true`,
-   configure role commands, `WORKTREE_SETUP`, and at least one real `VALIDATE_*`
-   command in `$SF_HOME/config/team.config.md`:
+1. Set the bundle path for your installation, confirm the shipped
+   `TEAM_MODE=true` setting, configure role commands, `WORKTREE_SETUP`, and at
+   least one real `VALIDATE_*` command in `$SF_HOME/config/team.config.md`:
 
    ```bash
    SF_HOME=.agents/skills/startup-factory        # Codex / shared Agent Skills
@@ -1352,8 +1358,9 @@ team-lead signature—does not create that receipt and grants no authority.
    non-empty, non-no-op `WORKTREE_SETUP` and at
    least one meaningful `VALIDATE_SCRIPT`, `VALIDATE_BUILD`, `VALIDATE_TEST`,
    `VALIDATE_LINT`, or `VALIDATE_FORMAT` command in `config/team.config.md`.
-2. Set `TEAM_MODE=true`, `TRACKER_WRITERS=broker`, and a scriptable, explicit tracker
-   scope. Linear requires `LINEAR_ACCESS=rest` plus `LINEAR_DEFAULT_TEAM`; Jira requires
+2. Keep the shipped `TEAM_MODE=true` default, set `TRACKER_WRITERS=broker`, and
+   configure a scriptable, explicit tracker scope. Linear requires
+   `LINEAR_ACCESS=rest` plus `LINEAR_DEFAULT_TEAM`; Jira requires
    `JIRA_ACCESS=rest` plus an exact `JIRA_PROJECT_KEY` and `JIRA_TASK_ISSUE_TYPE`;
    GitHub requires an explicit `GITHUB_REPO`.
    Review `reference/guardrails.md`; ordinary agents must have no cloud/database

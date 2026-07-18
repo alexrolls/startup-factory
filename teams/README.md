@@ -23,8 +23,8 @@ optional evidence/finding roles.
 
 ## Use a team
 
-1. Configure your tracker (`config/project-management.config.md`, set
-   `TEAM_MODE=true`) and the team layer (`config/team.config.md`): set
+1. Configure your tracker (`config/project-management.config.md`; the shipped
+   default is `TEAM_MODE=true`) and the team layer (`config/team.config.md`): set
    `TEAM_DEFAULT_CMD` — roles with no `<ROLE>_CMD` key of their own fall back to
    it, so you don't need a key per role. Add `<ROLE>_CMD` (e.g.
    `SENIOR_STAFF_ENGINEER_CMD`) only to pin a specific CLI to a specific role; set

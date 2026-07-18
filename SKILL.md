@@ -140,7 +140,7 @@ each generic operation through the adapter's *Operations* table:
 | File a bug / follow-up found mid-work | 6 — File newly-discovered work |
 | Work is stuck / blocked / cannot proceed | 7 — Block a `[task]` |
 | (anything wrong / blocked / failed) | 8 — Andon cord: stop & report |
-| Run an agent team on a feature ("launch the team") | Team: set `TEAM_MODE=true`; gate roles use `start`/`compose`, task workers use `start-task`/`compose-task`, and `dispatch.sh` owns claims and bounded scheduling |
+| Run an agent team on a feature ("launch the team") | Team: keep the shipped `TEAM_MODE=true` default; gate roles use `start`/`compose`, task workers use `start-task`/`compose-task`, and `dispatch.sh` owns claims and bounded scheduling |
 | Connect a new tool / switch tools | 9 — Connect / switch |
 | Design/plan everything up front, sign off all designs before coding | 10 — Pre-flight design pass |
 | Monitor queued and Blocked work; launch eligible queued tasks automatically | 11 — Portfolio automation; install the skill outside the target checkout, provision an external mode-0700 lifecycle root outside every agent mount, set its absolute project/config environment, `scanIntervalMinutes` (default 3), and `ignoredTaskLabels` (default `human-work`), then run `bin/pm-agent.py --once` with protected Python `-I -S -E -s` |

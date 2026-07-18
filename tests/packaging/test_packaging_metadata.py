@@ -24,6 +24,7 @@ except ModuleNotFoundError:  # pragma: no cover - metadata tests run on 3.11+
 
 ROOT = Path(__file__).resolve().parents[2]
 PYPROJECT = ROOT / "pyproject.toml"
+PROJECT_MANAGEMENT_CONFIG = ROOT / "config" / "project-management.config.md"
 RESOURCE_ARCHIVE = "startup_factory_cli/resources/startup-factory.tar.gz"
 RESOURCE_CHECKSUM = f"{RESOURCE_ARCHIVE}.sha256"
 
@@ -144,6 +145,13 @@ class ProjectMetadataTests(unittest.TestCase):
             setuptools["package-data"]["startup_factory_cli"],
             ["resources/*.tar.gz", "resources/*.sha256"],
         )
+
+
+class BundledDefaultsTests(unittest.TestCase):
+    def test_team_mode_is_enabled_by_default(self) -> None:
+        config = PROJECT_MANAGEMENT_CONFIG.read_text(encoding="utf-8")
+        self.assertRegex(config, r"(?m)^TEAM_MODE=true(?:\s|$)")
+        self.assertNotRegex(config, r"(?m)^TEAM_MODE=false(?:\s|$)")
 
 
 class SdistCanonicalizationTests(unittest.TestCase):

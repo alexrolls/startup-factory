@@ -60,7 +60,7 @@ MARKDOWN_ROOT=.workspace/task-manager   # Where feature/task files live (repo-re
 Apply regardless of tool.
 
 ```
-TEAM_MODE=false        # true enables the status-ownership model in reference/team-roles.md
+TEAM_MODE=true         # false opts out to the single-agent workflow
 STRICT_STATUS=true     # true = before any write, verify the current status and that the
                        #        intended move is in that status's transitions list
                        #        (the "andon cord" — see reference/lifecycle.md)
