@@ -51,6 +51,7 @@ for required_file in \
   bin/policy-check.py \
   bin/release-feature.py \
   bin/runtime-state.py \
+  bin/ticket_content_security.py \
   bin/tracker-ops.sh \
   extensions/tracker-backends/README.md \
   reference/automation.md \

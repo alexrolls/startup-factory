@@ -26,6 +26,7 @@ refuse() { # refuse <desc> <needle> <cmd...>
 CUSTOM_SKILL="$TMP/custom-skill"
 mkdir -p "$CUSTOM_SKILL/bin" "$CUSTOM_SKILL/config" "$CUSTOM_SKILL/extensions/tracker-backends"
 cp "$SKILL_DIR/bin/tracker-ops.sh" "$CUSTOM_SKILL/bin/"
+cp "$SKILL_DIR/bin/ticket_content_security.py" "$CUSTOM_SKILL/bin/"
 cp "$SKILL_DIR/config/statuses.config.json" "$CUSTOM_SKILL/config/"
 cat > "$CUSTOM_SKILL/config/project-management.config.md" <<'EOF'
 ```
@@ -89,6 +90,13 @@ check "custom backend receives the task primitive" \
   grep -qx 'task=ACME-1' "$TMP/custom-backend.out"
 check "custom backend receives the core-validated body" \
   grep -qx 'body=custom body' "$TMP/custom-backend.out"
+OUTBOUND_SECRET='sk-proj-abcdefghijklmnopqrstuvwxyz012345'
+printf 'api_key=%s\n' "$OUTBOUND_SECRET" | CUSTOM_BACKEND_OUT="$TMP/custom-backend.out" \
+  "$CUSTOM_OPS" comment ACME-1 - >/dev/null
+check "custom backend never receives a raw credential" \
+  bash -c "! grep -Fq '$OUTBOUND_SECRET' '$TMP/custom-backend.out'"
+check "custom backend receives the redacted comment" \
+  grep -Fq '[REDACTED POTENTIAL SECRET]' "$TMP/custom-backend.out"
 
 ln -s Acme.py "$CUSTOM_SKILL/extensions/tracker-backends/AcmeLink.py"
 cat > "$CUSTOM_SKILL/config/project-management.config.md" <<'EOF'
@@ -123,6 +131,7 @@ check "refused custom operations never reach mutation primitives" \
 cd "$TMP"
 mkdir -p skill/config skill/bin
 cp "$SKILL_DIR/bin/tracker-ops.sh" skill/bin/
+cp "$SKILL_DIR/bin/ticket_content_security.py" skill/bin/
 cp "$SKILL_DIR/config/statuses.config.json" skill/config/
 cat > skill/config/project-management.config.md <<'EOF'
 ```
@@ -158,11 +167,17 @@ EOF
 T="feat/feature.md"
 
 # -- generated PM surfaces: one task progress block + one feature digest -------
+printf '[progress]\ncredential: %s\n' "$OUTBOUND_SECRET" | "$OPS" upsert-progress "$T#2" - >/dev/null
+check "progress projection never stores a raw credential" bash -c "! grep -Fq '$OUTBOUND_SECRET' '$T'"
+check "progress projection stores a redaction marker" grep -Fq '[REDACTED POTENTIAL SECRET]' "$T"
 printf '[progress]\nstage: planned\nsummary: queued\n' | "$OPS" upsert-progress "$T#2" -
 printf '[progress]\nstage: ready\nsummary: design approved\n' | "$OPS" upsert-progress "$T#2" -
 check "progress upsert keeps one managed block" test "$(grep -c 'agent-squad:progress:start' "$T")" -eq 1
 check "progress upsert replaces old content" grep -q '^> stage: ready$' "$T"
 if grep -q '^> stage: planned$' "$T"; then echo "FAIL: stale progress retained"; FAILURES=$((FAILURES+1)); else echo "ok: stale progress removed"; fi
+printf '[digest]\ncredential: %s\n' "$OUTBOUND_SECRET" | "$OPS" upsert-digest "$T" - >/dev/null
+check "digest projection never stores a raw credential" bash -c "! grep -Fq '$OUTBOUND_SECRET' '$T'"
+check "digest projection stores a redaction marker" grep -Fq '[REDACTED POTENTIAL SECRET]' "$T"
 printf '[digest]\nT#1 - planned\n' | "$OPS" upsert-digest "$T" -
 printf '[digest]\nT#1 - active\n' | "$OPS" upsert-digest "$T" -
 check "digest upsert keeps one managed block" test "$(grep -c 'agent-squad:digest:start' "$T")" -eq 1
@@ -182,6 +197,9 @@ check "sibling task untouched"   grep -q '^## 2 Wire endpoint \[Planned\]$' "$T"
 printf '[design-note] Approach: "quote" & $dollar.\nSecond line.\n' | "$OPS" comment "$T#1" -
 check "comment marker extracted"  grep -q '> \[design-note\] (....-..-..): Approach: "quote" & $dollar\.' "$T"
 check "comment multiline quoted"  grep -q '^> Second line\.$' "$T"
+printf '[security-test] api_key=%s\n' "$OUTBOUND_SECRET" | "$OPS" comment "$T#1" - >/dev/null
+check "comment never stores a raw credential" bash -c "! grep -Fq '$OUTBOUND_SECRET' '$T'"
+check "comment stores a redaction marker" grep -Fq '[REDACTED POTENTIAL SECRET]' "$T"
 
 # -- comment: body from a file ---------------------------------------------------
 printf 'From a file.\n' > body.txt
@@ -219,6 +237,8 @@ printf '[review-request]\nFiles: a.py\n' > delivery.txt
 "$OPS" comment-once "$T#1" delivery-123 delivery.txt
 "$OPS" comment-once "$T#1" delivery-123 delivery.txt
 check "comment-once retry keeps one delivery" test "$(grep -c 'delivery-id: delivery-123' "$T")" -eq 1
+refuse "secret-bearing delivery identifier is refused" "unsafe content detected in outbound comment-delivery-id" \
+  "$OPS" comment-once "$T#1" "$OUTBOUND_SECRET" delivery.txt
 
 # -- record-denial: guardrail DENY becomes idempotent ticket-level evidence -----
 printf 'deploy.apply argv: terraform destroy -auto-approve (production)\n' > denied.txt
@@ -232,6 +252,10 @@ check "denial carries an id"               grep -q '^> denial-id: denial-' "$T"
 check "denial retry is idempotent" bash -c \
   "'$OPS' record-denial '$T#1' --actor deep-infra/devops --reason 'infrastructure destroy is forbidden' denied.txt \
    && [ \"\$(grep -c 'denial-id: ' '$T')\" -eq 1 ]"
+printf 'attempted request included password=%s\n' "$OUTBOUND_SECRET" | "$OPS" record-denial "$T#1" \
+  --actor policy-gate --reason "credential exposure is forbidden" --denial-id denial-secret-0001 - >/dev/null
+check "denial evidence never stores a raw credential" bash -c "! grep -Fq '$OUTBOUND_SECRET' '$T'"
+check "denial evidence stores a redaction marker" grep -Fq '[REDACTED POTENTIAL SECRET]' "$T"
 printf 'curl 169.254.169.254 \x01\x02with control bytes\n' | "$OPS" record-denial "$T#1" \
   --actor full-stack/backend --reason "metadata credential access is forbidden" --denial-id denial-ctrl-0001 -
 check "denial strips control bytes" bash -c "grep -q 'curl 169.254.169.254 *with control bytes' '$T' && ! grep -q \$'\x01' '$T'"
@@ -299,11 +323,25 @@ refuse "integration broker cannot release Blocked" "outbound \[Blocked\].*human-
 check "all refused outbound transitions preserve Blocked" \
   test "$(grep -c '\[Blocked\]$' held.md)" -eq 4
 
+cat > secure-fields.md <<'EOF'
+# Secure structural fields [Planned]
+
+## 1 Reject credential routing [Planned]
+
+**Assignee:** —
+EOF
+refuse "secret-bearing assignee role is refused before mutation" "unsafe content detected in outbound assignee-role" \
+  "$OPS" claim secure-fields.md#1 "$OUTBOUND_SECRET"
+check "refused assignee role leaves task and assignee unchanged" bash -c \
+  "grep -q '^## 1 Reject credential routing \[Planned\]$' secure-fields.md && grep -q '^\\*\\*Assignee:\\*\\* —$' secure-fields.md"
+
 # -- integrate: terminal move + hash citation + extra body -----------------------
-printf 'VALIDATE_TEST green. Merged: a.py\n' | "$OPS" integrate "$T#1" abc1234 -
+printf 'VALIDATE_TEST green. Merged: a.py\napi_key=%s\n' "$OUTBOUND_SECRET" | "$OPS" integrate "$T#1" abc1234 -
 check "integrate terminal status" grep -q '^## 1 Add form \[Ready to deploy\]$' "$T"
 check "integrate cites the hash"  grep -q 'Integrated: commit abc1234\.' "$T"
 check "integrate appends body"    grep -q 'VALIDATE_TEST green\. Merged: a\.py' "$T"
+check "integration comment never stores a raw credential" bash -c "! grep -Fq '$OUTBOUND_SECRET' '$T'"
+check "integration comment stores a redaction marker" grep -Fq '[REDACTED POTENTIAL SECRET]' "$T"
 check "integrate signed"          grep -q -- '— integrator' "$T"
 printf 'VALIDATE_TEST green. Merged: a.py\n' | "$OPS" integrate "$T#1" abc1234 -
 check "integrate retry is idempotent" test "$(grep -c 'Integrated: commit abc1234\.' "$T")" -eq 1
@@ -367,6 +405,9 @@ assert d['orphans'] == []
 "
 
 # -- feature projection and state use their own configured state machine --------
+printf '[deployment]\ncredential: %s\n' "$OUTBOUND_SECRET" | "$OPS" upsert-deployment "$T" - >/dev/null
+check "deployment projection never stores a raw credential" bash -c "! grep -Fq '$OUTBOUND_SECRET' '$T'"
+check "deployment projection stores a redaction marker" grep -Fq '[REDACTED POTENTIAL SECRET]' "$T"
 printf '[deployment]\nstate: verifying\n' | "$OPS" upsert-deployment "$T" -
 printf '[deployment]\nstate: succeeded\n' | "$OPS" upsert-deployment "$T" -
 check "deployment upsert keeps one managed block" test "$(grep -c 'agent-squad:deployment:start' "$T")" -eq 1

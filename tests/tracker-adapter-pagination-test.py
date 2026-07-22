@@ -23,8 +23,11 @@ def load_definitions(adapter, extra_config=""):
     temp = tempfile.TemporaryDirectory()
     skill = Path(temp.name)
     (skill / "config").mkdir()
+    (skill / "bin").mkdir()
     shutil.copy(ROOT / "config" / "statuses.config.json",
                 skill / "config" / "statuses.config.json")
+    shutil.copy(ROOT / "bin" / "ticket_content_security.py",
+                skill / "bin" / "ticket_content_security.py")
     (skill / "config" / "project-management.config.md").write_text(
         "PRODUCT_MANAGEMENT_TOOL=%s\nSTATUS_CONFIG=config/statuses.config.json\n%s"
         % (adapter, extra_config))

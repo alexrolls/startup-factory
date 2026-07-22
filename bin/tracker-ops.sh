@@ -57,6 +57,33 @@ def die(msg):
 SKILL_DIR = sys.argv[1]
 ARGS = sys.argv[2:]
 
+# Tracker writes are a data-loss-prevention boundary.  Reuse the same bounded,
+# standard-library scanner that protects inbound ticket packets so no backend or
+# project-owned adapter can receive a raw credential from agent-authored text.
+sys.path.insert(0, os.path.join(SKILL_DIR, 'bin'))
+try:
+    from ticket_content_security import TicketContentSecurityError, protect_ticket_content
+except (ImportError, OSError) as e:
+    die("cannot load ticket content security policy: %s — andon" % e)
+
+def protect_outbound_ticket_text(value, destination, structural=False):
+    """Return tracker-safe text, or refuse unsafe structural field values."""
+    try:
+        protected = protect_ticket_content(value, 'outbound.%s' % destination)
+    except TicketContentSecurityError as e:
+        die("outbound %s failed the ticket content security policy: %s — andon"
+            % (destination, e))
+    if structural and protected.flagged:
+        # Redacting an identifier or assignee would silently change routing and
+        # idempotency semantics.  Refuse it without echoing attacker content.
+        die("unsafe content detected in outbound %s; tracker mutation refused — andon"
+            % destination)
+    if protected.redaction_count:
+        print("tracker-ops: warning — redacted %d potential credential(s) from "
+              "outbound %s before tracker mutation"
+              % (protected.redaction_count, destination), file=sys.stderr)
+    return protected.safe_text
+
 # ---- config -----------------------------------------------------------------
 def read_config_keys(path):
     keys = {}
@@ -1993,7 +2020,8 @@ def op_task_reopen(args):
 def op_comment(args):
     if len(args) not in (1, 2):
         die("usage: comment <taskId> [bodyfile]  (no file / '-' = stdin)")
-    body = read_body(args[1] if len(args) == 2 else None)
+    body = protect_outbound_ticket_text(
+        read_body(args[1] if len(args) == 2 else None), 'comment-body')
     if body.count('\n') + 1 > 50:
         print("tracker-ops: warning — comment body exceeds the 50-line budget "
               "(protocol: move detail to <TEAMWORK_ROOT>/<team>/artifacts/ and cite the path)",
@@ -2007,10 +2035,13 @@ def op_comment_once(args):
     task_id, delivery_id = args[0], args[1]
     if not re.fullmatch(r'[A-Za-z0-9._:-]+', delivery_id):
         die("invalid delivery id '%s'" % delivery_id)
+    delivery_id = protect_outbound_ticket_text(
+        delivery_id, 'comment-delivery-id', structural=True)
     body = read_body(args[2])
     token = "delivery-id: %s" % delivery_id
     if token not in body:
         body += "\n\n" + token
+    body = protect_outbound_ticket_text(body, 'comment-body')
     if not backend.comment_exists(task_id, token):
         backend.comment(task_id, body)
     print("comment delivery %s recorded on %s" % (delivery_id, task_id))
@@ -2020,7 +2051,9 @@ def op_update_comment(args):
         die("usage: update-comment <taskId> <commentId> [bodyfile]  (no file / '-' = stdin)")
     if not hasattr(backend, 'update_comment'):
         die("adapter '%s' does not support update-comment" % ADAPTER)
-    backend.update_comment(args[0], args[1], read_body(args[2] if len(args) == 3 else None))
+    body = protect_outbound_ticket_text(
+        read_body(args[2] if len(args) == 3 else None), 'comment-body')
+    backend.update_comment(args[0], args[1], body)
     print("comment %s updated on %s" % (args[1], args[0]))
 
 def op_upsert_progress(args):
@@ -2029,6 +2062,7 @@ def op_upsert_progress(args):
     body = read_body(args[1] if len(args) == 2 else None)
     if not body.lstrip().startswith('[progress]'):
         die("upsert-progress body must begin with [progress]")
+    body = protect_outbound_ticket_text(body, 'progress-body')
     fresh_task_status(args[0])
     cid = backend.upsert_progress(args[0], body)
     print("progress updated on %s%s" % (args[0], " (id: %s)" % cid if cid else ""))
@@ -2039,6 +2073,7 @@ def op_upsert_digest(args):
     body = read_body(args[1] if len(args) == 2 else None)
     if not body.lstrip().startswith('[digest]'):
         die("upsert-digest body must begin with [digest]")
+    body = protect_outbound_ticket_text(body, 'digest-body')
     backend.upsert_digest(args[0], body)
     print("digest updated on %s" % args[0])
 
@@ -2048,6 +2083,7 @@ def op_upsert_deployment(args):
     body = read_body(args[1] if len(args) == 2 else None)
     if not body.lstrip().startswith('[deployment]'):
         die("upsert-deployment body must begin with [deployment]")
+    body = protect_outbound_ticket_text(body, 'deployment-body')
     backend.upsert_deployment(args[0], body)
     print("deployment updated on %s" % args[0])
 
@@ -2066,6 +2102,9 @@ def op_claim(args):
     if len(args) != 2:
         die("usage: claim <taskId> <role> [--to <Status>]")
     task_id, role = args
+    role = protect_outbound_ticket_text(role, 'assignee-role', structural=True).strip()
+    if not role or '\n' in role or len(role) > 128:
+        die("claim role must be a non-empty single-line value of at most 128 characters")
     init = initial_status()
     expected = expected or init['name']
     if expected != init['name']:
@@ -2085,6 +2124,8 @@ def op_claim(args):
     claim_id = claim_id or ('claim-' + hashlib.sha256(('%s\0%s\0%s' % (task_id, role, to)).encode()).hexdigest()[:24])
     if not re.fullmatch(r'[A-Za-z0-9._:-]{8,128}', claim_id):
         die("invalid claim id '%s'" % claim_id)
+    claim_id = protect_outbound_ticket_text(
+        claim_id, 'claim-id', structural=True)
     token = "claim-id: %s" % claim_id
     current = backend.current_status(task_id)
     if current is None:
@@ -2098,7 +2139,10 @@ def op_claim(args):
         die("claim conflict: expected [%s], observed [%s] for %s — no launch" % (expected, current, task_id))
     if not backend.comment_exists(task_id, token):
         fresh_task_status(task_id, expected)
-        backend.comment(task_id, "[claim]\n%s\nrole: %s\ntarget-status: %s\n\n— dispatcher" % (token, role, to))
+        body = protect_outbound_ticket_text(
+            "[claim]\n%s\nrole: %s\ntarget-status: %s\n\n— dispatcher"
+            % (token, role, to), 'comment-body')
+        backend.comment(task_id, body)
     if hasattr(backend, 'set_assignee'):
         fresh_task_status(task_id, expected)
         backend.set_assignee(task_id, role)
@@ -2127,17 +2171,24 @@ def op_record_denial(args):
     task_id = args[0]
     if not actor or not reason:
         die("record-denial requires --actor and --reason")
-    actor = sanitize_untrusted(actor.replace('\n', ' '), 128)
-    reason = sanitize_untrusted(reason.replace('\n', '; '), 500)
+    actor = protect_outbound_ticket_text(
+        sanitize_untrusted(actor.replace('\n', ' '), 128),
+        'denial-actor', structural=True)
+    reason = protect_outbound_ticket_text(
+        sanitize_untrusted(reason.replace('\n', '; '), 500), 'denial-reason')
     if not actor or not reason:
         die("record-denial actor/reason must not be empty after sanitization")
-    attempted = sanitize_untrusted(read_body(args[1] if len(args) == 2 else None), 1800)
+    attempted = protect_outbound_ticket_text(
+        sanitize_untrusted(read_body(args[1] if len(args) == 2 else None), 1800),
+        'denial-attempt')
     if not attempted:
         die("record-denial requires a non-empty attempted-action description")
     denial_id = denial_id or ('denial-' + hashlib.sha256(
         ('%s\0%s\0%s\0%s' % (task_id, actor, reason, attempted)).encode()).hexdigest()[:24])
     if not re.fullmatch(r'[A-Za-z0-9._:-]{8,128}', denial_id):
         die("invalid denial id '%s'" % denial_id)
+    denial_id = protect_outbound_ticket_text(
+        denial_id, 'denial-id', structural=True)
     token = "denial-id: %s" % denial_id
     if backend.comment_exists(task_id, token):
         print("%s denial %s already recorded" % (task_id, denial_id))
@@ -2147,6 +2198,7 @@ def op_record_denial(args):
             "Denial reason: %s\n\n"
             "This action was blocked by the fail-closed policy gate and was not executed.\n\n"
             "— policy gate" % (token, actor, attempted, reason))
+    body = protect_outbound_ticket_text(body, 'comment-body')
     backend.comment(task_id, body)
     print("%s denial recorded (denial-id: %s)" % (task_id, denial_id))
 
@@ -2156,12 +2208,14 @@ def op_integrate(args):
     task_id, commit = args[0], args[1]
     if not re.fullmatch(r'[0-9a-f]{7,40}', commit):
         die("'%s' does not look like a commit hash" % commit)
-    extra = read_body(args[2]) if len(args) == 3 else None
+    extra = (protect_outbound_ticket_text(read_body(args[2]), 'integration-comment-body')
+             if len(args) == 3 else None)
     term = terminal_status()
     body = "Integrated: commit %s." % commit
     if extra:
         body += "\n\n" + extra
     body += "\n\n— integrator"
+    body = protect_outbound_ticket_text(body, 'comment-body')
     current_name = backend.current_status(task_id)
     if current_name is None:
         die("cannot reverse-map the current status of %s — andon" % task_id)

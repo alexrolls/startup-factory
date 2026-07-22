@@ -189,6 +189,7 @@ trusted={name:digest(pathlib.Path(root)/rel) for name,rel in {
   "outbox_capability.py":"bin/outbox_capability.py",
   "broker_evidence.py":"bin/broker_evidence.py",
   "runtime-state.py":"bin/runtime-state.py",
+  "ticket_content_security.py":"bin/ticket_content_security.py",
   "task_metadata.py":"bin/task_metadata.py",
   "product_acceptance.py":"bin/product_acceptance.py",
   "statuses.config.json":"config/statuses.config.json",

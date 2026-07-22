@@ -764,6 +764,7 @@ def trusted_file_specs() -> dict[str, tuple[Path, Path]]:
         "outbox_capability.py": ((SKILL_DIR / "bin" / "outbox_capability.py").resolve(), Path("bin/outbox_capability.py")),
         "broker_evidence.py": ((SKILL_DIR / "bin" / "broker_evidence.py").resolve(), Path("bin/broker_evidence.py")),
         "runtime-state.py": ((SKILL_DIR / "bin" / "runtime-state.py").resolve(), Path("bin/runtime-state.py")),
+        "ticket_content_security.py": ((SKILL_DIR / "bin" / "ticket_content_security.py").resolve(), Path("bin/ticket_content_security.py")),
         "task_metadata.py": ((SKILL_DIR / "bin" / "task_metadata.py").resolve(), Path("bin/task_metadata.py")),
         "product_acceptance.py": ((SKILL_DIR / "bin" / "product_acceptance.py").resolve(), Path("bin/product_acceptance.py")),
         "teamwork-path.py": ((SKILL_DIR / "bin" / "teamwork-path.py").resolve(), Path("bin/teamwork-path.py")),

@@ -46,6 +46,7 @@ RELEASE_SNAPSHOT_FILES = {
     "outbox_capability.py": Path("bin/outbox_capability.py"),
     "broker_evidence.py": Path("bin/broker_evidence.py"),
     "runtime-state.py": Path("bin/runtime-state.py"),
+    "ticket_content_security.py": Path("bin/ticket_content_security.py"),
     "task_metadata.py": Path("bin/task_metadata.py"),
     "product_acceptance.py": Path("bin/product_acceptance.py"),
     "teamwork-path.py": Path("bin/teamwork-path.py"),

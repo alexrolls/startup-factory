@@ -516,7 +516,7 @@ the default.
    ```
 
    For Claude Code use `--agent claude-code`. Pin a release in controlled
-   environments, for example `startup-factory@0.1.4`. `uvx` creates an isolated
+   environments, for example `startup-factory@0.1.5`. `uvx` creates an isolated
    environment for the installer and leaves no Startup Factory package in your
    project environment.
 

@@ -129,6 +129,18 @@ Pre-integration launch and workspace handling are also fail closed:
   driver's parameterized-query API; labeling or escaping a ticket payload is
   not a SQL-injection defense at the database boundary. Tool calls remain
   independently allowlisted and validated against task intent.
+- Every agent-authored tracker write supported by `bin/tracker-ops.sh` passes
+  through that same scanner immediately before the selected backend is called.
+  Potential API keys, passwords, tokens, private keys, and other recognized
+  credentials are replaced with `[REDACTED POTENTIAL SECRET]` in comments and
+  managed progress, digest, deployment, denial, and integration text. Unsafe
+  structural values such as assignee roles and idempotency identifiers fail
+  closed because silently rewriting them would alter routing or retry semantics.
+  Adapter implementations, including project-owned adapters, receive only the
+  protected value. The warning and error paths never echo the detected secret.
+  SQL, shell, file-deletion, and other dangerous examples remain inert ticket
+  data: posting them is not execution and does not bypass the independent tool
+  and release-policy gates described above.
 - `TEAMWORK_ROOT` must be repository-relative, cannot contain `..`, and every
   managed child path is resolved before a read, directory creation, or write.
   Absolute roots and every existing symlink component are rejected, including a
