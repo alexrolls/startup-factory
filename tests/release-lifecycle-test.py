@@ -51,6 +51,106 @@ class ReleaseLifecycleTest(unittest.TestCase):
             ),
         }
 
+    @staticmethod
+    def valid_verification_proof() -> dict:
+        return {
+            "schemaVersion": 1,
+            "healthy": True,
+            "releaseId": "release-fixture-12345678",
+            "artifactDigest": "sha256:" + "a" * 64,
+            "probes": [
+                {
+                    "id": "acceptance.public-entry",
+                    "acceptanceCriterion": "AC-1",
+                    "entryPath": "public service endpoint",
+                    "preconditions": ["authenticated session"],
+                    "passed": True,
+                    "negativeControl": False,
+                    "evidenceDigest": "sha256:" + "b" * 64,
+                },
+                {
+                    "id": "acceptance.denied-path",
+                    "acceptanceCriterion": "AC-2",
+                    "entryPath": "public service endpoint",
+                    "preconditions": [],
+                    "passed": True,
+                    "negativeControl": True,
+                    "evidenceDigest": "sha256:" + "c" * 64,
+                },
+            ],
+        }
+
+    def test_verification_requires_exact_behavioral_probe_coverage(self) -> None:
+        config = {
+            "verification": {
+                "requiredProbeIds": [
+                    "acceptance.public-entry",
+                    "acceptance.denied-path",
+                ],
+                "requireNegativeProbe": True,
+            }
+        }
+        proof = self.valid_verification_proof()
+        release.validate_verification_attestation(
+            proof,
+            release_id="release-fixture-12345678",
+            artifact_digest="sha256:" + "a" * 64,
+            config=config,
+        )
+        with self.assertRaisesRegex(release.ReleaseError, "cover exactly"):
+            release.validate_verification_attestation(
+                {**proof, "probes": proof["probes"][:1]},
+                release_id="release-fixture-12345678",
+                artifact_digest="sha256:" + "a" * 64,
+                config=config,
+            )
+        with self.assertRaisesRegex(release.ReleaseError, "negative/failure-path"):
+            release.validate_verification_attestation(
+                {
+                    **proof,
+                    "probes": [
+                        {**item, "negativeControl": False}
+                        for item in proof["probes"]
+                    ],
+                },
+                release_id="release-fixture-12345678",
+                artifact_digest="sha256:" + "a" * 64,
+                config=config,
+            )
+
+    def test_verification_rejects_helper_only_or_unbound_evidence(self) -> None:
+        config = {
+            "verification": {
+                "requiredProbeIds": [
+                    "acceptance.public-entry",
+                    "acceptance.denied-path",
+                ],
+                "requireNegativeProbe": True,
+            }
+        }
+        proof = self.valid_verification_proof()
+        invalid = {
+            **proof,
+            "probes": [
+                {**proof["probes"][0], "entryPath": ""},
+                proof["probes"][1],
+            ],
+        }
+        with self.assertRaisesRegex(release.ReleaseError, "entryPath"):
+            release.validate_verification_attestation(
+                invalid,
+                release_id="release-fixture-12345678",
+                artifact_digest="sha256:" + "a" * 64,
+                config=config,
+            )
+        with self.assertRaisesRegex(release.ReleaseError, "deployed artifact"):
+            release.validate_verification_attestation(
+                proof,
+                release_id="release-fixture-12345678",
+                artifact_digest="sha256:" + "d" * 64,
+                config=config,
+            )
+
     def test_ci_proof_requires_exact_commit_and_closed_schema(self) -> None:
         proof = self.valid_ci_proof()
         proof["pipelineId"] = "1"

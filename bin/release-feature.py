@@ -1918,6 +1918,128 @@ def validate_ci_proof(
         raise AwaitingCi("CI/CD green proof expired before deployment")
 
 
+def verification_requirements(config: dict) -> tuple[tuple[str, ...], bool]:
+    value = config.get("verification")
+    expected = {"requiredProbeIds", "requireNegativeProbe"}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ReleaseError(
+            "enabled deployment verification must use the exact closed schema "
+            "{requiredProbeIds, requireNegativeProbe}"
+        )
+    probe_ids = value.get("requiredProbeIds")
+    if (
+        not isinstance(probe_ids, list)
+        or not probe_ids
+        or len(probe_ids) != len(set(probe_ids))
+        or any(
+            not isinstance(item, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", item)
+            for item in probe_ids
+        )
+    ):
+        raise ReleaseError(
+            "verification.requiredProbeIds must be a non-empty unique list of stable probe ids"
+        )
+    require_negative = value.get("requireNegativeProbe")
+    if type(require_negative) is not bool:
+        raise ReleaseError("verification.requireNegativeProbe must be boolean")
+    return tuple(probe_ids), require_negative
+
+
+def validate_verification_attestation(
+    proof: dict,
+    *,
+    release_id: str,
+    artifact_digest: str,
+    config: dict,
+) -> None:
+    expected_fields = {
+        "schemaVersion", "healthy", "releaseId", "artifactDigest", "probes",
+    }
+    if not isinstance(proof, dict) or set(proof) != expected_fields:
+        raise ReleaseError("verify hook must return the exact closed verification schema")
+    if type(proof.get("schemaVersion")) is not int or proof.get("schemaVersion") != 1:
+        raise ReleaseError("verification schemaVersion must be 1")
+    if proof.get("healthy") is not True:
+        raise ReleaseError("verification attestation is not healthy")
+    if proof.get("releaseId") != release_id:
+        raise ReleaseError("verification attestation is not bound to the exact release id")
+    if proof.get("artifactDigest") != artifact_digest:
+        raise ReleaseError("verification attestation is not bound to the deployed artifact")
+
+    required_ids, require_negative = verification_requirements(config)
+    probes = proof.get("probes")
+    probe_fields = {
+        "id", "acceptanceCriterion", "entryPath", "preconditions",
+        "passed", "negativeControl", "evidenceDigest",
+    }
+    if not isinstance(probes, list) or any(
+        not isinstance(item, dict) or set(item) != probe_fields for item in probes
+    ):
+        raise ReleaseError("verification probes must use the exact closed probe schema")
+    observed_ids: list[str] = []
+    negative_count = 0
+    for index, probe in enumerate(probes):
+        probe_id = probe.get("id")
+        if (
+            not isinstance(probe_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", probe_id)
+        ):
+            raise ReleaseError(f"verification probe {index} has an invalid id")
+        observed_ids.append(probe_id)
+        for field in ("acceptanceCriterion", "entryPath"):
+            text = probe.get(field)
+            if (
+                not isinstance(text, str)
+                or not text.strip()
+                or text != text.strip()
+                or len(text) > 512
+                or any(ord(character) < 32 for character in text)
+            ):
+                raise ReleaseError(
+                    f"verification probe {probe_id} needs a bounded {field}"
+                )
+        preconditions = probe.get("preconditions")
+        if (
+            not isinstance(preconditions, list)
+            or len(preconditions) != len(set(preconditions))
+            or any(
+                not isinstance(item, str)
+                or not item.strip()
+                or item != item.strip()
+                or len(item) > 256
+                or any(ord(character) < 32 for character in item)
+                for item in preconditions
+            )
+        ):
+            raise ReleaseError(
+                f"verification probe {probe_id} preconditions must be unique bounded non-secret names"
+            )
+        if probe.get("passed") is not True:
+            raise ReleaseError(f"required verification probe {probe_id} did not pass")
+        if type(probe.get("negativeControl")) is not bool:
+            raise ReleaseError(
+                f"verification probe {probe_id} negativeControl must be boolean"
+            )
+        negative_count += int(probe["negativeControl"])
+        if not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(probe.get("evidenceDigest") or "")
+        ):
+            raise ReleaseError(
+                f"verification probe {probe_id} needs a sha256 evidence digest"
+            )
+    if len(observed_ids) != len(set(observed_ids)):
+        raise ReleaseError("verification attestation contains duplicate probe ids")
+    if set(observed_ids) != set(required_ids):
+        raise ReleaseError(
+            "verification attestation does not cover exactly the configured acceptance probes"
+        )
+    if require_negative and negative_count < 1:
+        raise ReleaseError(
+            "verification requires at least one passing negative/failure-path probe"
+        )
+
+
 def verify_ci(
     config: dict,
     values: dict[str, str],
@@ -2683,6 +2805,7 @@ def execute(args: argparse.Namespace) -> int:
         raise ReleaseError("approval-required mode needs a verifyApproval hook")
     if config["mode"] == "automatic" and not (config.get("hooks") or {}).get("verifyDelivery"):
         raise ReleaseError("automatic mode needs a protected verifyDelivery identity/isolation attestor")
+    verification_requirements(config)
 
     validate_planning_isolation_config(config)
     configure_trusted_tools(config, repository)
@@ -3701,13 +3824,17 @@ def execute(args: argparse.Namespace) -> int:
             verification = strict_json(verification_result.stdout)
         except ValueError as exc:
             raise ReleaseError("verify hook must print one JSON attestation") from exc
-        verified = (
-            verification_result.returncode == 0
-            and isinstance(verification, dict)
-            and verification.get("healthy") is True
-            and verification.get("artifactDigest") == transaction.get("artifactDigest")
-            and verification.get("releaseId") in {None, release_id}
-        )
+        verification_error = ""
+        try:
+            validate_verification_attestation(
+                verification,
+                release_id=release_id,
+                artifact_digest=str(transaction.get("artifactDigest") or ""),
+                config=config,
+            )
+        except ReleaseError as exc:
+            verification_error = str(exc)
+        verified = verification_result.returncode == 0 and not verification_error
         if not verified:
             rollback = plan.get("rollback") or {}
             hook = (config.get("hooks") or {}).get("rollback")
@@ -3718,7 +3845,11 @@ def execute(args: argparse.Namespace) -> int:
                 and rollback.get("previousArtifactDigest") == previous
             )
             if safe:
-                transaction.update({"phase": "rolling-back", "updatedAt": now(), "failure": "verification failed"})
+                transaction.update({
+                    "phase": "rolling-back",
+                    "updatedAt": now(),
+                    "failure": ("verification failed: " + verification_error)[:512],
+                })
                 atomic_json(transaction_file, transaction)
                 rollback_authorization = canonical_digest({
                     "releaseId": release_id, "planDigest": transaction["planDigest"],
@@ -3738,7 +3869,14 @@ def execute(args: argparse.Namespace) -> int:
                 else:
                     transaction.update({"phase": "failed", "updatedAt": now(), "failure": "rollback could not be verified"})
             else:
-                transaction.update({"phase": "failed", "updatedAt": now(), "failure": "verification failed; no verified safe rollback"})
+                transaction.update({
+                    "phase": "failed",
+                    "updatedAt": now(),
+                    "failure": (
+                        "verification failed; no verified safe rollback: "
+                        + verification_error
+                    )[:512],
+                })
             atomic_json(transaction_file, transaction)
             project_transaction(transaction, release_dir, repository, args.feature, tracker_env)
             if transaction.get("phase") == "rolled-back":

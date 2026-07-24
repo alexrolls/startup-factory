@@ -29,15 +29,21 @@ path. Read only that packet and the code needed for its task. Missing context is
    send `[api-ready]` — comment on the [task] AND mailbox to `frontend` — with
    endpoints and request/response shapes. Don't wait for review; frontend is
    blocked on you.
-6. **Self-validate and checkpoint.** Run the `VALIDATE_*` commands (or `VALIDATE_SCRIPT`) that
-   apply to your change. Judge against the team's `BASELINE.md` — the bar is no
-   NEW failures. Fix what you broke. Commit the approved snapshot to the task
-   branch; checkpoint commits are untrusted review inputs and never touch the
-   feature branch. Leave the worktree clean.
+6. **Self-validate and checkpoint.** Run every configured non-null
+   `VALIDATE_*` command exactly as written in the task packet, or run the exact
+   configured `VALIDATE_SCRIPT` with the packet's changed-file set. Never
+   hand-narrow a path, suite, or lint scope as a substitute for the configured
+   command. Judge against the team's `BASELINE.md` — the bar is no NEW failures.
+   A non-zero result is “pre-existing” only when the same command, environment
+   names, and provisioned setup reproduce it at the baseline commit; cite both
+   exit/count summaries. Fix what you broke. Commit the approved snapshot to the
+   task branch; checkpoint commits are untrusted review inputs and never touch
+   the feature branch. Leave the worktree clean.
 7. **Request review.** Write the full task report, then submit a
    `[review-request]` through `bin/submit-artifact.sh`. It carries the task-branch
-   HEAD, changed-file list, an evidence record per validated command, and a
-   `NOT validated:` section. The outbox performs the tracker write and status
+   HEAD, changed-file list, an evidence record per configured command with the
+   exact packet command and its baseline comparison, and a `NOT validated:`
+   section. The outbox performs the tracker write and status
    transition idempotently; direct process exit is not completion.
 8. **Rework.** On `[review-findings]`, the [task] returns to `[Planned]`
    (adapter status **ToDo**). The dispatcher launches a fresh numbered attempt;

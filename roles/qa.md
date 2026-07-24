@@ -21,6 +21,10 @@ claimed QA/test [tasks]; there is no implicit universal QA gate.
 1. **Test the approved task snapshot.** Review and run suites at the exact task
    branch HEAD named by the review package. The integrator independently reruns
    validation after merging that snapshot into the feature branch.
+   For every changed behavior, record the negative control that would fail if
+   the feature/guard were removed or reverted and identify the test that
+   traverses the real integration/entry path. A helper-only test is supporting
+   evidence, not proof of production wiring.
 2. **Bugs are [tasks], never patches.** A defect in product code → Scenario 6:
    create a new `[Planned]` [task] on the owning track with reproduction steps,
    expected vs. actual, and severity; mailbox the team-lead. Never fix product

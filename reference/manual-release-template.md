@@ -47,21 +47,27 @@ values in this document.
 ## Environment activation
 
 Code delivery is not necessarily activation. List every required configuration,
-cache, index, data, schema, model, prompt, tenant, or routing refresh. Name the
-owner and observable success condition for each. If none apply, state why.
+cache, index, data, schema, model, prompt, tenant, or routing refresh in execution
+order. Name the owner, compatibility direction (old code/new state and new
+code/old state), and observable success condition for each. Schema migrations
+must be explicit steps; never assume the artifact deploy runs them. If none
+apply, state why.
 
-| Activation step | Owner | Expected evidence | Failure action |
-|---|---|---|---|
-|  |  |  | stop / rollback / escalate |
+| Order | Activation step | Owner | Compatibility direction | Expected evidence | Failure action |
+|---|---|---|---|---|---|
+|  |  |  |  |  | stop / rollback / escalate |
 
 ## Post-deploy probes
 
-Derive these from acceptance criteria, review conditions, and changed trust
-boundaries. Include at least one negative/failure-path probe when relevant.
+Derive stable probe ids from every acceptance criterion, review condition, and
+changed trust boundary. Configure those ids in
+`deployment.config.json.verification.requiredProbeIds`. Exercise the real entry
+path, declare non-secret preconditions needed to make the probe meaningful, and
+include at least one negative/failure-path probe when configured.
 
-| Probe | Pass criterion | Evidence location | Failure action |
-|---|---|---|---|
-|  |  |  | stop / rollback / file [task] |
+| Probe id / acceptance row | Real entry path | Non-secret preconditions | Pass criterion | Evidence digest/location | Failure action |
+|---|---|---|---|---|---|
+|  |  |  |  |  | stop / rollback / file [task] |
 
 ## Rollback
 

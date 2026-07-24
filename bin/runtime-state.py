@@ -751,6 +751,14 @@ def cmd_packet(args) -> None:
         "",
         "## Validation",
         "",
+        (
+            "Run every configured command below exactly as written. A narrowed path, suite, "
+            "or lint scope is a different command and does not satisfy the configured check. "
+            "For each evidence record, cite the same-command baseline entry from BASELINE.md; "
+            "a claimed pre-existing failure requires reproduction with the same setup and "
+            "non-secret environment names."
+        ),
+        "",
     ]
     validations = packet["validation"]
     lines.extend(["- `%s`: `%s`" % item for item in validations.items()] or ["- No validation commands configured; report every skip."])

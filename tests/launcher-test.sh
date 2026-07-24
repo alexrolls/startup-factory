@@ -318,6 +318,24 @@ assert any(name.endswith('.json') for name in os.listdir(records))
 assert all(stat.S_IMODE(os.stat(os.path.join(records,name)).st_mode) == 0o600 for name in os.listdir(records))
 PY
 
+AGENT_CLI_HOME="$TMP/agent-cli-home"
+mkdir -m 700 "$AGENT_CLI_HOME"
+printf 'AGENT_SANDBOX_HOME="%s"\n' "$AGENT_CLI_HOME" >> .claude/skills/pm/config/team.config.md
+TEAM_RUNNER=background "$LAUNCH" start dedicated-home FEAT-HOME backend
+for i in $(seq 1 20); do
+  [ -f agent-env.txt ] && grep -qx "$AGENT_CLI_HOME" agent-env.txt && break
+  sleep 0.1
+done
+check "dedicated CLI-state home is passed without ambient HOME" grep -qx "$AGENT_CLI_HOME" agent-env.txt
+sed_i 's|^AGENT_ENV_ALLOWLIST=.*|AGENT_ENV_ALLOWLIST="PATH HOME"|' .claude/skills/pm/config/team.config.md
+if TEAM_RUNNER=background "$LAUNCH" start ambient-home FEAT-HOME backend >/dev/null 2>&1; then
+  echo "FAIL: launcher accepted ambient HOME inheritance"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: launcher refuses ambient HOME inheritance"
+fi
+sed_i 's|^AGENT_ENV_ALLOWLIST=.*|AGENT_ENV_ALLOWLIST="PATH TMPDIR LANG LC_ALL TERM SAFE_AGENT_FLAG"|' .claude/skills/pm/config/team.config.md
+sed_i '/^AGENT_SANDBOX_HOME=/d' .claude/skills/pm/config/team.config.md
+
 sed_i 's|^AGENT_ENV_ALLOWLIST=.*|AGENT_ENV_ALLOWLIST="PATH LINEAR_API_KEY"|' .claude/skills/pm/config/team.config.md
 if LINEAR_API_KEY=tracker-secret TEAM_RUNNER=background "$LAUNCH" start blocked-env FEAT-ENV backend >/dev/null 2>&1; then
   echo "FAIL: broker mode accepted a tracker credential in AGENT_ENV_ALLOWLIST"; FAILURES=$((FAILURES+1))
@@ -325,6 +343,34 @@ else
   echo "ok: broker mode refuses tracker credentials in AGENT_ENV_ALLOWLIST"
 fi
 sed_i 's|^AGENT_ENV_ALLOWLIST=.*|AGENT_ENV_ALLOWLIST="PATH TMPDIR LANG LC_ALL TERM SAFE_AGENT_FLAG"|' .claude/skills/pm/config/team.config.md
+
+# -- doctor: real env/prompt/auth round trip before a persistent team launch ---
+cp .claude/skills/pm/config/team.config.md "$TMP/team.config.before-doctor"
+sed_i 's|^TEAM_LEAD_CMD=.*|TEAM_LEAD_CMD="cat '\''{prompt_file}'\''"|' .claude/skills/pm/config/team.config.md
+sed_i 's|^SENIOR_SECURITY_ENGINEER_CMD=.*|SENIOR_SECURITY_ENGINEER_CMD="cat '\''{prompt_file}'\''"|' .claude/skills/pm/config/team.config.md
+sed_i 's|^SENIOR_QA_ENGINEER_CMD=.*|SENIOR_QA_ENGINEER_CMD="cat '\''{prompt_file}'\''"|' .claude/skills/pm/config/team.config.md
+sed_i 's|^TEAM_DEFAULT_CMD=.*|TEAM_DEFAULT_CMD="cat '\''{prompt_file}'\''"|' .claude/skills/pm/config/team.config.md
+doctor_out="$("$LAUNCH" doctor full-stack doctor-team FEAT-DOCTOR)"
+printf '%s' "$doctor_out" | grep -q "every distinct configured command completed" \
+  && echo "ok: doctor completes prompt/auth round trips under the real agent environment" \
+  || { echo "FAIL: doctor did not complete: $doctor_out"; FAILURES=$((FAILURES+1)); }
+sed_i 's|^SENIOR_QA_ENGINEER_CMD=.*|SENIOR_QA_ENGINEER_CMD="false"|' .claude/skills/pm/config/team.config.md
+if doctor_out="$("$LAUNCH" doctor full-stack doctor-fail FEAT-DOCTOR 2>&1)"; then
+  echo "FAIL: doctor accepted a configured command that could not complete the round trip"; FAILURES=$((FAILURES+1))
+elif printf '%s' "$doctor_out" | grep -q "doctor FAILED"; then
+  echo "ok: doctor fails before launch when one configured command is unusable"
+else
+  echo "FAIL: doctor produced the wrong failure: $doctor_out"; FAILURES=$((FAILURES+1))
+fi
+sed_i 's|^SENIOR_QA_ENGINEER_CMD=.*|SENIOR_QA_ENGINEER_CMD="true"|' .claude/skills/pm/config/team.config.md
+if doctor_out="$("$LAUNCH" doctor full-stack doctor-no-token FEAT-DOCTOR 2>&1)"; then
+  echo "FAIL: doctor accepted exit zero without the prompt challenge token"; FAILURES=$((FAILURES+1))
+elif printf '%s' "$doctor_out" | grep -q "did not complete the prompt/authentication round trip"; then
+  echo "ok: doctor rejects exit zero without the prompt challenge token"
+else
+  echo "FAIL: doctor produced the wrong no-token failure: $doctor_out"; FAILURES=$((FAILURES+1))
+fi
+cp "$TMP/team.config.before-doctor" .claude/skills/pm/config/team.config.md
 
 # Broker mode strips tracker credentials from the team lead too. The broker is
 # a deterministic process, not an LLM role with a privileged environment.

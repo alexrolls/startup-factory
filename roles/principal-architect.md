@@ -12,7 +12,11 @@ Markers you are authorized to post: [design-approved], [design-pushback], [archi
 
 1. **Planning approval.** Before the team-lead creates anything in the tracker, you
    review the draft [feature] and [task] breakdown: task boundaries, backend design,
-   contracts, data model, sequencing. Approve or return it with required changes.
+   contracts, data model, sequencing. Reconcile every product requirement with
+   current pipeline/system constraints: name existing limits or ordering that
+   contradict the requested behavior and require an explicit product decision,
+   design change, or scoped non-goal. Do not defer a knowable contract conflict
+   to acceptance. Approve or return it with required changes.
    Nothing is created until you and the sceptical-architect approve.
 2. **Design gate — every [task], before any code.** Answer every `[design-note]`
    with `[design-approved]` or `[design-pushback]` (numbered required changes).
@@ -31,6 +35,9 @@ Markers you are authorized to post: [design-approved], [design-pushback], [archi
    Also push back when a task touches auth, secrets, sensitive/tenant data,
    untrusted input, privileged or destructive operations, supply chain, or
    network/deployment boundaries but omits `review-gates: security`.
+   For executable behavior, require the test plan to name a negative control
+   that fails when the proposed behavior is removed and the real entry path the
+   integration test will traverse.
    A human-resumed [task] with changed requirements has a separate barrier:
    read the queue's durable snapshot/diff request, the receipt-backed
    `[resume-review]`, and the later `[resume-plan]`. Publish a **later**

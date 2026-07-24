@@ -72,6 +72,12 @@ AGENT_ENV_ALLOWLIST="PATH TMPDIR LANG LC_ALL TERM NO_COLOR"
                                  # starts them with env -i, then adds only these non-secret names
                                  # plus fixed STARTUP_FACTORY_* role metadata and the hardening
                                  # value AWS_EC2_METADATA_DISABLED=true. PATH is required.
+AGENT_SANDBOX_HOME=null          # Optional absolute mode-0700 directory outside the repository
+                                 # containing only the minimum CLI login/state needed by configured
+                                 # agent commands. The launcher passes it as HOME without inheriting
+                                 # the operator's ambient home. Keep null when CLIs do not need HOME.
+DOCTOR_TIMEOUT_SECONDS=60        # Per distinct configured command. team/gate-team runs one
+                                 # non-mutating prompt/auth round trip before launching any role.
 POLL_INTERVAL_SECONDS=120        # Fallback only; local runtime events wake dispatch within ~1s
 STUCK_AFTER_MINUTES=15           # Lead treats silence longer than this as "stuck"
 ESCALATE_AFTER_ATTEMPTS=2        # Failed unblock attempts before the Lead escalates to the human
@@ -116,9 +122,10 @@ see `teams/_PLAYBOOK.md` → *Review modes*.
 
 ## Validation commands (framework-agnostic Integrator)
 
-The Integrator runs these before every merge+commit. Set them to your project's real
-commands; `null` skips that check (allowed, but the Integrator records the skip in
-its completion comment on the [task]).
+Workers and the Integrator run these exact commands. Set them to your project's
+real CI-equivalent commands; `null` skips that check (allowed, but the
+Integrator records the skip in its completion comment on the [task]). A worker
+must not replace a configured whole-tree command with a hand-scoped subset.
 
 ```
 VALIDATE_BUILD=null              # e.g. "npm run build" / "dotnet build" / "cargo build"
@@ -156,9 +163,15 @@ is "no new failures", not "all green".
 - `AGENT_ENV_ALLOWLIST` is a space-separated list of environment variable names,
   not values. Keep it small and non-secret. Privileged cloud/release variables are
   always refused, and tracker credentials are refused unless the explicit unsafe
-  `TRACKER_WRITERS=all` mode is in use. `HOME` is intentionally absent because an
-  ambient home commonly contains credential stores; if a model CLI requires it,
-  allow only a dedicated sandbox home containing the minimum CLI-specific state.
+  `TRACKER_WRITERS=all` mode is in use. Ambient `HOME` is always refused. If a
+  model CLI requires a home for authentication, configure `AGENT_SANDBOX_HOME`
+  as a dedicated external mode-0700 directory containing only its minimum
+  reviewed CLI state. Do not point it at the operator's normal home.
+- Run `bin/launch-team.sh doctor <preset> <team> <featureId>` after changing a
+  role command, CLI login, sandbox runner, allowlist, or dedicated CLI-state
+  home. Normal `team` and `gate-team` launches run it automatically after the
+  tracker preflight and before any persistent role starts. A successful binary
+  lookup without a prompt/authentication round trip is not a viable team.
 - `AGENT_SANDBOX_RUNNER` must be an absolute protected executable outside the
   repository, owned by the executor or root, and not group/world-writable. It is
   responsible for enforcing worktree-only writes, hiding host/broker state, and

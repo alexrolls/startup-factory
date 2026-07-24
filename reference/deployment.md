@@ -49,6 +49,13 @@ executor refuses unless all of these hold:
   CI/CD check for the exact feature commit succeeded; failed, pending, skipped,
   missing, stale, or unverifiable checks stop before planning and are checked
   again immediately before the apply process starts;
+- protected config names a non-empty set of stable acceptance-probe ids. The
+  digest-pinned `verify` hook must return one closed attestation covering
+  exactly those ids after activation, with the real entry path, non-secret
+  preconditions, pass result, and evidence digest for each. A health endpoint,
+  successful process exit, or unit-suite result cannot substitute for these
+  behavioral probes; when `requireNegativeProbe=true`, at least one passing
+  denial/failure-path probe is mandatory;
 - the tracked index/worktree is clean (untracked bytes and ignored submodule
   dirt are not release inputs), and the requested branch resolves to a full
   immutable commit; archive inspection separately rejects every gitlink;
@@ -185,6 +192,10 @@ setting `enabled`):
   "planningEnvironmentAllowlist": ["PATH", "TMPDIR", "LANG", "LC_ALL"],
   "trackerEnvironmentAllowlist": ["PATH", "TMPDIR", "LANG", "LC_ALL", "TRACKER_ADAPTER", "LINEAR_API_KEY"],
   "environmentAllowlist": ["PATH", "TMPDIR", "LANG", "LC_ALL"],
+  "verification": {
+    "requiredProbeIds": ["acceptance.primary-entry", "acceptance.denied-path"],
+    "requireNegativeProbe": true
+  },
   "trustedCodeDigests": {
     "release-feature.py": "sha256:<64 lowercase hex>",
     "policy-check.py": "sha256:<64 lowercase hex>",
@@ -253,6 +264,34 @@ bytes (for example, `shasum -a 256 <file>`) and store each value with the
 rotation in the protected external config. The PM supervisor and release
 executor independently capture the pinned custom backend into their protected
 snapshots.
+
+`verification.requiredProbeIds` is an operator-reviewed release contract, not
+tracker text. Derive one stable id per acceptance row and changed trust
+boundary. The `verify` hook returns:
+
+```json
+{
+  "schemaVersion": 1,
+  "healthy": true,
+  "releaseId": "<exact release id>",
+  "artifactDigest": "sha256:<deployed artifact>",
+  "probes": [{
+    "id": "acceptance.primary-entry",
+    "acceptanceCriterion": "AC-1",
+    "entryPath": "public API or user-visible workflow",
+    "preconditions": ["authenticated session"],
+    "passed": true,
+    "negativeControl": false,
+    "evidenceDigest": "sha256:<protected probe evidence>"
+  }]
+}
+```
+
+Probe ids must cover the configured set exactly. `entryPath` identifies the
+actual boundary exercised, `preconditions` names setup without secret values,
+and `evidenceDigest` points to protected raw results. Missing, duplicate,
+helper-only, failed, or unbound probes make verification fail and follow the
+normal rollback/failure path before the terminal [feature] transition.
 
 There are four positive environment boundaries:
 

@@ -27,6 +27,8 @@ skill's directory):
 - `roles/<role>.md` + `config/team.config.md` + `bin/launch-team.sh` — the agent team
 - `bin/launch-team.sh compose-task|compose-review` — lean harness prompts for one
   implementation [task] or one exact review package
+- `bin/launch-team.sh doctor` — non-mutating CLI authentication/startup smoke
+  test under the real sanitized agent environment
 - `bin/tracker-ops.sh` — ergonomic CLI for recurring tracker operations (scriptable mechanisms)
 - `extensions/tracker-backends/<Tool>.py` — project-owned primitive port for a custom tracker
 - `bin/update-installed-skill.sh` — install or refresh a legacy/source-managed bundle while preserving project config
@@ -144,7 +146,9 @@ preparation:
      section probe (a cheap read proving access works). If it fails, stop and tell the
      user to fix the *MCP / CLI Setup* — do not proceed.
    - **Team CLI** (launched by `bin/launch-team.sh`): `preflight` owns the shared adapter
-     probe; do not re-run it. If a `Verified tracker tool prefix` appears in your startup
+     probe and `doctor` proves each distinct configured command can complete a
+     prompt/authentication round trip before any persistent role starts. Do not
+     re-run either from an agent. If a `Verified tracker tool prefix` appears in your startup
      context, use it verbatim — do not re-derive from adapter docs.
    - **Harness** (subagent from a `compose` prompt): the orchestrator resolved the MCP
      tools before spawning you. Use the `Verified tracker tool prefix` from your startup
@@ -270,6 +274,11 @@ each generic operation through the adapter's *Operations* table:
   or unverifiable check. The executor verifies this before planning and twice
   at the apply-process boundary. No agent may deploy to production or another
   environment when the pipeline is not green.
+- **Only acceptance-derived live probes may close delivery.** Protected release
+  config names the required probe ids; the `verify` hook must cover each through
+  the real entry path with declared non-secret preconditions and a protected
+  evidence digest. Health checks, command success, and passing pre-deploy tests
+  are not terminal behavioral evidence.
 - **Only the release executor closes a [feature].** Disabled, waiting, denied,
   failed, or rolled-back production delivery remains non-terminal and visible.
 - **No LLM owns time.** Cron/service timers call one bounded, protected external

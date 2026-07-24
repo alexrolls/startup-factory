@@ -97,13 +97,15 @@ PY
     printf 'apply\n' >> "$FAKE_LOG"
     ;;
   verify)
+    release_id="$1"
     printf 'secret=%s\n' "${FAKE_SECRET:-missing}" >&2
     printf 'verify\n' >> "$FAKE_LOG"
     if [ "${FAKE_VERIFY_FAIL:-0}" = "1" ]; then
-      printf '{"healthy":false,"artifactDigest":"%s"}\n' "$artifact"
+      healthy=false
     else
-      printf '{"healthy":true,"artifactDigest":"%s"}\n' "$artifact"
+      healthy=true
     fi
+    printf '{"schemaVersion":1,"healthy":%s,"releaseId":"%s","artifactDigest":"%s","probes":[{"id":"acceptance.real-entry","acceptanceCriterion":"AC-1","entryPath":"fixture public endpoint","preconditions":["fixture session"],"passed":true,"negativeControl":false,"evidenceDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"id":"acceptance.denied-path","acceptanceCriterion":"AC-2","entryPath":"fixture public endpoint","preconditions":[],"passed":true,"negativeControl":true,"evidenceDigest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}\n' "$healthy" "$release_id" "$artifact"
     ;;
   rollback)
     printf 'applied-old\n' > "$FAKE_STATE"
@@ -233,6 +235,10 @@ json.dump({
   "planningEnvironmentAllowlist":["PATH","TMPDIR","LANG","FAKE_LOG","FAKE_PLAN_FAIL","FAKE_CI_STATE"],
   "trackerEnvironmentAllowlist":["PATH","TMPDIR","LANG","TRACKER_ADAPTER"],
   "environmentAllowlist":["PATH","TMPDIR","LANG","FAKE_STATE","FAKE_LOG","FAKE_VERIFY_FAIL","FAKE_REOPEN_BEFORE_APPLY","FAKE_REOPEN_FEATURE_PATH"],
+  "verification":{
+    "requiredProbeIds":["acceptance.real-entry","acceptance.denied-path"],
+    "requireNegativeProbe":True
+  },
   "trustedCodeDigests":trusted,
   "trustedHookDigests":{name:digest(hook) for name in ["plan","apply","status","verify","rollback","verifyCi","verifyDelivery"]},
   "hooks":{

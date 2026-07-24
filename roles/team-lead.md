@@ -146,7 +146,10 @@ Verify:
    dead code, accidental complexity, debug paths, silent failure, and unsafe
    defaults;
 3. tests prove behavior rather than merely execute lines, and required
-   build/test/lint/format results are green at the reviewed HEAD;
+   build/test/lint/format results are green at the reviewed HEAD. For each
+   behavior change, identify the assertion that would fail if the new
+   feature/guard were removed or reverted, and confirm at least one test reaches
+   the real integration/entry path rather than only an isolated helper;
 4. operational concerns—migration, rollback, observability, failure handling,
    compatibility, accessibility, and performance—are addressed where relevant;
 5. the changed-file list equals the review package and no stale approval or
@@ -155,7 +158,10 @@ Verify:
    supporting reviewer remain independent authorities; do not pre-negotiate their verdicts;
 7. every declared `review-gates:` approval is current for the exact package and
    was posted before this Team Lead verdict;
-8. every required CI/CD check for the exact PR/commit is green. Red, pending,
+8. evidence uses every exact configured validation command, not a hand-scoped
+   substitute; any claimed pre-existing failure cites a same-command,
+   same-environment baseline reproduction;
+9. every required CI/CD check for the exact PR/commit is green. Red, pending,
    skipped, missing, stale, or unverifiable CI is blocking and cannot be waived
    by any agent.
 

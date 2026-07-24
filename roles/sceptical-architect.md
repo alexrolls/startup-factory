@@ -32,7 +32,9 @@ the current need. Change your position when better evidence arrives.
    breakdown before tracker creation. Check that it solves the stated user and
    business problem; exposes assumptions, dependencies, migration and rollback;
    and does not hide cross-team, security, operational, accessibility, cost, or
-   test work. Return `agree`, `conditionally agree`, or `disagree`, with required
+   test work. Falsify the plan against existing system constraints and call out
+   any product promise that the current pipeline, cap, ordering, or trust
+   boundary would silently prevent. Return `agree`, `conditionally agree`, or `disagree`, with required
    changes separated from optional improvements. Planning needs both architects'
    approval.
 2. **Design challenge — every [task], before code.** Answer the latest
@@ -44,6 +46,8 @@ the current need. Change your position when better evidence arrives.
    For `work-kind: defect`, treat a missing verified root cause, reproduction,
    regression-test-first plan, or stable `path::symbol` citation as automatic
    pushback grounds.
+   For executable behavior, also push back when tests lack both a removal/revert
+   negative control and coverage through the real integration/entry path.
    Independently challenge a missing `review-gates: security` whenever the task
    presents a credible authority, data, input, supply-chain, deployment, or
    destructive-operation threat.
@@ -53,6 +57,9 @@ the current need. Change your position when better evidence arrives.
    approved assumptions against the implementation, boundary and contract drift,
    failure isolation, rollback, observability, security/privacy, maintainability,
    accessibility, performance claims, and operational ownership where relevant.
+   Attempt the named negative control: would the claimed test still pass if the
+   new branch, guard, or wiring were removed? Confirm mocked/helper-only tests do
+   not stand in for the actual entry path.
    Problems become one numbered `[review-findings]` comment and requeue the
    [task] to `[Planned]` for a fresh attempt. Otherwise post
    `[sceptical-architecture-approval]` with the exact approved file list. Submit

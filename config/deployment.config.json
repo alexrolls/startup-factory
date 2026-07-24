@@ -31,6 +31,10 @@
     "PATH", "TMPDIR", "LANG", "LC_ALL", "TRACKER_ADAPTER"
   ],
   "environmentAllowlist": ["PATH", "TMPDIR", "LANG", "LC_ALL"],
+  "verification": {
+    "requiredProbeIds": [],
+    "requireNegativeProbe": false
+  },
   "trustedCodeDigests": {},
   "trustedHookDigests": {},
   "hooks": {

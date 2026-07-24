@@ -44,7 +44,10 @@ is context, not a trigger.
 
 1. **Intake.** The TPM turns the ask into a [feature] draft: problem statement,
    scope, explicit NOT-in-scope, dependencies, and per-[task] **acceptance
-   criteria** — testable, implementation-free statements. When a validated
+   criteria** — testable, implementation-free statements. Before approval, the
+   TPM and both architects reconcile those criteria against known system
+   constraints and make every contradiction an explicit decision instead of
+   leaving it for late acceptance. When a validated
    Claude/Superpowers planning handoff exists, the TPM and architects read its
    exact specification and plan as intake evidence. The handoff does not approve
    scope or authorize execution.
@@ -86,12 +89,17 @@ is context, not a trigger.
 4. **Implementation.** One immutable task packet, task branch, and worktree per
    attempt in both execution modes; the [task]'s [subtasks] as checklist,
    `[divergence]` comments for every deviation, checkpoint commits, and
-   self-validation with the `VALIDATE_*` commands before requesting review.
+   self-validation with every exact configured `VALIDATE_*` command (or the
+   configured `VALIDATE_SCRIPT`) before requesting review. Scoped substitutes
+   are not evidence for a broader configured command.
 5. **Review board.** When implementation matches the specification and is nearly
    releasable, move the [task] to `[Review]` (mapped to `In Review`) and generate
    one exact review package. The Team Lead, Principal Architect, and Sceptical
    Principal Architect independently review that same package and post their
    own bound approval or `[review-findings]`.
+   The board explicitly checks test sensitivity: the relevant test must fail
+   when the feature/guard is removed or reverted, and at least one test must
+   exercise the real integration/entry path rather than only a helper or mock.
    Team-specific QA, SRE, penetration-test, accessibility, or other specialist
    passes may run too. Required specialist passes must be declared as task
    metadata (`review-gates: qa,security`); prose alone does not create an

@@ -32,6 +32,10 @@
   "planningEnvironmentAllowlist": ["PATH", "TMPDIR", "LANG", "LC_ALL"],
   "trackerEnvironmentAllowlist": ["PATH", "TMPDIR", "LANG", "LC_ALL", "TRACKER_ADAPTER"],
   "environmentAllowlist": ["PATH", "TMPDIR", "LANG", "LC_ALL"],
+  "verification": {
+    "requiredProbeIds": ["replace-with-acceptance-probe-id"],
+    "requireNegativeProbe": true
+  },
   "trustedCodeDigests": {},
   "trustedHookDigests": {},
   "hooks": {

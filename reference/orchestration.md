@@ -334,7 +334,7 @@ pre-v2 comments count as round 0). WIP narration, setup chatter, and restated
 | `[resume-plan]` | team-lead | Revised implementation plan after a `requirements-changed` resume verdict. It must be later than that verdict and followed by both later design approvals before a clean-worktree hold can clear. |
 | `[api-ready]` | backend | Contract available for frontend: endpoints, request/response shapes. Also sent by mailbox. |
 | `[divergence]` | implementer | What was done differently from the [task]/design note and why. Additive — **never edit the original [task] description.** |
-| `[review-request]` | implementer | Ready for review: what changed, list of changed files, an **evidence record per validated command** (see *Evidence and re-execution*), an explicit `NOT validated:` section for anything not run (with reason), and any index-only staging operation performed. A claimed result without its evidence record **is** NOT validated. Written when moving to `[Review]`. `review-package.sh` emits a sibling binding manifest; reviewers read that file and let the broker add bindings instead of retyping hashes. |
+| `[review-request]` | implementer | Ready for review: what changed, list of changed files, an **evidence record per configured validation command** (see *Evidence and re-execution*), its exact baseline comparison, an explicit `NOT validated:` section for anything not run (with reason), and any index-only staging operation performed. Hand-scoped substitutes do not satisfy a broader configured command. A claimed result without its evidence record **is** NOT validated. Written when moving to `[Review]`. `review-package.sh` emits a sibling binding manifest; reviewers read that file and let the broker add bindings instead of retyping hashes. |
 | `[review-findings]` | reviewer / qa / team-lead / principal-architect / sceptical-architect / security-reviewer | Numbered problems that must be fixed. Task goes back to `[Planned]`/`ToDo` for a fresh attempt. |
 | `[review-approval]` | reviewer / qa | Optional supporting approval with the **explicit list of approved file paths**. |
 | `[team-lead-approval]` | team-lead | Mandatory independent specification, quality, test, and operability sign-off with exact files. |
@@ -550,11 +550,18 @@ Evidence:
   env:      <non-secret variable names required by the command; values omitted>
   exit:     <code>
   counts:   <e.g. 47 passed, 0 failed, 2 skipped>
+  baseline: <same exact command's baseline commit, exit, and counts; cite BASELINE.md>
   duration: <seconds>
   log:      <TEAMWORK_ROOT>/<team>/artifacts/<taskId>/validate-<round>-<role>.log
 NOT validated:
   <command> — <reason (e.g. worktree unprovisioned, N/A for this change)>
 ```
+
+The task packet is the command authority. Run each non-null configured command
+verbatim; a path-narrowed test/lint command is a different command and belongs
+under `NOT validated`, not under the configured command's evidence. Never call
+a failure pre-existing from prose or memory: reproduce it at the cited baseline
+commit with the same command, setup, and non-secret environment names.
 
 Who executes suites (the two independent executions that catch real defects are
 **never** traded away):
@@ -572,6 +579,15 @@ Who executes suites (the two independent executions that catch real defects are
 Any mismatch between an evidence record and a re-run (exit code or counts) is an
 automatic `[review-findings]` labeled `trust-breach (severity: critical)` —
 resolvable only by a fresh implementer run and a new record, never by explanation.
+
+Every behavior-changing review also performs two sensitivity checks:
+
+1. **Negative control:** identify the assertion that fails when the new
+   feature, guard, or wiring is removed/reverted. A test that remains green does
+   not prove the change.
+2. **Real path:** require at least one test through the actual integration/entry
+   path. Isolated helpers and mocks may localize failures but cannot prove that
+   production wiring invokes the behavior.
 
 ## Integration
 
@@ -651,8 +667,11 @@ the release transaction described by `reference/deployment.md`.
   digest-pinned `verifyCi` hook must prove every required CI/CD check for the
   exact commit succeeded. Red, pending, skipped, missing, stale, or unverifiable
   CI blocks every deployment environment and cannot be waived by an agent.
-- The executor queries release state before applying, verifies health/version
-  independently, and moves the [feature] terminal only on verified success. In
+- The executor queries release state before applying, then requires the
+  protected `verify` hook to attest every configured acceptance-derived
+  behavioral probe through its real entry path (including a negative probe when
+  configured). Health/version alone is insufficient. It moves the [feature]
+  terminal only on verified success. In
   broker mode, `tracker-ops.sh` refuses that terminal write unless the release
   executor flag is present; credential and OS isolation remain the real boundary.
 - Any held or manually taken-over [task] keeps its [feature] ineligible for
