@@ -34,6 +34,7 @@ esac
 
 FULL_PYTHON_TESTS=(
   ticket-content-security-test.py
+  retrospective-test.py
   product-acceptance-test.py
   superpowers-planning-test.py
   review-evidence-test.py
@@ -56,6 +57,7 @@ FULL_SHELL_TESTS=(
 )
 SMOKE_PYTHON_TESTS=(
   ticket-content-security-test.py
+  retrospective-test.py
   product-acceptance-test.py
   superpowers-planning-test.py
   review-evidence-test.py

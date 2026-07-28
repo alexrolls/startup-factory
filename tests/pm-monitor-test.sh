@@ -82,7 +82,7 @@ mkdir -p "$REPO"
 git -C "$REPO" init -q -b main
 git -C "$REPO" config user.email test@example.com
 git -C "$REPO" config user.name Test
-printf '.teamwork/\n' > "$REPO/.gitignore"
+printf '.teamwork/\n/.startup-factory-retrospective.md\n/.startup-factory-retrospective.lock\n' > "$REPO/.gitignore"
 printf 'fixture\n' > "$REPO/app.txt"
 git -C "$REPO" add .gitignore app.txt
 git -C "$REPO" commit -qm init

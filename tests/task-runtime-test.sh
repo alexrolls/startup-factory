@@ -29,7 +29,9 @@ refuse() { local desc="$1" needle="$2" output rc; shift 2
 cd "$TMP"; git init -q repo && cd repo
 git config user.email test@example.com
 git config user.name Test
-git commit -q --allow-empty -m init; git checkout -q -b feature-runtime
+printf '/.startup-factory-retrospective.md\n/.startup-factory-retrospective.lock\n' > .gitignore
+git add .gitignore
+git commit -q -m init; git checkout -q -b feature-runtime
 LIFECYCLE_ROOT="$TMP/protected-lifecycle"
 mkdir -m 700 "$LIFECYCLE_ROOT"
 PROTECTED_FORGERY_ROOT="$TMP/protected-forgery-lifecycle"
@@ -241,7 +243,7 @@ check "packet includes every tracker comment, including ordinary human clarifica
 import hashlib, json, sys
 d=json.load(open(sys.argv[1])); snapshot=json.load(open(sys.argv[2]))
 comments=d["commentHistory"]
-assert d["schemaVersion"] == 3
+assert d["schemaVersion"] == 4
 tracked=next(task for task in snapshot["tasks"] if task["taskId"] == d["taskId"])
 assert comments != tracked["comments"]
 assert d["commentHistoryCount"] == len(comments)

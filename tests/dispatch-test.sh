@@ -18,7 +18,9 @@ check() { local desc="$1"; shift
 cd "$TMP"; git init -q repo && cd repo
 git config user.email test@example.com
 git config user.name Test
-git commit -q --allow-empty -m init; git checkout -q -b feat-team
+printf '/.startup-factory-retrospective.md\n/.startup-factory-retrospective.lock\n' > .gitignore
+git add .gitignore
+git commit -q -m init; git checkout -q -b feat-team
 LIFECYCLE_ROOT="$TMP/protected-lifecycle"
 mkdir -m 700 "$LIFECYCLE_ROOT"
 mkdir -p .claude/skills/pm

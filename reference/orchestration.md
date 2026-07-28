@@ -120,6 +120,12 @@ Idle with undelivered work is a protocol violation — the lead treats it as
 **Stuck** immediately, and a repeat on the same assignment as grounds to
 reassign or relaunch.
 
+Every completed task report also carries a compact `## Retrospective` section:
+1..10 short bullets (target five total) using only `- Start:`, `- More:`,
+`- Less:`, `- Stop:`, and `- Keep:`. Record reusable process improvements, not
+task detail; never include credentials, API keys, secrets, personal data, source
+excerpts, or logs.
+
 The launch handshake is the same contract from the lead's side:
 
 - **The spawn prompt is context, not a trigger.** After spawning or relaunching a
@@ -632,8 +638,9 @@ branches.
    tracker, rejects any active task hold, recomputes the canonical
    review-envelope digest, revalidates every
    base/head/package/request binding and current approval marker/file list,
-   performs the idempotent terminal move, emits the integration event, removes
-   the clean task worktree, then—and only then—marks the transaction `completed`.
+   performs the idempotent terminal move, emits the integration event, records or
+   safely substitutes the project-local Starfish retrospective, removes the clean
+   task worktree, then—and only then—marks the transaction `completed`.
    A malformed, symlinked, path-escaping, stale, or forged record fails the whole
    broker pass closed.
    If a legitimate later `[review-findings]` invalidates an awaiting or completed

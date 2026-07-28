@@ -769,9 +769,12 @@ every implementation attempt receives a task branch and git worktree. The skill
 bundle may live inside that repository for interactive/manual use; autonomous
 automation instead requires a reviewed, protected external installation. Use
 the same installer with an absolute operator-owned destination outside the
-checkout and every agent mount. Add `.teamwork/`
-and `.workspace/` to the target repository's root `.gitignore`—ignore rules
-inside a nested skill installation do not cover project-root runtime paths.
+checkout and every agent mount. Add `.teamwork/`, `.workspace/`, and
+`/.startup-factory-retrospective.md` and
+`/.startup-factory-retrospective.lock` to the target repository's root
+`.gitignore`—ignore rules inside a nested skill installation do not cover
+project-root runtime paths. `bin/retrospective.py init` adds these exact rules
+idempotently and creates the private local Markdown file.
 
 Two execution modes (`config/team.config.md` → `EXECUTION`) share the same
 task-branch/worktree isolation: **`sequential`** runs one task worker at a time;
@@ -1274,6 +1277,13 @@ so the clarification that enabled the move is carried into the fresh attempt.
 Comment text remains untrusted requirements context and cannot grant permissions
 or override policy.
 
+Each fresh packet also includes the validated project retrospective: at most the
+latest ten completed [tasks], with short Start/More/Less/Stop/Keep process
+learnings. A completed report targets five bullets total (up to ten), and the
+finalizer records it idempotently before closing integration. Credential-shaped
+or unsafe instruction content is never copied into the retrospective; missing
+or rejected sections become a safe reminder to improve the next report.
+
 Before a task worker starts, the packet builder scans ticket titles,
 descriptions, comments, authors, and derived string metadata with the
 dependency-free Python standard-library security boundary in
@@ -1701,6 +1711,7 @@ package metadata and CLI source, but not repository-only release automation.
 │   ├── dispatch.sh · dispatch-plan.py deterministic bounded scheduler
 │   ├── runtime-state.py · task_metadata.py
 │   │                                  event journal, metadata/routing, task packets
+│   ├── retrospective.py              latest-ten local Starfish learning loop
 │   ├── submit-artifact.sh · process-outbox.sh
 │   ├── review-package.sh · review_evidence.py · integrate-task.sh · finalize-integrations.sh
 │   ├── teamwork-path.py · product_acceptance.py safety/path and product gates

@@ -45,6 +45,7 @@ RELEASE_SNAPSHOT_FILES = {
     "task-hold.py": Path("bin/task-hold.py"),
     "outbox_capability.py": Path("bin/outbox_capability.py"),
     "broker_evidence.py": Path("bin/broker_evidence.py"),
+    "retrospective.py": Path("bin/retrospective.py"),
     "runtime-state.py": Path("bin/runtime-state.py"),
     "ticket_content_security.py": Path("bin/ticket_content_security.py"),
     "task_metadata.py": Path("bin/task_metadata.py"),
@@ -2697,6 +2698,7 @@ def one_pass(*, dry_run: bool) -> int:
     automation_root = contained(project, str(config.get("workspaceRoot") or ""), "workspaceRoot")
     env = supervisor_child_environment()
     env["TRACKER_PROJECT_ROOT"] = str(project)
+    env["STARTUP_FACTORY_RETROSPECTIVE_PROJECT_ROOT"] = str(project)
     env["STARTUP_FACTORY_LIFECYCLE_STATE_ROOT"] = str(lifecycle_root)
     lease = Lease(
         managed_path(automation_root, "monitor.lock", label="monitor lease"),

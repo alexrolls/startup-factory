@@ -34,4 +34,4 @@ mkdir -p "$workspace"
 python3 "$SKILL_DIR/bin/runtime-state.py" packet \
   --workspace "$workspace" --tasks "$tasks" --feature "$feature" --task "$task" \
   --role "$role" --attempt "$attempt" --worktree "$worktree" --branch "$branch" \
-  --config "$CONFIG" --contracts "$contracts" --baseline "$baseline"
+  --config "$CONFIG" --contracts "$contracts" --baseline "$baseline" --repo "$repo"

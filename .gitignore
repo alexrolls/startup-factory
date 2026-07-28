@@ -1,5 +1,7 @@
 .superpowers/
 .teamwork/
+/.startup-factory-retrospective.md
+/.startup-factory-retrospective.lock
 .DS_Store
 .workspace/
 __pycache__/

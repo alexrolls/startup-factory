@@ -126,7 +126,13 @@ actually does what the [task] asked):
    the feature branch, commits, and records an exact broker request. In default
    `TRACKER_WRITERS=broker` mode, the deterministic dispatcher verifies that request,
    updates the tracker, removes the worktree last, and closes the transaction.
-3. If **all** [tasks] in the [feature] have reached the terminal status, leave the
+3. Before closing the transaction, the broker records the task report's compact
+   `## Retrospective` Starfish bullets through `bin/retrospective.py`. The local
+   Markdown file keeps only the newest ten [tasks], replaces the same [task] after
+   rework, and excludes unsafe or sensitive content. In single-agent mode, create
+   the same short report section and run
+   `python3 <skill-dir>/bin/retrospective.py record --repo <project-root> --task <taskId> --source <report>`.
+4. If **all** [tasks] in the [feature] have reached the terminal status, leave the
    [feature] visibly non-terminal and awaiting deployment. This is also the
    behavior when production delivery is disabled or no external deployment
    configuration is installed; the disabled executor creates no `[deployment]`

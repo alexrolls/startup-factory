@@ -45,6 +45,7 @@
     "bin/pm-agent.py",
     "bin/policy-check.py",
     "bin/release-feature.py",
+    "bin/retrospective.py",
     "bin/runtime-state.py",
     "bin/tracker-ops.sh",
     "bin/update-installed-skill.sh",
@@ -64,6 +65,7 @@
     "roles/team-lead.md",
     "teams/_PLAYBOOK.md",
     "tests/ticket-content-security-test.py",
+    "tests/retrospective-test.py",
     "tests/run-all.sh"
   ],
   "preservationPolicy": {
