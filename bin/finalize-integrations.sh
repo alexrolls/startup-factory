@@ -1186,7 +1186,7 @@ PY
 }
 
 finalize_one() {
-  local entry="$1" snapshot="$2" fields task role attempt commit worktree body txid phase
+  local entry="$1" snapshot="$2" fields task role attempt commit worktree body txid phase report
   fields="$(validate_unheld_entry "$entry" "$snapshot")"
   task="$(printf '%s\n' "$fields" | sed -n '1p')"
   role="$(printf '%s\n' "$fields" | sed -n '2p')"
@@ -1196,6 +1196,9 @@ finalize_one() {
   body="$(printf '%s\n' "$fields" | sed -n '6p')"
   txid="$(printf '%s\n' "$fields" | sed -n '7p')"
   phase="$(printf '%s\n' "$fields" | sed -n '8p')"
+  report="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child \
+    --repo "$repo" --workspace "$workspace" \
+    --relative "artifacts/$(python3 "$SKILL_DIR/bin/runtime-state.py" key "$task")/attempt-$attempt/task-report.md")"
   if [ "$phase" = "completed" ]; then
     echo "$task integration already finalized at $commit"
     return 0
@@ -1243,6 +1246,9 @@ finalize_one() {
   fi
   if [ "$phase" = "event-emitted" ]; then
     assert_task_not_held "$task"
+    python3 "$SKILL_DIR/bin/retrospective.py" record \
+      --repo "$repo" --task "$task" --source "$report" --allow-fallback >/dev/null \
+      || die "cannot safely record the project retrospective for $task"
     if [ -e "$worktree" ]; then
       [ -z "$(git_unprivileged -C "$worktree" status --porcelain -uall)" ] \
         || die "task worktree became dirty before cleanup: $worktree"

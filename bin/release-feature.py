@@ -763,6 +763,7 @@ def trusted_file_specs() -> dict[str, tuple[Path, Path]]:
         "task-hold.py": ((SKILL_DIR / "bin" / "task-hold.py").resolve(), Path("bin/task-hold.py")),
         "outbox_capability.py": ((SKILL_DIR / "bin" / "outbox_capability.py").resolve(), Path("bin/outbox_capability.py")),
         "broker_evidence.py": ((SKILL_DIR / "bin" / "broker_evidence.py").resolve(), Path("bin/broker_evidence.py")),
+        "retrospective.py": ((SKILL_DIR / "bin" / "retrospective.py").resolve(), Path("bin/retrospective.py")),
         "runtime-state.py": ((SKILL_DIR / "bin" / "runtime-state.py").resolve(), Path("bin/runtime-state.py")),
         "ticket_content_security.py": ((SKILL_DIR / "bin" / "ticket_content_security.py").resolve(), Path("bin/ticket_content_security.py")),
         "task_metadata.py": ((SKILL_DIR / "bin" / "task_metadata.py").resolve(), Path("bin/task_metadata.py")),

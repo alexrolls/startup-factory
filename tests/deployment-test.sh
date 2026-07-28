@@ -199,6 +199,7 @@ trusted={name:digest(pathlib.Path(root)/rel) for name,rel in {
   "task-hold.py":"bin/task-hold.py",
   "outbox_capability.py":"bin/outbox_capability.py",
   "broker_evidence.py":"bin/broker_evidence.py",
+  "retrospective.py":"bin/retrospective.py",
   "runtime-state.py":"bin/runtime-state.py",
   "ticket_content_security.py":"bin/ticket_content_security.py",
   "task_metadata.py":"bin/task_metadata.py",
@@ -261,7 +262,7 @@ make_fixture() {
   git -C "$repo" init -q -b "$team"
   git -C "$repo" config user.email test@example.com
   git -C "$repo" config user.name Test
-  printf '.workspace/\n.teamwork/\n' > "$repo/.gitignore"
+  printf '.workspace/\n.teamwork/\n/.startup-factory-retrospective.md\n/.startup-factory-retrospective.lock\n' > "$repo/.gitignore"
   printf 'release fixture\n' > "$repo/app.txt"
   git -C "$repo" add .gitignore app.txt
   git -C "$repo" commit -qm init

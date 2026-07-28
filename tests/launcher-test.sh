@@ -46,7 +46,9 @@ cd "$TMP"
 git init -q repo && cd repo
 git config user.email test@example.com
 git config user.name Test
-git commit -q --allow-empty -m init
+printf '/.startup-factory-retrospective.md\n/.startup-factory-retrospective.lock\n' > .gitignore
+git add .gitignore
+git commit -q -m init
 git checkout -q -b test-feature
 mkdir -p .claude/skills/pm
 cp -R "$SKILL_DIR/roles" "$SKILL_DIR/reference" "$SKILL_DIR/bin" "$SKILL_DIR/teams" .claude/skills/pm/

@@ -687,6 +687,7 @@ for required_file in \
   bin/pm-agent.py \
   bin/policy-check.py \
   bin/release-feature.py \
+  bin/retrospective.py \
   bin/runtime-state.py \
   bin/ticket_content_security.py \
   bin/tracker-ops.sh \

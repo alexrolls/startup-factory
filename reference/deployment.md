@@ -204,6 +204,7 @@ setting `enabled`):
     "task-hold.py": "sha256:<64 lowercase hex>",
     "outbox_capability.py": "sha256:<64 lowercase hex>",
     "broker_evidence.py": "sha256:<64 lowercase hex>",
+    "retrospective.py": "sha256:<64 lowercase hex>",
     "runtime-state.py": "sha256:<64 lowercase hex>",
     "task_metadata.py": "sha256:<64 lowercase hex>",
     "product_acceptance.py": "sha256:<64 lowercase hex>",

@@ -1422,7 +1422,7 @@ compose_task_prompt() { # compose_task_prompt <team> <featureId> <role> <taskId>
     echo "4. Follow test-driven development where the task changes executable behavior."
     echo "5. Commit checkpoints only to the task branch. Never switch to or modify the feature branch."
     echo "6. Run every exact non-null validation command from the packet (or its exact VALIDATE_SCRIPT); never substitute a hand-scoped command."
-    echo "7. Before reporting DONE, leave the task branch clean and write the complete report file."
+    echo "7. Before reporting DONE, leave the task branch clean and write the complete report file, including its compact non-sensitive Starfish retrospective."
     echo "8. Return one status: DONE, DONE_WITH_CONCERNS, BLOCKED, or NEEDS_CONTEXT."
     echo "9. Emit stage changes with:"
     echo "   $SKILL_DIR/bin/runtime-event.sh '$team' '$fid' '$task' '$attempt' '$role' <event-type> <stage> '<summary>' [artifact]"

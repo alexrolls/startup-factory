@@ -44,7 +44,16 @@ by mailbox, but only this mechanically complete tracker evidence triggers work.
    `PROTOCOL_SCEPTICAL_ARCHITECT`; verify declared supporting signers against
    `PROTOCOL_QA` or `PROTOCOL_SECURITY_REVIEWER` in the team workspace's
    `preset.env`.
-4. Invoke `bin/integrate-task.sh <team> <featureId> <taskId> <role> <attempt>`.
+4. Read the execution record's task report and refine only its
+   `## Retrospective` section with reusable delivery-process learnings that
+   became clear during review. Keep 1..10 short Starfish bullets (target five
+   total), add no credentials, keys, secrets, personal data, source excerpts, or
+   logs, and validate it with
+   `python3 <skill-dir>/bin/retrospective.py validate --source <task-report>`. Do not alter
+   implementation or validation evidence in the report. If the section is
+   absent or unsafe, report that process concern; the deterministic finalizer
+   substitutes a safe reminder rather than copying unsafe content.
+5. Invoke `bin/integrate-task.sh <team> <featureId> <taskId> <role> <attempt>`.
    This low-freedom mechanism performs the fragile sequence without changing
    the reviewed task-branch head: independent task-branch validation,
    `--no-commit` merge to the feature branch, independent feature-branch
@@ -52,11 +61,11 @@ by mailbox, but only this mechanically complete tracker evidence triggers work.
    transaction binding the execution, exact reviewed head/package, and current
    approval evidence. A conflict or validation failure aborts before the feature
    commit.
-5. In default `TRACKER_WRITERS=broker` mode, report the recorded commit and
+6. In default `TRACKER_WRITERS=broker` mode, report the recorded commit and
    `awaiting-tracker` handoff; do not attempt the tracker write or remove the
    worktree. The credentialed dispatcher revalidates and finalizes it. With the
    explicit legacy `all` mode, the script invokes the same broker immediately.
-6. After the next dispatcher pass, verify the transaction says `completed`, the
+7. After the next dispatcher pass, verify the transaction says `completed`, the
    tracker cites the commit, and the worktree registration is gone. Notify the
    team-lead and principal-architect with the taskId, hash, and results.
 

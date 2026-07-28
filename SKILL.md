@@ -34,6 +34,8 @@ skill's directory):
 - `bin/update-installed-skill.sh` — install or refresh a legacy/source-managed bundle while preserving project config
 - `bin/runtime-state.py` + `bin/task-packet.sh` — durable events, PM projections,
   and minimal task-local context
+- `bin/retrospective.py` — compact, project-local Starfish learnings loaded into
+  every fresh task packet and capped at the latest ten completed [tasks]
 - `bin/task-hold.py` — task-scoped `[Blocked]` holds, communication snapshots,
   dependency-impact review, and human-resume barriers
 - `bin/submit-artifact.sh` + `bin/process-outbox.sh` + `bin/outbox_capability.py`
@@ -107,15 +109,22 @@ preparation:
    `config/planning.config.md`). Note
    `PRODUCT_MANAGEMENT_TOOL`, the per-tool settings block, and the flags `TEAM_MODE` /
    `STRICT_STATUS` / `USE_SUPERPOWERS`.
-2. **Load the adapter** for that tool: `adapters/<PRODUCT_MANAGEMENT_TOOL>.md`. This is
+2. **Load the project retrospective.** Outside a dispatched task instance, run
+   `python3 <skill-dir>/bin/retrospective.py init --repo <exact-project-root>`
+   and read the printed Markdown path before acting on a [task]. The file is project-local,
+   Git-ignored, and limited to the latest ten short Starfish retrospectives.
+   Never put credentials, API keys, secrets, personal data, source excerpts, or
+   logs in it. A dispatched task reads the validated snapshot already embedded
+   in its packet instead of opening the live file.
+3. **Load the adapter** for that tool: `adapters/<PRODUCT_MANAGEMENT_TOOL>.md`. This is
    your only source for concrete operations, terminology, status, and ID mappings. If the
    file doesn't exist, stop and tell the user to create it from `adapters/_TEMPLATE.md`.
-3. **Read `reference/vocabulary.md` and `reference/lifecycle.md`** if not already in
+4. **Read `reference/vocabulary.md` and `reference/lifecycle.md`** if not already in
    context. If `TEAM_MODE=true`, also read `reference/team-roles.md` and `reference/orchestration.md`.
    For autonomous monitoring or production delivery, also read
    `reference/automation.md`, `reference/guardrails.md`, and
    `reference/deployment.md` before enabling anything.
-4. **Select the planning intake.** For Scenario 1 or 10, when
+5. **Select the planning intake.** For Scenario 1 or 10, when
    `USE_SUPERPOWERS=true` and the current runtime is Claude Code, read
    `reference/superpowers-planning.md` and run its plugin preflight. Use
    `superpowers:brainstorming` plus `superpowers:writing-plans` when requirements
@@ -126,7 +135,7 @@ preparation:
    selected intake and continue with Startup Factory's own team. When disabled
    or running in another runtime, use the native lifecycle. Never hand execution,
    worktrees, dispatch, review, integration, or release to Superpowers.
-5. **Select review authority before launching anyone.** Use exactly one profile:
+6. **Select review authority before launching anyone.** Use exactly one profile:
    - **Single-agent:** one agent may implement and self-review, but must label the
      result as self-review. Never emit a mandatory board-approval marker or claim
      independent approval.
@@ -141,7 +150,7 @@ preparation:
      `[sceptical-architecture-approval]`, or `[security-approval]`; do not call
      the result a review-board approval; and do not move the [task] to
      `[Ready to deploy]`. Launch authenticated gate roles or escalate.
-6. **Initialize the tool** — steps depend on your execution mode:
+7. **Initialize the tool** — steps depend on your execution mode:
    - **Single-agent** (`TEAM_MODE` unset or false): run the adapter's *Initialization*
      section probe (a cheap read proving access works). If it fails, stop and tell the
      user to fix the *MCP / CLI Setup* — do not proceed.
@@ -155,8 +164,8 @@ preparation:
      context; do not call ToolSearch to re-derive it.
    - **Task instance** (startup prompt names a task packet, worktree, and report):
      read the packet and your role brief only. The dispatcher already resolved the
-     tracker, task state, baseline, contracts, and validation commands. Do not load
-     the whole orchestration reference or tracker history.
+     tracker, task state, baseline, contracts, project retrospective, and validation
+     commands. Do not load the whole orchestration reference or tracker history.
 
 ## Executing the request
 

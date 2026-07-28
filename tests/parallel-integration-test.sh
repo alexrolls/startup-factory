@@ -75,6 +75,8 @@ cp "$SKILL_DIR/roles/backend.md" .agent-squad/roles/
 cat > .gitignore <<'EOF'
 .teamwork/
 .workspace/
+/.startup-factory-retrospective.md
+/.startup-factory-retrospective.lock
 EOF
 echo base > app.txt
 git add .gitignore app.txt .agent-squad
@@ -216,6 +218,10 @@ check "integration commit has task trailer" git log -1 --format=%B --grep="Task-
 check "tracker reaches terminal status" grep -q '^## 1 Change app \[Ready to deploy\]$' "$FID"
 key="$(python3 .agent-squad/bin/runtime-state.py key "$TID")"
 check "integration transaction completes" grep -q '"phase": "completed"' ".teamwork/feature-integration/integrations/$key.json"
+check "completed task records a project retrospective" \
+  grep -q "### \\[task\\] \`$TID\`" .startup-factory-retrospective.md
+check "project retrospective is ignored by Git" \
+  git check-ignore -q .startup-factory-retrospective.md
 check "worktree is removed last" test ! -d "$wt"
 before="$(git rev-list --count HEAD)"
 .agent-squad/bin/integrate-task.sh feature-integration "$FID" "$TID" backend 1 >/dev/null
