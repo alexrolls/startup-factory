@@ -36,6 +36,7 @@ for title in (
 assert profile("Fix README typo") == "fast"
 assert profile("Update documentation") == "fast"
 assert profile("Update contributor guide", "files: docs/contributing.md") == "fast"
+assert profile("Update component guide", "files: docs/component.mdx") == "standard"
 assert profile(
     "Add regression test",
     "parallel-safe: true\nfiles: tests/test_widget.py",
@@ -49,11 +50,13 @@ assert profile(
     "parallel-safe: true\nfiles: src/endpoint.py",
 ) == "standard"
 assert profile("Update authentication docs", "files: docs/auth.md") == "strong"
-assert profile("Implement auth", "model-profile: fast") == "fast"
+assert profile("Implement auth", "model-profile: fast") == "strong"
+assert profile("Implement endpoint", "model-profile: fast") == "standard"
+assert profile("Fix README typo", "model-profile: standard") == "standard"
 
 parsed = parse_task_metadata(
     "track: frontend\nparallel-safe: yes\nfiles: a.ts, b.ts\n"
-    "resources: api:widget\nmodel-profile: strong\nwork-kind: defect"
+    "resources: api:widget\nmodel-profile: strong\ndelivery-profile: standard\nwork-kind: defect"
     "\nreview-gates: security, qa"
 )
 assert parsed == {
@@ -62,6 +65,7 @@ assert parsed == {
     "resources": ["api:widget"],
     "track": "frontend",
     "modelProfile": "strong",
+    "deliveryProfile": "standard",
     "workKind": "defect",
     "reviewGates": ["qa", "security"],
 }
@@ -70,7 +74,7 @@ assert planner.metadata(
         "title": "Any",
         "description": (
             "track: frontend\nparallel-safe: yes\nfiles: a.ts, b.ts\n"
-            "resources: api:widget\nmodel-profile: strong\nwork-kind: defect"
+            "resources: api:widget\nmodel-profile: strong\ndelivery-profile: standard\nwork-kind: defect"
             "\nreview-gates: security, qa"
         ),
     }
@@ -84,6 +88,21 @@ except ValueError as exc:
     assert "work-kind" in str(exc)
 else:
     raise AssertionError("invalid work-kind must fail closed")
+try:
+    parse_task_metadata("delivery-profile: turbo", "Ambiguous profile")
+except ValueError as exc:
+    assert "delivery-profile" in str(exc)
+else:
+    raise AssertionError("invalid delivery-profile must fail closed")
+try:
+    parse_task_metadata(
+        "delivery-profile: standard\ndelivery-profile: micro",
+        "Conflicting profile",
+    )
+except ValueError as exc:
+    assert "more than once" in str(exc)
+else:
+    raise AssertionError("duplicate delivery-profile must fail closed")
 try:
     parse_task_metadata("review-gates: qa, operability", "Unsupported gate")
 except ValueError as exc:

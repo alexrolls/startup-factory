@@ -38,6 +38,8 @@ FULL_PYTHON_TESTS=(
   product-acceptance-test.py
   superpowers-planning-test.py
   review-evidence-test.py
+  delivery-profile-test.py
+  evidence-provider-test.py
   release-lifecycle-test.py
   tracker-adapter-pagination-test.py
   task-hold-test.py
@@ -61,6 +63,8 @@ SMOKE_PYTHON_TESTS=(
   product-acceptance-test.py
   superpowers-planning-test.py
   review-evidence-test.py
+  delivery-profile-test.py
+  evidence-provider-test.py
   tracker-adapter-pagination-test.py
   task-hold-test.py
 )
@@ -110,6 +114,29 @@ run_test() {
   FAILURES+=("$test (exit $status)")
 }
 
+run_optional_node_test() {
+  local test="$1"
+  local status
+
+  echo "==> $test"
+  if ! command -v node >/dev/null 2>&1; then
+    echo "SKIP: node is not installed; provider test remains optional"
+    return
+  fi
+  if [ ! -f "$ROOT/$test" ]; then
+    echo "FAIL: $test is missing"
+    FAILURES+=("$test (missing)")
+    return
+  fi
+  if node --test "$ROOT/$test"; then
+    return
+  else
+    status=$?
+  fi
+  echo "FAIL: $test exited with status $status"
+  FAILURES+=("$test (exit $status)")
+}
+
 echo "Running $MODE test suite"
 for test in "${PYTHON_TESTS[@]}"; do
   run_test python "$test"
@@ -117,6 +144,9 @@ done
 for test in "${SHELL_TESTS[@]}"; do
   run_test shell "$test"
 done
+if [ "$MODE" = full ]; then
+  run_optional_node_test "extensions/evidence-providers/playwright/provider.test.mjs"
+fi
 
 echo "---"
 if [ "${#FAILURES[@]}" -ne 0 ]; then

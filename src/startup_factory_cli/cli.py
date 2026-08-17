@@ -19,6 +19,7 @@ from .installer import (
     validate_bundle,
     verify_installation,
 )
+from .readiness import MODES, diagnose, initialize
 
 
 AGENTS = ("codex", "aider", "claude", "claude-code")
@@ -58,7 +59,7 @@ def _mutation_arguments(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="startup-factory",
-        description="Install and verify a project-scoped Startup Factory skill bundle.",
+        description="Install, initialize, and verify a project-scoped Startup Factory skill bundle.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     install = subparsers.add_parser("install", help="install a new bundle or repair a SKILL.md-only copy")
@@ -67,6 +68,24 @@ def build_parser() -> argparse.ArgumentParser:
     _mutation_arguments(update)
     verify = subparsers.add_parser("verify", help="verify installed runtime files and provenance")
     _target_arguments(verify)
+    initialize_parser = subparsers.add_parser(
+        "init", help="preview or apply safe project initialization"
+    )
+    _target_arguments(initialize_parser)
+    initialize_parser.add_argument("--mode", choices=MODES, required=True)
+    initialize_parser.add_argument(
+        "--product-management-tool",
+        metavar="ADAPTER",
+        help="optional adapter name to set with TEAM_MODE",
+    )
+    initialize_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="atomically apply the preview (solo and team modes only)",
+    )
+    doctor = subparsers.add_parser("doctor", help="inspect offline readiness without mutation")
+    _target_arguments(doctor)
+    doctor.add_argument("--mode", choices=MODES, required=True)
     version = subparsers.add_parser("version", help="print the installer package version")
     version.add_argument("--json", action="store_true", help="emit one machine-readable JSON result")
     return parser
@@ -138,6 +157,35 @@ def _print_result(result: OperationResult, *, as_json: bool) -> None:
         print("Dry run complete; no files were written.")
 
 
+def _print_init_result(result: object, *, as_json: bool) -> None:
+    data = result.as_dict()  # type: ignore[attr-defined]
+    if as_json:
+        print(json.dumps(data, sort_keys=True, separators=(",", ":")))
+        return
+    verb = "Applied" if data["applied"] else "Previewed"
+    print(f"{verb} Startup Factory {data['mode']} initialization at: {data['target']}")
+    if data["changes"]:
+        for change in data["changes"]:
+            print(f"  {change['key']}: {change['before']} -> {change['after']}")
+    else:
+        print("  No configuration changes.")
+    print(data["message"])
+
+
+def _print_doctor_report(report: object, *, as_json: bool) -> None:
+    data = report.as_dict()  # type: ignore[attr-defined]
+    if as_json:
+        print(json.dumps(data, sort_keys=True, separators=(",", ":")))
+        return
+    print(
+        f"Startup Factory doctor: {data['overall']} ({data['mode']}) at {data['target']}"
+    )
+    for check in data["checks"]:
+        print(f"  [{check['status']}] {check['level']} {check['id']}: {check['message']}")
+        if "remediation" in check:
+            print(f"    {check['remediation']}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -157,6 +205,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if args.command == "verify":
             result = verify_installation(target)
+        elif args.command == "init":
+            init_result = initialize(
+                target,
+                mode=args.mode,
+                product_management_tool=args.product_management_tool,
+                apply=bool(args.apply),
+            )
+            _print_init_result(init_result, as_json=json_output)
+            return 0
+        elif args.command == "doctor":
+            report = diagnose(args.project, target, mode=args.mode)
+            _print_doctor_report(report, as_json=json_output)
+            return 0 if report.ready else 1
         else:
             with _bundle_path(args.bundle) as (bundle_path, expected_digest):
                 bundle = validate_bundle(bundle_path, expected_sha256=expected_digest)

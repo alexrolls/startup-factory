@@ -1,42 +1,95 @@
 # Startup Factory
 
-> **Turn your product board into a governed software delivery system.**
+> **Turn a product ticket into reviewed, tested, production-ready software—with
+> an AI team you control.**
 
-**Startup Factory is an agentic orchestration framework for end-to-end product
-delivery.** Connect the project-management tool your team already loves—Linear,
-Jira, GitHub Issues, local Markdown, or your own adapter—and make it the durable
-control plane for a cross-functional team of AI agents.
+**One product board. Multiple specialist agents. One auditable path from idea
+to production.**
 
-Put a `[task]` in ToDo—the shipped mapping of the generic queued state.
-When automation is enabled and scheduled, the deterministic PM supervisor
-checks the board every three minutes by default, leaves anything labeled
-`human-work` to people, routes every other queued task by its explicit team
-preset (or your configured default), and drives it through architecture,
-implementation, a three-reviewer core `In Review` gate, declared Security/QA
-specialist gates, and
-integration. It also observes Blocked work as a human-controlled safety lock:
-the matching task workers stop, while independent ToDo work continues. When
-your release policy, exact approval, and protected green CI proof allow it, a
-separate credential-isolated executor deploys the reviewed immutable artifact,
-verifies the target, and only then closes the parent `[feature]` as `Live`.
+AI coding tools are good at generating code. Shipping a real product takes much
+more: clear scope, architecture, implementation, independent review, QA,
+integration, release controls, and recovery when something fails.
 
-Bring your own models, repository, stack, tracker, and infrastructure.
-Provider-neutral structured hooks can target production in any cloud,
-platform, cluster, datacenter, or internal environment that can implement the
-plan/apply/status/verify contract. Startup Factory supplies the delivery
-protocol, team topology, deterministic runtime, recovery model, and safety
-boundaries around them.
+Startup Factory turns the project-management tool you already use—Linear,
+Jira, GitHub Issues, local Markdown, or your own adapter—into the control plane
+for that entire delivery system.
 
-**Project-management native · Multi-model · Cloud agnostic · Fail closed ·
-Auditable**
+Give it a feature and Startup Factory coordinates the work around the code:
 
-This is not a hidden chatbot loop. Plans, ownership, progress, decisions,
+1. A **Product Manager** turns the request into acceptance criteria and
+   executable tasks.
+2. A **Principal Architect** proposes the design and a **Sceptical Architect**
+   tries to break it before implementation begins.
+3. Backend, frontend, infrastructure, security, QA, and other specialists work
+   in isolated branches and worktrees.
+4. Independent reviewers judge one exact package; findings trigger a fresh,
+   traceable attempt instead of silently approving changed code.
+5. A dedicated integrator runs your build, test, lint, and format checks before
+   merging.
+6. If you enable production delivery, a credential-isolated executor deploys
+   only the approved commit with current CI and policy evidence, then verifies
+   the target.
+
+No single agent is asked to plan, approve, build, review, and ship its own work.
+You keep your models, repository, stack, tracker, cloud, and infrastructure.
+Startup Factory supplies the team, delivery protocol, safety boundaries, and
+durable record around them.
+
+This is not a hidden chatbot loop. Scope, ownership, progress, decisions,
 evidence, blockers, approvals, policy denials, and deployment state remain
-visible in the same board where your team manages the product. Tracker text and
-claimed authorship are workflow evidence, never security authentication or
-production authority.
+visible in the same board where your team manages the product.
+
+**Project-management native · Multi-model · Cloud agnostic · Fail closed · MIT
+licensed**
 
 ![Startup Factory demo](https://raw.githubusercontent.com/alexrolls/startup-factory/main/exports/execmatchai-issues-57s-70s.gif)
+
+## Who it is for
+
+| You are | Startup Factory helps you |
+|---|---|
+| **A founder or CTO who still ships** | Turn product intent into structured execution without becoming the dispatcher for every AI coding session. |
+| **A technical lead adopting coding agents** | Separate design, implementation, review, integration, and release authority instead of trusting one long agent loop. |
+| **An AI-first engineering team** | Mix Claude, Codex, Gemini, Aider, or other file-reading agents by role while keeping one shared workflow. |
+| **A team already living in a product board** | Keep scope, progress, findings, approvals, blockers, and deployment state where product decisions already happen. |
+
+## Quick Start (2 minutes, no accounts)
+
+Start with one agent and the local Markdown tracker. You do not need a tracker
+account, API key, application server, or coordinator database.
+
+1. **Install Startup Factory from your project root.** Codex and Aider use the
+   shared Agent Skills project directory:
+
+   ```bash
+   uvx startup-factory@latest install --agent codex
+   uvx startup-factory@latest init --agent codex --mode solo \
+     --product-management-tool Markdown --apply
+   ```
+
+   For Claude Code, use `--agent claude-code`. Pin a release in controlled
+   environments, for example `startup-factory@0.1.8`. For a Git checkout or an
+   offline installation, use the
+   [auditable shell compatibility path](#shell-compatibility-path).
+
+2. **Ask your agent in plain language:**
+
+   ```text
+   Plan a feature: add CSV export to the reports page.
+   ```
+
+   Startup Factory creates the feature and its tasks under
+   `.workspace/task-manager/`. Then run the delivery loop:
+
+   ```text
+   Start task 1.        -> moves it to Active and implements it
+   Send task 1 to review.
+   Finalize task 1.     -> verifies, commits, and marks it Ready to deploy
+   ```
+
+That is the smallest useful loop: **plan → build → review → verify**. It uses
+the same workflow vocabulary as the governed team, automated-board, and
+protected-release modes, so you can add those layers without starting over.
 
 ```text
 ToDo -> In Progress -> In Review -> Ready for production -> deploy -> Live
@@ -48,17 +101,32 @@ ToDo -> In Progress -> In Review -> Ready for production -> deploy -> Live
 > disabled. Ordinary agents never receive production credentials; enabling a
 > release requires protected external configuration, hooks, identities, and
 > verification. Only an exact, current green CI/CD proof for the release commit
-> permits deployment.
+> permits deployment. Tracker comments and claimed authorship are workflow
+> evidence, never security authentication or production authority.
+
+## Why Startup Factory
+
+| Advantage | What it gives you |
+|---|---|
+| **Move fast without merge chaos** | A deterministic dispatcher launches only design-approved, dependency-ready, resource-safe work. Each attempt gets its own task branch and worktree; integration stays serialized. |
+| **See the whole delivery, not just agent output** | One live `[progress]` record per `[task]` and one `[digest]` per `[feature]` show tracker status, execution stage, actor, and attempt in your project-management tool. |
+| **Use the right model for each job** | Mix Claude, Codex, Gemini, or any file-reading CLI by role, then route individual tasks to fast, standard, or strong model profiles. |
+| **Keep quality gates explicit** | Architecture approval precedes implementation. Independent reviewers evaluate one exact package; optional QA and security specialists add evidence, and the integrator runs your build, test, and lint commands before merging. |
+| **Recover instead of restarting** | Immutable task packets, durable events, checkpoint branches, an idempotent outbox, and attempt-aware relaunches make interrupted work inspectable and recoverable. |
+| **Keep your stack and your tracker** | The same workflow runs across languages, frameworks, LLMs, and project-management tools. Start offline with Markdown and switch adapters without rewriting the process. |
+| **Turn the board into a safe delivery queue** | A deterministic cron/service pass observes queued/blocked work, restores in-flight runs, chooses an explicit team preset, and launches LLMs only for eligible queued tasks. |
+| **Pause one task without stopping the factory** | On the next scan, `[Blocked]` immediately fences only the matching task. Independent ToDo work and other features continue; only a human can unlock it. |
+| **Keep dangerous authority out of agents** | One deny/approval/allow contract governs every role. The code gate blocks dangerous privileged release hooks and plans; your required OS sandbox and least-privilege identities enforce ordinary-agent filesystem, network, process, and IAM boundaries. |
 
 ## Table of contents
 
-- [Layered safety boundaries for AI builders](#layered-safety-boundaries-for-ai-builders)
+- [Quick Start (2 minutes, no accounts)](#quick-start-2-minutes-no-accounts)
 - [Why Startup Factory](#why-startup-factory)
+- [Layered safety boundaries for AI builders](#layered-safety-boundaries-for-ai-builders)
 - [Superpowers + Startup Factory](#superpowers--startup-factory-split-the-sdlc-by-strength)
 - [Full transparency in your tracker](#full-transparency-in-your-tracker)
 - [Choose your operating mode](#choose-your-operating-mode)
 - [Requirements](#requirements)
-- [Quick Start (2 minutes, no accounts)](#quick-start-2-minutes-no-accounts)
 - [Install into your repository](#install-into-your-repository)
 - [Connect your LLM](#connect-your-llm)
 - [Connect your tracker](#connect-your-tracker)
@@ -129,20 +197,6 @@ tracker, the workflow actor, workflow approvals, production approval ID, and
 policy denials for each delivery. Authenticated production approver identity
 remains in protected transaction state; tracker authorship is never treated as
 authentication.
-
-## Why Startup Factory
-
-| Advantage | What it gives you |
-|---|---|
-| **Move fast without merge chaos** | A deterministic dispatcher launches only design-approved, dependency-ready, resource-safe work. Each attempt gets its own task branch and worktree; integration stays serialized. |
-| **See the whole delivery, not just agent output** | One live `[progress]` record per `[task]` and one `[digest]` per `[feature]` show tracker status, execution stage, actor, and attempt in your project-management tool. |
-| **Use the right model for each job** | Mix Claude, Codex, Gemini, or any file-reading CLI by role, then route individual tasks to fast, standard, or strong model profiles. |
-| **Keep quality gates explicit** | Architecture approval precedes implementation. In Review requires independent approvals from the Principal Architect, Sceptical Principal Architect, Senior Security Engineer, and Team Lead over one exact package; optional QA may add evidence, and the integrator runs your build, test, and lint commands before merging. |
-| **Recover instead of restarting** | Immutable task packets, durable events, checkpoint branches, an idempotent outbox, and attempt-aware relaunches make interrupted work inspectable and recoverable. |
-| **Keep your stack and your tracker** | The same workflow runs across languages, frameworks, LLMs, and project-management tools. Start offline with Markdown and switch adapters without rewriting the process. |
-| **Turn the board into a safe delivery queue** | A deterministic cron/service pass observes queued/blocked work, restores in-flight runs, chooses an explicit team preset, and launches LLMs only for eligible queued tasks. |
-| **Pause one task without stopping the factory** | On the next scan, `[Blocked]` immediately fences only the matching task. Independent ToDo work and other features continue; only a human can unlock it. |
-| **Keep dangerous authority out of agents** | One deny/approval/allow contract governs every role. The code gate blocks dangerous privileged release hooks and plans; your required OS sandbox and least-privilege identities enforce ordinary-agent filesystem, network, process, and IAM boundaries. |
 
 ## Superpowers + Startup Factory: split the SDLC by strength
 
@@ -502,58 +556,6 @@ for that tool.
 
 ---
 
-## Quick Start (2 minutes, no accounts)
-
-The fastest win: one AI agent managing work in local Markdown files. No tracker
-account, API key, Homebrew formula, or global package is required—`Markdown` is
-the default.
-
-1. **From your project root, install the complete, versioned release bundle.**
-   Codex and Aider use the shared Agent Skills project directory:
-
-   ```bash
-   uvx startup-factory@latest install --agent codex
-   ```
-
-   For Claude Code use `--agent claude-code`. Pin a release in controlled
-   environments, for example `startup-factory@0.1.7`. `uvx` creates an isolated
-   environment for the installer and leaves no Startup Factory package in your
-   project environment.
-
-   > The `uvx` path downloads the published PyPI package. For a Git checkout or
-   > offline use, use the [auditable shell compatibility path](#shell-compatibility-path).
-
-   This quick start demonstrates the one-agent workflow. Set `TEAM_MODE=false`
-   in the installed `config/project-management.config.md` before continuing;
-   fresh installations otherwise use the team workflow by default.
-
-2. **Ask your agent, in plain language:**
-
-   ```
-   Plan a feature: add CSV export to the reports page.
-   ```
-
-   The skill creates a `[feature]` and a handful of `[tasks]` as Markdown files
-   under `.workspace/task-manager/`. Then drive them:
-
-   ```
-   Start task 1.        → moves it to [Active], implements it
-   Send task 1 to review.
-   Finalize task 1.     → verified, committed + [Ready to deploy]
-   ```
-
-That's the whole loop — plan → start → review → complete — in generic vocabulary
-that works identically on every tracker. When you're ready for a real tracker or
-a full team, keep reading.
-
-> **Sanity-check the runtime** (no LLM calls, no cost): from the installed
-> skill directory, run `bash tests/run-all.sh --smoke` for a fast core check or
-> `bash tests/run-all.sh` for the full offline suite. The runner executes every
-> selected test, reports all failures together, and finishes with
-> `ALL TESTS PASS`.
-
----
-
 ## Install into your repository
 
 Use a **project-scoped** copy. Startup Factory contains mutable tracker, team,
@@ -602,6 +604,28 @@ For an explicit path instead of an agent mapping:
 uvx startup-factory@latest install \
   --install-dir /absolute/path/to/startup-factory
 ```
+
+### Initialize and diagnose readiness
+
+After installation, preview the smallest safe configuration change for the
+operating mode you want. Initialization is non-mutating unless `--apply` is
+present, and phase one can apply only `solo` or `team` mode:
+
+```bash
+startup-factory init --agent codex --mode solo --json
+startup-factory init --agent codex --mode solo \
+  --product-management-tool Markdown --apply
+startup-factory doctor --agent codex --mode solo --json
+```
+
+`init` changes only `TEAM_MODE` and, when supplied,
+`PRODUCT_MANAGEMENT_TOOL` in the preserved project-management config. It never
+accepts credentials or enables autonomous execution or release. `doctor` is
+offline and read-only. Its checks distinguish what was merely `detected`, what
+is structurally `configured`, and what was actually `proved`; an unknown live
+tracker, agent-authentication, sandbox, or release proof never appears green.
+Use the authenticated launcher/release probes named by its remediation output
+for those live proofs.
 
 ### Shell compatibility path
 
@@ -697,6 +721,9 @@ installation into a partial one. Its main operator options are:
 | `--bundle PATH` | For install/update, use an explicitly supplied local canonical archive. |
 | `--overwrite-config` | For install/update, replace all seven preserved project configuration files. |
 | `--dry-run` | For install/update, print the plan without writing the destination or lock. |
+| `--mode solo\|team\|autonomous\|release` | Select the initialization/readiness profile; protected modes are inspection-only in phase one. |
+| `--apply` | For `init`, atomically apply a supported preview; without it initialization is read-only. |
+| `--product-management-tool ADAPTER` | For `init`, select an installed regular adapter without accepting credentials. |
 | `--json` | Emit machine-readable output for operator automation. |
 
 Legacy/source-installed copies can continue to use the shell compatibility
@@ -839,13 +866,30 @@ Optional `TASK_FAST_CMD`, `TASK_STANDARD_CMD`, and `TASK_STRONG_CMD` overrides
 route individual task packets by explicit `model-profile:`, conservative risk
 classification, or a bounded low-risk fast path for documentation, formatting,
 and structurally small test/config tasks. Missing overrides fall back to the
-role command.
+role command. A requested model profile can increase rigor but cannot downgrade
+the computed security-risk floor.
+
+`delivery-profile: auto|micro|standard` is a separate, diagnostic-only signal.
+The current `micro` assessor accepts only a bounded committed diff of ordinary
+documentation and recomputes from Git; code, executable documentation, control
+files, tests, configuration, binaries, non-regular files, renames, deletions,
+scope mismatch, or ambiguity resolve to `standard`. It does not remove either
+design verdict, any core review verdict, validation, integration, CI, product
+acceptance, or release policy. See `bin/delivery_profile.py`.
 
 Use `review-gates: qa`, `review-gates: security`, or both in a [task]
 description when risk requires those independent passes. The dispatcher routes
 declared specialists before Team Lead review, and the integration evidence
 validator rejects missing, stale, reordered, or package-mismatched supporting
 approval. Deep Infra and Deep Security make `security` effective automatically.
+
+Optional browser QA is supplied through the project-owned evidence-provider
+extension contract. The reference Playwright worker uses fresh Chromium
+contexts and emits commit-bound local artifacts, while the standard-library
+validator checks their schema, hashes, containment, and trusted expected
+binding. Provider output remains untrusted supporting evidence: it cannot post
+an approval, move a [task], integrate code, or authorize release. See
+`extensions/evidence-providers/README.md` and `reference/evidence-providers.md`.
 
 ### Harness mode — teammates as subagents, no CLI processes
 

@@ -18,7 +18,12 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 from retrospective import read_project
-from task_metadata import effective_review_gates, is_fast_task, parse_task_metadata
+from task_metadata import (
+    effective_review_gates,
+    is_fast_task,
+    parse_task_metadata,
+    requires_strong_model,
+)
 from ticket_content_security import (
     ProtectedContent,
     protect_ticket_content,
@@ -386,19 +391,17 @@ def cmd_sync(args) -> None:
 
 
 def model_profile(task: dict, metadata: dict) -> str:
+    levels = {"fast": 0, "standard": 1, "strong": 2}
+    if requires_strong_model(task):
+        automatic = "strong"
+    elif is_fast_task(task, metadata):
+        automatic = "fast"
+    else:
+        automatic = "standard"
     explicit = metadata.get("modelProfile")
     if explicit in {"fast", "standard", "strong"}:
-        return explicit
-    text = "%s\n%s" % (task.get("title") or "", task.get("description") or "")
-    if re.search(
-        r"\b(?:auth\w*|security|permissions?|tenant|migrations?|schemas?|concurren\w*|races?|crypt\w*|contracts?|public\s+api)\b",
-        text,
-        re.I,
-    ):
-        return "strong"
-    if is_fast_task(task, metadata):
-        return "fast"
-    return "standard"
+        return max((automatic, explicit), key=levels.__getitem__)
+    return automatic
 
 
 def read_config(path: Path) -> dict:
