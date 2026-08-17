@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "playwrightVersion": "1.55.0",
+  "subject": {
+    "taskId": "TASK-42",
+    "attempt": 1,
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "baseUrl": "http://127.0.0.1:3000/",
+  "allowedOrigins": [
+    "http://127.0.0.1:3000"
+  ],
+  "assertions": [
+    {
+      "id": "cart-add",
+      "acceptanceCriterion": "A visitor can add an available item to the cart.",
+      "entryPath": "/shop",
+      "behavioral": {
+        "actions": [
+          {
+            "type": "click",
+            "selector": "[data-testid='add-item']"
+          }
+        ],
+        "checks": [
+          {
+            "id": "cart-visible",
+            "type": "visible",
+            "selector": "[data-testid='cart']"
+          },
+          {
+            "id": "cart-count",
+            "type": "text-contains",
+            "selector": "[data-testid='cart-count']",
+            "expected": "1"
+          }
+        ]
+      },
+      "precondition": {
+        "actions": [],
+        "checks": [
+          {
+            "id": "cart-empty-before-action",
+            "type": "hidden",
+            "selector": "[data-testid='cart']"
+          }
+        ]
+      }
+    }
+  ]
+}

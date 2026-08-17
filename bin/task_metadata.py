@@ -8,7 +8,7 @@ from pathlib import PurePosixPath
 
 
 METADATA_RE = re.compile(
-    r"^\s*(track|parallel-safe|files|resources|model-profile|work-kind|review-gates)\s*:\s*(.+?)\s*$",
+    r"^\s*(track|parallel-safe|files|resources|model-profile|delivery-profile|work-kind|review-gates)\s*:\s*(.+?)\s*$",
     re.I,
 )
 FRONTEND_RE = re.compile(r"\b(frontend|client|browser|component|css|ui)\b", re.I)
@@ -17,9 +17,24 @@ OBVIOUS_FAST_RE = re.compile(
     re.I,
 )
 STRUCTURAL_FAST_RE = re.compile(r"\b(rename|copy|config(?:uration)?|constants?|test-only|tests? only)\b", re.I)
-DOC_SUFFIXES = {".adoc", ".md", ".mdx", ".rst", ".txt"}
+DOC_SUFFIXES = {".adoc", ".md", ".rst", ".txt"}
 DOC_NAMES = {"changelog", "contributing", "license", "readme"}
 SUPPORTED_REVIEW_GATES = ("qa", "security")
+STRONG_RISK_RE = re.compile(
+    r"\b(?:auth\w*|oauth|sso|mfa|security|permissions?|tenant|migrations?|schemas?|"
+    r"concurren\w*|races?|crypt\w*|contracts?|public\s+api|secrets?|credentials?|"
+    r"tokens?|passwords?|deploy\w*|release|production|polic(?:y|ies)|guardrails?|sandbox)\b",
+    re.I,
+)
+
+
+def contains_strong_risk(value: object) -> bool:
+    return bool(STRONG_RISK_RE.search(str(value or "")))
+
+
+def requires_strong_model(task: dict) -> bool:
+    text = "%s\n%s" % (task.get("title") or "", task.get("description") or "")
+    return contains_strong_risk(text)
 
 
 def normalize_review_gates(values: list[str] | tuple[str, ...]) -> list[str]:
@@ -61,6 +76,7 @@ def parse_task_metadata(description: object, title: object = "") -> dict:
         "resources": [],
         "track": None,
         "modelProfile": None,
+        "deliveryProfile": "auto",
         "workKind": None,
         "reviewGates": [],
     }
@@ -70,15 +86,21 @@ def parse_task_metadata(description: object, title: object = "") -> dict:
         "files": "files",
         "resources": "resources",
         "model-profile": "modelProfile",
+        "delivery-profile": "deliveryProfile",
         "work-kind": "workKind",
         "review-gates": "reviewGates",
     }
+    seen_delivery_profile = False
     for line in text.splitlines():
         match = METADATA_RE.match(line)
         if not match:
             continue
         key = aliases[match.group(1).lower()]
         value = match.group(2).strip()
+        if key == "deliveryProfile":
+            if seen_delivery_profile:
+                raise ValueError("delivery-profile must not be declared more than once")
+            seen_delivery_profile = True
         if key == "parallelSafe":
             result[key] = value.lower() in {"true", "yes", "1"}
         elif key in {"files", "resources", "reviewGates"}:
@@ -90,6 +112,12 @@ def parse_task_metadata(description: object, title: object = "") -> dict:
             if result[key] not in {"defect", "change", "research", "operations"}:
                 raise ValueError(
                     "work-kind must be defect, change, research, or operations"
+                )
+        elif key == "deliveryProfile":
+            result[key] = value.lower()
+            if result[key] not in {"auto", "micro", "standard"}:
+                raise ValueError(
+                    "delivery-profile must be auto, micro, or standard"
                 )
         else:
             result[key] = value.lower()
@@ -103,9 +131,7 @@ def _is_documentation_file(path: str) -> bool:
     normalized = path.lower().replace("\\", "/")
     parsed = PurePosixPath(normalized)
     stem = parsed.stem.lower()
-    return parsed.suffix.lower() in DOC_SUFFIXES or stem in DOC_NAMES or any(
-        part in {"doc", "docs", "documentation"} for part in parsed.parts[:-1]
-    )
+    return parsed.suffix.lower() in DOC_SUFFIXES or stem in DOC_NAMES
 
 
 def _is_test_file(path: str) -> bool:
@@ -131,8 +157,8 @@ def is_fast_task(task: dict, metadata: dict) -> bool:
         return True
     if metadata.get("parallelSafe") and files and all(_is_test_file(path) for path in files):
         return True
-    if OBVIOUS_FAST_RE.search(text):
-        return len(files) <= 2
+    if OBVIOUS_FAST_RE.search(text) and not files:
+        return True
     return bool(
         metadata.get("parallelSafe")
         and len(files) <= 2

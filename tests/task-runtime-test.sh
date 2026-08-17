@@ -61,7 +61,7 @@ EOF
 cat > .agent-squad/config/team.config.md <<'EOF'
 ```
 BACKEND_CMD="false"
-TASK_FAST_CMD="cat {prompt_file} > task-fast-prompt.txt"
+TASK_STRONG_CMD="cat {prompt_file} > task-strong-prompt.txt"
 TEAM_DEFAULT_CMD="false"
 TEAMWORK_ROOT=.teamwork
 AGENT_ENV_ALLOWLIST="PATH TMPDIR LANG LC_ALL TERM"
@@ -227,7 +227,7 @@ else
 fi
 packet_json=".teamwork/feature-runtime/artifacts/$key/attempt-1/task-packet.json"
 packet_md=".teamwork/feature-runtime/artifacts/$key/attempt-1/task-packet.md"
-check "packet records fast model profile" grep -q '"modelProfile": "fast"' "$packet_json"
+check "packet preserves the strong model risk floor" grep -q '"modelProfile": "strong"' "$packet_json"
 check "packet requirement excludes Markdown comment history" python3 -c '
 import json, sys
 d=json.load(open(sys.argv[1]))
@@ -276,7 +276,7 @@ set -euo pipefail
 cp "$1" claude-task-prompt.txt
 EOF
 chmod +x "$TMP/claude"
-sed_i "s|^TASK_FAST_CMD=.*|TASK_FAST_CMD=\"$TMP/claude {prompt_file}\"|" "$CFG"
+sed_i "s|^TASK_STRONG_CMD=.*|TASK_STRONG_CMD=\"$TMP/claude {prompt_file}\"|" "$CFG"
 TEAM_RUNNER=background "$LAUNCH" start-task feature-runtime "$FID" backend "$TID" 1
 for _i in $(seq 1 30); do [ -f "$wt/claude-task-prompt.txt" ] && break; sleep 0.1; done
 check "direct Claude task command is classified as Claude" \
@@ -284,12 +284,12 @@ check "direct Claude task command is classified as Claude" \
 check "direct Claude task command receives Superpowers worker methods" \
   grep -q 'Claude Superpowers task method' "$wt/claude-task-prompt.txt"
 rm -f "$wt/claude-task-prompt.txt"
-sed_i 's|^TASK_FAST_CMD=.*|TASK_FAST_CMD="cat {prompt_file} > task-fast-prompt.txt"|' "$CFG"
+sed_i 's|^TASK_STRONG_CMD=.*|TASK_STRONG_CMD="cat {prompt_file} > task-strong-prompt.txt"|' "$CFG"
 
 TEAM_RUNNER=background "$LAUNCH" start-task feature-runtime "$FID" backend "$TID" 1
-for _i in $(seq 1 30); do [ -f "$wt/task-fast-prompt.txt" ] && break; sleep 0.1; done
-check "task-specific model command ran" test -f "$wt/task-fast-prompt.txt"
-if grep -q 'Claude Superpowers task method' "$wt/task-fast-prompt.txt"; then
+for _i in $(seq 1 30); do [ -f "$wt/task-strong-prompt.txt" ] && break; sleep 0.1; done
+check "task-specific model command ran" test -f "$wt/task-strong-prompt.txt"
+if grep -q 'Claude Superpowers task method' "$wt/task-strong-prompt.txt"; then
   echo "FAIL: non-Claude launched task received Superpowers worker methods"; FAILURES=$((FAILURES+1))
 else
   echo "ok: non-Claude launched task excludes Superpowers worker methods"
@@ -310,7 +310,7 @@ check "dispatcher projects event stage to tracker progress" grep -q '^> stage: i
 
 # The review envelope is generated from the exact committed task branch. Remove
 # the task-runner probe and leave one real, clean checkpoint for the package.
-rm -f "$wt/task-fast-prompt.txt"
+rm -f "$wt/task-strong-prompt.txt"
 mkdir -p "$wt/src"
 printf 'def endpoint():\n    return "ok"\n' > "$wt/src/endpoint.py"
 git -C "$wt" add src/endpoint.py
@@ -333,7 +333,7 @@ rm -f linked-progress-note.md
 printf '%s\n' "$entry" > "$STARTUP_FACTORY_CANONICAL_WORKSPACE/linked-entry.path"
 EOF
 chmod +x task-submit-probe.sh
-sed_i "s|^TASK_FAST_CMD=.*|TASK_FAST_CMD=\"$(pwd)/task-submit-probe.sh {prompt_file}\"|" "$CFG"
+sed_i "s|^TASK_STRONG_CMD=.*|TASK_STRONG_CMD=\"$(pwd)/task-submit-probe.sh {prompt_file}\"|" "$CFG"
 rm -f ".teamwork/feature-runtime/pids/tasks/backend--$key--a1.pid" \
   .teamwork/feature-runtime/linked-entry.path
 TEAM_RUNNER=background "$LAUNCH" start-task feature-runtime "$FID" backend "$TID" 1 >/dev/null
@@ -348,7 +348,7 @@ PY
 check "linked task worktree gets no shadow outbox" test ! -e "$wt/.teamwork"
 .agent-squad/bin/process-outbox.sh feature-runtime "$FID" "$linked_entry" >/dev/null
 check "broker accepts a legitimate launched-task signature" grep -q 'Submitted from the linked task worktree' "$FID"
-sed_i 's|^TASK_FAST_CMD=.*|TASK_FAST_CMD="cat {prompt_file} > task-fast-prompt.txt"|' "$CFG"
+sed_i 's|^TASK_STRONG_CMD=.*|TASK_STRONG_CMD="cat {prompt_file} > task-strong-prompt.txt"|' "$CFG"
 
 cat > review.md <<'EOF'
 [review-request]
@@ -802,7 +802,7 @@ check "rejected outbox entries do not add tracker comments" test "$(grep -c 'del
 # The test probe is intentionally a one-shot process. Remove its stale
 # background-runner pid record before exercising dispatcher relaunch behavior.
 rm -f ".teamwork/feature-runtime/pids/tasks/backend--$key--a1.pid"
-rm -f "$wt/task-fast-prompt.txt"
+rm -f "$wt/task-strong-prompt.txt"
 cat > findings.md <<'EOF'
 [review-findings]
 round: 1
@@ -814,8 +814,8 @@ EOF
 "$OPS" state "$TID" Planned >/dev/null
 dispatch_output="$(TEAM_RUNNER=background .agent-squad/bin/dispatch.sh feature-runtime "$FID" --once --unblock=off 2>&1)"
 attempt2_wt=".teamwork/feature-runtime/worktrees/backend#2-$key"
-for _i in $(seq 1 30); do [ -f "$attempt2_wt/task-fast-prompt.txt" ] && break; sleep 0.1; done
-[ -f "$attempt2_wt/task-fast-prompt.txt" ] || printf '%s\n' "$dispatch_output" >&2
+for _i in $(seq 1 30); do [ -f "$attempt2_wt/task-strong-prompt.txt" ] && break; sleep 0.1; done
+[ -f "$attempt2_wt/task-strong-prompt.txt" ] || printf '%s\n' "$dispatch_output" >&2
 check "review findings launch a fresh attempt" grep -q '"attempt": 2' ".teamwork/feature-runtime/executions/$key.json"
 check "fresh rework packet includes findings" grep -q '\[review-findings\]' ".teamwork/feature-runtime/artifacts/$key/attempt-2/task-packet.md"
 check "clean prior worktree is retired" test ! -d "$wt"

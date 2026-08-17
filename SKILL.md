@@ -29,6 +29,12 @@ skill's directory):
   implementation [task] or one exact review package
 - `bin/launch-team.sh doctor` — non-mutating CLI authentication/startup smoke
   test under the real sanitized agent environment
+- `bin/delivery_profile.py` — diagnostic-only task/committed-diff assessment;
+  `micro` never removes a design, review, validation, integration, or release gate
+- `bin/evidence_provider.py` + `reference/evidence-providers.md` — strict offline
+  validation/indexing for commit-bound, non-authoritative provider evidence
+- `extensions/evidence-providers/` — preserved project-owned evidence workers;
+  the Playwright reference never installs a browser or grants workflow authority
 - `bin/tracker-ops.sh` — ergonomic CLI for recurring tracker operations (scriptable mechanisms)
 - `extensions/tracker-backends/<Tool>.py` — project-owned primitive port for a custom tracker
 - `bin/update-installed-skill.sh` — install or refresh a legacy/source-managed bundle while preserving project config
