@@ -104,6 +104,97 @@ ToDo -> In Progress -> In Review -> Ready for production -> deploy -> Live
 > permits deployment. Tracker comments and claimed authorship are workflow
 > evidence, never security authentication or production authority.
 
+## Ten easy prompts for startup delivery
+
+Replace the brackets and paste. Each prompt assumes the same rules: use the
+installed Startup Factory skill, keep agents inside their assigned roles, require
+current tests and independent review, deploy only through the protected release
+executor, and stop visibly when a gate or approval is missing.
+
+> The **Senior Security Engineer** already exists and reviews independently; an
+> implementation engineer writes the fix. For continuous work, use bounded
+> `pm-agent.py` passes—not one endless LLM session.
+
+### 1. Ship a product feature
+
+```text
+Deliver [FEATURE] from [TRACKER] to production with Startup Factory. Launch the
+full-stack team, define measurable acceptance criteria, build and test isolated
+slices, review independently, deploy the approved commit, and verify [OUTCOME].
+```
+
+### 2. Clear the Linear bug queue
+
+```text
+In Linear [TEAM/PROJECT], process queued tickets labelled "Bug". Choose the right
+team per ticket, require security review, reproduce each bug with a failing test,
+fix it, run regressions, deploy safely, and report the result.
+```
+
+### 3. Fix cloud infrastructure and backups
+
+```text
+Audit [CLOUD/ENVIRONMENT] with the deep-infra team. Fix drift through IaC, review
+IAM, networking, monitoring, cost, backups, and restore readiness; validate the
+plan and rollback, obtain production approval, then verify the service.
+```
+
+### 4. Harden product security
+
+```text
+Harden [SERVICE/FEATURE] with the deep-security team. Threat-model it, implement
+the highest-risk fixes, run authorized abuse tests, require independent security
+approval, deploy the verified commit, and monitor for regressions.
+```
+
+### 5. Build a regression safety net
+
+```text
+Create a regression suite for [PRODUCT]. Launch the appropriate engineering team
+with QA review, cover critical journeys and past incidents with reliable
+unit/API/E2E tests, remove flakiness, run them in CI, and publish release criteria.
+```
+
+### 6. Turn customer feedback into a roadmap
+
+```text
+Analyze [FEEDBACK SOURCE] with Startup Factory. Group evidence-backed themes,
+rank them by impact, confidence, and effort, create scoped tracker features, and
+deliver the approved top priority with measurable acceptance criteria.
+```
+
+### 7. Improve onboarding conversion
+
+```text
+Improve [ONBOARDING STEP] from [BASELINE] to [TARGET]. Launch the full-stack
+team, instrument the funnel, define experiment guardrails, ship the change,
+verify real analytics, and recommend keep, iterate, or rollback.
+```
+
+### 8. Prevent a production incident from recurring
+
+```text
+Investigate [INCIDENT] with the appropriate backend or infra team. Build an
+evidence-based timeline, fix the root cause, add tests, alerts, and a runbook,
+rehearse recovery safely, then verify the production signals.
+```
+
+### 9. Run a safe data migration
+
+```text
+Migrate [DATA/SYSTEM] with the deep-backend team. Use a backward-compatible
+expand/contract plan, rehearse on representative non-production data, verify
+integrity and rollback, obtain production approval, then monitor completion.
+```
+
+### 10. Ship an AI feature responsibly
+
+```text
+Deliver [AI FEATURE] with the deep-llm team. Define quality, safety, latency,
+and cost thresholds; secure prompts, tools, and data; run reproducible evals,
+release gradually, and monitor drift, failures, and spend.
+```
+
 ## Why Startup Factory
 
 | Advantage | What it gives you |
@@ -121,6 +212,7 @@ ToDo -> In Progress -> In Review -> Ready for production -> deploy -> Live
 ## Table of contents
 
 - [Quick Start (2 minutes, no accounts)](#quick-start-2-minutes-no-accounts)
+- [Ten easy prompts for startup delivery](#ten-easy-prompts-for-startup-delivery)
 - [Why Startup Factory](#why-startup-factory)
 - [Layered safety boundaries for AI builders](#layered-safety-boundaries-for-ai-builders)
 - [Superpowers + Startup Factory](#superpowers--startup-factory-split-the-sdlc-by-strength)
