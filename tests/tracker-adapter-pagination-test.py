@@ -123,7 +123,10 @@ class LinearPaginationTest(unittest.TestCase):
             self.fail("unexpected Linear query: %s" % query)
 
         self.linear.gql = gql
-        tasks = self.linear.export(project_id)
+        envelope = self.linear.export(project_id)
+        self.assertEqual(envelope["snapshotSchemaVersion"], 2)
+        self.assertIs(envelope["snapshotComplete"], True)
+        tasks = envelope["tasks"]
         self.ns["normalize_task_record"](tasks[0], "Linear export fixture")
         self.assertEqual(2, len(top_queries))
         self.assertEqual(["c2", "progress", "c1"],
@@ -297,7 +300,10 @@ class JiraPaginationTest(unittest.TestCase):
             self.fail("unexpected Jira path: %s" % path)
 
         self.jira.api = api
-        tasks = self.jira.export("EPIC-1")
+        envelope = self.jira.export("EPIC-1")
+        self.assertEqual(envelope["snapshotSchemaVersion"], 2)
+        self.assertIs(envelope["snapshotComplete"], True)
+        tasks = envelope["tasks"]
         self.ns["normalize_task_record"](tasks[0], "Jira export fixture")
         self.assertEqual([None, "page-2"],
                          [page.get("nextPageToken") for page in search_payloads])
@@ -468,7 +474,10 @@ class GitHubPaginationTest(unittest.TestCase):
             self.fail("unexpected GitHub endpoint: %s" % endpoint.geturl())
 
         self.github.raw_gh = raw_gh
-        tasks = self.github.export("delivery")
+        envelope = self.github.export("delivery")
+        self.assertEqual(envelope["snapshotSchemaVersion"], 2)
+        self.assertIs(envelope["snapshotComplete"], True)
+        tasks = envelope["tasks"]
         self.ns["normalize_task_record"](tasks[0], "GitHub export fixture")
 
         self.assertEqual([1, 2], [task["taskId"] for task in tasks])

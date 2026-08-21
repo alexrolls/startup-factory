@@ -213,6 +213,93 @@ echo "$human_plan" | grep -q "claim $HUMAN_FID#2.*backend" \
   && echo "ok: non-human sibling remains automatically claimable" \
   || { echo "FAIL: automatic sibling was not claimed: $human_plan"; FAILURES=$((FAILURES+1)); }
 
+# Ignored labels fence candidates, not graph visibility. A non-candidate
+# dependency must still prevent a dependant from becoming ready.
+cat > feat/ignored-dependency.md <<'EOF'
+# Ignored dependency [Active]
+
+## 1 Human-owned prerequisite [Active]
+
+**Assignee:** backend
+**Labels:** human-work
+
+## 2 Automatic dependant [Planned]
+
+**Assignee:** —
+**BlockedBy:** 1
+
+track: backend
+
+> [design-note] ready — backend
+
+> [design-approved] approved — principal-architect
+
+> [sceptical-design-approved] approved — sceptical-architect
+EOF
+IGNORED_DEP_FID="feat/ignored-dependency.md"
+ignored_dependency_plan="$(STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='["human-work"]' TEAM_RUNNER=background "$DISPATCH" feat-ignored-dependency "$IGNORED_DEP_FID" --once --dry-run)"
+if echo "$ignored_dependency_plan" | grep -q "claim $IGNORED_DEP_FID#2"; then
+  echo "FAIL: dependant ignored its graph-visible human-work prerequisite"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: ignored prerequisite remains graph-visible and blocks readiness"
+fi
+
+# The planner parses and validates the complete snapshot before it can emit an
+# action. Exercise migration and duplicate-key failures against the real entry.
+GRAPH_PLAN=".claude/skills/pm/bin/dispatch-plan.py"
+GRAPH_WORKSPACE="$(pwd)/.teamwork/graph-validation"
+mkdir -p "$GRAPH_WORKSPACE"
+refuse_graph_without_action() { # description, expected fragment
+  local description="$1" expected="$2" output
+  if output="$(python3 "$GRAPH_PLAN" \
+      --skill "$(pwd)/.claude/skills/pm" --workdir "$GRAPH_WORKSPACE" \
+      --team graph-validation --feature graph-validation \
+      --stuck-minutes 15 --execution sequential 2>&1)"; then
+    echo "FAIL: $description (accepted)"; FAILURES=$((FAILURES+1)); return
+  fi
+  if ! printf '%s' "$output" | grep -q "$expected"; then
+    echo "FAIL: $description (wrong error: $output)"; FAILURES=$((FAILURES+1)); return
+  fi
+  if printf '%s\n' "$output" | grep -Eq '^(launch|launch-task|claim|blocked-hold|product-closeout)( |$)'; then
+    echo "FAIL: $description (emitted an action before failure)"; FAILURES=$((FAILURES+1)); return
+  fi
+  echo "ok: $description fails before any dispatch action"
+}
+cat > "$GRAPH_WORKSPACE/tasks.json" <<'EOF'
+{"snapshotSchemaVersion":2,"snapshotComplete":true,"snapshotComplete":true,"featureId":"graph-validation","tasks":[]}
+EOF
+refuse_graph_without_action "duplicate snapshot JSON key" "duplicate field snapshotComplete"
+cat > "$GRAPH_WORKSPACE/tasks.json" <<'EOF'
+{"featureId":"graph-validation","tasks":[]}
+EOF
+refuse_graph_without_action "cached schema-1 snapshot" "snapshotSchemaVersion"
+
+cat > feat/missing-dependency.md <<'EOF'
+# Missing dependency [Active]
+
+## 1 Unsafe candidate [Planned]
+
+**Assignee:** —
+**BlockedBy:** 99
+
+track: backend
+
+> [design-note] ready — backend
+
+> [design-approved] approved — principal-architect
+
+> [sceptical-design-approved] approved — sceptical-architect
+EOF
+MISSING_DEP_FID="feat/missing-dependency.md"
+if missing_dependency_output="$(TEAM_RUNNER=background "$DISPATCH" feat-missing-dependency "$MISSING_DEP_FID" --once --dry-run 2>&1)"; then
+  echo "FAIL: missing dependency target was accepted"; FAILURES=$((FAILURES+1))
+elif printf '%s' "$missing_dependency_output" | grep -q "dependency has unknown target" \
+    && ! printf '%s\n' "$missing_dependency_output" | grep -Eq '^plan: (launch|claim)'; then
+  echo "ok: missing dependency target fails before claim or launch"
+else
+  echo "FAIL: missing dependency produced wrong output: $missing_dependency_output"; FAILURES=$((FAILURES+1))
+fi
+
 # -- real pass: blocked task stays held while unrelated gate queues still run --
 TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once
 check "dispatcher never moves Blocked outbound" grep -q '^## 2 Blocked thing \[Blocked\]$' "$FID"

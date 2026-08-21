@@ -34,6 +34,7 @@ esac
 
 FULL_PYTHON_TESTS=(
   ticket-content-security-test.py
+  execution-graph-test.py
   retrospective-test.py
   product-acceptance-test.py
   superpowers-planning-test.py
