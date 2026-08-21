@@ -349,8 +349,13 @@ def main() -> None:
     filtered_tasks = []
     for task in tasks:
         labels = task.get("labels")
-        if not isinstance(labels, list) or any(not isinstance(label, str) for label in labels):
-            raise RuntimeError("tracker snapshot task labels must be a list of label names")
+        if not isinstance(labels, list) or any(
+            not isinstance(label, str) or not label or label != label.strip()
+            for label in labels
+        ):
+            raise RuntimeError(
+                "tracker snapshot task labels must be a list of non-empty canonical label names"
+            )
         if excluded.intersection(label.casefold() for label in labels):
             continue
         filtered_tasks.append(task)
