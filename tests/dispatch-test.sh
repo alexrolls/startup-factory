@@ -213,6 +213,101 @@ echo "$human_plan" | grep -q "claim $HUMAN_FID#2.*backend" \
   && echo "ok: non-human sibling remains automatically claimable" \
   || { echo "FAIL: automatic sibling was not claimed: $human_plan"; FAILURES=$((FAILURES+1)); }
 
+# Ignored labels fence candidates, not graph visibility. A non-candidate
+# dependency must still prevent a dependant from becoming ready.
+cat > feat/ignored-dependency.md <<'EOF'
+# Ignored dependency [Active]
+
+## 1 Human-owned prerequisite [Active]
+
+**Assignee:** backend
+**Labels:** human-work
+
+## 2 Automatic dependant [Planned]
+
+**Assignee:** —
+**BlockedBy:** 1
+
+track: backend
+
+> [design-note] ready — backend
+
+> [design-approved] approved — principal-architect
+
+> [sceptical-design-approved] approved — sceptical-architect
+EOF
+IGNORED_DEP_FID="feat/ignored-dependency.md"
+ignored_dependency_plan="$(STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='["human-work"]' TEAM_RUNNER=background "$DISPATCH" feat-ignored-dependency "$IGNORED_DEP_FID" --once --dry-run)"
+if echo "$ignored_dependency_plan" | grep -q "claim $IGNORED_DEP_FID#2"; then
+  echo "FAIL: dependant ignored its graph-visible human-work prerequisite"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: ignored prerequisite remains graph-visible and blocks readiness"
+fi
+
+# The planner parses and validates the complete snapshot before it can emit an
+# action. Exercise migration and duplicate-key failures against the real entry.
+GRAPH_PLAN=".claude/skills/pm/bin/dispatch-plan.py"
+GRAPH_WORKSPACE="$(pwd)/.teamwork/graph-validation"
+mkdir -p "$GRAPH_WORKSPACE"
+refuse_graph_without_action() { # description, expected fragment
+  local description="$1" expected="$2" output
+  if output="$(python3 "$GRAPH_PLAN" \
+      --skill "$(pwd)/.claude/skills/pm" --workdir "$GRAPH_WORKSPACE" \
+      --team graph-validation --feature graph-validation \
+      --stuck-minutes 15 --execution sequential 2>&1)"; then
+    echo "FAIL: $description (accepted)"; FAILURES=$((FAILURES+1)); return
+  fi
+  if ! printf '%s' "$output" | grep -q "$expected"; then
+    echo "FAIL: $description (wrong error: $output)"; FAILURES=$((FAILURES+1)); return
+  fi
+  if printf '%s\n' "$output" | grep -Eq '^(launch|launch-task|claim|blocked-hold|product-closeout)( |$)'; then
+    echo "FAIL: $description (emitted an action before failure)"; FAILURES=$((FAILURES+1)); return
+  fi
+  echo "ok: $description fails before any dispatch action"
+}
+cat > "$GRAPH_WORKSPACE/tasks.json" <<'EOF'
+{"snapshotSchemaVersion":2,"snapshotComplete":true,"snapshotComplete":true,"featureId":"graph-validation","tasks":[]}
+EOF
+refuse_graph_without_action "duplicate snapshot JSON key" "duplicate field snapshotComplete"
+cat > "$GRAPH_WORKSPACE/tasks.json" <<'EOF'
+{"featureId":"graph-validation","tasks":[]}
+EOF
+refuse_graph_without_action "cached schema-1 snapshot" "snapshotSchemaVersion"
+for malformed_label in '42' '""' '" human-work"' '"human-work "'; do
+  cat > "$GRAPH_WORKSPACE/tasks.json" <<EOF
+{"snapshotSchemaVersion":2,"snapshotComplete":true,"featureId":"graph-validation","tasks":[{"taskId":"graph-validation#1","status":"Planned","blockedBy":[],"labels":[$malformed_label]}]}
+EOF
+  refuse_graph_without_action \
+    "malformed task label $malformed_label" \
+    "task labels must be a list of non-empty canonical label names"
+done
+
+cat > feat/missing-dependency.md <<'EOF'
+# Missing dependency [Active]
+
+## 1 Unsafe candidate [Planned]
+
+**Assignee:** —
+**BlockedBy:** 99
+
+track: backend
+
+> [design-note] ready — backend
+
+> [design-approved] approved — principal-architect
+
+> [sceptical-design-approved] approved — sceptical-architect
+EOF
+MISSING_DEP_FID="feat/missing-dependency.md"
+if missing_dependency_output="$(TEAM_RUNNER=background "$DISPATCH" feat-missing-dependency "$MISSING_DEP_FID" --once --dry-run 2>&1)"; then
+  echo "FAIL: missing dependency target was accepted"; FAILURES=$((FAILURES+1))
+elif printf '%s' "$missing_dependency_output" | grep -q "dependency has unknown target" \
+    && ! printf '%s\n' "$missing_dependency_output" | grep -Eq '^plan: (launch|claim)'; then
+  echo "ok: missing dependency target fails before claim or launch"
+else
+  echo "FAIL: missing dependency produced wrong output: $missing_dependency_output"; FAILURES=$((FAILURES+1))
+fi
+
 # -- real pass: blocked task stays held while unrelated gate queues still run --
 TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once
 check "dispatcher never moves Blocked outbound" grep -q '^## 2 Blocked thing \[Blocked\]$' "$FID"
@@ -414,6 +509,165 @@ TEAM_RUNNER=background "$DISPATCH" feat-human-held "$HELD_FID" --once >/dev/null
 check "resume-status metadata leaves task Blocked" grep -q '^## 2 Human-held ticket \[Blocked\]$' "$HELD_FID"
 check "independent Todo is claimed"              grep -q '^## 3 Independent Todo \[Active\]$' "$HELD_FID"
 check "dependent stays queued pending lead verdict" grep -q '^## 4 Potential dependent \[Planned\]$' "$HELD_FID"
+
+# -- exact dependency verdict is a bounded readiness overlay ------------------
+# Exercise the real dispatch entry path: the tracker export supplies the graph,
+# while task-holds.json supplies a separately bound human clearance receipt.
+cat > feat/dependency-clearance.md <<'EOF'
+# Dependency Clearance [Active]
+
+## 1 First blocked source [Blocked]
+
+**Assignee:** backend
+
+Human-held.
+
+## 2 Second blocked source [Blocked]
+
+**Assignee:** backend
+
+Human-held.
+
+## 3 Cleared dependent [Planned]
+
+**Assignee:** —
+**BlockedBy:** 1, 2
+
+track: backend
+
+> [design-note] ready — backend
+
+> [design-approved] approved — principal-architect
+
+> [sceptical-design-approved] approved — sceptical-architect
+EOF
+CLEAR_FID="feat/dependency-clearance.md"
+CLEAR_TEAM="feat-dependency-clearance"
+CLEAR_TASK="$CLEAR_FID#3"
+CLEAR_WORKSPACE=".teamwork/$CLEAR_TEAM"
+CLEAR_GRAPH_STATE="$CLEAR_WORKSPACE/graph-before.json"
+
+uncleared_plan="$(TEAM_RUNNER=background "$DISPATCH" "$CLEAR_TEAM" "$CLEAR_FID" --once --dry-run)"
+if printf '%s\n' "$uncleared_plan" | grep -Eq "(claim|launch task) $CLEAR_TASK"; then
+  echo "FAIL: dependent was eligible without an exact dependency verdict"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: dependent remains ineligible without a dependency verdict"
+fi
+
+python3 - "$CLEAR_WORKSPACE/tasks.json" "$CLEAR_GRAPH_STATE" "$(pwd)/.claude/skills/pm" <<'PY'
+import json
+import sys
+
+snapshot_path, state_path, skill = sys.argv[1:]
+sys.path.insert(0, skill + "/bin")
+from execution_graph import ExecutionGraph, graph_digest
+
+snapshot = json.load(open(snapshot_path, encoding="utf-8"))
+board = json.load(open(skill + "/config/statuses.config.json", encoding="utf-8"))
+statuses = board["tasks"]["statuses"]
+graph = ExecutionGraph.from_snapshot(
+    snapshot,
+    {item["name"] for item in statuses},
+    {item["name"] for item in statuses if item.get("terminal")},
+)
+with open(state_path, "w", encoding="utf-8") as handle:
+    json.dump(
+        {"digest": graph_digest(graph), "state": graph.validation.canonical_payload},
+        handle,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+PY
+
+write_dependency_clearance() { # verdict-or-mismatch mode
+  python3 - "$CLEAR_WORKSPACE/tasks.json" "$CLEAR_WORKSPACE/task-holds.json" \
+    "$CLEAR_FID" "$CLEAR_TASK" "$1" <<'PY'
+import hashlib
+import json
+import re
+import sys
+
+snapshot_path, registry_path, feature_id, task_id, mode = sys.argv[1:]
+snapshot = json.load(open(snapshot_path, encoding="utf-8"))
+candidate = next(item for item in snapshot["tasks"] if item["taskId"] == task_id)
+blockers = sorted(candidate["blockedBy"])
+slug = re.sub(r"[^a-zA-Z0-9]+", "-", task_id).strip("-").lower()[:32] or "task"
+key = "%s-%s" % (slug, hashlib.sha256(task_id.encode()).hexdigest()[:10])
+receipt = {
+    "taskId": task_id,
+    "status": candidate["status"],
+    "revision": candidate["revision"],
+    "blockedBy": blockers,
+    "blockedSources": blockers,
+    "verdict": mode if mode in {"partially-actionable", "independent"} else "partially-actionable",
+}
+if mode == "taskId-mismatch":
+    receipt["taskId"] = task_id + "-stale"
+elif mode == "status-mismatch":
+    receipt["status"] = "Active"
+elif mode == "revision-mismatch":
+    receipt["revision"] = str(candidate["revision"]) + "-stale"
+elif mode == "blockedBy-mismatch":
+    receipt["blockedBy"] = blockers[:-1]
+elif mode == "blockedSources-mismatch":
+    receipt["blockedSources"] = blockers[:-1]
+elif mode == "verdict-mismatch":
+    receipt["verdict"] = "actionable"
+registry = {
+    "schemaVersion": 1,
+    "featureId": feature_id,
+    "tasks": {},
+    "dependencyVerdicts": {key: receipt},
+}
+with open(registry_path, "w", encoding="utf-8") as handle:
+    json.dump(registry, handle, indent=2, sort_keys=True)
+PY
+}
+
+for clearance_verdict in partially-actionable independent; do
+  write_dependency_clearance "$clearance_verdict"
+  clearance_plan="$(TEAM_RUNNER=background "$DISPATCH" "$CLEAR_TEAM" "$CLEAR_FID" --once --dry-run)"
+  if printf '%s\n' "$clearance_plan" | grep -q "claim $CLEAR_TASK.*backend"; then
+    echo "ok: exact $clearance_verdict dependency verdict makes the dependent eligible"
+  else
+    echo "FAIL: exact $clearance_verdict dependency verdict did not make the dependent eligible: $clearance_plan"
+    FAILURES=$((FAILURES+1))
+  fi
+done
+
+for mismatch in taskId status revision blockedBy blockedSources verdict; do
+  write_dependency_clearance "$mismatch-mismatch"
+  mismatch_plan="$(TEAM_RUNNER=background "$DISPATCH" "$CLEAR_TEAM" "$CLEAR_FID" --once --dry-run)"
+  if printf '%s\n' "$mismatch_plan" | grep -Eq "(claim|launch task) $CLEAR_TASK"; then
+    echo "FAIL: $mismatch mismatch retained dependency clearance"; FAILURES=$((FAILURES+1))
+  else
+    echo "ok: $mismatch mismatch prevents dependent launch"
+  fi
+done
+
+python3 - "$CLEAR_WORKSPACE/tasks.json" "$CLEAR_GRAPH_STATE" "$(pwd)/.claude/skills/pm" <<'PY'
+import json
+import sys
+
+snapshot_path, state_path, skill = sys.argv[1:]
+sys.path.insert(0, skill + "/bin")
+from execution_graph import ExecutionGraph, graph_digest
+
+before = json.load(open(state_path, encoding="utf-8"))
+snapshot = json.load(open(snapshot_path, encoding="utf-8"))
+board = json.load(open(skill + "/config/statuses.config.json", encoding="utf-8"))
+statuses = board["tasks"]["statuses"]
+graph = ExecutionGraph.from_snapshot(
+    snapshot,
+    {item["name"] for item in statuses},
+    {item["name"] for item in statuses if item.get("terminal")},
+)
+after = {"digest": graph_digest(graph), "state": graph.validation.canonical_payload}
+if after != before:
+    raise SystemExit("dependency clearance altered graph digest or canonical state")
+PY
+echo "ok: dependency clearance leaves graph digest and canonical state unchanged"
 
 # -- D2.5: Linear+MCP → dispatch fails before tracker-ops ----------------------
 cat > .claude/skills/pm/config/project-management.config.md <<'EOF'

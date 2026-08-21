@@ -98,6 +98,8 @@ check "custom backend never receives a raw credential" \
   bash -c "! grep -Fq '$OUTBOUND_SECRET' '$TMP/custom-backend.out'"
 check "custom backend receives the redacted comment" \
   grep -Fq '[REDACTED POTENTIAL SECRET]' "$TMP/custom-backend.out"
+refuse "custom backend bare-list export cannot assert completeness" "schema-2 exhaustive-export envelope" \
+  env TRACKER_ADAPTER=Acme "$CUSTOM_OPS" export ACME-FEATURE "$TMP/custom-export.json"
 
 ln -s Acme.py "$CUSTOM_SKILL/extensions/tracker-backends/AcmeLink.py"
 cat > "$CUSTOM_SKILL/config/project-management.config.md" <<'EOF'
@@ -352,6 +354,7 @@ check "integrate retry is idempotent" test "$(grep -c 'Integrated: commit abc123
 check "export writes JSON" python3 -c "
 import json
 d = json.load(open('tasks.json'))
+assert d['snapshotSchemaVersion'] == 2 and d['snapshotComplete'] is True
 assert d['adapter'] == 'Markdown' and len(d['tasks']) == 2
 byid = {t['taskId']: t for t in d['tasks']}
 assert byid['$T#1']['status'] == 'Ready to deploy'
@@ -366,15 +369,19 @@ assert any('design-note' in c['body'] for c in byid['$T#1']['comments'])
 assert any(c['body'].startswith('[progress]') for c in byid['$T#2']['comments'])
 assert byid['$T#2']['blockedBy'] == ['$T#1'], byid['$T#2'].get('blockedBy')
 assert byid['$T#1']['blockedBy'] == []
+assert byid['$T#2']['dependencies'] == [
+    {'targetTaskId': '$T#1', 'kind': 'requires', 'affectsReadiness': True}
+]
+assert byid['$T#1']['dependencies'] == []
 "
 
 STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='["human-work"]' "$OPS" export "$T" filtered-tasks.json
-check "ignored label filters autonomous feature export" python3 -c "
+check "feature export remains exhaustive despite ignored candidate labels" python3 -c "
 import json
 d=json.load(open('filtered-tasks.json'))
-assert [task['taskId'] for task in d['tasks']] == ['$T#2']
+assert [task['taskId'] for task in d['tasks']] == ['$T#1', '$T#2']
 "
-refuse "malformed ignored-label policy fails closed" "must be a JSON list" \
+check "feature export does not interpret candidate-label policy" \
   env STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='{}' "$OPS" export "$T" filtered-tasks.json
 
 # -- board scan: generic statuses, parent grouping, routing inputs ---------------

@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
+from execution_graph import ExecutionGraph, ExecutionGraphError
 from product_acceptance import ProductAcceptancePending, evaluate as evaluate_product_acceptance, validate_request
 from task_metadata import effective_review_gates, parse_task_metadata, required_review_gates
 
@@ -274,7 +275,10 @@ def main() -> None:
     workdir = Path(args.workdir)
     workdir_fd = open_directory(workdir, "team workspace")
     board = json.loads((skill / "config" / "statuses.config.json").read_text())
-    payload = json.loads(read_regular_at(workdir_fd, "tasks.json", "tracker snapshot"))
+    payload = strict_object(
+        read_regular_at(workdir_fd, "tasks.json", "tracker snapshot"),
+        "tracker snapshot",
+    )
     try:
         executions_fd = open_child_directory(workdir_fd, "executions", "execution-record directory")
     except FileNotFoundError:
@@ -319,24 +323,46 @@ def main() -> None:
     def task_is_held(task_id: str) -> bool:
         entry = hold_entry(task_id)
         return bool(entry and entry.get("state") in HOLD_STATES)
-    tasks = payload.get("tasks") or []
+    if str(payload.get("featureId") or "") != args.feature:
+        raise RuntimeError("tracker snapshot featureId does not match the dispatcher invocation")
+    status_records = board.get("tasks", {}).get("statuses")
+    if not isinstance(status_records, list) or not status_records:
+        raise RuntimeError("task status board is malformed")
+    allowed_statuses = {
+        status.get("name") for status in status_records
+        if isinstance(status, dict) and isinstance(status.get("name"), str)
+    }
+    if len(allowed_statuses) != len(status_records):
+        raise RuntimeError("task status board contains malformed or duplicate names")
+    terminal = {
+        status["name"] for status in status_records if status.get("terminal")
+    }
+    try:
+        graph = ExecutionGraph.from_snapshot(payload, allowed_statuses, terminal)
+    except ExecutionGraphError as exc:
+        raise RuntimeError(f"tracker snapshot execution graph is invalid: {exc}") from exc
+
+    # The graph is always complete. Ignored labels fence autonomous candidates
+    # only; their nodes and statuses remain dependency-visible.
+    tasks = payload["tasks"]
     excluded = ignored_labels(args.ignored_labels_json)
     filtered_tasks = []
     for task in tasks:
         labels = task.get("labels")
-        if not isinstance(labels, list) or any(not isinstance(label, str) for label in labels):
-            raise RuntimeError("tracker snapshot task labels must be a list of label names")
+        if not isinstance(labels, list) or any(
+            not isinstance(label, str) or not label or label != label.strip()
+            for label in labels
+        ):
+            raise RuntimeError(
+                "tracker snapshot task labels must be a list of non-empty canonical label names"
+            )
         if excluded.intersection(label.casefold() for label in labels):
             continue
         filtered_tasks.append(task)
     tasks = filtered_tasks
-    if str(payload.get("featureId") or "") != args.feature:
-        raise RuntimeError("tracker snapshot featureId does not match the dispatcher invocation")
-    by_id = {str(task["taskId"]): task for task in tasks}
-    terminal = {status["name"] for status in board["tasks"]["statuses"] if status.get("terminal")}
     by_kind = {
         status.get("kind"): status["name"]
-        for status in board["tasks"]["statuses"]
+        for status in status_records
         if status.get("kind")
     }
     queued_status = by_kind.get("queued", "Planned")
@@ -424,26 +450,27 @@ def main() -> None:
             specialist_dispatch_tracks.add("llm")
 
     def blockers_terminal(task: dict) -> bool:
-        blockers = [str(blocker) for blocker in (task.get("blockedBy") or [])]
+        task_id = str(task.get("taskId") or "")
+        blockers = graph.blocker_task_ids(task_id)
         unfinished = [
             blocker
             for blocker in blockers
-            if by_id.get(blocker, {}).get("status") not in terminal
+            if graph.task_status(blocker) not in terminal
         ]
         if not unfinished:
             return True
         blocked_sources = sorted(
             blocker
             for blocker in unfinished
-            if by_id.get(blocker, {}).get("status") == blocked_status
+            if graph.task_status(blocker) == blocked_status
         )
         if sorted(unfinished) != blocked_sources:
             return False
-        clearance = dependency_verdicts.get(task_key(str(task.get("taskId") or "")))
+        clearance = dependency_verdicts.get(task_key(task_id))
         if not isinstance(clearance, dict):
             return False
         expected = {
-            "taskId": str(task.get("taskId") or ""),
+            "taskId": task_id,
             "status": task.get("status"),
             "revision": task.get("revision"),
             "blockedBy": sorted(blockers),
@@ -459,7 +486,11 @@ def main() -> None:
         for task in tasks
         if task.get("status") == blocked_status
     ]
-    blocked_ids = set(blocked_tasks)
+    blocked_ids = {
+        task_id
+        for task_id, _status in graph.validation.nodes
+        if graph.task_status(task_id) == blocked_status
+    }
     blocked_impacts = []
     for task in tasks:
         task_id = str(task["taskId"])
@@ -470,18 +501,12 @@ def main() -> None:
             and task.get("status") in {queued_status, working_status, review_status}
         ):
             blocked_dependencies = [
-                str(blocker)
-                for blocker in task.get("blockedBy") or []
-                if str(blocker) in blocked_ids
+                blocker
+                for blocker in graph.blocker_task_ids(task_id)
+                if blocker in blocked_ids
             ]
             if blocked_dependencies:
                 blocked_impacts.append("%s <- %s" % (task_id, ",".join(blocked_dependencies)))
-        for blocker in task.get("blockedBy") or []:
-            if str(blocker) not in by_id:
-                print(
-                    "dispatch: warning - %s blockedBy references unknown [task] '%s'" % (task_id, blocker),
-                    file=sys.stderr,
-                )
 
     design_queue = [
         str(task["taskId"])

@@ -241,6 +241,14 @@ NORMALIZED_TASK_FIELDS = {
     'taskId', 'title', 'status', 'statusRaw', 'assignee', 'description',
     'comments', 'blockedBy', 'labels', 'updatedAt', 'revision',
 }
+DEPENDENCY_KIND_READINESS = {
+    'requires': True,
+    'parent': False,
+    'related': False,
+    'derived-from': False,
+}
+SNAPSHOT_SCHEMA_VERSION = 2
+MISSING_DEPENDENCIES = object()
 
 def sortable_value(value, context):
     """Return a total-order key for a timestamp/revision or fail closed."""
@@ -322,6 +330,51 @@ def normalize_comments(value, context):
         die("%s comments are not deterministically oldest-first — andon" % context)
     return normalized
 
+def normalize_dependencies(value, blocked_by, context):
+    """Canonicalize optional typed edges while keeping blockedBy authoritative."""
+    if value is MISSING_DEPENDENCIES:
+        return [
+            {'targetTaskId': target, 'kind': 'requires', 'affectsReadiness': True}
+            for target in blocked_by
+        ]
+    if not isinstance(value, list):
+        die("%s dependencies must be a list — andon" % context)
+    normalized, seen = [], set()
+    expected_fields = {'targetTaskId', 'kind', 'affectsReadiness'}
+    for index, raw in enumerate(value):
+        dctx = "%s dependency %d" % (context, index + 1)
+        if not isinstance(raw, dict) or set(raw) != expected_fields:
+            die("%s must contain exactly targetTaskId, kind, and affectsReadiness — andon" % dctx)
+        target = raw['targetTaskId']
+        if isinstance(target, bool) or not isinstance(target, (str, int)):
+            die("%s has a malformed targetTaskId — andon" % dctx)
+        target = str(target).strip()
+        if not target:
+            die("%s has an empty targetTaskId — andon" % dctx)
+        kind = raw['kind']
+        if not isinstance(kind, str) or kind not in DEPENDENCY_KIND_READINESS:
+            die("%s has an unknown dependency kind — andon" % dctx)
+        affects = raw['affectsReadiness']
+        if type(affects) is not bool or affects is not DEPENDENCY_KIND_READINESS[kind]:
+            die("%s affectsReadiness does not match dependency kind '%s' — andon" %
+                (dctx, kind))
+        identity = (target, kind)
+        if identity in seen:
+            die("%s duplicates dependency edge (%s,%s) — andon" %
+                (context, target, kind))
+        seen.add(identity)
+        normalized.append({
+            'targetTaskId': target,
+            'kind': kind,
+            'affectsReadiness': affects,
+        })
+    readiness_targets = {
+        item['targetTaskId'] for item in normalized if item['affectsReadiness']
+    }
+    if readiness_targets != set(blocked_by):
+        die("%s readiness dependencies do not match blockedBy — andon" % context)
+    return sorted(normalized, key=lambda item: (item['targetTaskId'], item['kind']))
+
 def normalize_task_record(raw, context, feature_field=False):
     """Validate and canonicalize the adapter-neutral task wire shape."""
     if not isinstance(raw, dict):
@@ -352,6 +405,9 @@ def normalize_task_record(raw, context, feature_field=False):
     sortable_value(value['revision'], context + ' revision')
     value['blockedBy'] = normalize_string_list(
         value['blockedBy'], 'blockedBy', context, allow_integer=True)
+    value['dependencies'] = normalize_dependencies(
+        raw.get('dependencies', MISSING_DEPENDENCIES),
+        value['blockedBy'], context)
     value['labels'] = normalize_string_list(value['labels'], 'labels', context)
     value['comments'] = normalize_comments(value['comments'], context)
     if feature_field:
@@ -391,6 +447,29 @@ def ignored_task_labels_from_environment():
 
 def task_has_ignored_label(task, ignored_labels):
     return bool(ignored_labels.intersection(label.casefold() for label in task.get('labels') or []))
+
+def exhaustive_feature_export(tasks):
+    """Attest completion only at the end of a built-in exhaustive export."""
+    return {
+        'snapshotSchemaVersion': SNAPSHOT_SCHEMA_VERSION,
+        'snapshotComplete': True,
+        'tasks': tasks,
+    }
+
+def exhaustive_export_tasks(value, context):
+    """Validate the versioned backend evidence envelope; bare lists are unsafe."""
+    if not isinstance(value, dict):
+        die("%s must return a schema-2 exhaustive-export envelope, not a bare list — andon" % context)
+    version = value.get('snapshotSchemaVersion')
+    if type(version) is not int or version != SNAPSHOT_SCHEMA_VERSION:
+        die("%s has an unsupported snapshotSchemaVersion — andon" % context)
+    complete = value.get('snapshotComplete')
+    if type(complete) is not bool or complete is not True:
+        die("%s does not attest snapshotComplete=true — andon" % context)
+    tasks = value.get('tasks')
+    if not isinstance(tasks, list):
+        die("%s has a malformed tasks list — andon" % context)
+    return tasks
 
 # ---- adapter backends --------------------------------------------------------
 def http_json(url, payload=None, headers=None, method=None):
@@ -705,7 +784,7 @@ class Linear:
                           'blockedBy': hydrated['blockedBy'],
                           'labels': hydrated['labels'],
                           'updatedAt': issue.get('updatedAt'), 'revision': issue.get('updatedAt')})
-        return tasks
+        return exhaustive_feature_export(tasks)
 
     def scan(self, statuses):
         wanted = {tool_value(status_by_name(name)) for name in statuses}
@@ -1006,7 +1085,7 @@ class Jira:
                                        for c in comments],
                           'blockedBy': blocked_by, 'labels': f.get('labels') or [],
                           'updatedAt': f.get('updated'), 'revision': f.get('updated')})
-        return tasks
+        return exhaustive_feature_export(tasks)
 
     def scan(self, statuses):
         project_key, task_issue_type = self.resolve_scope()
@@ -1405,7 +1484,8 @@ class GitHubIssues:
         if milestone.get('state') == 'closed':
             return self.resolve_closed_status(
                 FEATURE_STATUSES, feature_tool_value, [])
-        tasks = self.export(feature_id)
+        tasks = exhaustive_export_tasks(
+            self.export(feature_id), "GitHub Issues internal feature export")
         initial = next(s['name'] for s in TASK_STATUSES if s.get('initial'))
         if any(task.get('status') != initial for task in tasks):
             return next((s['name'] for s in FEATURE_STATUSES if s.get('kind') == 'working'), None)
@@ -1438,7 +1518,7 @@ class GitHubIssues:
                                        for c in comments],
                           'blockedBy': blocked_by, 'labels': labels,
                           'updatedAt': i.get('updated_at'), 'revision': i.get('updated_at')})
-        return tasks
+        return exhaustive_feature_export(tasks)
 
     def scan(self, statuses):
         wanted = set(statuses)
@@ -1869,7 +1949,7 @@ class Markdown:
                           'blockedBy': blocked_by, 'labels': labels,
                           'updatedAt': datetime.fromtimestamp(os.path.getmtime(self.contained_path(feature_id)), timezone.utc).isoformat(),
                           'revision': str(os.stat(self.contained_path(feature_id)).st_mtime_ns)})
-        return tasks
+        return exhaustive_feature_export(tasks)
 
     def scan(self, statuses):
         wanted = set(statuses)
@@ -1885,7 +1965,9 @@ class Markdown:
             text = self.load(path)
             title_match = re.search(r'^# (.*?)\s*\[[^\]]+\][ \t]*$', text, re.M)
             feature_title = title_match.group(1).strip() if title_match else os.path.basename(current)
-            for task in self.export(path):
+            tasks = exhaustive_export_tasks(
+                self.export(path), "Markdown internal feature export")
+            for task in tasks:
                 if task.get('status') not in wanted:
                     continue
                 item = dict(task)
@@ -2292,11 +2374,9 @@ def op_export(args):
     if len(args) != 2:
         die("usage: export <featureId> <outfile>")
     feature_id, outfile = args
-    tasks = backend.export(feature_id)
-    if not isinstance(tasks, list):
-        die("adapter returned a malformed feature export — andon")
+    tasks = exhaustive_export_tasks(
+        backend.export(feature_id), "adapter feature export")
     normalized, seen = [], set()
-    ignored_labels = ignored_task_labels_from_environment()
     for index, task in enumerate(tasks):
         value = normalize_task_record(
             task, "feature export record %d" % (index + 1))
@@ -2304,11 +2384,11 @@ def op_export(args):
             die("adapter returned a duplicate task identity '%s' in feature export — andon"
                 % value['taskId'])
         seen.add(value['taskId'])
-        if task_has_ignored_label(value, ignored_labels):
-            continue
         normalized.append(value)
     tasks = normalized
-    payload = {'featureId': feature_id, 'adapter': ADAPTER,
+    payload = {'snapshotSchemaVersion': SNAPSHOT_SCHEMA_VERSION,
+               'snapshotComplete': True,
+               'featureId': feature_id, 'adapter': ADAPTER,
                'exportedAt': datetime.now(timezone.utc).isoformat(timespec='seconds'),
                'tasks': tasks}
     with open(outfile, 'w') as f:
