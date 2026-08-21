@@ -63,7 +63,7 @@ if [ -n "${STARTUP_FACTORY_EXECUTION_KIND:-}${STARTUP_FACTORY_TEAM:-}${STARTUP_F
       ;;
     *) echo "submit-artifact: unknown fixed execution kind" >&2; exit 1 ;;
   esac
-  for name in STARTUP_FACTORY_INSTANCE STARTUP_FACTORY_CANONICAL_REPO STARTUP_FACTORY_CANONICAL_WORKSPACE \
+  for name in STARTUP_FACTORY_INSTANCE \
       STARTUP_FACTORY_OUTBOX_CAPABILITY_ID STARTUP_FACTORY_OUTBOX_CAPABILITY_SECRET \
       STARTUP_FACTORY_OUTBOX_CAPABILITY_EXPIRES_AT; do
     [ -n "${!name:-}" ] || { echo "submit-artifact: incomplete launched-role capability ($name is absent)" >&2; exit 1; }
@@ -74,14 +74,35 @@ elif [ -n "${STARTUP_FACTORY_OUTBOX_CAPABILITY_ID:-}${STARTUP_FACTORY_OUTBOX_CAP
 fi
 
 current_repo="$(git rev-parse --show-toplevel)"
-if [ "$launched" = yes ]; then
+scoped_ingress=no
+if [ "$launched" = yes ] && [ -n "${STARTUP_FACTORY_OUTBOX_INGRESS:-}" ]; then
+  scoped_ingress=yes
+  repo="$current_repo"
+elif [ "$launched" = yes ]; then
+  [ -n "${STARTUP_FACTORY_CANONICAL_REPO:-}" ] && [ -n "${STARTUP_FACTORY_CANONICAL_WORKSPACE:-}" ] \
+    || { echo "submit-artifact: legacy launch omitted canonical broker bindings" >&2; exit 1; }
   repo="$STARTUP_FACTORY_CANONICAL_REPO"
 else
   repo="$current_repo"
 fi
 root="$(read_key TEAMWORK_ROOT)"; root="${root:-.teamwork}"
-workspace="$(python3 "$SKILL_DIR/bin/teamwork-path.py" workspace --repo "$repo" --root "$root" --team "$team")"
-if [ "$launched" = yes ]; then
+workspace=""
+[ "$scoped_ingress" = yes ] \
+  || workspace="$(python3 "$SKILL_DIR/bin/teamwork-path.py" workspace --repo "$repo" --root "$root" --team "$team")"
+if [ "$scoped_ingress" = yes ]; then
+  python3 - "$current_repo" "$STARTUP_FACTORY_AGENT_WORKTREE" "$STARTUP_FACTORY_OUTBOX_INGRESS" "$STARTUP_FACTORY_OUTBOX_CAPABILITY_ID" <<'PY'
+import os,re,stat,subprocess,sys
+current,fixed,ingress,capability=sys.argv[1:]
+def fail(message): raise SystemExit("submit-artifact: "+message)
+top=subprocess.run(["git","-C",current,"rev-parse","--show-toplevel"],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True).stdout.strip()
+if os.path.realpath(top)!=current or current!=fixed or os.path.realpath(fixed)!=fixed: fail("runtime clone does not match broker-issued identity")
+git_dir=os.path.join(current,".git")
+if not os.path.isdir(git_dir) or os.path.islink(git_dir): fail("runtime clone lacks independent Git state")
+if not re.fullmatch(r"cap-[0-9a-f]{32}",capability) or os.path.basename(ingress)!=capability: fail("scoped ingress capability identity changed")
+info=os.lstat(ingress)
+if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or stat.S_IMODE(info.st_mode)&0o077: fail("scoped ingress is unsafe")
+PY
+elif [ "$launched" = yes ]; then
   [ "$workspace" = "$STARTUP_FACTORY_CANONICAL_WORKSPACE" ] \
     || { echo "submit-artifact: launcher-fixed canonical workspace does not match team configuration" >&2; exit 1; }
   worktree_mode="$(read_key TASK_WORKTREE_MODE)"; worktree_mode="${worktree_mode:-linked-worktree}"
@@ -132,12 +153,19 @@ elif common(current) != common(canonical):
 PY
 fi
 id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-pending="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative outbox/pending)"
-bodies="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative outbox/bodies)"
-done="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative outbox/done)"
-python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative events.ndjson >/dev/null
-mkdir -p "$pending" "$bodies" "$done"
-body="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "outbox/bodies/$id.md")"
+if [ "$scoped_ingress" = yes ]; then
+  pending="$STARTUP_FACTORY_OUTBOX_INGRESS"
+  bodies="$STARTUP_FACTORY_OUTBOX_INGRESS"
+  done="$STARTUP_FACTORY_OUTBOX_INGRESS"
+  body="$bodies/$id.md"
+else
+  pending="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative outbox/pending)"
+  bodies="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative outbox/bodies)"
+  done="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative outbox/done)"
+  python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative events.ndjson >/dev/null
+  mkdir -p "$pending" "$bodies" "$done"
+  body="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "outbox/bodies/$id.md")"
+fi
 # Copy through no-follow descriptors into a new file. The later credentialed
 # broker creates a second, broker-owned immutable stage and assigns deliveryId.
 python3 - "$source" "$body" <<'PY'
@@ -174,7 +202,11 @@ try:
 except OSError as exc:
     raise SystemExit("submit-artifact: secure body staging failed: %s" % exc)
 PY
-entry="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "outbox/pending/$id.json")"
+if [ "$scoped_ingress" = yes ]; then
+  entry="$pending/$id.json"
+else
+  entry="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "outbox/pending/$id.json")"
+fi
 python3 - "$entry" "$id" "$team" "$feature" "$task" "$attempt" "$actor" "$marker" "$body" "$target" "$SKILL_DIR" <<'PY'
 import json, os, sys
 from datetime import datetime, timezone
@@ -212,11 +244,15 @@ with open(temp, 'w') as handle:
     handle.write('\n')
 os.replace(temp, path)
 PY
-python3 "$SKILL_DIR/bin/runtime-state.py" emit --workspace "$workspace" --team "$team" \
-  --feature "$feature" --task "$task" --attempt "$attempt" --actor "$actor" \
-  --type artifact.ready --stage artifact-ready --summary "[$marker] queued for tracker publication" --artifact "$body" >/dev/null
+if [ "$scoped_ingress" != yes ]; then
+  python3 "$SKILL_DIR/bin/runtime-state.py" emit --workspace "$workspace" --team "$team" \
+    --feature "$feature" --task "$task" --attempt "$attempt" --actor "$actor" \
+    --type artifact.ready --stage artifact-ready --summary "[$marker] queued for tracker publication" --artifact "$body" >/dev/null
+fi
 
-if [ "$(read_key TRACKER_WRITERS)" = "all" ]; then
+if [ "$scoped_ingress" = yes ]; then
+  echo "$entry"
+elif [ "$(read_key TRACKER_WRITERS)" = "all" ]; then
   ( cd "$repo" && "$SKILL_DIR/bin/process-outbox.sh" "$team" "$feature" "$entry" )
 else
   echo "$entry"

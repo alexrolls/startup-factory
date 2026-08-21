@@ -26,6 +26,7 @@ DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 CONFIG_KEYS = (
     "TASK_WORKTREE_MODE",
     "BROKER_TASK_CLONE_ROOT",
+    "BROKER_AGENT_OUTBOX_ROOT",
     "AGENT_SANDBOX_RUNNER",
     "AGENT_SANDBOX_ENFORCED",
     "BROKER_LIFECYCLE_ROOT",
@@ -102,6 +103,7 @@ class RuntimePlan:
     runtime_root: Path
     clone_root: Path
     lifecycle_root: Path
+    outbox_root: Path
     engine: Path
     image: str
     network: str
@@ -111,6 +113,7 @@ class RuntimePlan:
     config_after: bytes
     config_state: FileState
     plan_digest: str
+    installation_digest: str
     engine_proof: Mapping[str, Any]
     image_proof: Mapping[str, Any]
 
@@ -128,7 +131,7 @@ class RuntimePlan:
                     "keys": list(CONFIG_KEYS),
                 }
             )
-        for directory in (self.runtime_root, self.clone_root, self.lifecycle_root):
+        for directory in (self.runtime_root, self.clone_root, self.lifecycle_root, self.outbox_root):
             if not directory.exists():
                 changes.insert(0, {"path": str(directory), "action": "mkdir", "mode": "0700"})
         return changes
@@ -142,11 +145,13 @@ class RuntimePlan:
             "profile": PROFILE,
             "applied": applied,
             "planDigest": self.plan_digest,
+            "installationDigest": self.installation_digest,
             "readiness": "configured_unproved",
             "ready": False,
             "runtimeRoot": str(self.runtime_root),
             "cloneRoot": str(self.clone_root),
             "lifecycleRoot": str(self.lifecycle_root),
+            "outboxRoot": str(self.outbox_root),
             "changes": [] if applied and not self.changes else self.changes,
             "checks": [check.as_dict() for check in checks],
             "remediation": "Run authenticated launcher doctor and external boundary attestation; fixed probes never promote readiness.",
@@ -324,7 +329,17 @@ def _prove_engine(engine: Path, image: str) -> tuple[dict[str, Any], dict[str, A
     repo_digests = inspected[0].get("RepoDigests")
     if not isinstance(repo_digests, list) or image not in repo_digests:
         raise InstallerError("local Podman image digest does not match the requested pinned image")
-    return info, inspected[0]
+    image_id = inspected[0].get("Id")
+    if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        raise InstallerError("local Podman image proof has an invalid image identity")
+    normalized_engine = {
+        "version": version_text,
+        "rootless": True,
+        "uidmap": mappings["uidmap"],
+        "gidmap": mappings["gidmap"],
+    }
+    normalized_image = {"Id": image_id, "RepoDigests": sorted(set(repo_digests))}
+    return normalized_engine, normalized_image
 
 
 def _assignments(raw: bytes) -> tuple[str, dict[str, re.Match[str]], str]:
@@ -412,6 +427,7 @@ def plan_runtime_kit(
         raise InstallerError("runtime root parent must be caller-owned and mode 0700 or stricter")
     clone_root = runtime_root / "attempt-clones"
     lifecycle_root = runtime_root / "lifecycle"
+    outbox_root = runtime_root / "outbox-ingress"
     engine, engine_bytes = _validate_protected_executable(engine)
     if not IMAGE.fullmatch(image):
         raise InstallerError("runtime image must be pinned as repository@sha256:<64 lowercase hex>")
@@ -429,19 +445,9 @@ def plan_runtime_kit(
     version_name = "v1-" + source_digest.split(":", 1)[1][:16]
     asset_root = runtime_root / "assets" / version_name
     manifest_path = asset_root / "runtime-manifest.json"
-    manifest = {
-        "schemaVersion": 1,
-        "profile": PROFILE,
-        "sourceAssetsSha256": source_digest,
-        "engine": {"path": str(engine), "sha256": _sha256(engine_bytes), "proofSha256": _sha256(_canonical_json(engine_proof))},
-        "image": {"reference": image, "proofSha256": _sha256(_canonical_json(image_proof)), "pull": "never"},
-        "network": {"name": "none", "policySha256": _sha256(network_policy)},
-        "cloneRoot": str(clone_root),
-        "lifecycleRoot": str(lifecycle_root),
-        "readiness": "configured_unproved",
-        "capabilities": {"autonomousDelivery": False, "productionDelivery": False},
-    }
-    manifest_bytes = _canonical_json(manifest)
+    policy_path = asset_root / "container-policy.json"
+    network_path = asset_root / "network-policy.json"
+    runner_path = asset_root / "runner"
     runner = _render_runner(
         runner_template,
         {
@@ -449,14 +455,39 @@ def plan_runtime_kit(
             b"@@IMAGE@@": image,
             b"@@MANIFEST@@": str(manifest_path),
             b"@@NETWORK@@": network,
+            b"@@PROFILE@@": PROFILE,
+            b"@@CLONE_ROOT@@": str(clone_root),
+            b"@@OUTBOX_ROOT@@": str(outbox_root),
+            b"@@SKILL_ROOT@@": str(target),
+            b"@@POLICY@@": str(policy_path),
+            b"@@NETWORK_POLICY@@": str(network_path),
             b"@@ENGINE_SHA256@@": _sha256(engine_bytes).split(":", 1)[1],
-            b"@@MANIFEST_SHA256@@": _sha256(manifest_bytes).split(":", 1)[1],
+            b"@@ENGINE_PROOF_SHA256@@": _sha256(_canonical_json(engine_proof)).split(":", 1)[1],
+            b"@@IMAGE_PROOF_SHA256@@": _sha256(_canonical_json(image_proof)).split(":", 1)[1],
+            b"@@SOURCE_ASSETS_SHA256@@": source_digest.split(":", 1)[1],
         },
     )
+    manifest = {
+        "schemaVersion": 2,
+        "profile": PROFILE,
+        "sourceAssetsSha256": source_digest,
+        "engine": {"path": str(engine), "sha256": _sha256(engine_bytes), "proofSha256": _sha256(_canonical_json(engine_proof))},
+        "image": {"reference": image, "proofSha256": _sha256(_canonical_json(image_proof)), "pull": "never"},
+        "runner": {"path": str(runner_path), "sha256": _sha256(runner)},
+        "policy": {"path": str(policy_path), "sha256": _sha256(policy)},
+        "network": {"name": "none", "path": str(network_path), "sha256": _sha256(network_policy)},
+        "cloneRoot": str(clone_root),
+        "lifecycleRoot": str(lifecycle_root),
+        "outboxRoot": str(outbox_root),
+        "skillRoot": str(target),
+        "readiness": "configured_unproved",
+        "capabilities": {"autonomousDelivery": False, "productionDelivery": False},
+    }
+    manifest_bytes = _canonical_json(manifest)
     planned = (
-        PlannedFile(asset_root / "container-policy.json", policy, 0o600, _state(asset_root / "container-policy.json")),
-        PlannedFile(asset_root / "network-policy.json", network_policy, 0o600, _state(asset_root / "network-policy.json")),
-        PlannedFile(asset_root / "runner", runner, 0o700, _state(asset_root / "runner")),
+        PlannedFile(policy_path, policy, 0o600, _state(policy_path)),
+        PlannedFile(network_path, network_policy, 0o600, _state(network_path)),
+        PlannedFile(runner_path, runner, 0o700, _state(runner_path)),
         PlannedFile(manifest_path, manifest_bytes, 0o600, _state(manifest_path)),
     )
     for item in planned:
@@ -473,6 +504,7 @@ def plan_runtime_kit(
         {
             "TASK_WORKTREE_MODE": "standalone-clone",
             "BROKER_TASK_CLONE_ROOT": str(clone_root),
+            "BROKER_AGENT_OUTBOX_ROOT": str(outbox_root),
             "AGENT_SANDBOX_RUNNER": str(asset_root / "runner"),
             "AGENT_SANDBOX_ENFORCED": "true",
             "BROKER_LIFECYCLE_ROOT": str(lifecycle_root),
@@ -486,6 +518,7 @@ def plan_runtime_kit(
         "runtimeRoot": str(runtime_root),
         "cloneRoot": str(clone_root),
         "lifecycleRoot": str(lifecycle_root),
+        "outboxRoot": str(outbox_root),
         "engine": str(engine),
         "engineSha256": _sha256(engine_bytes),
         "engineProofSha256": _sha256(_canonical_json(engine_proof)),
@@ -498,9 +531,24 @@ def plan_runtime_kit(
         ],
         "config": {"path": str(config_path), "before": config_state.as_dict(), "afterSha256": _sha256(config_after)},
     }
+    desired = {
+        "schemaVersion": 1,
+        "profile": PROFILE,
+        "runtimeRoot": str(runtime_root),
+        "engineSha256": _sha256(engine_bytes),
+        "engineProofSha256": _sha256(_canonical_json(engine_proof)),
+        "image": image,
+        "imageProofSha256": _sha256(_canonical_json(image_proof)),
+        "files": [
+            {"path": str(item.path), "mode": item.mode, "sha256": _sha256(item.content)}
+            for item in planned
+        ],
+        "configAfterSha256": _sha256(config_after),
+    }
     return RuntimePlan(
-        target, project, runtime_root, clone_root, lifecycle_root, engine, image, network,
+        target, project, runtime_root, clone_root, lifecycle_root, outbox_root, engine, image, network,
         planned, config_path, config_before, config_after, config_state, _plan_material(material),
+        _plan_material(desired),
         engine_proof, image_proof,
     )
 
@@ -589,45 +637,154 @@ def _replace_config(plan: RuntimePlan) -> None:
             pass
 
 
+def _owned_transaction_content(path: Path, label: str) -> bytes:
+    content, info = _read_regular(path, label, 1024 * 1024)
+    if (
+        info.st_uid != os.geteuid()
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise InstallerError(f"{label} must be a caller-owned, single-link mode-0600 file")
+    return content
+
+
+def _validate_recovery_evidence(lock: Path, journal: Path) -> None:
+    """Fail closed on every incomplete transaction, including no-op retries."""
+
+    present = [path for path in (lock, journal) if os.path.lexists(path)]
+    if not present:
+        return
+    details: list[str] = []
+    for path, label in ((lock, "runtime-kit lock"), (journal, "runtime-kit journal")):
+        if not os.path.lexists(path):
+            details.append(f"{label} is missing")
+            continue
+        try:
+            content = _owned_transaction_content(path, label)
+            value = _strict_object(content, label)
+            token = value.get("transactionToken")
+            phase = value.get("phase")
+            if (
+                value.get("schemaVersion") != 2
+                or not isinstance(token, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", token)
+                or phase not in {"locked", "prepared", "assets-written", "config-replaced", "commit-marked"}
+            ):
+                raise InstallerError(f"{label} has an unsupported recovery schema")
+            details.append(f"{label} records phase {phase}")
+        except InstallerError as exc:
+            details.append(str(exc))
+    raise InstallerError(
+        "incomplete runtime-kit recovery state requires operator inspection; " + "; ".join(details)
+    )
+
+
+def _replace_owned_transaction_file(path: Path, before: bytes, after: bytes) -> None:
+    if _owned_transaction_content(path, "runtime-kit journal") != before:
+        raise InstallerError("runtime-kit journal changed during the transaction")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}")
+    try:
+        _write_exclusive(temporary, after, 0o600)
+        if _owned_transaction_content(path, "runtime-kit journal") != before:
+            raise InstallerError("runtime-kit journal changed before phase advancement")
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _commit_marker_content(plan: RuntimePlan) -> bytes:
+    return _canonical_json(
+        {
+            "schemaVersion": 1,
+            "installationDigest": plan.installation_digest,
+            "appliedPlanDigest": plan.plan_digest,
+        }
+    )
+
+
+def _verify_commit_marker(plan: RuntimePlan) -> None:
+    marker = plan.runtime_root / f".runtime-kit-committed-{plan.installation_digest.split(':', 1)[1]}"
+    content = _owned_transaction_content(marker, "runtime-kit commit marker")
+    value = _strict_object(content, "runtime-kit commit marker")
+    if (
+        value.get("schemaVersion") != 1
+        or value.get("installationDigest") != plan.installation_digest
+        or not DIGEST.fullmatch(str(value.get("appliedPlanDigest") or ""))
+    ):
+        raise InstallerError("runtime-kit commit marker does not bind the installed profile")
+
+
 def apply_runtime_kit(plan: RuntimePlan, *, expected_plan_digest: str) -> None:
     if expected_plan_digest != plan.plan_digest or not DIGEST.fullmatch(expected_plan_digest):
         raise InstallerError("--plan-digest must exactly match the current immutable preview")
     if sys.platform != "linux":
         raise InstallerError("runtime-kit apply is refused on Darwin; rerun inside a protected Linux guest")
+    lock = plan.runtime_root / ".runtime-kit.lock"
+    journal = plan.runtime_root / ".runtime-kit-journal.json"
+    _validate_recovery_evidence(lock, journal)
     # A fresh preview over an already applied, byte-identical profile is an
-    # idempotent no-op. Engine/image proof was still re-evaluated while building
-    # the plan, so this does not turn a stale apply request into success.
+    # idempotent no-op only when durable completion evidence is intact.
     if not plan.changes:
+        _verify_commit_marker(plan)
         return
     created_dirs: list[Path] = []
     created_files: list[PlannedFile] = []
-    lock = plan.runtime_root / ".runtime-kit.lock"
-    journal = plan.runtime_root / ".runtime-kit-journal.json"
     config_replaced = False
+    lock_created = False
+    journal_created = False
+    token = secrets.token_hex(32)
+    lock_content = _canonical_json(
+        {
+            "schemaVersion": 2,
+            "phase": "locked",
+            "transactionToken": token,
+            "planDigest": plan.plan_digest,
+            "installationDigest": plan.installation_digest,
+        }
+    )
+    journal_value = {
+        "schemaVersion": 2,
+        "phase": "prepared",
+        "transactionToken": token,
+        "planDigest": plan.plan_digest,
+        "installationDigest": plan.installation_digest,
+        "configPath": str(plan.config_path),
+        "configBefore": base64.b64encode(plan.config_before).decode("ascii"),
+        "configBeforeState": plan.config_state.as_dict(),
+        "configAfterSha256": _sha256(plan.config_after),
+        "files": [
+            {
+                "path": str(item.path),
+                "before": item.state.as_dict(),
+                "afterMode": item.mode,
+                "afterSha256": _sha256(item.content),
+            }
+            for item in plan.files
+        ],
+        "createdDirectories": [],
+    }
+    journal_content = _canonical_json(journal_value)
+
+    def advance(phase: str) -> None:
+        nonlocal journal_content
+        journal_value["phase"] = phase
+        journal_value["createdDirectories"] = [str(path) for path in created_dirs]
+        updated = _canonical_json(journal_value)
+        _replace_owned_transaction_file(journal, journal_content, updated)
+        journal_content = updated
+
     try:
         _mkdir_chain(plan.runtime_root, created_dirs)
         _validate_private_directory(plan.runtime_root, "runtime root")
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        if not nofollow:
-            raise InstallerError("runtime transaction requires secure no-follow locks")
-        lock_fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
-        os.fchmod(lock_fd, 0o600)
-        os.close(lock_fd)
-        _fsync_directory(plan.runtime_root)
-        journal_value = {
-            "schemaVersion": 1,
-            "phase": "prepared",
-            "planDigest": plan.plan_digest,
-            "configPath": str(plan.config_path),
-            "configBefore": base64.b64encode(plan.config_before).decode("ascii"),
-            "configBeforeSha256": _sha256(plan.config_before),
-            "configAfterSha256": _sha256(plan.config_after),
-            "created": [str(item.path) for item in plan.files if not item.state.exists],
-        }
-        if journal.exists():
-            raise InstallerError("an incomplete runtime-kit journal requires operator recovery")
-        _write_exclusive(journal, _canonical_json(journal_value), 0o600)
-        for directory in (plan.clone_root, plan.lifecycle_root, plan.files[0].path.parent):
+        _write_exclusive(lock, lock_content, 0o600)
+        lock_created = True
+        _write_exclusive(journal, journal_content, 0o600)
+        journal_created = True
+        for directory in (plan.clone_root, plan.lifecycle_root, plan.outbox_root, plan.files[0].path.parent):
             _mkdir_chain(directory, created_dirs)
             _validate_private_directory(directory, "runtime transaction directory")
         for item in plan.files:
@@ -637,13 +794,23 @@ def apply_runtime_kit(plan: RuntimePlan, *, expected_plan_digest: str) -> None:
                 continue
             _write_exclusive(item.path, item.content, item.mode)
             created_files.append(item)
+        advance("assets-written")
         config_replaced = plan.config_before != plan.config_after
         _replace_config(plan)
-        committed = plan.runtime_root / f".runtime-kit-committed-{plan.plan_digest.split(':', 1)[1]}"
-        _write_exclusive(committed, (plan.plan_digest + "\n").encode("ascii"), 0o600)
-        created_files.append(PlannedFile(committed, (plan.plan_digest + "\n").encode("ascii"), 0o600, FileState(False)))
-        journal.unlink()
+        advance("config-replaced")
+        committed = plan.runtime_root / f".runtime-kit-committed-{plan.installation_digest.split(':', 1)[1]}"
+        committed_content = _commit_marker_content(plan)
+        _write_exclusive(committed, committed_content, 0o600)
+        created_files.append(PlannedFile(committed, committed_content, 0o600, FileState(False)))
+        advance("commit-marked")
+        if _owned_transaction_content(lock, "runtime-kit lock") != lock_content:
+            raise InstallerError("runtime-kit lock changed before commit")
+        if _owned_transaction_content(journal, "runtime-kit journal") != journal_content:
+            raise InstallerError("runtime-kit journal changed before commit")
         lock.unlink()
+        lock_created = False
+        journal.unlink()
+        journal_created = False
         _fsync_directory(plan.runtime_root)
     except BaseException as original:
         rollback_errors: list[str] = []
@@ -670,15 +837,24 @@ def apply_runtime_kit(plan: RuntimePlan, *, expected_plan_digest: str) -> None:
                 _fsync_directory(item.path.parent)
             except BaseException as exc:
                 rollback_errors.append(str(exc))
-        try:
-            if lock.exists() and not lock.is_symlink():
+        if lock_created:
+            try:
+                if _owned_transaction_content(lock, "runtime-kit lock") != lock_content:
+                    raise InstallerError("runtime-kit lock changed and was preserved")
                 lock.unlink()
-        except OSError as exc:
-            rollback_errors.append(str(exc))
+                lock_created = False
+            except BaseException as exc:
+                rollback_errors.append(str(exc))
+        if journal_created:
+            try:
+                if _owned_transaction_content(journal, "runtime-kit journal") != journal_content:
+                    raise InstallerError("runtime-kit journal changed and was preserved")
+                journal.unlink()
+                journal_created = False
+            except BaseException as exc:
+                rollback_errors.append(str(exc))
         if not rollback_errors:
             try:
-                if journal.exists() and not journal.is_symlink():
-                    journal.unlink()
                 for directory in reversed(created_dirs):
                     directory.rmdir()
             except OSError:
@@ -690,15 +866,139 @@ def apply_runtime_kit(plan: RuntimePlan, *, expected_plan_digest: str) -> None:
 
 
 def probe_runtime_kit(plan: RuntimePlan) -> dict[str, Any]:
-    """Emit non-promoting, digest-bound fixed probe definitions/evidence."""
-    controls = {
-        "positive": ["standalone-workspace-write", "standalone-git-commit", "uid-mapping"],
-        "negative": [
-            "shared-git-common-unmounted", "sibling-workspaces-unmounted", "broker-state-unmounted",
-            "lifecycle-state-unmounted", "release-state-unmounted", "credential-paths-unmounted",
-            "container-sockets-unmounted", "metadata-route-denied", "host-services-denied",
+    """Execute fixed controls; observations never promote configured readiness."""
+
+    if plan.changes:
+        raise InstallerError("runtime-kit probe requires the exact applied profile with no pending changes")
+    _verify_commit_marker(plan)
+    token = secrets.token_hex(8)
+    sentinel = plan.runtime_root / f".runtime-probe-host-sentinel-{token}"
+    sibling_parent = plan.clone_root / "runtime-probe-sibling"
+    sibling = sibling_parent / f"probe#1-{token}"
+    _write_exclusive(sentinel, b"must remain outside the agent mount\n", 0o600)
+    _mkdir_chain(sibling, [])
+    _validate_private_directory(sibling, "probe sibling workspace")
+    base = subprocess.run(
+        ["/usr/bin/git", "-C", str(plan.project), "rev-parse", "HEAD"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+        env={"PATH": "/usr/bin:/bin", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
+        check=False,
+    )
+    if base.returncode or not re.fullmatch(r"[0-9a-f]{40,64}\n?", base.stdout):
+        raise InstallerError("runtime-kit probe cannot bind the project HEAD")
+    branch = f"agent-runtime/runtime-probe/{token}"
+    helper = plan.target / "bin/standalone_workspace.py"
+    created = subprocess.run(
+        [
+            "/usr/bin/python3", str(helper), "create", "--repo", str(plan.project),
+            "--root", str(plan.clone_root), "--team", "runtime-probe", "--role", "probe",
+            "--attempt", "1", "--task-key", token, "--branch", branch,
+            "--base-ref", base.stdout.strip(),
         ],
-    }
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+        env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"},
+        check=False,
+    )
+    if created.returncode:
+        detail = created.stderr.decode("utf-8", errors="replace").strip()[:512]
+        raise InstallerError(
+            "runtime-kit probe could not create its standalone clone"
+            + (f": {detail}" if detail else "")
+        )
+    try:
+        clone_data = _strict_object(created.stdout, "probe clone identity")
+        clone = Path(str(clone_data.get("path") or ""))
+        git_common = subprocess.run(
+            ["/usr/bin/git", "-C", str(plan.project), "rev-parse", "--git-common-dir"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+            env={"PATH": "/usr/bin:/bin", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
+            check=False,
+        )
+        if git_common.returncode:
+            raise InstallerError("runtime-kit probe cannot locate protected broker state")
+        common = Path(git_common.stdout.strip())
+        if not common.is_absolute():
+            common = plan.project / common
+        broker_state = common.resolve(strict=True) / "startup-factory-broker"
+        runner = plan.files[-2].path
+        environment = {
+            "PATH": "/usr/bin:/bin",
+            "TMPDIR": "/tmp",
+            "STARTUP_FACTORY_AGENT_WORKTREE": str(clone),
+            "STARTUP_FACTORY_SKILL_ROOT": str(plan.target),
+            "STARTUP_FACTORY_ROLE": "runtime-probe",
+            "STARTUP_FACTORY_TEAM": "runtime-probe",
+            "STARTUP_FACTORY_FEATURE_ID": "runtime-probe",
+            "STARTUP_FACTORY_PRESET": "deep-infra",
+            "STARTUP_FACTORY_EXECUTION_KIND": "doctor",
+            "STARTUP_FACTORY_TASK_ID": "-",
+            "STARTUP_FACTORY_ATTEMPT": "0",
+        }
+        observed = subprocess.run(
+            [
+                str(runner), "--workdir", str(clone), "--", "/usr/bin/python3",
+                str(plan.target / "bin/runtime-probe-agent.py"), "--workdir", str(clone),
+                "--host-sentinel", str(sentinel), "--canonical-repo", str(plan.project),
+                "--broker-state", str(broker_state), "--lifecycle-state", str(plan.lifecycle_root),
+                "--sibling-workspace", str(sibling),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            env=environment,
+            check=False,
+        )
+        if observed.returncode or observed.stderr or len(observed.stdout) > MAX_ENGINE_OUTPUT:
+            detail = observed.stderr.decode("utf-8", errors="replace").strip()[:512]
+            raise InstallerError(
+                "runtime-kit fixed boundary controls failed" + (f": {detail}" if detail else "")
+            )
+        observations = _strict_object(observed.stdout, "runtime probe observations")
+        denials = observations.get("denials")
+        if (
+            observations.get("schemaVersion") != 1
+            or observations.get("worktreeWrite") is not True
+            or re.fullmatch(r"[0-9a-f]{40,64}", str(observations.get("standaloneGitCommit") or "")) is None
+            or not isinstance(denials, dict)
+            or set(denials)
+            != {
+                "hostSentinel", "canonicalRepo", "brokerState", "lifecycleState",
+                "siblingWorkspace", "loopbackNetwork", "metadataNetwork",
+            }
+            or not all(value is True for value in denials.values())
+        ):
+            raise InstallerError("runtime-kit fixed boundary observations are incomplete or failed")
+        retired = subprocess.run(
+            [
+                "/usr/bin/python3", str(helper), "retire", "--repo", str(plan.project),
+                "--root", str(plan.clone_root), "--clone", str(clone), "--branch", branch,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"},
+            check=False,
+        )
+        if retired.returncode:
+            raise InstallerError("runtime-kit probe observations passed but disposable clone retirement failed")
+        sentinel.unlink()
+        sibling.rmdir()
+        sibling_parent.rmdir()
+    except BaseException:
+        # Failed observations remain available for operator inspection. A probe
+        # never uses broad cleanup to hide evidence or promote readiness.
+        raise
     evidence = {
         "schemaVersion": 1,
         "profile": PROFILE,
@@ -708,10 +1008,10 @@ def probe_runtime_kit(plan: RuntimePlan) -> dict[str, Any]:
         "imageProofSha256": _sha256(_canonical_json(plan.image_proof)),
         "uid": os.geteuid(),
         "gid": os.getegid(),
-        "mounts": ["standalone-attempt-clone"],
+        "mounts": ["standalone-attempt-clone", "read-only-installed-tools"],
         "network": plan.network,
-        "controls": controls,
-        "result": "definitions-verified-not-executed",
+        "observations": observations,
+        "result": "fixed-controls-passed-non-promoting",
     }
     evidence["evidenceDigest"] = _sha256(_canonical_json(evidence))
     return evidence

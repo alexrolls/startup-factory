@@ -10,12 +10,14 @@ fi
 manifest="${STARTUP_FACTORY_RUNTIME_MANIFEST:?set STARTUP_FACTORY_RUNTIME_MANIFEST}"
 worktree="${STARTUP_FACTORY_PROBE_WORKTREE:?set STARTUP_FACTORY_PROBE_WORKTREE to a disposable standalone clone}"
 runner="$(dirname "$manifest")/runner"
+skill_root="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["skillRoot"])' "$manifest")"
 [ -f "$manifest" ] && [ ! -L "$manifest" ] && [ -x "$runner" ] && [ ! -L "$runner" ] \
   || { echo "runtime manifest/runner is unsafe" >&2; exit 1; }
 [ -d "$worktree/.git" ] && [ ! -L "$worktree/.git" ] && [ ! -e "$worktree/.git/commondir" ] \
   || { echo "probe worktree is not a standalone clone" >&2; exit 1; }
 
 AWS_ACCESS_KEY_ID=must-not-cross GITHUB_TOKEN=must-not-cross \
+  STARTUP_FACTORY_AGENT_WORKTREE="$worktree" STARTUP_FACTORY_SKILL_ROOT="$skill_root" \
   "$runner" --workdir "$worktree" -- /bin/sh -eu -c '
     test -d .git && test ! -e .git/commondir
     test -z "${AWS_ACCESS_KEY_ID:-}" && test -z "${GITHUB_TOKEN:-}"

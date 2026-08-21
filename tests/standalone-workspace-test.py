@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import tempfile
 import unittest
@@ -82,6 +83,33 @@ class StandaloneWorkspaceTest(unittest.TestCase):
         with self.assertRaisesRegex(module.WorkspaceError, "indirection"):
             module.validate_attempt(clone, self.branch, self.base)
 
+    def test_recursive_git_symlinks_hardlinks_and_promisor_state_are_rejected(self) -> None:
+        cases = ("objects", "refs", "config")
+        for relative in cases:
+            with self.subTest(relative=relative):
+                clone = self.create()
+                target = clone / ".git" / relative
+                saved = clone / ".git" / (relative.replace("/", "-") + ".saved")
+                target.rename(saved)
+                target.symlink_to(saved, target_is_directory=saved.is_dir())
+                with self.assertRaisesRegex(module.WorkspaceError, "symlink"):
+                    module.validate_attempt(clone, self.branch, self.base)
+                target.unlink()
+                saved.rename(target)
+
+        clone = self.create()
+        source = clone / ".git/HEAD"
+        alias = clone / ".git/HEAD.hardlink"
+        os.link(source, alias)
+        with self.assertRaisesRegex(module.WorkspaceError, "hard-linked"):
+            module.validate_attempt(clone, self.branch, self.base)
+        alias.unlink()
+
+        promisor = clone / ".git/objects/pack/hostile.promisor"
+        promisor.write_text("partial clone\n")
+        with self.assertRaisesRegex(module.WorkspaceError, "indirection"):
+            module.validate_attempt(clone, self.branch, self.base)
+
     def test_head_outside_bound_base_is_rejected(self) -> None:
         clone = self.create()
         self.git(clone, "checkout", "--orphan", "replacement")
@@ -100,6 +128,24 @@ class StandaloneWorkspaceTest(unittest.TestCase):
         with self.assertRaisesRegex(module.WorkspaceError, "path is unsafe"):
             module.retire_attempt(self.repo, self.clone_root, alias, self.branch)
         self.assertTrue(clone.is_dir())
+
+    def test_bounded_inputs_are_staged_read_only_without_dirtying_clone(self) -> None:
+        clone = self.create()
+        source = self.root / "task-packet.md"
+        source.write_text("bounded task packet\n")
+        result = module.stage_input(clone, self.branch, self.base, source, "task-packet.md")
+        staged = Path(result["inputPath"])
+        self.assertEqual(staged.read_text(), "bounded task packet\n")
+        self.assertEqual(staged.stat().st_mode & 0o777, 0o400)
+        self.assertEqual(self.git(clone, "status", "--porcelain=v1", "-uall"), "")
+        source.write_text("changed after issue\n")
+        with self.assertRaisesRegex(module.WorkspaceError, "destination changed"):
+            module.stage_input(clone, self.branch, self.base, source, "task-packet.md")
+
+        symlink = self.root / "packet-link.md"
+        symlink.symlink_to(source)
+        with self.assertRaisesRegex(module.WorkspaceError, "source is unsafe"):
+            module.stage_input(clone, self.branch, self.base, symlink, "link.md")
 
 
 if __name__ == "__main__":

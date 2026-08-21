@@ -42,6 +42,27 @@ preset_file="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --
 python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative events.ndjson >/dev/null
 mkdir -p "$pending" "$bodies" "$staged" "$authority" "$done" "$failed" "$locks"
 
+# Agents in the governed runtime can write only to one capability-named external
+# ingress. The trusted broker promotes those bytes into its canonical queue
+# before any tracker authority or semantic processing is attempted.
+ingress_root="$(read_key BROKER_AGENT_OUTBOX_ROOT)"
+if [ -n "$ingress_root" ]; then
+  case "$only" in
+    "$ingress_root"/cap-*/*.json)
+      only="$(python3 "$SKILL_DIR/bin/promote-outbox-ingress.py" \
+        --root "$ingress_root" --pending "$pending" --bodies "$bodies" \
+        --team "$team" --feature "$feature" --entry "$only")" \
+        || { echo "process-outbox: could not promote the requested scoped outbox entry" >&2; exit 1; }
+      ;;
+    '')
+      python3 "$SKILL_DIR/bin/promote-outbox-ingress.py" \
+        --root "$ingress_root" --pending "$pending" --bodies "$bodies" \
+        --team "$team" --feature "$feature" >/dev/null \
+        || { echo "process-outbox: could not promote scoped outbox entries" >&2; exit 1; }
+      ;;
+  esac
+fi
+
 current_snapshot=""
 cleanup_snapshot() {
   if [ -n "$current_snapshot" ] && [ -f "$current_snapshot" ] && [ ! -L "$current_snapshot" ]; then

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import re
+import stat
+import subprocess
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -24,6 +27,10 @@ MODES = ("solo", "team", "autonomous", "release")
 APPLY_MODES = ("solo", "team")
 _SKILL_MARKER = re.compile(r"(?m)^name:[ \t]*startup-factory[ \t]*$")
 _ASSIGNMENT_VALUE = re.compile(r"^[A-Z][A-Z0-9_]*=(.*)$")
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_IMAGE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
+_MAX_RUNTIME_FILE = 2 * 1024 * 1024
+_MAX_ENGINE_OUTPUT = 256 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -325,6 +332,180 @@ def secure_runtime_checks(*, configured: bool, manifest: str | None) -> tuple[Re
     )
 
 
+def _runtime_digest(content: bytes) -> str:
+    return "sha256:" + hashlib.sha256(content).hexdigest()
+
+
+def _runtime_canonical_json(value: Any) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+
+
+def _runtime_read(
+    path: Path,
+    *,
+    label: str,
+    mode: int | None = None,
+    executable: bool = False,
+    maximum: int = _MAX_RUNTIME_FILE,
+) -> bytes:
+    if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
+        raise ValueError(f"{label} path is not canonical")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        info = current.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"{label} path contains a symlink")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise ValueError("secure no-follow opens are unavailable")
+    descriptor = os.open(path, os.O_RDONLY | nofollow)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > maximum:
+            raise ValueError(f"{label} is not a bounded single-link file")
+        if info.st_uid not in {0, os.geteuid()} or stat.S_IMODE(info.st_mode) & 0o022:
+            raise ValueError(f"{label} has unsafe ownership or mode")
+        if mode is not None and stat.S_IMODE(info.st_mode) != mode:
+            raise ValueError(f"{label} mode changed")
+        if executable and not info.st_mode & 0o111:
+            raise ValueError(f"{label} is not executable")
+        content = bytearray()
+        while len(content) <= maximum:
+            block = os.read(descriptor, min(65536, maximum + 1 - len(content)))
+            if not block:
+                break
+            content.extend(block)
+        if len(content) > maximum:
+            raise ValueError(f"{label} exceeds its size limit")
+        return bytes(content)
+    finally:
+        os.close(descriptor)
+
+
+def _runtime_json(content: bytes, *, label: str) -> dict[str, Any]:
+    def pairs(rows: Iterable[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in rows:
+            if key in result:
+                raise ValueError(f"{label} contains a duplicate key")
+            result[key] = value
+        return result
+
+    value = json.loads(content, object_pairs_hook=pairs)
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object")
+    return value
+
+
+def _runtime_private_directory(path: Path, *, label: str) -> None:
+    if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
+        raise ValueError(f"{label} path is not canonical")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        info = current.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"{label} path contains a symlink")
+    info = path.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise ValueError(f"{label} is not a caller-owned private directory")
+
+
+def _runtime_engine_json(engine: Path, arguments: list[str], *, label: str) -> Any:
+    result = subprocess.run(
+        [str(engine), *arguments],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/nonexistent",
+            "XDG_RUNTIME_DIR": f"/run/user/{os.geteuid()}",
+        },
+    )
+    if result.returncode or result.stderr or len(result.stdout) > _MAX_ENGINE_OUTPUT:
+        raise ValueError(f"{label} proof is invalid")
+
+    def pairs(rows: Iterable[tuple[str, Any]]) -> dict[str, Any]:
+        output: dict[str, Any] = {}
+        for key, value in rows:
+            if key in output:
+                raise ValueError(f"{label} proof contains a duplicate key")
+            output[key] = value
+        return output
+
+    return json.loads(result.stdout, object_pairs_hook=pairs)
+
+
+def _runtime_proofs(engine: Path, image: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    info = _runtime_engine_json(engine, ["info", "--format", "json"], label="engine")
+    if not isinstance(info, dict):
+        raise ValueError("engine proof is not an object")
+    version = info.get("version")
+    host = info.get("host")
+    security = host.get("security") if isinstance(host, dict) else None
+    mappings = host.get("idMappings") if isinstance(host, dict) else None
+    version_text = version.get("Version") if isinstance(version, dict) else None
+
+    def valid_mapping(rows: Any) -> bool:
+        return bool(
+            isinstance(rows, list)
+            and rows
+            and all(
+                isinstance(row, dict)
+                and set(row) == {"container_id", "host_id", "size"}
+                and all(type(row[key]) is int and row[key] >= 0 for key in ("container_id", "host_id"))
+                and type(row["size"]) is int
+                and row["size"] > 0
+                for row in rows
+            )
+            and any(row["container_id"] == 0 for row in rows)
+        )
+
+    if (
+        not isinstance(version_text, str)
+        or version_text.split(".", 1)[0] != "5"
+        or not isinstance(security, dict)
+        or security.get("rootless") is not True
+        or not isinstance(mappings, dict)
+        or set(mappings) != {"uidmap", "gidmap"}
+        or not valid_mapping(mappings["uidmap"])
+        or not valid_mapping(mappings["gidmap"])
+    ):
+        raise ValueError("engine proof is not rootless Podman 5")
+    inspected = _runtime_engine_json(
+        engine, ["image", "inspect", "--format", "json", image], label="image"
+    )
+    if not isinstance(inspected, list) or len(inspected) != 1 or not isinstance(inspected[0], dict):
+        raise ValueError("image proof cardinality changed")
+    repository_digests = inspected[0].get("RepoDigests")
+    image_id = inspected[0].get("Id")
+    if (
+        not isinstance(repository_digests, list)
+        or not all(isinstance(item, str) for item in repository_digests)
+        or image not in repository_digests
+        or not isinstance(image_id, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+    ):
+        raise ValueError("image proof identity changed")
+    return (
+        {
+            "version": version_text,
+            "rootless": True,
+            "uidmap": mappings["uidmap"],
+            "gidmap": mappings["gidmap"],
+        },
+        {"Id": image_id, "RepoDigests": sorted(set(repository_digests))},
+    )
+
+
 def _secure_runtime_configuration(target: Path) -> tuple[bool, str | None] | None:
     """Validate an installed profile as configuration, never boundary proof.
 
@@ -340,6 +521,7 @@ def _secure_runtime_configuration(target: Path) -> tuple[bool, str | None] | Non
     keys = (
         "TASK_WORKTREE_MODE",
         "BROKER_TASK_CLONE_ROOT",
+        "BROKER_AGENT_OUTBOX_ROOT",
         "AGENT_SANDBOX_RUNNER",
         "AGENT_SANDBOX_ENFORCED",
         "BROKER_LIFECYCLE_ROOT",
@@ -360,60 +542,121 @@ def _secure_runtime_configuration(target: Path) -> tuple[bool, str | None] | Non
         or any(values[key] == "null" for key in keys[1:])
     ):
         return False, None if manifest_raw == "null" else manifest_raw
-    resolved: dict[str, Path] = {}
-    for key in (
-        "BROKER_TASK_CLONE_ROOT",
-        "AGENT_SANDBOX_RUNNER",
-        "BROKER_LIFECYCLE_ROOT",
-        "AGENT_RUNTIME_MANIFEST",
-    ):
-        candidate = Path(values[key])
-        if not candidate.is_absolute() or Path(os.path.normpath(str(candidate))) != candidate:
-            return False, manifest_raw
-        resolved[key] = candidate
-    runner = resolved["AGENT_SANDBOX_RUNNER"]
-    manifest_path = resolved["AGENT_RUNTIME_MANIFEST"]
-    clone_root = resolved["BROKER_TASK_CLONE_ROOT"]
-    lifecycle_root = resolved["BROKER_LIFECYCLE_ROOT"]
     try:
-        runner_info = runner.lstat()
-        manifest_info = manifest_path.lstat()
-        root_info = clone_root.lstat()
-        lifecycle_info = lifecycle_root.lstat()
-    except OSError:
+        resolved = {key: Path(values[key]) for key in keys[1:] if key != "AGENT_SANDBOX_ENFORCED"}
+        clone_root = resolved["BROKER_TASK_CLONE_ROOT"]
+        outbox_root = resolved["BROKER_AGENT_OUTBOX_ROOT"]
+        lifecycle_root = resolved["BROKER_LIFECYCLE_ROOT"]
+        runner = resolved["AGENT_SANDBOX_RUNNER"]
+        manifest_path = resolved["AGENT_RUNTIME_MANIFEST"]
+        for directory, label in (
+            (clone_root, "clone root"),
+            (outbox_root, "outbox root"),
+            (lifecycle_root, "lifecycle root"),
+        ):
+            _runtime_private_directory(directory, label=label)
+        runner_content = _runtime_read(runner, label="runner", mode=0o700, executable=True)
+        manifest_content = _runtime_read(manifest_path, label="manifest", mode=0o600)
+        manifest = _runtime_json(manifest_content, label="manifest")
+        expected_keys = {
+            "schemaVersion", "profile", "sourceAssetsSha256", "engine", "image", "runner",
+            "policy", "network", "cloneRoot", "lifecycleRoot", "outboxRoot", "readiness",
+            "skillRoot", "capabilities",
+        }
+        if (
+            set(manifest) != expected_keys
+            or manifest.get("schemaVersion") != 2
+            or manifest.get("profile") != "rootless-podman-5"
+            or manifest.get("cloneRoot") != str(clone_root)
+            or manifest.get("lifecycleRoot") != str(lifecycle_root)
+            or manifest.get("outboxRoot") != str(outbox_root)
+            or manifest.get("skillRoot") != str(target)
+            or manifest.get("readiness") != "configured_unproved"
+            or manifest.get("capabilities")
+            != {"autonomousDelivery": False, "productionDelivery": False}
+        ):
+            raise ValueError("runtime manifest schema or identity changed")
+        runner_binding = manifest.get("runner")
+        policy_binding = manifest.get("policy")
+        network_binding = manifest.get("network")
+        engine_binding = manifest.get("engine")
+        image_binding = manifest.get("image")
+        if runner_binding != {"path": str(runner), "sha256": _runtime_digest(runner_content)}:
+            raise ValueError("runner binding changed")
+        if not isinstance(policy_binding, dict) or set(policy_binding) != {"path", "sha256"}:
+            raise ValueError("policy binding is malformed")
+        if not isinstance(network_binding, dict) or set(network_binding) != {"name", "path", "sha256"}:
+            raise ValueError("network binding is malformed")
+        if network_binding.get("name") != "none":
+            raise ValueError("unsupported runtime network")
+        policy_path = Path(str(policy_binding["path"]))
+        network_path = Path(str(network_binding["path"]))
+        policy_content = _runtime_read(policy_path, label="runtime policy", mode=0o600)
+        network_content = _runtime_read(network_path, label="network policy", mode=0o600)
+        if policy_binding["sha256"] != _runtime_digest(policy_content):
+            raise ValueError("runtime policy digest changed")
+        if network_binding["sha256"] != _runtime_digest(network_content):
+            raise ValueError("network policy digest changed")
+        source_runner = _runtime_read(target / "runtime/runner-linux-container.sh", label="source runner")
+        source_policy = _runtime_read(target / "runtime/container-policy.json", label="source policy")
+        source_network = _runtime_read(target / "runtime/network-policy-none.json", label="source network policy")
+        if manifest.get("sourceAssetsSha256") != _runtime_digest(
+            source_runner + source_policy + source_network
+        ):
+            raise ValueError("source asset digest changed")
+        if not isinstance(engine_binding, dict) or set(engine_binding) != {"path", "sha256", "proofSha256"}:
+            raise ValueError("engine binding is malformed")
+        engine = Path(str(engine_binding["path"]))
+        engine_content = _runtime_read(
+            engine, label="engine", executable=True, maximum=128 * 1024 * 1024
+        )
+        if engine_binding["sha256"] != _runtime_digest(engine_content):
+            raise ValueError("engine digest changed")
+        if (
+            not isinstance(image_binding, dict)
+            or set(image_binding) != {"reference", "proofSha256", "pull"}
+            or image_binding.get("pull") != "never"
+            or not isinstance(image_binding.get("reference"), str)
+            or _IMAGE.fullmatch(image_binding["reference"]) is None
+        ):
+            raise ValueError("image binding is malformed")
+        engine_proof, image_proof = _runtime_proofs(engine, image_binding["reference"])
+        if engine_binding["proofSha256"] != _runtime_digest(_runtime_canonical_json(engine_proof)):
+            raise ValueError("engine proof digest changed")
+        if image_binding["proofSha256"] != _runtime_digest(_runtime_canonical_json(image_proof)):
+            raise ValueError("image proof digest changed")
+        config_content = _runtime_read(path, label="team configuration")
+        desired = {
+            "schemaVersion": 1,
+            "profile": "rootless-podman-5",
+            "runtimeRoot": str(manifest_path.parent.parent.parent),
+            "engineSha256": engine_binding["sha256"],
+            "engineProofSha256": engine_binding["proofSha256"],
+            "image": image_binding["reference"],
+            "imageProofSha256": image_binding["proofSha256"],
+            "files": [
+                {"path": str(policy_path), "mode": 0o600, "sha256": policy_binding["sha256"]},
+                {"path": str(network_path), "mode": 0o600, "sha256": network_binding["sha256"]},
+                {"path": str(runner), "mode": 0o700, "sha256": runner_binding["sha256"]},
+                {"path": str(manifest_path), "mode": 0o600, "sha256": _runtime_digest(manifest_content)},
+            ],
+            "configAfterSha256": _runtime_digest(config_content),
+        }
+        installation_digest = _runtime_digest(_runtime_canonical_json(desired))
+        marker = manifest_path.parent.parent.parent / (
+            ".runtime-kit-committed-" + installation_digest.split(":", 1)[1]
+        )
+        marker_content = _runtime_read(marker, label="commit marker", mode=0o600)
+        marker_value = _runtime_json(marker_content, label="commit marker")
+        if (
+            marker_value.get("schemaVersion") != 1
+            or marker_value.get("installationDigest") != installation_digest
+            or _DIGEST.fullmatch(str(marker_value.get("appliedPlanDigest") or "")) is None
+        ):
+            raise ValueError("commit marker binding changed")
+        return True, manifest_raw
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
         return False, manifest_raw
-    if (
-        runner.is_symlink()
-        or not runner.is_file()
-        or runner_info.st_uid != os.geteuid()
-        or runner_info.st_mode & 0o022
-        or not runner_info.st_mode & 0o100
-        or manifest_path.is_symlink()
-        or not manifest_path.is_file()
-        or manifest_info.st_uid != os.geteuid()
-        or manifest_info.st_mode & 0o077
-        or clone_root.is_symlink()
-        or not clone_root.is_dir()
-        or root_info.st_uid != os.geteuid()
-        or root_info.st_mode & 0o077
-        or lifecycle_root.is_symlink()
-        or not lifecycle_root.is_dir()
-        or lifecycle_info.st_uid != os.geteuid()
-        or lifecycle_info.st_mode & 0o077
-    ):
-        return False, manifest_raw
-    manifest = _strict_json_object(manifest_path)
-    configured = bool(
-        manifest
-        and manifest.get("schemaVersion") == 1
-        and manifest.get("profile") == "rootless-podman-5"
-        and manifest.get("cloneRoot") == str(clone_root)
-        and manifest.get("lifecycleRoot") == str(lifecycle_root)
-        and manifest.get("readiness") == "configured_unproved"
-        and manifest.get("capabilities")
-        == {"autonomousDelivery": False, "productionDelivery": False}
-    )
-    return configured, manifest_raw
 
 
 def diagnose(project: Path, target: Path, *, mode: str) -> DoctorReport:

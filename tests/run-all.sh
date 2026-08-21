@@ -33,6 +33,7 @@ esac
 }
 
 FULL_PYTHON_TESTS=(
+  outbox-ingress-test.py
   standalone-workspace-test.py
   ticket-content-security-test.py
   execution-graph-test.py

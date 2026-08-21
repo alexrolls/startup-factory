@@ -21,7 +21,11 @@ and exactly one already-local image containing the requested repository digest.
 The profile always uses `--pull=never`; provisioning never contacts a registry.
 
 Applying creates versioned external assets and then updates the preserved team
-configuration last. The resulting state is **configured, not proved**. File
+configuration last. A mode-0600 lock, phase-aware journal, complete pre-image,
+and digest-bound commit marker protect the compensating transaction. Foreign,
+hard-linked, malformed, or incomplete recovery evidence is preserved and
+requires operator inspection; an idempotent no-op is accepted only after the
+commit marker is revalidated. The resulting state is **configured, not proved**. File
 modes and repository scripts are not an OS boundary. `doctor` remains yellow
 until an authenticated external execution boundary proves the required
 isolation; the fixed probe is useful negative-control evidence but never grants
@@ -37,13 +41,24 @@ Network defaults to `none`. Networked model access requires a separately
 provisioned, named, digest-bound egress gateway and a short-lived model session
 capability; upstream provider credentials remain outside the agent container.
 Tracker, cloud, release, broker, lifecycle, host-home, SSH-agent, and container
-socket paths are never mounted.
+socket paths are never mounted. Each doctor, gate, and task role receives a
+broker-created standalone clone, bounded read-only prompt/packet copies, the
+immutable installed tool bundle read-only, and at most one capability-named
+outbox ingress. The broker revalidates the runtime manifest and all locally
+provable engine, image, runner, policy, network, source, and commit-marker
+bindings before every launch. Agent submissions are promoted from the scoped
+ingress into the canonical outbox by the trusted broker; agents never mount the
+canonical repository, `.git`, `.teamwork`, lifecycle, or broker state.
 
 The first release supports rollback of an incomplete transaction only. It has
 no uninstall command and never removes operator-modified assets.
 
-`startup-factory runtime-kit ... --probe --json` emits digest-bound fixed probe
-definitions but does not execute a container or change readiness. The shipped
+After apply, `startup-factory runtime-kit ... --probe --json` creates a
+disposable standalone clone and executes fixed positive and negative controls
+through the configured runner. It records worktree write/commit observations
+and denial of the host sentinel, canonical repository, broker/lifecycle state,
+sibling workspace, loopback service, and metadata route. Failed evidence is
+preserved for inspection; passing evidence never changes readiness. The shipped
 `tests/runtime-boundary-linux-opt-in.sh` is the explicit real-engine check; it
 is skipped unless the operator supplies a disposable standalone clone and sets
 `STARTUP_FACTORY_REAL_RUNTIME_PROBE=1`. Even a passing probe is evidence, not an

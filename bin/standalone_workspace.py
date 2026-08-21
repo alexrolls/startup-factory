@@ -40,7 +40,7 @@ class WorkspaceError(RuntimeError):
 
 def _git(repo: Path, *argv: str, check: bool = True) -> str:
     environment = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PATH": "/usr/bin:/bin",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
@@ -114,6 +114,23 @@ def _mkdir_private(path: Path) -> None:
         directory.mkdir(mode=0o700)
 
 
+def _install_private_excludes(clone: Path) -> None:
+    path = clone / ".git" / "info" / "exclude"
+    if path.is_symlink() or not path.is_file():
+        raise WorkspaceError("standalone clone exclude file is unsafe")
+    content = path.read_bytes()
+    additions = b"\n.startup-factory-input/\n.startup-factory-output/\n"
+    if b".startup-factory-input/" not in content and b".startup-factory-output/" not in content:
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.write(descriptor, additions)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    elif not all(marker in content for marker in (b".startup-factory-input/", b".startup-factory-output/")):
+        raise WorkspaceError("standalone clone private excludes are incomplete")
+
+
 def create_attempt(
     repository: Path,
     root: Path,
@@ -134,20 +151,24 @@ def create_attempt(
         raise WorkspaceError("base ref did not resolve to a commit")
     if destination.exists() or destination.is_symlink():
         validation = validate_attempt(destination, branch, base)
+        _install_private_excludes(destination)
         return {**validation, "created": False}
     _mkdir_private(destination.parent)
     environment = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PATH": "/usr/bin:/bin",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
     }
+    clone_arguments = [
+        "git", "-c", "core.hooksPath=/dev/null", "clone", "--no-local", "--no-hardlinks",
+        "--no-tags",
+    ]
+    if not COMMIT.fullmatch(base_ref):
+        clone_arguments.extend(["--single-branch", "--branch", base_ref])
+    clone_arguments.extend(["--no-checkout", str(repository), str(destination)])
     result = subprocess.run(
-        [
-            "git", "-c", "core.hooksPath=/dev/null", "clone", "--no-local", "--no-hardlinks",
-            "--no-tags", "--single-branch", "--branch", base_ref, "--no-checkout",
-            str(repository), str(destination),
-        ],
+        clone_arguments,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -160,12 +181,14 @@ def create_attempt(
     try:
         _git(destination, "checkout", "-b", branch, base)
         _git(destination, "remote", "remove", "origin")
-        if base_ref != branch:
-            _git(destination, "branch", "-D", base_ref)
+        for existing_branch in _git(destination, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines():
+            if existing_branch and existing_branch != branch:
+                _git(destination, "branch", "-D", existing_branch)
         _git(destination, "config", "core.hooksPath", "/dev/null")
         _git(destination, "config", "core.fsmonitor", "false")
         _git(destination, "config", "user.name", "Startup Factory Task")
         _git(destination, "config", "user.email", "task@startup-factory.invalid")
+        _install_private_excludes(destination)
         validation = validate_attempt(destination, branch, base)
     except BaseException:
         # A newly created, not-yet-issued disposable attempt is the only removal scope.
@@ -182,7 +205,7 @@ def _config(clone: Path) -> dict[str, list[str]]:
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
+        env={"PATH": "/usr/bin:/bin", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
         text=True,
         timeout=10,
         check=False,
@@ -207,6 +230,52 @@ def _config(clone: Path) -> dict[str, list[str]]:
     return values
 
 
+def _validate_git_tree(git_dir: Path) -> None:
+    """Reject indirection/special nodes anywhere below independent Git state."""
+
+    forbidden = {
+        "commondir",
+        "shallow",
+        "shallow.lock",
+        "info/grafts",
+        "objects/info/alternates",
+        "objects/info/http-alternates",
+    }
+    pending: list[tuple[Path, str, int]] = [(git_dir, "", 0)]
+    visited = 0
+    while pending:
+        directory, relative_root, depth = pending.pop()
+        if depth > 64:
+            raise WorkspaceError("standalone Git metadata exceeds maximum depth")
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise WorkspaceError("cannot inspect standalone Git metadata") from exc
+        for entry in entries:
+            visited += 1
+            if visited > 250_000:
+                raise WorkspaceError("standalone Git metadata exceeds entry limit")
+            relative = f"{relative_root}/{entry.name}".lstrip("/")
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise WorkspaceError("standalone Git metadata changed during inspection") from exc
+            if stat.S_ISLNK(info.st_mode):
+                raise WorkspaceError(f"standalone Git metadata contains a symlink: {relative}")
+            if info.st_uid != os.geteuid():
+                raise WorkspaceError(f"standalone Git metadata has a foreign owner: {relative}")
+            if stat.S_ISDIR(info.st_mode):
+                pending.append((Path(entry.path), relative, depth + 1))
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise WorkspaceError(f"standalone Git metadata contains a special node: {relative}")
+            if info.st_nlink != 1:
+                raise WorkspaceError(f"standalone Git metadata contains a hard-linked file: {relative}")
+            lowered = relative.casefold()
+            if lowered in forbidden or lowered.endswith(".promisor"):
+                raise WorkspaceError(f"hostile clone indirection is forbidden: {relative}")
+
+
 def validate_attempt(clone: Path, branch: str, base: str) -> dict[str, Any]:
     if not clone.is_absolute() or clone.is_symlink() or not clone.is_dir():
         raise WorkspaceError("standalone clone path is unsafe")
@@ -214,11 +283,7 @@ def validate_attempt(clone: Path, branch: str, base: str) -> dict[str, Any]:
     git_dir = clone / ".git"
     if git_dir.is_symlink() or not git_dir.is_dir():
         raise WorkspaceError("attempt must contain an independent .git directory")
-    for relative in (
-        "commondir", "shallow", "info/grafts", "objects/info/alternates", "objects/info/http-alternates",
-    ):
-        if os.path.lexists(git_dir / relative):
-            raise WorkspaceError(f"hostile clone indirection is forbidden: {relative}")
+    _validate_git_tree(git_dir)
     _config(clone)
     observed_branch = _git(clone, "branch", "--show-current")
     if observed_branch != branch:
@@ -248,6 +313,63 @@ def validate_attempt(clone: Path, branch: str, base: str) -> dict[str, Any]:
         "tree": tree,
         "gitDirectory": str(git_dir),
     }
+
+
+def stage_input(clone: Path, branch: str, base: str, source: Path, name: str) -> dict[str, Any]:
+    validation = validate_attempt(clone, branch, base)
+    _safe(name, "input name")
+    if "/" in name or name in {".", ".."}:
+        raise WorkspaceError("unsafe input name")
+    _install_private_excludes(clone)
+    if source.is_symlink() or not source.is_file():
+        raise WorkspaceError("staged input source is unsafe")
+    source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(source_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size <= 0 or info.st_size > 2 * 1024 * 1024:
+            raise WorkspaceError("staged input must be a bounded single-link regular file")
+        content = b""
+        while len(content) <= 2 * 1024 * 1024:
+            block = os.read(source_fd, 65536)
+            if not block:
+                break
+            content += block
+        if len(content) > 2 * 1024 * 1024:
+            raise WorkspaceError("staged input exceeds size limit")
+    finally:
+        os.close(source_fd)
+    directory = clone / ".startup-factory-input"
+    if not directory.exists():
+        directory.mkdir(mode=0o700)
+    info = directory.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise WorkspaceError("staged input directory is unsafe")
+    destination = directory / name
+    staged_files = list(directory.iterdir())
+    staged_info = [item.lstat() for item in staged_files]
+    if any(stat.S_ISLNK(item.st_mode) or not stat.S_ISREG(item.st_mode) or item.st_nlink != 1 for item in staged_info):
+        raise WorkspaceError("staged input directory contains an unsafe node")
+    total_staged = sum(item.st_size for item in staged_info)
+    if len(staged_files) > 64 or total_staged > 4 * 1024 * 1024:
+        raise WorkspaceError("staged input directory exceeds its bounded record budget")
+    if destination.exists() or destination.is_symlink():
+        if destination.is_symlink() or not destination.is_file() or destination.read_bytes() != content:
+            raise WorkspaceError("staged input destination changed")
+    else:
+        if len(staged_files) >= 64 or total_staged + len(content) > 4 * 1024 * 1024:
+            raise WorkspaceError("staged input directory exceeds its bounded record budget")
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o400,
+        )
+        try:
+            os.fchmod(descriptor, 0o400)
+            os.write(descriptor, content)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    return {**validation, "inputPath": str(destination), "inputSha256": "sha256:" + hashlib.sha256(content).hexdigest()}
 
 
 def quarantine_import(
@@ -320,6 +442,7 @@ def main() -> int:
     create_parser = sub.add_parser("create")
     validate_parser = sub.add_parser("validate")
     import_parser = sub.add_parser("import")
+    stage_parser = sub.add_parser("stage-input")
     retire_parser = sub.add_parser("retire")
     for selected in (path_parser, create_parser):
         selected.add_argument("--repo", required=True)
@@ -334,6 +457,11 @@ def main() -> int:
         selected.add_argument("--clone", required=True)
         selected.add_argument("--branch", required=True)
         selected.add_argument("--base", required=True)
+    stage_parser.add_argument("--clone", required=True)
+    stage_parser.add_argument("--branch", required=True)
+    stage_parser.add_argument("--base", required=True)
+    stage_parser.add_argument("--source", required=True)
+    stage_parser.add_argument("--name", required=True)
     import_parser.add_argument("--repo", required=True)
     import_parser.add_argument("--team", required=True)
     import_parser.add_argument("--task-key", required=True)
@@ -354,6 +482,8 @@ def main() -> int:
             print(json.dumps(validate_attempt(Path(args.clone), args.branch, args.base), sort_keys=True))
         elif args.command == "import":
             print(json.dumps(quarantine_import(Path(args.repo), Path(args.clone), args.branch, args.base, args.team, args.task_key, args.attempt, Path(args.bundle)), sort_keys=True))
+        elif args.command == "stage-input":
+            print(json.dumps(stage_input(Path(args.clone), args.branch, args.base, Path(args.source), args.name), sort_keys=True))
         else:
             retire_attempt(Path(args.repo), Path(args.root), Path(args.clone), args.branch)
     except WorkspaceError as exc:

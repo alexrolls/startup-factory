@@ -106,6 +106,7 @@ TASK_WORKTREE_MODE=linked-worktree # linked-worktree preserves the legacy manual
                                   # protected execution refuses shared Git-common metadata.
 BROKER_TASK_CLONE_ROOT=null       # External mode-0700 root for broker-created standalone attempts.
                                   # Never mount the root itself; mount only one per-attempt clone.
+BROKER_AGENT_OUTBOX_ROOT=null     # External mode-0700 root; mount only one capability-named ingress.
 AGENT_SANDBOX_RUNNER=null        # Absolute executable outside the agent repository. In enforced mode
                                  # the launcher invokes: runner --workdir <absolute> -- /usr/bin/env -i ...
                                  # It rejects symlinks, non-regular/non-executable files, foreign

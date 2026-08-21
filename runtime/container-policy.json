@@ -13,6 +13,8 @@
   "cpus": "2",
   "networkDefault": "none",
   "workspaceMounts": 1,
+  "readOnlyToolMounts": 1,
+  "scopedOutboxIngressMounts": 1,
   "tmpfs": [
     "/home/agent:rw,nodev,nosuid,noexec,size=256m",
     "/tmp:rw,nodev,nosuid,noexec,size=256m",

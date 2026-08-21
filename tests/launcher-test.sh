@@ -67,7 +67,7 @@ TEAM_DEFAULT_CMD="true"
 SENIOR_QA_ENGINEER_CMD="cat {prompt_file} > qa-received.txt"
 SENIOR_TECHNICAL_PRODUCT_MANAGER_CMD=null
 TEAMWORK_ROOT=.teamwork
-AGENT_ENV_ALLOWLIST="PATH TMPDIR LANG LC_ALL TERM SAFE_AGENT_FLAG"
+AGENT_ENV_ALLOWLIST="PATH TMPDIR LANG LC_ALL TERM SAFE_AGENT_FLAG SANDBOX_RUNNER_LOG"
 POLL_INTERVAL_SECONDS=1
 STUCK_AFTER_MINUTES=1
 ESCALATE_AFTER_ATTEMPTS=2
@@ -335,7 +335,7 @@ if TEAM_RUNNER=background "$LAUNCH" start ambient-home FEAT-HOME backend >/dev/n
 else
   echo "ok: launcher refuses ambient HOME inheritance"
 fi
-sed_i 's|^AGENT_ENV_ALLOWLIST=.*|AGENT_ENV_ALLOWLIST="PATH TMPDIR LANG LC_ALL TERM SAFE_AGENT_FLAG"|' .claude/skills/pm/config/team.config.md
+sed_i 's|^AGENT_ENV_ALLOWLIST=.*|AGENT_ENV_ALLOWLIST="PATH TMPDIR LANG LC_ALL TERM SAFE_AGENT_FLAG SANDBOX_RUNNER_LOG"|' .claude/skills/pm/config/team.config.md
 sed_i '/^AGENT_SANDBOX_HOME=/d' .claude/skills/pm/config/team.config.md
 
 sed_i 's|^AGENT_ENV_ALLOWLIST=.*|AGENT_ENV_ALLOWLIST="PATH LINEAR_API_KEY"|' .claude/skills/pm/config/team.config.md
@@ -344,7 +344,7 @@ if LINEAR_API_KEY=tracker-secret TEAM_RUNNER=background "$LAUNCH" start blocked-
 else
   echo "ok: broker mode refuses tracker credentials in AGENT_ENV_ALLOWLIST"
 fi
-sed_i 's|^AGENT_ENV_ALLOWLIST=.*|AGENT_ENV_ALLOWLIST="PATH TMPDIR LANG LC_ALL TERM SAFE_AGENT_FLAG"|' .claude/skills/pm/config/team.config.md
+sed_i 's|^AGENT_ENV_ALLOWLIST=.*|AGENT_ENV_ALLOWLIST="PATH TMPDIR LANG LC_ALL TERM SAFE_AGENT_FLAG SANDBOX_RUNNER_LOG"|' .claude/skills/pm/config/team.config.md
 
 # -- doctor: real env/prompt/auth round trip before a persistent team launch ---
 cp .claude/skills/pm/config/team.config.md "$TMP/team.config.before-doctor"

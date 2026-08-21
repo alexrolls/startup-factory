@@ -42,6 +42,8 @@ OUTBOX_TASK_BASE_COMMIT=""
 OUTBOX_RUNTIME_MANIFEST_DIGEST=""
 AGENT_SANDBOX_RUNNER_PATH=""
 AGENT_SANDBOX_HOME_PATH=""
+AGENT_WORKTREE_PATH=""
+OUTBOX_INGRESS_DIR=""
 EXECUTION_ARGS=()
 LIFECYCLE_STATE_ROOT=""
 LIFECYCLE_ENABLED=false
@@ -81,6 +83,12 @@ read_key() { # read_key KEY -> value with surrounding quotes stripped; empty if 
   fi
   [ "$line" = "null" ] && line=""
   printf '%s' "$line"
+}
+
+governed_runtime_active() {
+  [ "$(read_key AGENT_SANDBOX_ENFORCED)" = true ] \
+    && [ "$(read_key TASK_WORKTREE_MODE)" = standalone-clone ] \
+    && [ -n "$(read_key AGENT_RUNTIME_MANIFEST)" ]
 }
 
 validate_unique_config_keys() {
@@ -211,16 +219,27 @@ prepare_agent_env() { # role team feature preset kind task attempt -> global AGE
     "STARTUP_FACTORY_EXECUTION_KIND=$kind"
     "STARTUP_FACTORY_TASK_ID=$task"
     "STARTUP_FACTORY_ATTEMPT=$attempt"
+    "STARTUP_FACTORY_AGENT_WORKTREE=$AGENT_WORKTREE_PATH"
   )
-  if [ "$kind" != setup ]; then
+  if [ "$kind" = gate ] || [ "$kind" = task ]; then
     AGENT_ENV_ARGS+=(
       "STARTUP_FACTORY_INSTANCE=$OUTBOX_CAPABILITY_INSTANCE"
-      "STARTUP_FACTORY_CANONICAL_REPO=$REPO_ROOT"
-      "STARTUP_FACTORY_CANONICAL_WORKSPACE=$OUTBOX_CANONICAL_WORKSPACE"
       "STARTUP_FACTORY_OUTBOX_CAPABILITY_ID=$OUTBOX_CAPABILITY_ID"
       "STARTUP_FACTORY_OUTBOX_CAPABILITY_SECRET=$OUTBOX_CAPABILITY_SECRET"
       "STARTUP_FACTORY_OUTBOX_CAPABILITY_EXPIRES_AT=$OUTBOX_CAPABILITY_EXPIRES_AT"
     )
+    if governed_runtime_active; then
+      [ -n "$OUTBOX_INGRESS_DIR" ] || die "internal launch error: scoped outbox ingress is absent"
+      AGENT_ENV_ARGS+=(
+        "STARTUP_FACTORY_OUTBOX_INGRESS=$OUTBOX_INGRESS_DIR"
+        "STARTUP_FACTORY_SKILL_ROOT=$SKILL_DIR"
+      )
+    else
+      AGENT_ENV_ARGS+=(
+        "STARTUP_FACTORY_CANONICAL_REPO=$REPO_ROOT"
+        "STARTUP_FACTORY_CANONICAL_WORKSPACE=$OUTBOX_CANONICAL_WORKSPACE"
+      )
+    fi
     if [ "$kind" = task ]; then
       [ -n "$OUTBOX_TASK_WORKTREE" ] || die "internal launch error: task worktree binding is absent"
       AGENT_ENV_ARGS+=("STARTUP_FACTORY_TASK_WORKTREE=$OUTBOX_TASK_WORKTREE")
@@ -229,7 +248,7 @@ prepare_agent_env() { # role team feature preset kind task attempt -> global AGE
 }
 
 validate_sandbox_runner_config() {
-  local enforced runner
+  local enforced runner verified verified_runner
   enforced="$(read_key AGENT_SANDBOX_ENFORCED)"
   case "$enforced" in
     false)
@@ -284,8 +303,16 @@ else:
     fail("file must be external to the agent repository")
 print(resolved)
 PY
-)"; then
+  )"; then
     die "refusing enforced agent execution without a protected sandbox runner"
+  fi
+  if governed_runtime_active; then
+    verified="$(python3 "$SKILL_DIR/bin/runtime-static-verify.py" --target "$SKILL_DIR")" \
+      || die "refusing enforced agent execution because runtime integrity changed"
+    verified_runner="$(printf '%s' "$verified" | python3 -c 'import json,sys; print(json.load(sys.stdin)["runner"])')" \
+      || die "runtime verifier returned malformed evidence"
+    [ "$verified_runner" = "$AGENT_SANDBOX_RUNNER_PATH" ] \
+      || die "runtime verifier runner does not match configured runner"
   fi
 }
 
@@ -293,7 +320,7 @@ configure_lifecycle_state() {
   local configured
   configured="${STARTUP_FACTORY_LIFECYCLE_STATE_ROOT:-$(read_key BROKER_LIFECYCLE_ROOT)}"
   if [ -z "$configured" ]; then
-    if [ "$(read_key AGENT_SANDBOX_ENFORCED)" = true ]; then
+    if governed_runtime_active; then
       die "BROKER_LIFECYCLE_ROOT or STARTUP_FACTORY_LIFECYCLE_STATE_ROOT is required in enforced autonomous mode"
     fi
     LIFECYCLE_ENABLED=false
@@ -576,11 +603,12 @@ prepare_execution() { # workdir command role team feature preset kind task attem
   local workdir="$1" command="$2"
   shift 2
   case "$workdir" in /*) ;; *) die "internal launch error: execution workdir must be absolute" ;; esac
+  AGENT_WORKTREE_PATH="$workdir"
   prepare_agent_env "$@"
   if [ "$(read_key AGENT_SANDBOX_ENFORCED)" = true ]; then
-    [ -n "$AGENT_SANDBOX_RUNNER_PATH" ] || validate_sandbox_runner_config
+    validate_sandbox_runner_config
     EXECUTION_ARGS=(
-      "$AGENT_SANDBOX_RUNNER_PATH" --workdir "$workdir" --
+      /usr/bin/env "${AGENT_ENV_ARGS[@]}" "$AGENT_SANDBOX_RUNNER_PATH" --workdir "$workdir" --
       /usr/bin/env "${AGENT_ENV_ARGS[@]}" /bin/bash -c "$command"
     )
   else
@@ -617,6 +645,36 @@ mint_outbox_capability() { # role team feature kind task attempt instance worksp
   [ -n "$OUTBOX_CAPABILITY_ID" ] && [ -n "$OUTBOX_CAPABILITY_SECRET" ] \
     && [ -n "$OUTBOX_CAPABILITY_INSTANCE" ] && [ -n "$OUTBOX_CAPABILITY_EXPIRES_AT" ] \
     || die "outbox capability mint returned incomplete launch authority"
+}
+
+prepare_outbox_ingress() {
+  local configured
+  OUTBOX_INGRESS_DIR=""
+  governed_runtime_active || return 0
+  configured="$(read_key BROKER_AGENT_OUTBOX_ROOT)"
+  [ -n "$configured" ] || die "BROKER_AGENT_OUTBOX_ROOT is required for enforced role submission"
+  OUTBOX_INGRESS_DIR="$(python3 - "$configured" "$OUTBOX_CAPABILITY_ID" <<'PY'
+import os,re,stat,sys
+from pathlib import Path
+root=Path(sys.argv[1]); capability=sys.argv[2]
+def fail(message): raise SystemExit("launch-team: invalid scoped outbox ingress: "+message)
+if not root.is_absolute() or Path(os.path.normpath(str(root)))!=root: fail("root is not canonical")
+current=Path(root.anchor)
+for part in root.parts[1:]:
+ current/=part; info=current.lstat()
+ if stat.S_ISLNK(info.st_mode): fail("root contains a symlink")
+info=root.lstat()
+if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or stat.S_IMODE(info.st_mode)&0o077: fail("root is not private")
+if not re.fullmatch(r"cap-[0-9a-f]{32}",capability): fail("capability id is invalid")
+destination=root/capability
+try: destination.mkdir(mode=0o700)
+except FileExistsError: fail("capability ingress already exists")
+descriptor=os.open(root,os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+try: os.fsync(descriptor)
+finally: os.close(descriptor)
+print(destination)
+PY
+)" || die "could not create a capability-bound outbox ingress"
 }
 
 git_unprivileged() { # run Git without scheduler/tracker/cloud credentials reaching filters/hooks
@@ -777,6 +835,49 @@ task_worktree_path() { # team role task attempt
     dir="$(teamroot "$team")" || die "unsafe team workspace"
     team_path "$dir" "worktrees/$role#$attempt-$(task_key "$task")" || die "unsafe task worktree path"
   fi
+}
+
+isolated_role_workspace() { # team role key -> JSON identity
+  local team="$1" role="$2" key="$3" root branch
+  root="$(read_key BROKER_TASK_CLONE_ROOT)"
+  [ -n "$root" ] || die "isolated role workspace requires BROKER_TASK_CLONE_ROOT"
+  branch="agent-runtime/$team/$key"
+  python3 "$SKILL_DIR/bin/standalone_workspace.py" create --repo "$REPO_ROOT" --root "$root" \
+    --team "$team" --role "$role" --attempt 1 --task-key "$key" \
+    --branch "$branch" --base-ref "$team"
+}
+
+stage_isolated_file() { # clone branch base source name -> staged path
+  python3 "$SKILL_DIR/bin/standalone_workspace.py" stage-input \
+    --clone "$1" --branch "$2" --base "$3" --source "$4" --name "$5" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["inputPath"])'
+}
+
+stage_isolated_prompt() { # source clone branch base workspace [packet staged-packet]
+  local source="$1" clone="$2" branch="$3" base="$4" workspace="$5"
+  local packet="${6:-}" staged_packet="${7:-}" temporary staged prompt_digest
+  temporary="$(mktemp "${TMPDIR:-/tmp}/startup-factory-prompt.XXXXXXXX")" \
+    || die "could not create bounded prompt staging file"
+  python3 - "$source" "$temporary" "$REPO_ROOT" "$clone" "$workspace" "$packet" "$staged_packet" <<'PY'
+import os,sys
+source,destination,repository,clone,workspace,packet,staged_packet=sys.argv[1:]
+content=open(source,"rb").read()
+if not content or len(content)>2*1024*1024: raise SystemExit("launch-team: isolated prompt is outside size bounds")
+text=content.decode("utf-8")
+if packet:
+    text=text.replace(packet,staged_packet)
+text=text.replace(workspace,clone+"/.startup-factory-output")
+text=text.replace(repository,clone)
+open(destination,"w",encoding="utf-8",newline="").write(text)
+os.chmod(destination,0o600)
+PY
+  prompt_digest="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest()[:16])' "$temporary")"
+  staged="$(stage_isolated_file "$clone" "$branch" "$base" "$temporary" "role-prompt-$prompt_digest.md")" \
+    || { rm -f -- "$temporary"; die "could not stage isolated role prompt"; }
+  rm -f -- "$temporary"
+  mkdir -p "$clone/.startup-factory-output"
+  chmod 700 "$clone/.startup-factory-output"
+  printf '%s' "$staged"
 }
 
 key_is_null() { # key_is_null KEY -> 0 if the config sets KEY explicitly to null (disabled)
@@ -1243,6 +1344,7 @@ PY
 doctor() { # doctor <preset> <team> <featureId>
   local preset="$1" team="$2" fid="$3"
   local roster role key cmd_tpl digest seen=" " token timeout dir preflight_dir prompt cmd
+  local isolated identity workdir branch base staged_prompt
   local security_role
   validate_preset_id "$preset"; validate_team_id "$team"
   [ -f "$SKILL_DIR/teams/$preset.md" ] \
@@ -1282,9 +1384,24 @@ doctor() { # doctor <preset> <team> <featureId>
     digest="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$cmd_tpl")"
     case "$seen" in *" $digest "*) continue ;; esac
     seen="$seen$digest "
-    cmd="${cmd_tpl//\{prompt_file\}/$prompt}"
-    prepare_execution "$REPO_ROOT" "$cmd" "$role" "$team" "$fid" "$preset" doctor - 0
+    if governed_runtime_active; then
+      identity="$(isolated_role_workspace "$team" "$role" "doctor-${digest:0:16}")" \
+        || die "could not create isolated doctor workspace"
+      workdir="$(printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])')"
+      branch="$(printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["branch"])')"
+      base="$(printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["baseCommit"])')"
+      staged_prompt="$(stage_isolated_prompt "$prompt" "$workdir" "$branch" "$base" "$dir")"
+    else
+      workdir="$REPO_ROOT"; staged_prompt="$prompt"
+    fi
+    cmd="${cmd_tpl//\{prompt_file\}/$staged_prompt}"
+    prepare_execution "$workdir" "$cmd" "$role" "$team" "$fid" "$preset" doctor - 0
     run_doctor_execution "role $role" "$token" "$timeout"
+    if governed_runtime_active; then
+      python3 "$SKILL_DIR/bin/standalone_workspace.py" retire --repo "$REPO_ROOT" \
+        --root "$(read_key BROKER_TASK_CLONE_ROOT)" --clone "$workdir" --branch "$branch" \
+        || die "doctor succeeded but its isolated workspace could not be retired"
+    fi
   done
 
   for key in TASK_FAST_CMD TASK_STANDARD_CMD TASK_STRONG_CMD; do
@@ -1294,9 +1411,24 @@ doctor() { # doctor <preset> <team> <featureId>
     case "$seen" in *" $digest "*) continue ;; esac
     seen="$seen$digest "
     role="$(printf '%s' "$key" | tr 'A-Z_' 'a-z-' | sed 's/-cmd$//')"
-    cmd="${cmd_tpl//\{prompt_file\}/$prompt}"
-    prepare_execution "$REPO_ROOT" "$cmd" "$role" "$team" "$fid" "$preset" doctor - 0
+    if [ "$(read_key AGENT_SANDBOX_ENFORCED)" = true ]; then
+      identity="$(isolated_role_workspace "$team" "$role" "doctor-${digest:0:16}")" \
+        || die "could not create isolated doctor workspace"
+      workdir="$(printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])')"
+      branch="$(printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["branch"])')"
+      base="$(printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["baseCommit"])')"
+      staged_prompt="$(stage_isolated_prompt "$prompt" "$workdir" "$branch" "$base" "$dir")"
+    else
+      workdir="$REPO_ROOT"; staged_prompt="$prompt"
+    fi
+    cmd="${cmd_tpl//\{prompt_file\}/$staged_prompt}"
+    prepare_execution "$workdir" "$cmd" "$role" "$team" "$fid" "$preset" doctor - 0
     run_doctor_execution "$key override" "$token" "$timeout"
+    if governed_runtime_active; then
+      python3 "$SKILL_DIR/bin/standalone_workspace.py" retire --repo "$REPO_ROOT" \
+        --root "$(read_key BROKER_TASK_CLONE_ROOT)" --clone "$workdir" --branch "$branch" \
+        || die "doctor succeeded but its isolated workspace could not be retired"
+    fi
   done
   echo "doctor OK: every distinct configured command completed under the real agent environment"
 }
@@ -1657,13 +1789,25 @@ launch_one() { # launch_one <team> <featureId> <role> [preset]
   [ -n "$cmd_tpl" ] || die "no command for role '$role' ($key absent and TEAM_DEFAULT_CMD is null)"
   local runtime; runtime="$(classify_command_runtime "$cmd_tpl")"
   local prompt; prompt="$(compose_prompt "$team" "$fid" "$role" "$preset" "$runtime")"
-  local cmd="${cmd_tpl//\{prompt_file\}/$prompt}"
-  local dir pidfile logfile env_cmd rc quoted_workdir quoted_marker
+  local cmd dir pidfile logfile env_cmd rc quoted_workdir quoted_marker
+  local identity workdir branch base staged_prompt
   dir="$(teamroot "$team")" || die "unsafe team workspace"
   pidfile="$(team_path "$dir" "pids/$role.pid")" || die "unsafe role pid path"
   logfile="$(team_path "$dir" "pids/$role.log")" || die "unsafe role log path"
+  if governed_runtime_active; then
+    identity="$(isolated_role_workspace "$team" "$role" "gate-$role")" \
+      || die "could not create isolated gate workspace"
+    workdir="$(printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])')"
+    branch="$(printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["branch"])')"
+    base="$(printf '%s' "$identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["baseCommit"])')"
+    staged_prompt="$(stage_isolated_prompt "$prompt" "$workdir" "$branch" "$base" "$dir")"
+  else
+    workdir="$REPO_ROOT"; staged_prompt="$prompt"
+  fi
+  cmd="${cmd_tpl//\{prompt_file\}/$staged_prompt}"
   mint_outbox_capability "$role" "$team" "$fid" gate - 0 "gate:$role" "$dir"
-  prepare_execution "$REPO_ROOT" "$cmd" "$role" "$team" "$fid" "$preset" gate - 0
+  prepare_outbox_ingress
+  prepare_execution "$workdir" "$cmd" "$role" "$team" "$fid" "$preset" gate - 0
 
   if [ "$LIFECYCLE_ENABLED" = true ]; then
     if lifecycle_probe "$team" gate "$role"; then
@@ -1678,9 +1822,9 @@ launch_one() { # launch_one <team> <featureId> <role> [preset]
   if [ "${TEAM_RUNNER:-auto}" != "background" ] && command -v tmux >/dev/null 2>&1; then
     env_cmd="$(execution_shell_command)"
     if [ "$LIFECYCLE_ENABLED" = true ]; then
-      spawn_managed_tmux "$REPO_ROOT" "$pidfile" "$team" gate "$role" "$env_cmd"
+      spawn_managed_tmux "$workdir" "$pidfile" "$team" gate "$role" "$env_cmd"
     else
-      printf -v quoted_workdir '%q' "$REPO_ROOT"
+      printf -v quoted_workdir '%q' "$workdir"
       printf -v quoted_marker '%q' "$pidfile"
       tmux has-session -t "team-$team" 2>/dev/null || tmux new-session -d -s "team-$team" -n _hub
       tmux new-window -d -t "team-$team" -n "$role" \
@@ -1690,10 +1834,10 @@ launch_one() { # launch_one <team> <featureId> <role> [preset]
     echo "launched $role in tmux session team-$team"
   else
     if [ "$LIFECYCLE_ENABLED" = true ]; then
-      spawn_managed_background "$REPO_ROOT" "$logfile" "$pidfile" "$team" gate "$role"
+      spawn_managed_background "$workdir" "$logfile" "$pidfile" "$team" gate "$role"
       echo "launched $role in background (protected pid $LAUNCHED_PID)"
     else
-      ( cd "$REPO_ROOT" && exec "${EXECUTION_ARGS[@]}" >"$logfile" 2>&1 ) &
+      ( cd "$workdir" && exec "${EXECUTION_ARGS[@]}" >"$logfile" 2>&1 ) &
       LAUNCHED_PID=$!
       printf 'unmanaged\n' > "$pidfile"
       echo "launched $role in unmanaged background mode (pid $LAUNCHED_PID; status/stop disabled)"
@@ -1759,7 +1903,7 @@ launch_task() { # launch_task <team> <featureId> <role> <taskId> <attempt> [pres
   fi
   local wt; wt="$("$0" worktree "$team" "$role" "$task" "$attempt")"
   local prompt; prompt="$(compose_task_prompt "$team" "$fid" "$role" "$task" "$attempt" "$preset" launch)"
-  local execution profile task_cmd_key cmd_tpl
+  local execution profile task_cmd_key cmd_tpl staged_prompt packet staged_packet task_branch_name base_commit
   execution="$(team_path "$dir" "executions/$(task_key "$task").json")" || die "unsafe execution path"
   profile="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["modelProfile"])' "$execution")"
   task_cmd_key="TASK_$(printf '%s' "$profile" | tr 'a-z-' 'A-Z_')_CMD"
@@ -1767,7 +1911,17 @@ launch_task() { # launch_task <team> <featureId> <role> <taskId> <attempt> [pres
   [ -n "$cmd_tpl" ] || cmd_tpl="$(read_key "$key")"
   [ -n "$cmd_tpl" ] || cmd_tpl="$(read_key TEAM_DEFAULT_CMD)"
   [ -n "$cmd_tpl" ] || die "no command for task role '$role' or model profile '$profile'"
-  local cmd="${cmd_tpl//\{prompt_file\}/$prompt}"
+  if governed_runtime_active; then
+    packet="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["packetPath"])' "$execution")"
+    task_branch_name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["branch"])' "$execution")"
+    base_commit="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseCommit"])' "$execution")"
+    staged_packet="$(stage_isolated_file "$wt" "$task_branch_name" "$base_commit" "$packet" task-packet.md)" \
+      || die "could not stage isolated task packet"
+    staged_prompt="$(stage_isolated_prompt "$prompt" "$wt" "$task_branch_name" "$base_commit" "$dir" "$packet" "$staged_packet")"
+  else
+    staged_prompt="$prompt"
+  fi
+  local cmd="${cmd_tpl//\{prompt_file\}/$staged_prompt}"
   local instance; instance="$(task_instance "$role" "$task" "$attempt")"
   local pidfile logfile pids_tasks env_cmd rc quoted_workdir quoted_marker
   pidfile="$(team_path "$dir" "pids/tasks/$instance.pid")" || die "unsafe task pid path"
@@ -1787,6 +1941,7 @@ launch_task() { # launch_task <team> <featureId> <role> <taskId> <attempt> [pres
   OUTBOX_TASK_BASE_COMMIT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("baseCommit") or "")' "$execution")"
   OUTBOX_RUNTIME_MANIFEST_DIGEST="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("runtimeManifestDigest") or "")' "$execution")"
   mint_outbox_capability "$role" "$team" "$fid" task "$task" "$attempt" "$instance" "$dir"
+  prepare_outbox_ingress
   prepare_execution "$wt" "$cmd" "$role" "$team" "$fid" "$preset" task "$task" "$attempt"
 
   if [ "${TEAM_RUNNER:-auto}" != "background" ] && command -v tmux >/dev/null 2>&1; then
@@ -2059,6 +2214,17 @@ case "${1:-}" in
         marker="$(team_path "$dir" "pids/tasks/$instance.pid")" || die "unsafe task marker path"
       fi
       rm -f "$marker"
+      if [ "$category" = gate ] && governed_runtime_active; then
+        gate_clone="$(python3 "$SKILL_DIR/bin/standalone_workspace.py" path \
+          --repo "$REPO_ROOT" --root "$(read_key BROKER_TASK_CLONE_ROOT)" \
+          --team "$2" --role "$instance" --attempt 1 --task-key "gate-$instance")"
+        if [ -d "$gate_clone" ] && [ ! -L "$gate_clone" ]; then
+          python3 "$SKILL_DIR/bin/standalone_workspace.py" retire --repo "$REPO_ROOT" \
+            --root "$(read_key BROKER_TASK_CLONE_ROOT)" --clone "$gate_clone" \
+            --branch "agent-runtime/$2/gate-$instance" \
+            || die "gate stopped but its isolated workspace requires operator inspection"
+        fi
+      fi
     done <<< "$records"
     echo "stopped team $2"
     ;;
