@@ -33,6 +33,7 @@ esac
 }
 
 FULL_PYTHON_TESTS=(
+  standalone-workspace-test.py
   ticket-content-security-test.py
   execution-graph-test.py
   retrospective-test.py
@@ -47,6 +48,8 @@ FULL_PYTHON_TESTS=(
   custom-tracker-release-snapshot-test.py
 )
 FULL_SHELL_TESTS=(
+  standalone-launcher-test.sh
+  runtime-boundary-linux-opt-in.sh
   update-installed-skill-test.sh
   tracker-ops-test.sh
   task-routing-test.sh

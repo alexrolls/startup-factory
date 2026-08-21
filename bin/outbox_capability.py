@@ -171,6 +171,9 @@ def mint(
     attempt: int,
     instance: str,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    task_worktree: str | None = None,
+    base_commit: str | None = None,
+    runtime_manifest_digest: str | None = None,
 ) -> Dict[str, Any]:
     repo = _repo(repository)
     workspace_path = Path(workspace)
@@ -222,6 +225,32 @@ def mint(
         "expiresAt": issued + ttl_seconds,
         "issuedAtUtc": datetime.fromtimestamp(issued, timezone.utc).isoformat(timespec="seconds"),
     }
+    if any(value is not None for value in (task_worktree, base_commit, runtime_manifest_digest)):
+        if execution_kind != "task" or not all((task_worktree, base_commit, runtime_manifest_digest)):
+            raise CapabilityError("standalone task capability bindings must be complete")
+        task_path = Path(str(task_worktree))
+        if (
+            not task_path.is_absolute()
+            or task_path.is_symlink()
+            or not (task_path / ".git").is_dir()
+            or (task_path / ".git").is_symlink()
+        ):
+            raise CapabilityError("standalone task worktree must contain an independent .git directory")
+        task_path = task_path.resolve(strict=True)
+        info = task_path.stat()
+        if not re.fullmatch(r"[0-9a-f]{40,64}", str(base_commit)):
+            raise CapabilityError("invalid standalone task base commit")
+        if not BODY_DIGEST.fullmatch(str(runtime_manifest_digest)):
+            raise CapabilityError("invalid standalone runtime manifest digest")
+        record.update(
+            {
+                "schemaVersion": 2,
+                "taskWorktree": str(task_path),
+                "taskWorktreeId": f"{info.st_dev}:{info.st_ino}",
+                "baseCommit": str(base_commit),
+                "runtimeManifestDigest": str(runtime_manifest_digest),
+            }
+        )
     record_path = records / (capability_id + ".json")
     _write_exclusive(record_path, _canonical(record) + b"\n")
     active_path = active / (_active_key(record) + ".id")
@@ -341,7 +370,9 @@ def _verify_entry(
         "team", "featureId", "role", "executionKind", "taskId", "attempt",
         "instance", "issuedAt", "expiresAt", "issuedAtUtc",
     }
-    if not isinstance(record, dict) or set(record) != required or record.get("schemaVersion") != 1:
+    if isinstance(record, dict) and record.get("schemaVersion") == 2:
+        required.update({"taskWorktree", "taskWorktreeId", "baseCommit", "runtimeManifestDigest"})
+    if not isinstance(record, dict) or set(record) != required or record.get("schemaVersion") not in {1, 2}:
         raise CapabilityError("invalid capability record schema")
     if record.get("id") != capability_id:
         raise CapabilityError("capability record identity mismatch")
@@ -381,12 +412,28 @@ def _verify_entry(
     observed = "hmac-sha256:" + hmac.new(secret, _canonical(expected), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(observed, signature):
         raise CapabilityError("producer capability signature mismatch")
-    return {
+    verified = {
         "role": role,
         "executionKind": kind,
         "instance": record["instance"],
         "expiresAt": record["expiresAt"],
     }
+    if record.get("schemaVersion") == 2:
+        task_path = Path(str(record["taskWorktree"]))
+        try:
+            info = task_path.stat()
+        except OSError as exc:
+            raise CapabilityError("standalone task worktree is unavailable") from exc
+        if task_path.is_symlink() or f"{info.st_dev}:{info.st_ino}" != record["taskWorktreeId"]:
+            raise CapabilityError("standalone task worktree identity changed")
+        verified.update(
+            {
+                "taskWorktree": record["taskWorktree"],
+                "baseCommit": record["baseCommit"],
+                "runtimeManifestDigest": record["runtimeManifestDigest"],
+            }
+        )
+    return verified
 
 
 def verify_entry(
@@ -502,6 +549,9 @@ def main() -> int:
     mint_parser.add_argument("--attempt", type=int, required=True)
     mint_parser.add_argument("--instance", required=True)
     mint_parser.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS)
+    mint_parser.add_argument("--task-worktree")
+    mint_parser.add_argument("--base-commit")
+    mint_parser.add_argument("--runtime-manifest-digest")
     revoke_parser = subparsers.add_parser("revoke-task")
     revoke_parser.add_argument("--repo", required=True)
     revoke_parser.add_argument("--workspace", required=True)
@@ -513,6 +563,7 @@ def main() -> int:
             result = mint(
                 args.repo, args.workspace, args.team, args.feature, args.role,
                 args.kind, args.task, args.attempt, args.instance, args.ttl,
+                args.task_worktree, args.base_commit, args.runtime_manifest_digest,
             )
             print(json.dumps(result, sort_keys=True, separators=(",", ":")))
             return 0

@@ -821,6 +821,9 @@ def cmd_packet(args) -> None:
         "role": args.role,
         "branch": args.branch,
         "worktree": args.worktree,
+        "worktreeMode": args.worktree_mode,
+        "baseCommit": args.base_commit,
+        "runtimeManifestDigest": args.runtime_manifest_digest,
         "packetPath": str(packet_md),
         "packetJsonPath": str(packet_json),
         "reportPath": str(report_md),
@@ -882,6 +885,9 @@ def build_parser() -> argparse.ArgumentParser:
     packet.add_argument("--role", required=True)
     packet.add_argument("--attempt", type=int, required=True)
     packet.add_argument("--worktree", required=True)
+    packet.add_argument("--worktree-mode", default="linked-worktree")
+    packet.add_argument("--base-commit")
+    packet.add_argument("--runtime-manifest-digest")
     packet.add_argument("--branch", required=True)
     packet.add_argument("--config", required=True)
     packet.add_argument("--contracts", required=True)

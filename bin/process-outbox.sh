@@ -451,6 +451,15 @@ else:
         for name, value in expected.items():
             if execution.get(name) != value:
                 fail("producer %s does not match the canonical task execution" % name)
+        if verified_capability is not None and verified_capability.get("taskWorktree") is not None:
+            bindings = {
+                "worktree": verified_capability["taskWorktree"],
+                "baseCommit": verified_capability["baseCommit"],
+                "runtimeManifestDigest": verified_capability["runtimeManifestDigest"],
+            }
+            for name, value in bindings.items():
+                if execution.get(name) != value:
+                    fail("standalone capability %s does not match canonical execution" % name)
 
 # Blocked and manual-takeover stop every agent publication. During the narrow
 # human-resume review barrier, only authenticated, comment-only gate verdicts

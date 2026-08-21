@@ -300,6 +300,122 @@ def _release_configured(target: Path) -> bool:
     )
 
 
+def secure_runtime_checks(*, configured: bool, manifest: str | None) -> tuple[ReadinessCheck, ...]:
+    """Separate local runtime configuration from external boundary proof."""
+
+    return (
+        ReadinessCheck(
+            "secure-runtime.configured",
+            "configured",
+            "pass" if configured else "fail",
+            (
+                f"protected runtime manifest is configured at {manifest}"
+                if configured and manifest
+                else "protected runtime configuration is incomplete"
+            ),
+            None if configured else "Preview and explicitly apply startup-factory runtime-kit on Linux.",
+        ),
+        ReadinessCheck(
+            "secure-runtime.proved",
+            "proved",
+            "unknown",
+            "offline checks and fixed probes do not prove an OS/container security boundary",
+            "Use authenticated launcher doctor plus an independent external boundary attestation.",
+        ),
+    )
+
+
+def _secure_runtime_configuration(target: Path) -> tuple[bool, str | None] | None:
+    """Validate an installed profile as configuration, never boundary proof.
+
+    Legacy team configurations have no runtime-kit keys and retain their prior
+    doctor behavior. Once any runtime-kit key exists, an incomplete or unsafe
+    profile fails closed.
+    """
+
+    path = target / "config/team.config.md"
+    text = _regular_text(path)
+    if text is None:
+        return None
+    keys = (
+        "TASK_WORKTREE_MODE",
+        "BROKER_TASK_CLONE_ROOT",
+        "AGENT_SANDBOX_RUNNER",
+        "AGENT_SANDBOX_ENFORCED",
+        "BROKER_LIFECYCLE_ROOT",
+        "AGENT_RUNTIME_MANIFEST",
+    )
+    if not any(
+        f"{key}=" in text
+        for key in ("TASK_WORKTREE_MODE", "BROKER_TASK_CLONE_ROOT", "AGENT_RUNTIME_MANIFEST")
+    ):
+        return None
+    values = _exact_assignments(path, keys)
+    if values is None:
+        return False, None
+    manifest_raw = values["AGENT_RUNTIME_MANIFEST"]
+    if (
+        values["TASK_WORKTREE_MODE"] != "standalone-clone"
+        or values["AGENT_SANDBOX_ENFORCED"] != "true"
+        or any(values[key] == "null" for key in keys[1:])
+    ):
+        return False, None if manifest_raw == "null" else manifest_raw
+    resolved: dict[str, Path] = {}
+    for key in (
+        "BROKER_TASK_CLONE_ROOT",
+        "AGENT_SANDBOX_RUNNER",
+        "BROKER_LIFECYCLE_ROOT",
+        "AGENT_RUNTIME_MANIFEST",
+    ):
+        candidate = Path(values[key])
+        if not candidate.is_absolute() or Path(os.path.normpath(str(candidate))) != candidate:
+            return False, manifest_raw
+        resolved[key] = candidate
+    runner = resolved["AGENT_SANDBOX_RUNNER"]
+    manifest_path = resolved["AGENT_RUNTIME_MANIFEST"]
+    clone_root = resolved["BROKER_TASK_CLONE_ROOT"]
+    lifecycle_root = resolved["BROKER_LIFECYCLE_ROOT"]
+    try:
+        runner_info = runner.lstat()
+        manifest_info = manifest_path.lstat()
+        root_info = clone_root.lstat()
+        lifecycle_info = lifecycle_root.lstat()
+    except OSError:
+        return False, manifest_raw
+    if (
+        runner.is_symlink()
+        or not runner.is_file()
+        or runner_info.st_uid != os.geteuid()
+        or runner_info.st_mode & 0o022
+        or not runner_info.st_mode & 0o100
+        or manifest_path.is_symlink()
+        or not manifest_path.is_file()
+        or manifest_info.st_uid != os.geteuid()
+        or manifest_info.st_mode & 0o077
+        or clone_root.is_symlink()
+        or not clone_root.is_dir()
+        or root_info.st_uid != os.geteuid()
+        or root_info.st_mode & 0o077
+        or lifecycle_root.is_symlink()
+        or not lifecycle_root.is_dir()
+        or lifecycle_info.st_uid != os.geteuid()
+        or lifecycle_info.st_mode & 0o077
+    ):
+        return False, manifest_raw
+    manifest = _strict_json_object(manifest_path)
+    configured = bool(
+        manifest
+        and manifest.get("schemaVersion") == 1
+        and manifest.get("profile") == "rootless-podman-5"
+        and manifest.get("cloneRoot") == str(clone_root)
+        and manifest.get("lifecycleRoot") == str(lifecycle_root)
+        and manifest.get("readiness") == "configured_unproved"
+        and manifest.get("capabilities")
+        == {"autonomousDelivery": False, "productionDelivery": False}
+    )
+    return configured, manifest_raw
+
+
 def diagnose(project: Path, target: Path, *, mode: str) -> DoctorReport:
     """Inspect local files only; configured commands and hooks are never evaluated."""
 
@@ -485,6 +601,10 @@ def diagnose(project: Path, target: Path, *, mode: str) -> DoctorReport:
             "Run an authenticated tracker operation before relying on delivery readiness.",
         )
     )
+    secure_runtime = _secure_runtime_configuration(target)
+    if secure_runtime is not None:
+        configured, manifest = secure_runtime
+        checks.extend(secure_runtime_checks(configured=configured, manifest=manifest))
 
     if mode == "team":
         checks.append(

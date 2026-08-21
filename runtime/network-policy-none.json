@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "name": "none",
+  "network": "none",
+  "externalAttestationRequired": false,
+  "denies": [
+    "metadata-services",
+    "loopback-host-services",
+    "private-control-planes",
+    "arbitrary-internet"
+  ]
+}

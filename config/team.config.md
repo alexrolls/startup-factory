@@ -101,6 +101,11 @@ WORKTREE_SETUP=null              # Run once inside every freshly created task wo
                                  # null = bare worktree. Provisioning is what makes
                                  # implementer validation claims executable — an
                                  # unprovisioned tree produces misleading dependency/type failures.
+TASK_WORKTREE_MODE=linked-worktree # linked-worktree preserves the legacy manual default.
+                                  # runtime-kit explicitly migrates to standalone-clone; autonomous
+                                  # protected execution refuses shared Git-common metadata.
+BROKER_TASK_CLONE_ROOT=null       # External mode-0700 root for broker-created standalone attempts.
+                                  # Never mount the root itself; mount only one per-attempt clone.
 AGENT_SANDBOX_RUNNER=null        # Absolute executable outside the agent repository. In enforced mode
                                  # the launcher invokes: runner --workdir <absolute> -- /usr/bin/env -i ...
                                  # It rejects symlinks, non-regular/non-executable files, foreign
@@ -114,6 +119,8 @@ BROKER_LIFECYCLE_ROOT=null       # Absolute pre-created mode-0700 directory, ext
                                  # Authenticated PID/start-time/tmux records live here; .teamwork
                                  # contains non-authoritative markers only. Agent sandboxes must not
                                  # be able to read or write this directory.
+AGENT_RUNTIME_MANIFEST=null      # External digest-bound rootless Podman/runtime policy manifest.
+                                  # Configuration is not boundary proof; offline doctor stays yellow.
 ```
 
 Review depth (`REVIEW_MODE=sequential|parallel|tiered`) is a **per-team** choice

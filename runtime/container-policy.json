@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "profile": "rootless-podman-5",
+  "engine": "podman",
+  "minimumMajorVersion": 5,
+  "pull": "never",
+  "readOnlyRoot": true,
+  "userNamespace": "keep-id",
+  "dropCapabilities": ["ALL"],
+  "securityOptions": ["no-new-privileges"],
+  "pidsLimit": 256,
+  "memory": "2g",
+  "cpus": "2",
+  "networkDefault": "none",
+  "workspaceMounts": 1,
+  "tmpfs": [
+    "/home/agent:rw,nodev,nosuid,noexec,size=256m",
+    "/tmp:rw,nodev,nosuid,noexec,size=256m",
+    "/run:rw,nodev,nosuid,noexec,size=64m"
+  ],
+  "fixedEnvironment": {
+    "HOME": "/home/agent",
+    "AWS_EC2_METADATA_DISABLED": "true"
+  },
+  "forbiddenMountClasses": [
+    "host-home",
+    "sibling-workspaces",
+    "shared-git-common",
+    "tracker-credentials",
+    "cloud-credentials",
+    "release-state",
+    "broker-state",
+    "lifecycle-state",
+    "container-sockets",
+    "ssh-agent-sockets",
+    "host-devices"
+  ]
+}

@@ -84,13 +84,12 @@ workspace="$(python3 "$SKILL_DIR/bin/teamwork-path.py" workspace --repo "$repo" 
 if [ "$launched" = yes ]; then
   [ "$workspace" = "$STARTUP_FACTORY_CANONICAL_WORKSPACE" ] \
     || { echo "submit-artifact: launcher-fixed canonical workspace does not match team configuration" >&2; exit 1; }
-  # A linked task worktree is valid only when it belongs to the same Git common
-  # directory as the launcher-fixed integration repository. This prevents a
-  # copied environment from routing signed entries across projects.
-  python3 - "$current_repo" "$repo" <<'PY'
+  worktree_mode="$(read_key TASK_WORKTREE_MODE)"; worktree_mode="${worktree_mode:-linked-worktree}"
+  fixed_task_worktree="${STARTUP_FACTORY_TASK_WORKTREE:-}"
+  python3 - "$current_repo" "$repo" "$worktree_mode" "$STARTUP_FACTORY_EXECUTION_KIND" "$fixed_task_worktree" <<'PY'
 import os, subprocess, sys
 
-current, canonical = sys.argv[1:]
+current, canonical, mode, kind, fixed_task = sys.argv[1:]
 
 def fail(message):
     raise SystemExit("submit-artifact: " + message)
@@ -121,7 +120,14 @@ if not os.path.isabs(canonical) or os.path.abspath(canonical) != os.path.realpat
     fail("canonical repository must be an absolute non-symlink path")
 if top(canonical) != os.path.realpath(canonical):
     fail("canonical repository does not equal its Git toplevel")
-if common(current) != common(canonical):
+if mode == "standalone-clone" and kind == "task":
+    if not fixed_task or not os.path.isabs(fixed_task):
+        fail("standalone task worktree binding is absent")
+    if top(current) != os.path.realpath(fixed_task) or current != os.path.realpath(fixed_task):
+        fail("runtime clone does not match the launcher-fixed standalone task path")
+    if not os.path.isdir(os.path.join(current, ".git")) or os.path.islink(os.path.join(current, ".git")):
+        fail("runtime clone lacks an independent Git directory")
+elif common(current) != common(canonical):
     fail("runtime worktree is not linked to the launcher-fixed canonical repository")
 PY
 fi

@@ -32,14 +32,19 @@ key="$(python3 "$SKILL_DIR/bin/runtime-state.py" key "$task")"
 execution="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "executions/$key.json")"
 python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "artifacts/$key" >/dev/null
 [ -f "$execution" ] && [ ! -L "$execution" ] || { echo "review-package: no safe execution record for $task" >&2; exit 1; }
-branch="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["branch"])' "$execution")"
-read -r role attempt worktree <<EOF
-$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["role"], d["attempt"], d["worktree"])' "$execution")
+read -r role attempt worktree mode base branch <<EOF
+$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["role"], d["attempt"], d["worktree"], d.get("worktreeMode") or "linked-worktree", d.get("baseCommit") or "-", d["branch"])' "$execution")
 EOF
 case "$role" in ''|*[!a-z0-9-]*) echo "review-package: unsafe execution role" >&2; exit 1 ;; esac
 case "$attempt" in ''|*[!0-9]*) echo "review-package: unsafe execution attempt" >&2; exit 1 ;; esac
 [ "$branch" = "agent-task/$team/$key" ] || { echo "review-package: execution branch does not match task/team generation" >&2; exit 1; }
-expected_worktree="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "worktrees/$role#$attempt-$key")"
+if [ "$mode" = standalone-clone ]; then
+  expected_worktree="$(python3 "$SKILL_DIR/bin/standalone_workspace.py" path --repo "$repo" \
+    --root "$(read_key BROKER_TASK_CLONE_ROOT)" --team "$team" --role "$role" \
+    --attempt "$attempt" --task-key "$key")"
+else
+  expected_worktree="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "worktrees/$role#$attempt-$key")"
+fi
 [ "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$worktree")" = "$expected_worktree" ] \
   || { echo "review-package: execution worktree is outside its task slot" >&2; exit 1; }
 worktree="$expected_worktree"
@@ -48,8 +53,20 @@ worktree="$expected_worktree"
   echo "review-package: $task has uncommitted changes; worker must create task-branch checkpoint commits first" >&2
   exit 1
 }
-base="$(git_unprivileged -C "$repo" merge-base "$team" "$branch")"
-head="$(git_unprivileged -C "$repo" rev-parse "$branch")"
+if [ "$mode" = standalone-clone ]; then
+  case "$base" in ''|-|*[!0-9a-f]*) echo "review-package: standalone execution has invalid base" >&2; exit 1 ;; esac
+  clone_head="$(git_unprivileged -C "$worktree" rev-parse HEAD)"
+  bundle="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "artifacts/$key/quarantine-$clone_head.bundle")"
+  imported="$(python3 "$SKILL_DIR/bin/standalone_workspace.py" import --repo "$repo" --clone "$worktree" \
+    --branch "$branch" --base "$base" --team "$team" --task-key "$key" --attempt "$attempt" --bundle "$bundle")" \
+    || { echo "review-package: hostile standalone clone import failed" >&2; exit 1; }
+  source_ref="$(printf '%s' "$imported" | python3 -c 'import json,sys; print(json.load(sys.stdin)["quarantineRef"])')"
+  head="$(printf '%s' "$imported" | python3 -c 'import json,sys; print(json.load(sys.stdin)["headCommit"])')"
+else
+  base="$(git_unprivileged -C "$repo" merge-base "$team" "$branch")"
+  head="$(git_unprivileged -C "$repo" rev-parse "$branch")"
+  source_ref="$branch"
+fi
 out="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "artifacts/$key/review-$(git_unprivileged -C "$repo" rev-parse --short "$base")..$(git_unprivileged -C "$repo" rev-parse --short "$head").diff")"
 bindings="${out%.diff}.bindings.json"
 mkdir -p "$(dirname "$out")"
@@ -58,15 +75,16 @@ mkdir -p "$(dirname "$out")"
   echo
   echo "Base: $base"
   echo "Head: $head"
+  if [ "$mode" = standalone-clone ]; then echo "Quarantine ref: $source_ref"; fi
   echo
   echo "## Commits"
-  git_unprivileged -C "$repo" log --oneline "$base..$head"
+  git_unprivileged -C "$repo" log --oneline "$base..$source_ref"
   echo
   echo "## Files changed"
-  git_unprivileged -C "$repo" diff --stat "$base..$head"
+  git_unprivileged -C "$repo" diff --stat "$base..$source_ref"
   echo
   echo "## Diff"
-  git_unprivileged -C "$repo" diff -U10 "$base..$head"
+  git_unprivileged -C "$repo" diff -U10 "$base..$source_ref"
 } > "$out"
 python3 - "$out" "$bindings" "$base" "$head" <<'PY'
 import hashlib

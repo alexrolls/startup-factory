@@ -30,8 +30,26 @@ baseline="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --wor
 python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "artifacts/$key/attempt-$attempt" >/dev/null
 python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "executions/$key.json" >/dev/null
 mkdir -p "$workspace"
+worktree_mode="$(read_key TASK_WORKTREE_MODE)"; worktree_mode="${worktree_mode:-linked-worktree}"
+base_commit="$(git -C "$repo" rev-parse "$team^{commit}")"
+manifest="$(read_key AGENT_RUNTIME_MANIFEST)"
+manifest_digest=""
+if [ -n "$manifest" ]; then
+  manifest_digest="$(python3 - "$manifest" <<'PY'
+import hashlib,os,stat,sys
+path=sys.argv[1]; fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+try:
+ info=os.fstat(fd)
+ if not stat.S_ISREG(info.st_mode) or info.st_size > 1024*1024: raise SystemExit("unsafe runtime manifest")
+ print("sha256:"+hashlib.sha256(os.read(fd,info.st_size+1)).hexdigest())
+finally: os.close(fd)
+PY
+)"
+fi
 "$SKILL_DIR/bin/tracker-ops.sh" export "$feature" "$tasks" >/dev/null
 python3 "$SKILL_DIR/bin/runtime-state.py" packet \
   --workspace "$workspace" --tasks "$tasks" --feature "$feature" --task "$task" \
   --role "$role" --attempt "$attempt" --worktree "$worktree" --branch "$branch" \
-  --config "$CONFIG" --contracts "$contracts" --baseline "$baseline" --repo "$repo"
+  --config "$CONFIG" --contracts "$contracts" --baseline "$baseline" --repo "$repo" \
+  --worktree-mode "$worktree_mode" --base-commit "$base_commit" \
+  --runtime-manifest-digest "$manifest_digest"

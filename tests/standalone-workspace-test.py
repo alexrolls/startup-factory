@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import importlib.util
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location("standalone_workspace", ROOT / "bin/standalone_workspace.py")
+module = importlib.util.module_from_spec(SPEC)
+assert SPEC and SPEC.loader
+SPEC.loader.exec_module(module)
+
+
+class StandaloneWorkspaceTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        self.repo = self.root / "canonical"
+        self.repo.mkdir()
+        self.git(self.repo, "init", "-q", "-b", "main")
+        self.git(self.repo, "config", "user.name", "Fixture")
+        self.git(self.repo, "config", "user.email", "fixture@example.invalid")
+        (self.repo / "base.txt").write_text("base\n")
+        self.git(self.repo, "add", "base.txt")
+        self.git(self.repo, "commit", "-qm", "base")
+        self.git(self.repo, "branch", "feature-runtime")
+        self.base = self.git(self.repo, "rev-parse", "feature-runtime")
+        self.clone_root = self.root / "clones"
+        self.branch = "agent-task/feature-runtime/task-key"
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    @staticmethod
+    def git(where: Path, *args: str) -> str:
+        return subprocess.check_output(["git", "-C", str(where), *args], text=True).strip()
+
+    def create(self) -> Path:
+        result = module.create_attempt(
+            self.repo, self.clone_root, "feature-runtime", "backend", 1, "task-key",
+            self.branch, "feature-runtime",
+        )
+        return Path(result["path"])
+
+    def test_clone_has_independent_git_and_exact_quarantine_import(self) -> None:
+        clone = self.create()
+        self.assertTrue((clone / ".git").is_dir())
+        self.assertFalse((clone / ".git/commondir").exists())
+        (clone / "change.txt").write_text("change\n")
+        self.git(clone, "add", "change.txt")
+        self.git(clone, "commit", "-qm", "task checkpoint")
+        bundle = self.root / "broker" / "task.bundle"
+        imported = module.quarantine_import(
+            self.repo, clone, self.branch, self.base, "feature-runtime", "task-key", 1, bundle
+        )
+        self.assertEqual(self.git(self.repo, "rev-parse", imported["quarantineRef"]), imported["headCommit"])
+        self.assertEqual(self.git(self.repo, "rev-parse", imported["quarantineRef"] + "^{tree}"), imported["tree"])
+        self.assertRegex(imported["bundleSha256"], r"^sha256:[0-9a-f]{64}$")
+
+    def test_dirty_extra_refs_and_unsafe_git_config_fail_closed(self) -> None:
+        clone = self.create()
+        (clone / "dirty").write_text("dirty\n")
+        with self.assertRaisesRegex(module.WorkspaceError, "dirty"):
+            module.validate_attempt(clone, self.branch, self.base)
+        (clone / "dirty").unlink()
+        self.git(clone, "branch", "extra")
+        with self.assertRaisesRegex(module.WorkspaceError, "unexpected refs"):
+            module.validate_attempt(clone, self.branch, self.base)
+        self.git(clone, "branch", "-D", "extra")
+        self.git(clone, "config", "filter.hostile.clean", "/bin/false")
+        with self.assertRaisesRegex(module.WorkspaceError, "unsafe Git config"):
+            module.validate_attempt(clone, self.branch, self.base)
+
+    def test_alternates_and_linked_git_metadata_are_rejected(self) -> None:
+        clone = self.create()
+        alternates = clone / ".git/objects/info/alternates"
+        alternates.write_text(str(self.repo / ".git/objects") + "\n")
+        with self.assertRaisesRegex(module.WorkspaceError, "indirection"):
+            module.validate_attempt(clone, self.branch, self.base)
+
+    def test_head_outside_bound_base_is_rejected(self) -> None:
+        clone = self.create()
+        self.git(clone, "checkout", "--orphan", "replacement")
+        self.git(clone, "rm", "-qf", "base.txt")
+        (clone / "unrelated.txt").write_text("unrelated\n")
+        self.git(clone, "add", "unrelated.txt")
+        self.git(clone, "commit", "-qm", "unrelated root")
+        self.git(clone, "branch", "-M", self.branch)
+        with self.assertRaisesRegex(module.WorkspaceError, "not a descendant"):
+            module.validate_attempt(clone, self.branch, self.base)
+
+    def test_retire_refuses_symlink_alias_and_preserves_clone(self) -> None:
+        clone = self.create()
+        alias = self.root / "clone-alias"
+        alias.symlink_to(clone, target_is_directory=True)
+        with self.assertRaisesRegex(module.WorkspaceError, "path is unsafe"):
+            module.retire_attempt(self.repo, self.clone_root, alias, self.branch)
+        self.assertTrue(clone.is_dir())
+
+
+if __name__ == "__main__":
+    unittest.main()

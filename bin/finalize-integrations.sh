@@ -606,11 +606,11 @@ fi
 # evidence bindings. Output is a stable line protocol consumed below.
 validate_entry() {
   local entry="$1" snapshot="${2:-}"
-  python3 - "$entry" "$repo" "$workspace" "$team" "$feature" "$snapshot" "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/bin/review_evidence.py" <<'PY'
+  python3 - "$entry" "$repo" "$workspace" "$team" "$feature" "$snapshot" "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/bin/review_evidence.py" "$(read_key BROKER_TASK_CLONE_ROOT)" <<'PY'
 import hashlib, json, os, re, stat, subprocess, sys
 from pathlib import Path
 
-entry_raw, repo_raw, workspace_raw, team, feature, snapshot_raw, board_raw, review_module_raw = sys.argv[1:]
+entry_raw, repo_raw, workspace_raw, team, feature, snapshot_raw, board_raw, review_module_raw, clone_root_raw = sys.argv[1:]
 repo, workspace = Path(repo_raw).resolve(), Path(workspace_raw).resolve()
 entry = Path(entry_raw)
 sys.dont_write_bytecode = True
@@ -696,10 +696,6 @@ key = safe_key(task)
 if data.get("taskKey") != key or entry.name != key + ".json":
     fail("transaction filename/task key binding mismatch")
 expected_branch = "agent-task/" + team + "/" + key
-expected_worktree = workspace / "worktrees" / ("%s#%s-%s" % (role, attempt, key))
-if data.get("branch") != expected_branch or Path(str(data.get("worktree"))) != expected_worktree:
-    fail("transaction branch/worktree binding mismatch")
-
 execution_path = workspace / "executions" / (key + ".json")
 regular(execution_path, "execution record")
 contained(execution_path, workspace, "execution record")
@@ -707,6 +703,26 @@ try:
     execution = json.loads(execution_path.read_text())
 except (OSError, ValueError) as exc:
     fail("invalid execution record: %s" % exc)
+worktree_mode = execution.get("worktreeMode") or "linked-worktree"
+if worktree_mode == "standalone-clone":
+    if not clone_root_raw:
+        fail("standalone execution has no configured broker clone root")
+    clone_root = Path(clone_root_raw)
+    if not clone_root.is_absolute() or clone_root.is_symlink():
+        fail("configured broker clone root is unsafe")
+    expected_worktree = clone_root / team / ("%s#%s-%s" % (role, attempt, key))
+    if Path(str(execution.get("worktree"))) != expected_worktree:
+        fail("standalone execution worktree is outside its canonical task slot")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", str(execution.get("baseCommit") or "")):
+        fail("standalone execution base commit is invalid")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(execution.get("runtimeManifestDigest") or "")):
+        fail("standalone execution runtime manifest digest is invalid")
+elif worktree_mode == "linked-worktree":
+    expected_worktree = workspace / "worktrees" / ("%s#%s-%s" % (role, attempt, key))
+else:
+    fail("execution record has an unknown worktree mode")
+if data.get("branch") != expected_branch or Path(str(data.get("worktree"))) != expected_worktree:
+    fail("transaction branch/worktree binding mismatch")
 expected_exec = {
     "schemaVersion": 1,
     "featureId": feature,
@@ -735,7 +751,12 @@ for name in ("baseCommit", "reviewBaseCommit", "taskBranchHead", "commit"):
     resolved = run("git", "rev-parse", "--verify", data[name] + "^{commit}").strip()
     if resolved != data[name]:
         fail("%s is not the repository's canonical full commit id" % name)
-branch_head = run("git", "rev-parse", "--verify", "refs/heads/" + expected_branch).strip()
+if worktree_mode == "standalone-clone":
+    suffix = hashlib.sha256((team + "\0" + key + "\0" + str(attempt) + "\0" + data["taskBranchHead"]).encode()).hexdigest()[:32]
+    source_ref = "refs/startup-factory/quarantine/" + suffix
+else:
+    source_ref = "refs/heads/" + expected_branch
+branch_head = run("git", "rev-parse", "--verify", source_ref).strip()
 if branch_head != data["taskBranchHead"]:
     fail("task branch moved after review/integration")
 parents = run("git", "show", "-s", "--format=%P", data["commit"]).strip().split()
@@ -1112,6 +1133,7 @@ elif snapshot_raw and data["phase"] == "completed":
 for value in (
     task, role, str(attempt), data["commit"], str(worktree), str(body_path), data["transactionId"],
     data["phase"], data["taskBranchHead"], review_digest, data["approvalEvidenceDigest"], execution_digest,
+    worktree_mode,
 ):
     print(value)
 PY
@@ -1186,7 +1208,7 @@ PY
 }
 
 finalize_one() {
-  local entry="$1" snapshot="$2" fields task role attempt commit worktree body txid phase report
+  local entry="$1" snapshot="$2" fields task role attempt commit worktree body txid phase report worktree_mode key
   fields="$(validate_unheld_entry "$entry" "$snapshot")"
   task="$(printf '%s\n' "$fields" | sed -n '1p')"
   role="$(printf '%s\n' "$fields" | sed -n '2p')"
@@ -1196,9 +1218,11 @@ finalize_one() {
   body="$(printf '%s\n' "$fields" | sed -n '6p')"
   txid="$(printf '%s\n' "$fields" | sed -n '7p')"
   phase="$(printf '%s\n' "$fields" | sed -n '8p')"
+  worktree_mode="$(printf '%s\n' "$fields" | sed -n '13p')"
+  key="$(python3 "$SKILL_DIR/bin/runtime-state.py" key "$task")"
   report="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child \
     --repo "$repo" --workspace "$workspace" \
-    --relative "artifacts/$(python3 "$SKILL_DIR/bin/runtime-state.py" key "$task")/attempt-$attempt/task-report.md")"
+    --relative "artifacts/$key/attempt-$attempt/task-report.md")"
   if [ "$phase" = "completed" ]; then
     echo "$task integration already finalized at $commit"
     return 0
@@ -1252,9 +1276,15 @@ finalize_one() {
     if [ -e "$worktree" ]; then
       [ -z "$(git_unprivileged -C "$worktree" status --porcelain -uall)" ] \
         || die "task worktree became dirty before cleanup: $worktree"
-      git_unprivileged -C "$repo" worktree remove "$worktree"
+      if [ "$worktree_mode" = standalone-clone ]; then
+        python3 "$SKILL_DIR/bin/standalone_workspace.py" retire --repo "$repo" \
+          --root "$(read_key BROKER_TASK_CLONE_ROOT)" --clone "$worktree" \
+          --branch "agent-task/$team/$key"
+      else
+        git_unprivileged -C "$repo" worktree remove "$worktree"
+      fi
     fi
-    git_unprivileged -C "$repo" worktree prune
+    [ "$worktree_mode" = standalone-clone ] || git_unprivileged -C "$repo" worktree prune
     [ ! -e "$worktree" ] || die "task worktree still exists after cleanup: $worktree"
     if worktree_registered "$worktree"; then
       die "task worktree is still registered after cleanup: $worktree"

@@ -213,6 +213,14 @@ try: path.resolve().relative_to(workspace.resolve())
 except (OSError, ValueError): raise SystemExit("integrate-task: execution record escapes team workspace")
 try: execution=json.loads(path.read_text())
 except (OSError, ValueError) as exc: raise SystemExit("integrate-task: invalid execution record: %s" % exc)
+worktree_mode = execution.get("worktreeMode") or "linked-worktree"
+expected_worktree = (
+    execution.get("worktree")
+    if worktree_mode == "standalone-clone"
+    else str(workspace / "worktrees" / ("%s#%s-%s" % (role, attempt, key)))
+)
+if worktree_mode not in {"linked-worktree", "standalone-clone"}:
+    raise SystemExit("integrate-task: execution record has unknown worktree mode")
 expected = {
     "schemaVersion": 1,
     "featureId": feature,
@@ -221,7 +229,7 @@ expected = {
     "attempt": attempt,
     "role": role,
     "branch": "agent-task/" + team + "/" + key,
-    "worktree": str(workspace / "worktrees" / ("%s#%s-%s" % (role, attempt, key))),
+    "worktree": expected_worktree,
     "packetPath": str(workspace / "artifacts" / key / ("attempt-%s" % attempt) / "task-packet.md"),
     "packetJsonPath": str(workspace / "artifacts" / key / ("attempt-%s" % attempt) / "task-packet.json"),
     "reportPath": str(workspace / "artifacts" / key / ("attempt-%s" % attempt) / "task-report.md"),
@@ -239,6 +247,12 @@ branch="$(printf '%s\n' "$execution_fields" | sed -n '1p')"
 worktree="$(printf '%s\n' "$execution_fields" | sed -n '2p')"
 execution_digest="$(printf '%s\n' "$execution_fields" | sed -n '3p')"
 expected_worktree="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "worktrees/$role#$attempt-$key")"
+worktree_mode="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("worktreeMode") or "linked-worktree")' "$execution")"
+if [ "$worktree_mode" = standalone-clone ]; then
+  expected_worktree="$(python3 "$SKILL_DIR/bin/standalone_workspace.py" path --repo "$repo" \
+    --root "$(read_key BROKER_TASK_CLONE_ROOT)" --team "$team" --role "$role" \
+    --attempt "$attempt" --task-key "$key")"
+fi
 [ "$worktree" = "$expected_worktree" ] || die "execution worktree does not match its canonical task slot"
 worktree="$expected_worktree"
 
@@ -374,14 +388,29 @@ PY
   || die "task worktree is not on execution branch '$branch'"
 [ -z "$(git_unprivileged -C "$worktree" status --porcelain -uall)" ] \
   || die "task worktree is dirty; checkpoint commits are required before integration"
+merge_ref="$branch"
+if [ "$worktree_mode" = standalone-clone ]; then
+  recorded_base="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("baseCommit") or "")' "$execution")"
+  clone_head="$(git_unprivileged -C "$worktree" rev-parse HEAD)"
+  quarantine_bundle="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "artifacts/$key/quarantine-$clone_head.bundle")"
+  imported="$(python3 "$SKILL_DIR/bin/standalone_workspace.py" import --repo "$repo" --clone "$worktree" \
+    --branch "$branch" --base "$recorded_base" --team "$team" --task-key "$key" \
+    --attempt "$attempt" --bundle "$quarantine_bundle")" \
+    || die "standalone task could not be imported through the quarantine boundary"
+  merge_ref="$(printf '%s' "$imported" | python3 -c 'import json,sys; print(json.load(sys.stdin)["quarantineRef"])')"
+  [ "$(git_unprivileged -C "$repo" rev-parse "$merge_ref")" = "$clone_head" ] \
+    || die "standalone quarantine ref does not bind the exact clone head"
+  [ "$(git_unprivileged -C "$repo" merge-base "$recorded_base" "$merge_ref")" = "$recorded_base" ] \
+    || die "quarantine import does not descend from the execution base"
+fi
 changed_file_list="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "artifacts/$key/integration-files.txt")"
 mkdir -p "$(dirname "$changed_file_list")"
 if [ ! -e "$preparation" ]; then
-  ahead="$(git_unprivileged -C "$repo" rev-list --count "$team..$branch")"
+  ahead="$(git_unprivileged -C "$repo" rev-list --count "$team..$merge_ref")"
   [ "$ahead" -gt 0 ] || die "task branch $branch has no checkpoint commits to integrate"
   base_commit="$(git_unprivileged -C "$repo" rev-parse "$team")"
-  task_branch_head="$(git_unprivileged -C "$repo" rev-parse "$branch")"
-  review_base_commit="$(git_unprivileged -C "$repo" merge-base "$team" "$branch")"
+  task_branch_head="$(git_unprivileged -C "$repo" rev-parse "$merge_ref")"
+  review_base_commit="$(git_unprivileged -C "$repo" merge-base "$team" "$merge_ref")"
   git_unprivileged -C "$repo" diff --name-only "$review_base_commit..$task_branch_head" > "$changed_file_list"
   [ -s "$changed_file_list" ] || die "task branch has no changed files"
   run_validation "$worktree" "$changed_file_list"
@@ -440,7 +469,7 @@ review_package_digest="$(printf '%s\n' "$prepared" | sed -n '7p')"
 approval_evidence_digest="$(printf '%s\n' "$prepared" | sed -n '8p')"
 authorized_at="$(printf '%s\n' "$prepared" | sed -n '9p')"
 authorization_snapshot_digest="$(printf '%s\n' "$prepared" | sed -n '10p')"
-[ "$(git_unprivileged -C "$repo" rev-parse "$branch")" = "$task_branch_head" ] \
+[ "$(git_unprivileged -C "$repo" rev-parse "$merge_ref")" = "$task_branch_head" ] \
   || die "task branch moved after integration was prepared"
 git_unprivileged -C "$repo" diff --name-only "$review_base_commit..$task_branch_head" > "$changed_file_list"
 [ -s "$changed_file_list" ] || die "prepared task branch has no changed files"
@@ -487,7 +516,7 @@ else
     [ -z "$(git_unprivileged -C "$repo" status --porcelain -uall)" ] || die "feature-branch checkout is dirty"
     assert_task_not_held
     assert_tracker_task_review_authorized
-    if ! git_unprivileged -C "$repo" merge --no-ff --no-commit "$branch"; then
+    if ! git_unprivileged -C "$repo" merge --no-ff --no-commit "$merge_ref"; then
       git_unprivileged -C "$repo" merge --abort >/dev/null 2>&1 || true
       die "merge conflict; return the task branch to the worker"
     fi

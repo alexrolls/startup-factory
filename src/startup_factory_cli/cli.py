@@ -20,6 +20,7 @@ from .installer import (
     verify_installation,
 )
 from .readiness import MODES, diagnose, initialize
+from .runtime_kit import apply_runtime_kit, plan_runtime_kit, probe_runtime_kit
 
 
 AGENTS = ("codex", "aider", "claude", "claude-code")
@@ -86,6 +87,18 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor", help="inspect offline readiness without mutation")
     _target_arguments(doctor)
     doctor.add_argument("--mode", choices=MODES, required=True)
+    runtime = subparsers.add_parser(
+        "runtime-kit", help="preview, apply, or probe the protected Linux runtime kit"
+    )
+    _target_arguments(runtime)
+    runtime.add_argument("--runtime-root", type=Path, required=True)
+    runtime.add_argument("--engine", type=Path, required=True)
+    runtime.add_argument("--image", required=True)
+    runtime.add_argument("--network", default="none")
+    runtime.add_argument("--apply", action="store_true")
+    runtime.add_argument("--plan-digest")
+    runtime.add_argument("--probe", action="store_true")
+    runtime.add_argument("--host-platform", choices=("linux", "darwin"), help=argparse.SUPPRESS)
     version = subparsers.add_parser("version", help="print the installer package version")
     version.add_argument("--json", action="store_true", help="emit one machine-readable JSON result")
     return parser
@@ -218,6 +231,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             report = diagnose(args.project, target, mode=args.mode)
             _print_doctor_report(report, as_json=json_output)
             return 0 if report.ready else 1
+        elif args.command == "runtime-kit":
+            plan = plan_runtime_kit(
+                target=target,
+                project=args.project,
+                runtime_root=args.runtime_root,
+                engine=args.engine,
+                image=args.image,
+                network=args.network,
+                host_platform=args.host_platform,
+            )
+            if args.apply and args.probe:
+                raise InstallerError("runtime-kit --apply and --probe are mutually exclusive")
+            if args.apply:
+                if not args.plan_digest:
+                    raise InstallerError("runtime-kit --apply requires the exact --plan-digest from preview")
+                apply_runtime_kit(plan, expected_plan_digest=args.plan_digest)
+                result_data = plan.as_dict(applied=True)
+                result_data["changes"] = []
+            elif args.probe:
+                result_data = {
+                    "ok": True,
+                    "action": "runtime-kit-probe",
+                    "schemaVersion": 1,
+                    "ready": False,
+                    "readiness": "configured_unproved",
+                    "probe": probe_runtime_kit(plan),
+                }
+            else:
+                result_data = plan.as_dict(applied=False)
+            if json_output:
+                print(json.dumps(result_data, sort_keys=True, separators=(",", ":")))
+            else:
+                verb = "Applied" if args.apply else ("Probed" if args.probe else "Previewed")
+                print(f"{verb} secure runtime kit: {result_data['readiness']}")
+                print("This result does not prove an OS security boundary.")
+            return 0
         else:
             with _bundle_path(args.bundle) as (bundle_path, expected_digest):
                 bundle = validate_bundle(bundle_path, expected_sha256=expected_digest)

@@ -37,6 +37,9 @@ OUTBOX_CAPABILITY_SECRET=""
 OUTBOX_CAPABILITY_INSTANCE=""
 OUTBOX_CAPABILITY_EXPIRES_AT=""
 OUTBOX_CANONICAL_WORKSPACE=""
+OUTBOX_TASK_WORKTREE=""
+OUTBOX_TASK_BASE_COMMIT=""
+OUTBOX_RUNTIME_MANIFEST_DIGEST=""
 AGENT_SANDBOX_RUNNER_PATH=""
 AGENT_SANDBOX_HOME_PATH=""
 EXECUTION_ARGS=()
@@ -218,6 +221,10 @@ prepare_agent_env() { # role team feature preset kind task attempt -> global AGE
       "STARTUP_FACTORY_OUTBOX_CAPABILITY_SECRET=$OUTBOX_CAPABILITY_SECRET"
       "STARTUP_FACTORY_OUTBOX_CAPABILITY_EXPIRES_AT=$OUTBOX_CAPABILITY_EXPIRES_AT"
     )
+    if [ "$kind" = task ]; then
+      [ -n "$OUTBOX_TASK_WORKTREE" ] || die "internal launch error: task worktree binding is absent"
+      AGENT_ENV_ARGS+=("STARTUP_FACTORY_TASK_WORKTREE=$OUTBOX_TASK_WORKTREE")
+    fi
   fi
 }
 
@@ -583,11 +590,25 @@ prepare_execution() { # workdir command role team feature preset kind task attem
 
 mint_outbox_capability() { # role team feature kind task attempt instance workspace
   local role="$1" team="$2" feature="$3" kind="$4" task="$5" attempt="$6" instance="$7" workspace="$8"
-  local payload
-  payload="$(python3 "$SKILL_DIR/bin/outbox_capability.py" mint \
-    --repo "$REPO_ROOT" --workspace "$workspace" --team "$team" --feature "$feature" \
-    --role "$role" --kind "$kind" --task "$task" --attempt "$attempt" --instance "$instance")" \
-    || die "could not mint an outbox capability for $instance"
+  local payload extra=()
+  if [ "$kind" = task ] && [ "$(read_key TASK_WORKTREE_MODE)" = standalone-clone ]; then
+    [ -n "$OUTBOX_TASK_WORKTREE" ] && [ -n "$OUTBOX_TASK_BASE_COMMIT" ] \
+      && [ -n "$OUTBOX_RUNTIME_MANIFEST_DIGEST" ] \
+      || die "standalone task capability bindings are incomplete"
+    extra=(--task-worktree "$OUTBOX_TASK_WORKTREE" --base-commit "$OUTBOX_TASK_BASE_COMMIT" \
+      --runtime-manifest-digest "$OUTBOX_RUNTIME_MANIFEST_DIGEST")
+  fi
+  if [ "${#extra[@]}" -gt 0 ]; then
+    payload="$(python3 "$SKILL_DIR/bin/outbox_capability.py" mint \
+      --repo "$REPO_ROOT" --workspace "$workspace" --team "$team" --feature "$feature" \
+      --role "$role" --kind "$kind" --task "$task" --attempt "$attempt" --instance "$instance" "${extra[@]}")" \
+      || die "could not mint an outbox capability for $instance"
+  else
+    payload="$(python3 "$SKILL_DIR/bin/outbox_capability.py" mint \
+      --repo "$REPO_ROOT" --workspace "$workspace" --team "$team" --feature "$feature" \
+      --role "$role" --kind "$kind" --task "$task" --attempt "$attempt" --instance "$instance")" \
+      || die "could not mint an outbox capability for $instance"
+  fi
   OUTBOX_CAPABILITY_ID="$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
   OUTBOX_CAPABILITY_SECRET="$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin)["secret"])')"
   OUTBOX_CAPABILITY_INSTANCE="$(printf '%s' "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin)["instance"])')"
@@ -745,6 +766,19 @@ task_instance() { # task_instance <role> <taskId> <attempt>
   printf '%s--%s--a%s' "$1" "$(task_key "$2")" "$3"
 }
 
+task_worktree_path() { # team role task attempt
+  local team="$1" role="$2" task="$3" attempt="$4" dir root
+  if [ "$(read_key TASK_WORKTREE_MODE)" = standalone-clone ]; then
+    root="$(read_key BROKER_TASK_CLONE_ROOT)"
+    [ -n "$root" ] || die "standalone-clone requires BROKER_TASK_CLONE_ROOT"
+    python3 "$SKILL_DIR/bin/standalone_workspace.py" path --repo "$REPO_ROOT" --root "$root" \
+      --team "$team" --role "$role" --attempt "$attempt" --task-key "$(task_key "$task")"
+  else
+    dir="$(teamroot "$team")" || die "unsafe team workspace"
+    team_path "$dir" "worktrees/$role#$attempt-$(task_key "$task")" || die "unsafe task worktree path"
+  fi
+}
+
 key_is_null() { # key_is_null KEY -> 0 if the config sets KEY explicitly to null (disabled)
   grep -qE "^$1=null[[:space:]]*(#.*)?$" "$CONFIG"
 }
@@ -760,13 +794,21 @@ validate_planning_config() {
 }
 
 validate_config() { # MAX_ACTIVE_IMPLEMENTERS is a parallel-only knob (spec: throughput levers)
-  local exec_mode max_active
+  local exec_mode max_active worktree_mode
   validate_agent_env_allowlist
   validate_agent_sandbox_home
   validate_sandbox_runner_config
   configure_lifecycle_state
   validate_planning_config
   exec_mode="$(read_key EXECUTION)"
+  worktree_mode="$(read_key TASK_WORKTREE_MODE)"
+  case "${worktree_mode:-linked-worktree}" in
+    linked-worktree) ;;
+    standalone-clone)
+      [ -n "$(read_key BROKER_TASK_CLONE_ROOT)" ] || die "standalone-clone requires BROKER_TASK_CLONE_ROOT"
+      ;;
+    *) die "TASK_WORKTREE_MODE must be linked-worktree or standalone-clone" ;;
+  esac
   max_active="$(read_key MAX_ACTIVE_IMPLEMENTERS)"
   [ -z "$max_active" ] && return 0
   [ "$exec_mode" = "parallel" ] || die "MAX_ACTIVE_IMPLEMENTERS is set but EXECUTION is '${exec_mode:-sequential}' — the knob only applies under EXECUTION=parallel"
@@ -1371,7 +1413,7 @@ compose_task_prompt() { # compose_task_prompt <team> <featureId> <role> <taskId>
   local instance; instance="$(task_instance "$role" "$task" "$attempt")"
   local brief; brief="$(role_brief "$role")"
   [ -n "$brief" ] || die "unknown role: $role (no brief in roles/ or teams/roles/)"
-  local wt; wt="$(team_path "$dir" "worktrees/$role#$attempt-$(task_key "$task")")" || die "unsafe task worktree path"
+  local wt; wt="$(task_worktree_path "$team" "$role" "$task" "$attempt")"
   local branch; branch="$(task_branch "$team" "$task")"
   [ -d "$wt" ] || die "task worktree does not exist: $wt"
   local execution; execution="$("$SKILL_DIR/bin/task-packet.sh" "$team" "$fid" "$task" "$role" "$attempt" "$wt" "$branch")"
@@ -1686,7 +1728,7 @@ launch_task() { # launch_task <team> <featureId> <role> <taskId> <attempt> [pres
       recorded_previous_worktree="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["worktree"])' "$execution")"
       validate_role_id "$previous_role"
       case "$previous" in ''|*[!0-9]*) die "execution record has an unsafe previous attempt" ;; esac
-      previous_worktree="$(team_path "$dir" "worktrees/$previous_role#$previous-$(task_key "$task")")" || die "unsafe previous worktree path"
+      previous_worktree="$(task_worktree_path "$team" "$previous_role" "$task" "$previous")"
       [ "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$recorded_previous_worktree")" = "$previous_worktree" ] \
         || die "execution record points outside its task worktree slot"
       previous_instance="$(task_instance "$previous_role" "$task" "$previous")"
@@ -1703,8 +1745,14 @@ launch_task() { # launch_task <team> <featureId> <role> <taskId> <attempt> [pres
       if [ -d "$previous_worktree" ]; then
         [ -z "$(git_unprivileged -C "$previous_worktree" status --porcelain -uall)" ] \
           || die "cannot start attempt $attempt: prior worktree is dirty; quarantine or salvage it first"
-        git_unprivileged -C "$REPO_ROOT" worktree remove --force "$previous_worktree" >/dev/null
-        git_unprivileged -C "$REPO_ROOT" worktree prune
+        if [ "$(read_key TASK_WORKTREE_MODE)" = standalone-clone ]; then
+          python3 "$SKILL_DIR/bin/standalone_workspace.py" retire --repo "$REPO_ROOT" \
+            --root "$(read_key BROKER_TASK_CLONE_ROOT)" --clone "$previous_worktree" \
+            --branch "$(task_branch "$team" "$task")"
+        else
+          git_unprivileged -C "$REPO_ROOT" worktree remove --force "$previous_worktree" >/dev/null
+          git_unprivileged -C "$REPO_ROOT" worktree prune
+        fi
       fi
       rm -f "$previous_pidfile"
     fi
@@ -1735,6 +1783,9 @@ launch_task() { # launch_task <team> <featureId> <role> <taskId> <attempt> [pres
       [ "$rc" -eq 3 ] || die "protected lifecycle state is invalid for $team/$instance"
     fi
   fi
+  OUTBOX_TASK_WORKTREE="$wt"
+  OUTBOX_TASK_BASE_COMMIT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("baseCommit") or "")' "$execution")"
+  OUTBOX_RUNTIME_MANIFEST_DIGEST="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("runtimeManifestDigest") or "")' "$execution")"
   mint_outbox_capability "$role" "$team" "$fid" task "$task" "$attempt" "$instance" "$dir"
   prepare_execution "$wt" "$cmd" "$role" "$team" "$fid" "$preset" task "$task" "$attempt"
 
@@ -1889,13 +1940,19 @@ case "${1:-}" in
     key="$(task_key "$task")"
     branch="$(task_branch "$team" "$task")"
     dir="$(teamroot "$team")" || die "unsafe team workspace"
-    wt="$(team_path "$dir" "worktrees/$role#$attempt-$key")" || die "unsafe task worktree path"
+    wt="$(task_worktree_path "$team" "$role" "$task" "$attempt")"
     [ -d "$wt" ] && { echo "$wt"; exit 0; }
-    mkdir -p "$(dirname "$wt")"
-    if git_unprivileged -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
-      git_unprivileged -C "$REPO_ROOT" worktree add "$wt" "$branch" >/dev/null
+    if [ "$(read_key TASK_WORKTREE_MODE)" = standalone-clone ]; then
+      python3 "$SKILL_DIR/bin/standalone_workspace.py" create --repo "$REPO_ROOT" \
+        --root "$(read_key BROKER_TASK_CLONE_ROOT)" --team "$team" --role "$role" \
+        --attempt "$attempt" --task-key "$key" --branch "$branch" --base-ref "$team" >/dev/null
     else
-      git_unprivileged -C "$REPO_ROOT" worktree add "$wt" -b "$branch" "$team" >/dev/null
+      mkdir -p "$(dirname "$wt")"
+      if git_unprivileged -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
+        git_unprivileged -C "$REPO_ROOT" worktree add "$wt" "$branch" >/dev/null
+      else
+        git_unprivileged -C "$REPO_ROOT" worktree add "$wt" -b "$branch" "$team" >/dev/null
+      fi
     fi
     setup="$(read_key WORKTREE_SETUP)"
     if [ -n "$setup" ]; then
@@ -1904,8 +1961,13 @@ case "${1:-}" in
       # scheduler tracker/cloud credentials never reach repository scripts.
       prepare_execution "$wt" "$setup" "$role" "$team" - "" setup "$task" "$attempt"
       if ! ( cd "$wt" && exec "${EXECUTION_ARGS[@]}" ) >/dev/null; then
-        git_unprivileged -C "$REPO_ROOT" worktree remove --force "$wt" >/dev/null 2>&1 || true
-        git_unprivileged -C "$REPO_ROOT" worktree prune
+        if [ "$(read_key TASK_WORKTREE_MODE)" = standalone-clone ]; then
+          python3 "$SKILL_DIR/bin/standalone_workspace.py" retire --repo "$REPO_ROOT" \
+            --root "$(read_key BROKER_TASK_CLONE_ROOT)" --clone "$wt" --branch "$branch" >/dev/null 2>&1 || true
+        else
+          git_unprivileged -C "$REPO_ROOT" worktree remove --force "$wt" >/dev/null 2>&1 || true
+          git_unprivileged -C "$REPO_ROOT" worktree prune
+        fi
         die "WORKTREE_SETUP failed in $wt — worktree removed. Fix the command or the environment; never claim validations in an unprovisioned tree."
       fi
     fi
@@ -1923,10 +1985,15 @@ case "${1:-}" in
       rc=$?
       [ "$rc" -eq 3 ] || die "protected lifecycle state is invalid for $2/$instance"
     fi
-    dir="$(teamroot "$2")" || die "unsafe team workspace"
-    wt="$(team_path "$dir" "worktrees/$3#${5:-1}-$(task_key "$4")")" || die "unsafe task worktree path"
-    git_unprivileged -C "$REPO_ROOT" worktree remove --force "$wt" 2>/dev/null || true
-    git_unprivileged -C "$REPO_ROOT" worktree prune
+    wt="$(task_worktree_path "$2" "$3" "$4" "${5:-1}")"
+    if [ "$(read_key TASK_WORKTREE_MODE)" = standalone-clone ]; then
+      python3 "$SKILL_DIR/bin/standalone_workspace.py" retire --repo "$REPO_ROOT" \
+        --root "$(read_key BROKER_TASK_CLONE_ROOT)" --clone "$wt" \
+        --branch "$(task_branch "$2" "$4")"
+    else
+      git_unprivileged -C "$REPO_ROOT" worktree remove --force "$wt" 2>/dev/null || true
+      git_unprivileged -C "$REPO_ROOT" worktree prune
+    fi
     echo "removed $wt (registration pruned)"
     ;;
   status)
