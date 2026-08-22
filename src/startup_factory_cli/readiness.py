@@ -416,6 +416,26 @@ def _runtime_private_directory(path: Path, *, label: str) -> None:
         raise ValueError(f"{label} is not a caller-owned private directory")
 
 
+def _runtime_path_present_nofollow(path: Path, *, label: str) -> bool:
+    if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
+        raise ValueError(f"{label} path is not canonical")
+    current = Path(path.anchor)
+    parts = path.parts[1:]
+    for index, part in enumerate(parts):
+        current /= part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise ValueError(f"{label} path is unavailable") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"{label} path contains a symlink: {current}")
+        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"{label} path contains a non-directory ancestor: {current}")
+    return True
+
+
 def _runtime_engine_json(engine: Path, arguments: list[str], *, label: str) -> Any:
     result = subprocess.run(
         [str(engine), *arguments],
@@ -559,7 +579,7 @@ def _secure_runtime_configuration(target: Path) -> tuple[bool, str | None] | Non
         manifest_content = _runtime_read(manifest_path, label="manifest", mode=0o600)
         runtime_root = manifest_path.parent.parent.parent
         if any(
-            os.path.lexists(path)
+            _runtime_path_present_nofollow(path, label="runtime recovery evidence")
             for path in (runtime_root / ".runtime-kit.lock", runtime_root / ".runtime-kit-journal.json")
         ):
             raise ValueError("unresolved runtime-kit transaction requires explicit recovery")

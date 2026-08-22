@@ -282,6 +282,120 @@ runtime_kit.apply_runtime_kit(plan, expected_plan_digest=expected)
     def test_process_death_after_prepared_phase_recovers_by_exact_preview(self) -> None:
         self.assert_recovery_round_trip("prepared", "rollback")
 
+    def test_real_death_pre_asset_phases_preserve_substituted_ancestor_and_evidence(self) -> None:
+        for phase in ("locked", "prepared"):
+            with self.subTest(phase=phase):
+                digest = self.crash_apply_after_phase(phase)
+                outside = self.root / f"outside-after-{phase}"
+                outside.mkdir(mode=0o700)
+                substituted = self.runtime_root / "assets"
+                self.assertFalse(os.path.lexists(substituted))
+                substituted.symlink_to(outside, target_is_directory=True)
+                lock = self.runtime_root / ".runtime-kit.lock"
+                journal = self.runtime_root / ".runtime-kit-journal.json"
+                lock_before = lock.read_bytes()
+                journal_before = journal.read_bytes() if journal.exists() else None
+
+                code, _, error = self.runtime("--recover")
+                self.assertEqual(code, 1)
+                self.assertIn("substituted path", error)
+                self.assertIn("--recover", error)
+                self.assertEqual(lock.read_bytes(), lock_before)
+                if journal_before is not None:
+                    self.assertEqual(journal.read_bytes(), journal_before)
+                self.assertTrue(substituted.is_symlink())
+                self.assertEqual(list(outside.iterdir()), [])
+
+                # Ordinary preview/apply must validate the same absent-leaf
+                # ancestry and cannot clear recovery evidence.
+                code, _, error = self.apply_on_linux(digest)
+                self.assertEqual(code, 1)
+                self.assertIn("substituted path", error)
+                self.assertEqual(lock.read_bytes(), lock_before)
+                self.assertEqual(list(outside.iterdir()), [])
+
+                substituted.unlink()
+                recovery_code, recovery_output, recovery_error = self.runtime("--recover")
+                self.assertEqual((recovery_code, recovery_error), (0, ""), recovery_output + recovery_error)
+                recovery = json.loads(recovery_output)
+                code, output, error = self.runtime(
+                    "--recover", "--apply", "--plan-digest", recovery["recoveryDigest"]
+                )
+                self.assertEqual((code, error), (0, ""), output + error)
+                if phase == "locked":
+                    self.runtime_root.mkdir(mode=0o700, exist_ok=True)
+
+                # A substitution after a successful recovery preview must be
+                # caught by apply's mandatory re-preview. The stale digest can
+                # never authorize cleanup of the lock or journal.
+                self.crash_apply_after_phase(phase)
+                code, output, error = self.runtime("--recover")
+                self.assertEqual((code, error), (0, ""), output + error)
+                recovery = json.loads(output)
+                outside_apply = self.root / f"outside-apply-{phase}"
+                outside_apply.mkdir(mode=0o700)
+                substituted.symlink_to(outside_apply, target_is_directory=True)
+                lock_before = lock.read_bytes()
+                journal_before = journal.read_bytes() if journal.exists() else None
+                code, _, error = self.runtime(
+                    "--recover", "--apply", "--plan-digest", recovery["recoveryDigest"]
+                )
+                self.assertEqual(code, 1)
+                self.assertIn("substituted path", error)
+                self.assertEqual(lock.read_bytes(), lock_before)
+                if journal_before is not None:
+                    self.assertEqual(journal.read_bytes(), journal_before)
+                self.assertTrue(substituted.is_symlink())
+                self.assertEqual(list(outside_apply.iterdir()), [])
+                substituted.unlink()
+                code, output, error = self.runtime("--recover")
+                self.assertEqual((code, error), (0, ""), output + error)
+                recovery = json.loads(output)
+                code, output, error = self.runtime(
+                    "--recover", "--apply", "--plan-digest", recovery["recoveryDigest"]
+                )
+                self.assertEqual((code, error), (0, ""), output + error)
+                if phase == "locked":
+                    self.runtime_root.mkdir(mode=0o700, exist_ok=True)
+
+    def test_descriptor_relative_creation_never_follows_raced_assets_symlink(self) -> None:
+        digest = self.preview_digest()
+        outside = self.root / "outside-race-target"
+        outside.mkdir(mode=0o700)
+        substituted = self.runtime_root / "assets"
+        original_mkdir = runtime_kit.os.mkdir
+        injected = False
+
+        def substitute_before_create(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            nonlocal injected
+            if path == "assets" and dir_fd is not None and not injected:
+                substituted.symlink_to(outside, target_is_directory=True)
+                injected = True
+            original_mkdir(path, mode, dir_fd=dir_fd)
+
+        with (
+            mock.patch.object(runtime_kit.sys, "platform", "linux"),
+            mock.patch.object(runtime_kit.os, "mkdir", side_effect=substitute_before_create),
+        ):
+            code, _, error = self.runtime("--apply", "--plan-digest", digest)
+        self.assertEqual(code, 1)
+        self.assertTrue(injected)
+        self.assertIn("lock, journal, and substituted path were preserved", error)
+        self.assertTrue((self.runtime_root / ".runtime-kit.lock").exists())
+        self.assertTrue((self.runtime_root / ".runtime-kit-journal.json").exists())
+        self.assertTrue(substituted.is_symlink())
+        self.assertEqual(list(outside.iterdir()), [])
+
+        code, _, recovery_error = self.runtime("--recover")
+        self.assertEqual(code, 1)
+        self.assertIn("substituted path", recovery_error)
+        self.assertEqual(list(outside.iterdir()), [])
+
     def test_process_death_after_assets_written_phase_recovers_by_exact_preview(self) -> None:
         self.assert_recovery_round_trip("assets-written", "rollback")
 
@@ -430,6 +544,39 @@ runtime_kit.apply_runtime_kit(plan, expected_plan_digest=expected)
         self.assertEqual(code, 1)
         self.assertIn("refuses overwrite", error)
         self.assertIn(b"operator tamper", runner.read_bytes())
+
+    def test_missing_runtime_leaf_below_substituted_ancestor_fails_static_and_readiness(self) -> None:
+        code, output, error = self.apply_on_linux(self.preview_digest())
+        self.assertEqual((code, error), (0, ""), output + error)
+        asset_root = next((self.runtime_root / "assets").iterdir())
+        preserved = asset_root.with_name(asset_root.name + ".preserved")
+        asset_root.rename(preserved)
+        outside = self.root / "outside-static"
+        outside.mkdir(mode=0o700)
+        asset_root.symlink_to(outside, target_is_directory=True)
+
+        static = subprocess.run(
+            ["python3", str(self.target / "bin/runtime-static-verify.py"), "--target", str(self.target)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(static.returncode, 0)
+        self.assertIn("symlink", static.stderr)
+        code, output, error = invoke(
+            "doctor", "--project", str(self.project), "--install-dir", str(self.target),
+            "--mode", "team", "--json",
+        )
+        self.assertEqual((code, error), (1, ""), output + error)
+        configured = next(
+            item for item in json.loads(output)["checks"] if item["id"] == "secure-runtime.configured"
+        )
+        self.assertEqual(configured["status"], "fail")
+        code, _, error = self.runtime()
+        self.assertEqual(code, 1)
+        self.assertIn("substituted path", error)
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_failed_post_config_step_compensates_without_erasing_prestate(self) -> None:
         before = (self.target / "config/team.config.md").read_bytes()

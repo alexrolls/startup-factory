@@ -114,6 +114,25 @@ def private_directory(path: Path, label: str) -> None:
         fail(f"{label} is not a caller-owned private directory")
 
 
+def path_present_nofollow(path: Path, label: str) -> bool:
+    if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
+        fail(f"{label} path is not canonical")
+    current = Path(path.anchor)
+    for index, part in enumerate(path.parts[1:]):
+        current /= part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise VerificationError(f"{label} path is unavailable") from exc
+        if stat.S_ISLNK(info.st_mode):
+            fail(f"{label} path contains a symlink: {current}")
+        if index < len(path.parts[1:]) - 1 and not stat.S_ISDIR(info.st_mode):
+            fail(f"{label} path contains a non-directory ancestor: {current}")
+    return True
+
+
 def assignments(path: Path) -> dict[str, str]:
     content = read_file(path, "team configuration").decode("utf-8")
     keys = {
@@ -157,7 +176,7 @@ def verify(target: Path) -> dict[str, Any]:
     unresolved = [
         path.name
         for path in (runtime_root / ".runtime-kit.lock", runtime_root / ".runtime-kit-journal.json")
-        if os.path.lexists(path)
+        if path_present_nofollow(path, "runtime recovery evidence")
     ]
     if unresolved:
         fail(

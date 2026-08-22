@@ -44,7 +44,13 @@ startup-factory runtime-kit --project "$PWD" --install-dir /opt/startup-factory 
 
 The recovery preview validates the lock, journal phase, owner, target/config,
 asset pre/post-images, created-directory scope, plan and installation digests,
-and commit marker. `locked` clears only its exact orphaned lock; `prepared`,
+commit marker, and every existing component of the reserved runtime namespaces,
+even when the final asset path is absent. Directory and exclusive-file creation
+walk pinned directory descriptors and never follows a substituted ancestor.
+If an ancestor changes after a process death or preview, recovery/apply preserves
+the lock, journal, and substituted path; inspect the named mismatch, restore the
+exact caller-owned non-symlink namespace, and request a new `--recover` digest.
+`locked` clears only its exact orphaned lock; `prepared`,
 `assets-written`, and `config-replaced` compensate to the recorded pre-state;
 `commit-marked` finalizes only an exact durable post-state. Changed, foreign,
 or ambiguous evidence is never removed. The resulting state is **configured,

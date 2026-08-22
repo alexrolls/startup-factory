@@ -36,6 +36,10 @@ ASSIGNMENT = re.compile(r"(?m)^(?P<key>[A-Z][A-Z0-9_]*)=(?P<value>[^\r\n]*)(?P<n
 MAX_ENGINE_OUTPUT = 256 * 1024
 
 
+class PathSafetyError(InstallerError):
+    """A no-follow path identity check failed; durable evidence must survive."""
+
+
 def _canonical_json(value: Any) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
 
@@ -132,7 +136,7 @@ class RuntimePlan:
                 }
             )
         for directory in (self.runtime_root, self.clone_root, self.lifecycle_root, self.outbox_root):
-            if not directory.exists():
+            if not _path_lexists_nofollow(directory, "runtime plan directory"):
                 changes.insert(0, {"path": str(directory), "action": "mkdir", "mode": "0700"})
         return changes
 
@@ -212,15 +216,85 @@ def _components(path: Path) -> list[Path]:
     return result
 
 
+def _directory_open_flags() -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory:
+        raise PathSafetyError("runtime-kit requires descriptor-relative no-follow directory operations")
+    return os.O_RDONLY | nofollow | directory
+
+
+def _path_safety_error(label: str, path: Path) -> PathSafetyError:
+    return PathSafetyError(
+        f"{label} has an unsafe or substituted path component: {path}; preserve any runtime-kit "
+        "lock, journal, and substituted path, inspect the mismatch, restore the exact caller-owned "
+        "non-symlink path, then rerun --recover to obtain a new recovery digest"
+    )
+
+
+def _inspect_existing_components(path: Path, label: str) -> bool:
+    path = _normalized_absolute(path, label)
+    flags = _directory_open_flags()
+    descriptor = os.open(path.anchor, flags)
+    current = Path(path.anchor)
+    try:
+        parts = path.parts[1:]
+        if not parts:
+            return True
+        for index, part in enumerate(parts):
+            current /= part
+            try:
+                info = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                raise _path_safety_error(label, current) from exc
+            if stat.S_ISLNK(info.st_mode):
+                raise _path_safety_error(label, current)
+            if index == len(parts) - 1:
+                return True
+            if not stat.S_ISDIR(info.st_mode):
+                raise _path_safety_error(label, current)
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except OSError as exc:
+                raise _path_safety_error(label, current) from exc
+            child_info = os.fstat(child)
+            if (child_info.st_dev, child_info.st_ino) != (info.st_dev, info.st_ino):
+                os.close(child)
+                raise _path_safety_error(label, current)
+            os.close(descriptor)
+            descriptor = child
+    finally:
+        os.close(descriptor)
+
+
 def _validate_existing_components(path: Path, label: str) -> None:
-    for component in _components(path):
-        if not os.path.lexists(component):
-            break
-        info = component.lstat()
-        if stat.S_ISLNK(info.st_mode):
-            raise InstallerError(f"{label} contains a symlink: {component}")
-        if component != path and not stat.S_ISDIR(info.st_mode):
-            raise InstallerError(f"{label} parent is not a directory: {component}")
+    _inspect_existing_components(path, label)
+
+
+def _path_lexists_nofollow(path: Path, label: str) -> bool:
+    return _inspect_existing_components(path, label)
+
+
+def _open_directory_nofollow(path: Path, label: str) -> int:
+    path = _normalized_absolute(path, label)
+    flags = _directory_open_flags()
+    descriptor = os.open(path.anchor, flags)
+    current = Path(path.anchor)
+    try:
+        for part in path.parts[1:]:
+            current /= part
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except OSError as exc:
+                raise _path_safety_error(label, current) from exc
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _is_within(path: Path, parent: Path) -> bool:
@@ -263,7 +337,7 @@ def _read_regular(path: Path, label: str, maximum: int = 2 * 1024 * 1024) -> tup
 
 
 def _state(path: Path, *, maximum: int = 2 * 1024 * 1024) -> FileState:
-    if not os.path.lexists(path):
+    if not _path_lexists_nofollow(path, str(path)):
         return FileState(False)
     content, info = _read_regular(path, str(path), maximum)
     return FileState(
@@ -457,12 +531,6 @@ def plan_runtime_kit(
     target = target.resolve(strict=True)
     runtime_root = _normalized_absolute(runtime_root, "runtime root")
     _validate_existing_components(runtime_root, "runtime root")
-    if os.path.lexists(runtime_root / ".runtime-kit.lock") or os.path.lexists(
-        runtime_root / ".runtime-kit-journal.json"
-    ):
-        _validate_recovery_evidence(
-            runtime_root / ".runtime-kit.lock", runtime_root / ".runtime-kit-journal.json"
-        )
     _disjoint(runtime_root, project, "runtime root/project")
     _disjoint(runtime_root, target, "runtime root/installed skill")
     parent = runtime_root.parent
@@ -473,6 +541,23 @@ def plan_runtime_kit(
     clone_root = runtime_root / "attempt-clones"
     lifecycle_root = runtime_root / "lifecycle"
     outbox_root = runtime_root / "outbox-ingress"
+    for directory, label in (
+        (runtime_root, "runtime root"),
+        (clone_root, "clone root"),
+        (lifecycle_root, "lifecycle root"),
+        (outbox_root, "outbox root"),
+        (runtime_root / "assets", "runtime assets root"),
+    ):
+        if _path_lexists_nofollow(directory, label):
+            _validate_private_directory(directory, label)
+    if _path_lexists_nofollow(
+        runtime_root / ".runtime-kit.lock", "runtime-kit lock"
+    ) or _path_lexists_nofollow(
+        runtime_root / ".runtime-kit-journal.json", "runtime-kit journal"
+    ):
+        _validate_recovery_evidence(
+            runtime_root / ".runtime-kit.lock", runtime_root / ".runtime-kit-journal.json"
+        )
     engine, engine_bytes = _validate_protected_executable(engine)
     if not IMAGE.fullmatch(image):
         raise InstallerError("runtime image must be pinned as repository@sha256:<64 lowercase hex>")
@@ -599,7 +684,7 @@ def plan_runtime_kit(
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = _open_directory_nofollow(path, "runtime transaction directory")
     try:
         os.fsync(descriptor)
     finally:
@@ -607,23 +692,45 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _mkdir_chain(path: Path, created: list[Path]) -> None:
-    missing: list[Path] = []
-    cursor = path
-    while not cursor.exists():
-        missing.append(cursor)
-        cursor = cursor.parent
-    for directory in reversed(missing):
-        directory.mkdir(mode=0o700)
-        created.append(directory)
-        _fsync_directory(directory.parent)
-    for directory in _components(path)[1:]:
-        if directory.exists() and _is_within(directory, path.parent.parent):
-            info = directory.lstat()
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                raise InstallerError(f"runtime transaction directory became unsafe: {directory}")
+    path = _normalized_absolute(path, "runtime transaction directory")
+    flags = _directory_open_flags()
+    descriptor = os.open(path.anchor, flags)
+    current = Path(path.anchor)
+    try:
+        for part in path.parts[1:]:
+            current /= part
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                    created.append(current)
+                    os.fsync(descriptor)
+                except FileExistsError:
+                    # A concurrent creator or substituted path must still pass
+                    # the pinned-parent no-follow open below.
+                    pass
+                except OSError as exc:
+                    raise _path_safety_error("runtime transaction directory", current) from exc
+                try:
+                    child = os.open(part, flags, dir_fd=descriptor)
+                except OSError as exc:
+                    raise _path_safety_error("runtime transaction directory", current) from exc
+            except OSError as exc:
+                raise _path_safety_error("runtime transaction directory", current) from exc
+            child_info = os.fstat(child)
+            if not stat.S_ISDIR(child_info.st_mode):
+                os.close(child)
+                raise _path_safety_error("runtime transaction directory", current)
+            os.close(descriptor)
+            descriptor = child
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _validate_private_directory(path: Path, label: str) -> None:
+    _validate_existing_components(path, label)
     try:
         info = path.lstat()
     except OSError as exc:
@@ -641,18 +748,48 @@ def _write_exclusive(path: Path, content: bytes, mode: int) -> None:
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not nofollow:
         raise InstallerError("runtime transaction requires secure no-follow writes")
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, mode)
+    parent = _open_directory_nofollow(path.parent, "runtime transaction file parent")
+    descriptor = -1
     try:
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+                mode,
+                dir_fd=parent,
+            )
+        except OSError as exc:
+            raise _path_safety_error("runtime transaction file", path) from exc
         os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as stream:
             descriptor = -1
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
+        os.fsync(parent)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    _fsync_directory(path.parent)
+        os.close(parent)
+
+
+def _replace_same_parent(source: Path, destination: Path, label: str) -> None:
+    if source.parent != destination.parent:
+        raise PathSafetyError(f"{label} replacement paths do not share one pinned parent")
+    parent = _open_directory_nofollow(destination.parent, f"{label} parent")
+    try:
+        try:
+            os.replace(
+                source.name,
+                destination.name,
+                src_dir_fd=parent,
+                dst_dir_fd=parent,
+            )
+        except OSError as exc:
+            raise _path_safety_error(label, destination) from exc
+        os.fsync(parent)
+    finally:
+        os.close(parent)
 
 
 def _identity_matches(path: Path, state: FileState) -> bool:
@@ -673,8 +810,7 @@ def _replace_config(plan: RuntimePlan) -> None:
         _write_exclusive(temporary, plan.config_after, plan.config_state.mode or 0o600)
         if not _identity_matches(plan.config_path, plan.config_state):
             raise InstallerError("team configuration changed while runtime-kit was preparing")
-        os.replace(temporary, plan.config_path)
-        _fsync_directory(plan.config_path.parent)
+        _replace_same_parent(temporary, plan.config_path, "team configuration")
     finally:
         try:
             temporary.unlink()
@@ -696,12 +832,16 @@ def _owned_transaction_content(path: Path, label: str) -> bytes:
 def _validate_recovery_evidence(lock: Path, journal: Path) -> None:
     """Fail closed on every incomplete transaction, including no-op retries."""
 
-    present = [path for path in (lock, journal) if os.path.lexists(path)]
+    present = [
+        path
+        for path, label in ((lock, "runtime-kit lock"), (journal, "runtime-kit journal"))
+        if _path_lexists_nofollow(path, label)
+    ]
     if not present:
         return
     details: list[str] = []
     for path, label in ((lock, "runtime-kit lock"), (journal, "runtime-kit journal")):
-        if not os.path.lexists(path):
+        if not _path_lexists_nofollow(path, label):
             details.append(f"{label} is missing")
             continue
         try:
@@ -748,7 +888,7 @@ def _state_from_record(value: Any, label: str) -> FileState:
 
 
 def _directory_recovery_state(path: Path) -> dict[str, Any]:
-    if not os.path.lexists(path):
+    if not _path_lexists_nofollow(path, "runtime recovery directory"):
         return {"exists": False}
     _validate_existing_components(path, "runtime recovery directory")
     info = path.lstat()
@@ -761,6 +901,18 @@ def _directory_recovery_state(path: Path) -> dict[str, Any]:
         "mode": stat.S_IMODE(info.st_mode),
         "owner": info.st_uid,
     }
+
+
+def _runtime_namespace_states(runtime_root: Path) -> list[dict[str, Any]]:
+    return [
+        {"path": str(path), "state": _directory_recovery_state(path)}
+        for path in (
+            runtime_root / "assets",
+            runtime_root / "attempt-clones",
+            runtime_root / "lifecycle",
+            runtime_root / "outbox-ingress",
+        )
+    ]
 
 
 def _recovery_material(
@@ -780,6 +932,7 @@ def _recovery_material(
         "files": [],
         "commitMarker": None,
         "directories": [],
+        "runtimeNamespaces": _runtime_namespace_states(runtime_root),
     }
     if journal_value is not None:
         config_path = Path(str(journal_value["configPath"]))
@@ -810,10 +963,14 @@ def plan_runtime_recovery(*, target: Path, runtime_root: Path) -> RuntimeRecover
     target = target.resolve(strict=True)
     runtime_root = _normalized_absolute(runtime_root, "runtime root")
     _validate_existing_components(runtime_root, "runtime root")
+    # Even a lock-only crash reserves these names. A substituted symlink must
+    # block preview before the lock can be cleared and become part of the exact
+    # recovery digest when safely absent or present.
+    _runtime_namespace_states(runtime_root)
     lock = runtime_root / ".runtime-kit.lock"
     journal = runtime_root / ".runtime-kit-journal.json"
-    if not os.path.lexists(lock):
-        if os.path.lexists(journal):
+    if not _path_lexists_nofollow(lock, "runtime-kit lock"):
+        if _path_lexists_nofollow(journal, "runtime-kit journal"):
             raise InstallerError("runtime recovery journal has no matching lock and is preserved for operator inspection")
         raise InstallerError("runtime-kit recovery found no unresolved lock/journal")
     lock_content = _owned_transaction_content(lock, "runtime-kit lock")
@@ -850,7 +1007,7 @@ def plan_runtime_recovery(*, target: Path, runtime_root: Path) -> RuntimeRecover
     journal_value: dict[str, Any] | None = None
     action = "clear-lock"
     phase = "locked"
-    if os.path.lexists(journal):
+    if _path_lexists_nofollow(journal, "runtime-kit journal"):
         journal_content = _owned_transaction_content(journal, "runtime-kit journal")
         try:
             journal_value = _strict_object(journal_content, "runtime-kit journal")
@@ -936,7 +1093,7 @@ def plan_runtime_recovery(*, target: Path, runtime_root: Path) -> RuntimeRecover
             ".runtime-kit-committed-" + str(journal_value["installationDigest"]).split(":", 1)[1]
         )
         marker_exact = False
-        if os.path.lexists(marker):
+        if _path_lexists_nofollow(marker, "runtime-kit commit marker"):
             marker_content = _owned_transaction_content(marker, "runtime-kit commit marker")
             marker_value = _strict_object(marker_content, "runtime-kit commit marker")
             marker_exact = marker_value == {
@@ -1029,8 +1186,7 @@ def recover_runtime_kit(plan: RuntimeRecoveryPlan, *, expected_recovery_digest: 
     if current_config.digest == journal["configAfterSha256"]:
         temporary = config_path.with_name(f".{config_path.name}.recovery.{os.getpid()}.{secrets.token_hex(8)}")
         _write_exclusive(temporary, config_before, config_before_state.mode or 0o600)
-        os.replace(temporary, config_path)
-        _fsync_directory(config_path.parent)
+        _replace_same_parent(temporary, config_path, "runtime recovery configuration")
     elif current_config.digest != config_before_state.digest:
         raise InstallerError("runtime recovery config matches neither exact pre-image nor post-image; evidence was preserved")
     for record in reversed(journal["files"]):
@@ -1051,7 +1207,7 @@ def recover_runtime_kit(plan: RuntimeRecoveryPlan, *, expected_recovery_digest: 
                 raise InstallerError("created runtime asset changed during recovery; evidence was preserved")
             path.unlink()
             _fsync_directory(path.parent)
-    if os.path.lexists(marker):
+    if _path_lexists_nofollow(marker, "runtime-kit commit marker"):
         marker_content = _owned_transaction_content(marker, "runtime-kit commit marker")
         marker_value = _strict_object(marker_content, "runtime-kit commit marker")
         if marker_value != {
@@ -1079,8 +1235,7 @@ def _replace_owned_transaction_file(path: Path, before: bytes, after: bytes) -> 
         _write_exclusive(temporary, after, 0o600)
         if _owned_transaction_content(path, "runtime-kit journal") != before:
             raise InstallerError("runtime-kit journal changed before phase advancement")
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
+        _replace_same_parent(temporary, path, "runtime-kit journal")
     finally:
         try:
             temporary.unlink()
@@ -1207,6 +1362,13 @@ def apply_runtime_kit(plan: RuntimePlan, *, expected_plan_digest: str) -> None:
         journal_created = False
         _fsync_directory(plan.runtime_root)
     except BaseException as original:
+        if isinstance(original, PathSafetyError) and (lock_created or journal_created):
+            raise InstallerError(
+                "runtime-kit detected an unsafe path substitution after durable transaction evidence; "
+                "the lock, journal, and substituted path were preserved. Inspect the recorded paths, "
+                "restore the exact caller-owned non-symlink namespace, then run --recover for a new "
+                "digest-bound recovery preview"
+            ) from original
         rollback_errors: list[str] = []
         if config_replaced:
             try:
@@ -1218,8 +1380,7 @@ def apply_runtime_kit(plan: RuntimePlan, *, expected_plan_digest: str) -> None:
                 else:
                     temporary = plan.config_path.with_name(f".{plan.config_path.name}.rollback.{os.getpid()}")
                     _write_exclusive(temporary, plan.config_before, plan.config_state.mode or 0o600)
-                    os.replace(temporary, plan.config_path)
-                    _fsync_directory(plan.config_path.parent)
+                    _replace_same_parent(temporary, plan.config_path, "runtime rollback configuration")
             except BaseException as exc:
                 rollback_errors.append(str(exc))
         for item in reversed(created_files):
