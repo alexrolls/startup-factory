@@ -43,6 +43,7 @@
     "bin/dispatch.sh",
     "bin/delivery_profile.py",
     "bin/evidence_provider.py",
+    "bin/governed-validation.py",
     "bin/launch-team.sh",
     "bin/superpowers-planning.py",
     "bin/ticket_content_security.py",

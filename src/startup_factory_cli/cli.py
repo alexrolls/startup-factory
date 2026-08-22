@@ -20,7 +20,13 @@ from .installer import (
     verify_installation,
 )
 from .readiness import MODES, diagnose, initialize
-from .runtime_kit import apply_runtime_kit, plan_runtime_kit, probe_runtime_kit
+from .runtime_kit import (
+    apply_runtime_kit,
+    plan_runtime_kit,
+    plan_runtime_recovery,
+    probe_runtime_kit,
+    recover_runtime_kit,
+)
 
 
 AGENTS = ("codex", "aider", "claude", "claude-code")
@@ -98,6 +104,11 @@ def build_parser() -> argparse.ArgumentParser:
     runtime.add_argument("--apply", action="store_true")
     runtime.add_argument("--plan-digest")
     runtime.add_argument("--probe", action="store_true")
+    runtime.add_argument(
+        "--recover",
+        action="store_true",
+        help="preview unresolved transaction recovery; combine with --apply and the recovery digest to execute",
+    )
     runtime.add_argument("--host-platform", choices=("linux", "darwin"), help=argparse.SUPPRESS)
     version = subparsers.add_parser("version", help="print the installer package version")
     version.add_argument("--json", action="store_true", help="emit one machine-readable JSON result")
@@ -232,6 +243,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_doctor_report(report, as_json=json_output)
             return 0 if report.ready else 1
         elif args.command == "runtime-kit":
+            if args.probe and args.recover:
+                raise InstallerError("runtime-kit --probe and --recover are mutually exclusive")
+            if args.recover:
+                recovery = plan_runtime_recovery(target=target, runtime_root=args.runtime_root)
+                if args.apply:
+                    if not args.plan_digest:
+                        raise InstallerError("runtime-kit recovery apply requires its exact preview --plan-digest")
+                    recover_runtime_kit(recovery, expected_recovery_digest=args.plan_digest)
+                result_data = recovery.as_dict(applied=bool(args.apply))
+                if json_output:
+                    print(json.dumps(result_data, sort_keys=True, separators=(",", ":")))
+                else:
+                    verb = "Applied" if args.apply else "Previewed"
+                    print(f"{verb} runtime-kit recovery for phase {recovery.phase}: {recovery.action}")
+                    print("Recovery never proves or promotes an OS security boundary.")
+                return 0
             plan = plan_runtime_kit(
                 target=target,
                 project=args.project,

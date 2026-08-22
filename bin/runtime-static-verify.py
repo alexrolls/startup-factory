@@ -153,6 +153,17 @@ def verify(target: Path) -> dict[str, Any]:
         private_directory(path, label)
     runner = read_file(runner_path, "runner", mode=0o700, executable=True)
     manifest_content = read_file(manifest_path, "manifest", mode=0o600)
+    runtime_root = manifest_path.parent.parent.parent
+    unresolved = [
+        path.name
+        for path in (runtime_root / ".runtime-kit.lock", runtime_root / ".runtime-kit-journal.json")
+        if os.path.lexists(path)
+    ]
+    if unresolved:
+        fail(
+            "unresolved runtime-kit transaction evidence (%s); run the exact runtime-kit command "
+            "with --recover to preview digest-bound recovery" % ", ".join(unresolved)
+        )
     manifest = strict_json(manifest_content, "manifest")
     expected_keys = {
         "schemaVersion", "profile", "sourceAssetsSha256", "engine", "image", "runner",
@@ -207,7 +218,6 @@ def verify(target: Path) -> dict[str, Any]:
     if manifest.get("sourceAssetsSha256") != digest(source):
         fail("source asset binding changed")
     config_content = read_file(target / "config/team.config.md", "team configuration")
-    runtime_root = manifest_path.parent.parent.parent
     desired = {
         "schemaVersion": 1,
         "profile": "rootless-podman-5",

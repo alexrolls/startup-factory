@@ -147,6 +147,9 @@ VALIDATE_SCRIPT=null             # alternative to the four above: a repo-relativ
                                  # that receives the changed-file list as arguments and
                                  # runs whatever applies (per-area suites, tools that only
                                  # exist mid-feature). When set, it replaces VALIDATE_*.
+                                 # Enforced standalone mode runs it only in a fresh protected
+                                 # clone of the exact broker quarantine commit, never on the
+                                 # host in the producer or canonical checkout.
 ```
 
 Put stable, non-secret validation environment assignments directly in the

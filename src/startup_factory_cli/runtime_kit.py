@@ -158,6 +158,45 @@ class RuntimePlan:
         }
 
 
+@dataclasses.dataclass(frozen=True)
+class RuntimeRecoveryPlan:
+    target: Path
+    runtime_root: Path
+    lock: Path
+    journal: Path
+    action: str
+    phase: str
+    transaction_token: str
+    plan_digest: str
+    installation_digest: str
+    lock_content: bytes
+    journal_content: bytes | None
+    journal_value: Mapping[str, Any] | None
+    recovery_digest: str
+
+    def as_dict(self, *, applied: bool) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "action": "runtime-kit-recovery",
+            "schemaVersion": 1,
+            "applied": applied,
+            "ready": False,
+            "readiness": "configured_unproved",
+            "runtimeRoot": str(self.runtime_root),
+            "transactionPhase": self.phase,
+            "recoveryAction": self.action,
+            "planDigest": self.plan_digest,
+            "installationDigest": self.installation_digest,
+            "recoveryDigest": self.recovery_digest,
+            "remediation": (
+                "Apply only this exact recovery with --recover --apply --plan-digest "
+                f"{self.recovery_digest}; foreign or changed evidence remains preserved."
+                if not applied
+                else "Recovery completed without promoting readiness; rerun runtime-kit preview and doctor."
+            ),
+        }
+
+
 def _normalized_absolute(path: Path, label: str) -> Path:
     if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
         raise InstallerError(f"{label} must be an absolute normalized path")
@@ -418,6 +457,12 @@ def plan_runtime_kit(
     target = target.resolve(strict=True)
     runtime_root = _normalized_absolute(runtime_root, "runtime root")
     _validate_existing_components(runtime_root, "runtime root")
+    if os.path.lexists(runtime_root / ".runtime-kit.lock") or os.path.lexists(
+        runtime_root / ".runtime-kit-journal.json"
+    ):
+        _validate_recovery_evidence(
+            runtime_root / ".runtime-kit.lock", runtime_root / ".runtime-kit-journal.json"
+        )
     _disjoint(runtime_root, project, "runtime root/project")
     _disjoint(runtime_root, target, "runtime root/installed skill")
     parent = runtime_root.parent
@@ -675,8 +720,355 @@ def _validate_recovery_evidence(lock: Path, journal: Path) -> None:
         except InstallerError as exc:
             details.append(str(exc))
     raise InstallerError(
-        "incomplete runtime-kit recovery state requires operator inspection; " + "; ".join(details)
+        "incomplete runtime-kit recovery state requires the explicit recovery preview "
+        "(rerun the same runtime-kit command with --recover); " + "; ".join(details)
     )
+
+
+def _state_from_record(value: Any, label: str) -> FileState:
+    names = {field.name for field in dataclasses.fields(FileState)}
+    if not isinstance(value, dict) or set(value) != names or type(value.get("exists")) is not bool:
+        raise InstallerError(f"{label} has an invalid file-state record")
+    state = FileState(**value)
+    if not state.exists:
+        if any(getattr(state, name) is not None for name in names - {"exists"}):
+            raise InstallerError(f"{label} absent state contains unexpected metadata")
+        return state
+    if (
+        any(type(getattr(state, name)) is not int for name in ("device", "inode", "mode", "owner", "links", "size"))
+        or state.links != 1
+        or state.owner != os.geteuid()
+        or state.size is None
+        or state.size < 0
+        or not isinstance(state.digest, str)
+        or DIGEST.fullmatch(state.digest) is None
+    ):
+        raise InstallerError(f"{label} existing state is unsafe")
+    return state
+
+
+def _directory_recovery_state(path: Path) -> dict[str, Any]:
+    if not os.path.lexists(path):
+        return {"exists": False}
+    _validate_existing_components(path, "runtime recovery directory")
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise InstallerError(f"runtime recovery directory is unsafe: {path}")
+    return {
+        "exists": True,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+        "owner": info.st_uid,
+    }
+
+
+def _recovery_material(
+    *,
+    target: Path,
+    runtime_root: Path,
+    lock_content: bytes,
+    journal_content: bytes | None,
+    journal_value: Mapping[str, Any] | None,
+    action: str,
+    phase: str,
+) -> dict[str, Any]:
+    current: dict[str, Any] = {
+        "lockSha256": _sha256(lock_content),
+        "journalSha256": None if journal_content is None else _sha256(journal_content),
+        "config": None,
+        "files": [],
+        "commitMarker": None,
+        "directories": [],
+    }
+    if journal_value is not None:
+        config_path = Path(str(journal_value["configPath"]))
+        current["config"] = _state(config_path).as_dict()
+        for record in journal_value["files"]:
+            current["files"].append({"path": record["path"], "state": _state(Path(record["path"])).as_dict()})
+        marker = runtime_root / (
+            ".runtime-kit-committed-" + str(journal_value["installationDigest"]).split(":", 1)[1]
+        )
+        current["commitMarker"] = {"path": str(marker), "state": _state(marker).as_dict()}
+        current["directories"] = [
+            {"path": value, "state": _directory_recovery_state(Path(value))}
+            for value in journal_value["createdDirectories"]
+        ]
+    return {
+        "schemaVersion": 1,
+        "target": str(target),
+        "runtimeRoot": str(runtime_root),
+        "action": action,
+        "phase": phase,
+        "evidence": current,
+    }
+
+
+def plan_runtime_recovery(*, target: Path, runtime_root: Path) -> RuntimeRecoveryPlan:
+    """Build an immutable recovery preview from exact durable transaction evidence."""
+
+    target = target.resolve(strict=True)
+    runtime_root = _normalized_absolute(runtime_root, "runtime root")
+    _validate_existing_components(runtime_root, "runtime root")
+    lock = runtime_root / ".runtime-kit.lock"
+    journal = runtime_root / ".runtime-kit-journal.json"
+    if not os.path.lexists(lock):
+        if os.path.lexists(journal):
+            raise InstallerError("runtime recovery journal has no matching lock and is preserved for operator inspection")
+        raise InstallerError("runtime-kit recovery found no unresolved lock/journal")
+    lock_content = _owned_transaction_content(lock, "runtime-kit lock")
+    try:
+        lock_value = _strict_object(lock_content, "runtime-kit lock")
+    except InstallerError as exc:
+        raise InstallerError("runtime-kit lock is malformed or foreign and was preserved") from exc
+    required_lock = {
+        "schemaVersion", "phase", "transactionToken", "ownerPid", "planDigest", "installationDigest"
+    }
+    if (
+        set(lock_value) != required_lock
+        or lock_value.get("schemaVersion") != 2
+        or lock_value.get("phase") != "locked"
+        or re.fullmatch(r"[0-9a-f]{64}", str(lock_value.get("transactionToken") or "")) is None
+        or type(lock_value.get("ownerPid")) is not int
+        or lock_value["ownerPid"] < 1
+        or DIGEST.fullmatch(str(lock_value.get("planDigest") or "")) is None
+        or DIGEST.fullmatch(str(lock_value.get("installationDigest") or "")) is None
+    ):
+        raise InstallerError("runtime-kit lock is malformed or foreign and was preserved")
+    try:
+        os.kill(lock_value["ownerPid"], 0)
+    except ProcessLookupError:
+        pass
+    except (PermissionError, OSError) as exc:
+        raise InstallerError(
+            "runtime-kit transaction owner cannot be safely proved dead; lock was preserved"
+        ) from exc
+    else:
+        raise InstallerError("runtime-kit transaction owner is still active; lock was preserved")
+    token = str(lock_value["transactionToken"])
+    journal_content: bytes | None = None
+    journal_value: dict[str, Any] | None = None
+    action = "clear-lock"
+    phase = "locked"
+    if os.path.lexists(journal):
+        journal_content = _owned_transaction_content(journal, "runtime-kit journal")
+        try:
+            journal_value = _strict_object(journal_content, "runtime-kit journal")
+        except InstallerError as exc:
+            raise InstallerError(
+                "runtime-kit journal is malformed or foreign and was preserved"
+            ) from exc
+        required_journal = {
+            "schemaVersion", "phase", "transactionToken", "ownerPid", "planDigest", "installationDigest",
+            "configPath", "configBefore", "configBeforeState", "configAfterSha256", "files",
+            "createdDirectories",
+        }
+        phase = str(journal_value.get("phase") or "")
+        if (
+            set(journal_value) != required_journal
+            or journal_value.get("schemaVersion") != 2
+            or phase not in {"prepared", "assets-written", "config-replaced", "commit-marked"}
+            or journal_value.get("transactionToken") != token
+            or journal_value.get("ownerPid") != lock_value["ownerPid"]
+            or journal_value.get("planDigest") != lock_value["planDigest"]
+            or journal_value.get("installationDigest") != lock_value["installationDigest"]
+            or DIGEST.fullmatch(str(journal_value.get("configAfterSha256") or "")) is None
+        ):
+            raise InstallerError("runtime-kit journal is malformed, foreign, or does not match its lock; evidence was preserved")
+        config_path = Path(str(journal_value["configPath"]))
+        expected_config = target / "config/team.config.md"
+        if config_path != expected_config or not config_path.is_absolute():
+            raise InstallerError("runtime-kit recovery config path is outside the installed target")
+        before_state = _state_from_record(journal_value["configBeforeState"], "runtime-kit config pre-state")
+        try:
+            before_content = base64.b64decode(str(journal_value["configBefore"]), validate=True)
+        except (ValueError, TypeError) as exc:
+            raise InstallerError("runtime-kit config pre-image is malformed") from exc
+        if not before_state.exists or before_state.digest != _sha256(before_content) or before_state.size != len(before_content):
+            raise InstallerError("runtime-kit config pre-image does not match its recorded digest")
+        files = journal_value.get("files")
+        if not isinstance(files, list) or len(files) != 4:
+            raise InstallerError("runtime-kit recovery requires exactly four runtime assets")
+        seen_paths: set[Path] = set()
+        for record in files:
+            if not isinstance(record, dict) or set(record) != {"path", "before", "afterMode", "afterSha256"}:
+                raise InstallerError("runtime-kit recovery asset record is malformed")
+            path = Path(str(record["path"]))
+            if (
+                not path.is_absolute()
+                or path in seen_paths
+                or not _is_within(path, runtime_root / "assets")
+                or type(record["afterMode"]) is not int
+                or record["afterMode"] not in {0o600, 0o700}
+                or DIGEST.fullmatch(str(record["afterSha256"])) is None
+            ):
+                raise InstallerError("runtime-kit recovery asset identity is unsafe")
+            _state_from_record(record["before"], f"runtime-kit asset pre-state {path}")
+            seen_paths.add(path)
+        directories = journal_value.get("createdDirectories")
+        if not isinstance(directories, list) or len(directories) > 32 or len(directories) != len(set(directories)):
+            raise InstallerError("runtime-kit created-directory recovery record is malformed")
+        for value in directories:
+            path = Path(str(value))
+            if not path.is_absolute() or not _is_within(path, runtime_root):
+                raise InstallerError("runtime-kit created-directory recovery path escapes runtime root")
+        action = "finalize-commit" if phase == "commit-marked" else "rollback"
+        current_config = _state(config_path)
+        if current_config.digest not in {before_state.digest, journal_value["configAfterSha256"]}:
+            raise InstallerError("runtime recovery config matches neither recorded pre-image nor post-image; evidence was preserved")
+        all_after = current_config.digest == journal_value["configAfterSha256"]
+        for record in files:
+            path = Path(record["path"])
+            before = _state_from_record(record["before"], f"runtime-kit asset pre-state {path}")
+            current_state = _state(path)
+            matches_before = current_state == before
+            matches_after = bool(
+                current_state.exists
+                and current_state.digest == record["afterSha256"]
+                and current_state.mode == record["afterMode"]
+                and current_state.owner == os.geteuid()
+                and current_state.links == 1
+            )
+            if not matches_before and not matches_after:
+                raise InstallerError("runtime recovery asset matches neither recorded pre-state nor post-image; evidence was preserved")
+            all_after = all_after and matches_after
+        marker = runtime_root / (
+            ".runtime-kit-committed-" + str(journal_value["installationDigest"]).split(":", 1)[1]
+        )
+        marker_exact = False
+        if os.path.lexists(marker):
+            marker_content = _owned_transaction_content(marker, "runtime-kit commit marker")
+            marker_value = _strict_object(marker_content, "runtime-kit commit marker")
+            marker_exact = marker_value == {
+                "schemaVersion": 1,
+                "installationDigest": journal_value["installationDigest"],
+                "appliedPlanDigest": journal_value["planDigest"],
+            }
+            if not marker_exact:
+                raise InstallerError("runtime recovery commit marker is not exact; evidence was preserved")
+        if action == "finalize-commit" and (not all_after or not marker_exact):
+            raise InstallerError("commit-marked recovery is incomplete or changed; evidence was preserved")
+    material = _recovery_material(
+        target=target,
+        runtime_root=runtime_root,
+        lock_content=lock_content,
+        journal_content=journal_content,
+        journal_value=journal_value,
+        action=action,
+        phase=phase,
+    )
+    recovery_digest = _sha256(_canonical_json(material))
+    return RuntimeRecoveryPlan(
+        target,
+        runtime_root,
+        lock,
+        journal,
+        action,
+        phase,
+        token,
+        str(lock_value["planDigest"]),
+        str(lock_value["installationDigest"]),
+        lock_content,
+        journal_content,
+        journal_value,
+        recovery_digest,
+    )
+
+
+def _unlink_exact(path: Path, expected: bytes, label: str) -> None:
+    if _owned_transaction_content(path, label) != expected:
+        raise InstallerError(f"{label} changed after recovery preview and was preserved")
+    path.unlink()
+    _fsync_directory(path.parent)
+
+
+def recover_runtime_kit(plan: RuntimeRecoveryPlan, *, expected_recovery_digest: str) -> None:
+    if expected_recovery_digest != plan.recovery_digest or DIGEST.fullmatch(expected_recovery_digest) is None:
+        raise InstallerError("--plan-digest must exactly match the current immutable recovery preview")
+    current = plan_runtime_recovery(target=plan.target, runtime_root=plan.runtime_root)
+    if current.recovery_digest != plan.recovery_digest:
+        raise InstallerError("runtime recovery evidence or affected state changed after preview")
+    if plan.action == "clear-lock":
+        _unlink_exact(plan.lock, plan.lock_content, "runtime-kit lock")
+        try:
+            plan.runtime_root.rmdir()
+        except OSError:
+            pass
+        return
+    assert plan.journal_content is not None and plan.journal_value is not None
+    journal = dict(plan.journal_value)
+    marker = plan.runtime_root / f".runtime-kit-committed-{plan.installation_digest.split(':', 1)[1]}"
+    if plan.action == "finalize-commit":
+        config = _state(Path(str(journal["configPath"])))
+        if config.digest != journal["configAfterSha256"]:
+            raise InstallerError("committed runtime recovery config post-image changed; evidence was preserved")
+        for record in journal["files"]:
+            state = _state(Path(record["path"]))
+            if (
+                state.digest != record["afterSha256"]
+                or state.mode != record["afterMode"]
+                or state.owner != os.geteuid()
+                or state.links != 1
+            ):
+                raise InstallerError("committed runtime recovery asset changed; evidence was preserved")
+        marker_content = _owned_transaction_content(marker, "runtime-kit commit marker")
+        marker_value = _strict_object(marker_content, "runtime-kit commit marker")
+        if marker_value != {
+            "schemaVersion": 1,
+            "installationDigest": plan.installation_digest,
+            "appliedPlanDigest": plan.plan_digest,
+        }:
+            raise InstallerError("committed runtime recovery marker is not exact; evidence was preserved")
+        _unlink_exact(plan.journal, plan.journal_content, "runtime-kit journal")
+        _unlink_exact(plan.lock, plan.lock_content, "runtime-kit lock")
+        return
+    config_path = Path(str(journal["configPath"]))
+    config_before = base64.b64decode(str(journal["configBefore"]), validate=True)
+    config_before_state = _state_from_record(journal["configBeforeState"], "runtime-kit config pre-state")
+    current_config = _state(config_path)
+    if current_config.digest == journal["configAfterSha256"]:
+        temporary = config_path.with_name(f".{config_path.name}.recovery.{os.getpid()}.{secrets.token_hex(8)}")
+        _write_exclusive(temporary, config_before, config_before_state.mode or 0o600)
+        os.replace(temporary, config_path)
+        _fsync_directory(config_path.parent)
+    elif current_config.digest != config_before_state.digest:
+        raise InstallerError("runtime recovery config matches neither exact pre-image nor post-image; evidence was preserved")
+    for record in reversed(journal["files"]):
+        path = Path(record["path"])
+        before = _state_from_record(record["before"], f"runtime-kit asset pre-state {path}")
+        current_state = _state(path)
+        if before.exists:
+            if current_state != before:
+                raise InstallerError("pre-existing runtime asset changed during recovery; evidence was preserved")
+            continue
+        if current_state.exists:
+            if (
+                current_state.digest != record["afterSha256"]
+                or current_state.mode != record["afterMode"]
+                or current_state.owner != os.geteuid()
+                or current_state.links != 1
+            ):
+                raise InstallerError("created runtime asset changed during recovery; evidence was preserved")
+            path.unlink()
+            _fsync_directory(path.parent)
+    if os.path.lexists(marker):
+        marker_content = _owned_transaction_content(marker, "runtime-kit commit marker")
+        marker_value = _strict_object(marker_content, "runtime-kit commit marker")
+        if marker_value != {
+            "schemaVersion": 1,
+            "installationDigest": plan.installation_digest,
+            "appliedPlanDigest": plan.plan_digest,
+        }:
+            raise InstallerError("runtime recovery commit marker changed; evidence was preserved")
+        marker.unlink()
+        _fsync_directory(marker.parent)
+    _unlink_exact(plan.journal, plan.journal_content, "runtime-kit journal")
+    _unlink_exact(plan.lock, plan.lock_content, "runtime-kit lock")
+    for value in reversed(journal["createdDirectories"]):
+        try:
+            Path(value).rmdir()
+        except OSError:
+            pass
 
 
 def _replace_owned_transaction_file(path: Path, before: bytes, after: bytes) -> None:
@@ -742,6 +1134,7 @@ def apply_runtime_kit(plan: RuntimePlan, *, expected_plan_digest: str) -> None:
             "schemaVersion": 2,
             "phase": "locked",
             "transactionToken": token,
+            "ownerPid": os.getpid(),
             "planDigest": plan.plan_digest,
             "installationDigest": plan.installation_digest,
         }
@@ -750,6 +1143,7 @@ def apply_runtime_kit(plan: RuntimePlan, *, expected_plan_digest: str) -> None:
         "schemaVersion": 2,
         "phase": "prepared",
         "transactionToken": token,
+        "ownerPid": os.getpid(),
         "planDigest": plan.plan_digest,
         "installationDigest": plan.installation_digest,
         "configPath": str(plan.config_path),

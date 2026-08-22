@@ -62,6 +62,73 @@ class StandaloneWorkspaceTest(unittest.TestCase):
         self.assertEqual(self.git(self.repo, "rev-parse", imported["quarantineRef"] + "^{tree}"), imported["tree"])
         self.assertRegex(imported["bundleSha256"], r"^sha256:[0-9a-f]{64}$")
 
+    def test_fresh_disposable_clone_can_import_only_the_exact_quarantine_head(self) -> None:
+        producer = self.create()
+        (producer / "change.txt").write_text("exact imported validation input\n")
+        self.git(producer, "add", "change.txt")
+        self.git(producer, "commit", "-qm", "task checkpoint")
+        imported = module.quarantine_import(
+            self.repo,
+            producer,
+            self.branch,
+            self.base,
+            "feature-runtime",
+            "task-key",
+            1,
+            self.root / "broker" / "task.bundle",
+        )
+        validator = module.create_attempt(
+            self.repo,
+            self.clone_root,
+            "feature-runtime",
+            "integration-validator",
+            1,
+            "task-key-validation",
+            "startup-factory-validation/exact-head",
+            imported["headCommit"],
+        )
+        validation_clone = Path(validator["path"])
+        self.assertEqual(validator["headCommit"], imported["headCommit"])
+        self.assertEqual(validator["tree"], imported["tree"])
+        self.assertEqual(
+            self.git(validation_clone, "for-each-ref", "--format=%(refname)"),
+            "refs/heads/startup-factory-validation/exact-head",
+        )
+        self.assertFalse((validation_clone / ".git/commondir").exists())
+
+    def test_create_cli_rejects_an_extra_unbound_clone_root_argument(self) -> None:
+        result = subprocess.run(
+            [
+                "python3",
+                str(ROOT / "bin/standalone_workspace.py"),
+                "create",
+                "--repo",
+                str(self.repo),
+                "--root",
+                str(self.clone_root),
+                str(self.clone_root),
+                "--team",
+                "feature-runtime",
+                "--role",
+                "integration-validator",
+                "--attempt",
+                "1",
+                "--task-key",
+                "task-key-validation",
+                "--branch",
+                "startup-factory-validation/exact-head",
+                "--base-ref",
+                self.base,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unrecognized arguments", result.stderr)
+        self.assertFalse(self.clone_root.exists())
+
     def test_dirty_extra_refs_and_unsafe_git_config_fail_closed(self) -> None:
         clone = self.create()
         (clone / "dirty").write_text("dirty\n")

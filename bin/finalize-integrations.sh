@@ -339,7 +339,16 @@ def git(*args):
     if result.returncode: fail("Git check failed: "+(result.stderr.strip() or result.stdout.strip()))
     return result.stdout.strip()
 if git("rev-parse","refs/heads/"+team) != data["baseCommit"]: fail("feature branch moved after preparation")
-if git("rev-parse","refs/heads/"+data["branch"]) != data["taskBranchHead"]: fail("task branch moved after preparation")
+execution_path=workspace/"executions"/(data["taskKey"]+".json")
+regular(execution_path,"execution record",1024*1024)
+try: execution=json.loads(execution_path.read_text())
+except (OSError,ValueError) as exc: fail("invalid execution record: %s"%exc)
+if execution.get("worktreeMode")=="standalone-clone":
+    suffix=hashlib.sha256((team+"\0"+data["taskKey"]+"\0"+str(data["attempt"])+"\0"+data["taskBranchHead"]).encode()).hexdigest()[:32]
+    source_ref="refs/startup-factory/quarantine/"+suffix
+else:
+    source_ref="refs/heads/"+data["branch"]
+if git("rev-parse",source_ref) != data["taskBranchHead"]: fail("task source ref moved after preparation")
 if git("merge-base",data["baseCommit"],data["taskBranchHead"]) != data["reviewBaseCommit"]: fail("review base mismatch")
 package=Path(str(data["reviewPackagePath"]))
 try: package.resolve().relative_to(workspace)
@@ -409,6 +418,11 @@ PY
 
 run_recovery_validation() {
   local changed="$1" value command
+  if [ "$(read_key TASK_WORKTREE_MODE)" = "standalone-clone" ] \
+    && [ "$(read_key AGENT_SANDBOX_ENFORCED)" = "true" ]; then
+    echo "finalize-integrations: governed late-invalidation recovery refuses host validation; preserve the recovery journal and run an exact protected recovery workflow" >&2
+    return 125
+  fi
   value="$(read_key VALIDATE_SCRIPT)"
   if [ -n "$value" ]; then
     local changed_files=() item
@@ -606,11 +620,11 @@ fi
 # evidence bindings. Output is a stable line protocol consumed below.
 validate_entry() {
   local entry="$1" snapshot="${2:-}"
-  python3 - "$entry" "$repo" "$workspace" "$team" "$feature" "$snapshot" "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/bin/review_evidence.py" "$(read_key BROKER_TASK_CLONE_ROOT)" <<'PY'
+  python3 - "$entry" "$repo" "$workspace" "$team" "$feature" "$snapshot" "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/bin/review_evidence.py" "$(read_key BROKER_TASK_CLONE_ROOT)" "$(read_key AGENT_SANDBOX_ENFORCED)" <<'PY'
 import hashlib, json, os, re, stat, subprocess, sys
 from pathlib import Path
 
-entry_raw, repo_raw, workspace_raw, team, feature, snapshot_raw, board_raw, review_module_raw, clone_root_raw = sys.argv[1:]
+entry_raw, repo_raw, workspace_raw, team, feature, snapshot_raw, board_raw, review_module_raw, clone_root_raw, enforced_raw = sys.argv[1:]
 repo, workspace = Path(repo_raw).resolve(), Path(workspace_raw).resolve()
 entry = Path(entry_raw)
 sys.dont_write_bytecode = True
@@ -675,7 +689,10 @@ required = {
     "executionDigest", "reviewPackagePath", "reviewPackageSha256", "approvalEvidenceDigest",
     "completionBodyPath", "completionBodySha256", "updatedAt",
 }
-unknown, missing = set(data) - required, required - set(data)
+merge_validation_fields = {
+    "mergeValidationPath", "mergeValidationSha256", "mergeValidationCommit", "mergeValidationTree",
+}
+unknown, missing = set(data) - required - merge_validation_fields, required - set(data)
 if unknown or missing:
     fail("transaction fields mismatch (missing=%s unknown=%s)" % (sorted(missing), sorted(unknown)))
 if data["team"] != team or data["featureId"] != feature:
@@ -715,12 +732,20 @@ if worktree_mode == "standalone-clone":
         fail("standalone execution worktree is outside its canonical task slot")
     if not re.fullmatch(r"[0-9a-f]{40,64}", str(execution.get("baseCommit") or "")):
         fail("standalone execution base commit is invalid")
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(execution.get("runtimeManifestDigest") or "")):
-        fail("standalone execution runtime manifest digest is invalid")
+    if enforced_raw not in {"true", "false"}:
+        fail("AGENT_SANDBOX_ENFORCED must be true or false")
+    if enforced_raw == "true" and not re.fullmatch(r"sha256:[0-9a-f]{64}", str(execution.get("runtimeManifestDigest") or "")):
+        fail("governed standalone execution runtime manifest digest is invalid")
 elif worktree_mode == "linked-worktree":
     expected_worktree = workspace / "worktrees" / ("%s#%s-%s" % (role, attempt, key))
 else:
     fail("execution record has an unknown worktree mode")
+governed_standalone = worktree_mode == "standalone-clone" and enforced_raw == "true"
+present_merge_fields = set(data) & merge_validation_fields
+if governed_standalone and present_merge_fields != merge_validation_fields:
+    fail("governed transaction lacks complete protected merge-validation bindings")
+if not governed_standalone and present_merge_fields:
+    fail("legacy transaction unexpectedly carries governed merge-validation bindings")
 if data.get("branch") != expected_branch or Path(str(data.get("worktree"))) != expected_worktree:
     fail("transaction branch/worktree binding mismatch")
 expected_exec = {
@@ -779,11 +804,84 @@ if review_path != expected_review_path:
     fail("review package path is not the exact generated package for base/head")
 regular(review_path, "review package", maximum=8 * 1024 * 1024)
 contained(review_path, workspace, "review package")
-expected_package = "\n".join([
+actual_package = review_path.read_bytes()
+prefix = [
     "# Review package: %s" % task,
     "",
     "Base: %s" % data["reviewBaseCommit"],
     "Head: %s" % data["taskBranchHead"],
+]
+if worktree_mode == "standalone-clone":
+    prefix.append("Quarantine ref: " + source_ref)
+if worktree_mode == "standalone-clone" and enforced_raw == "true":
+    try:
+        package_text = actual_package.decode("utf-8")
+    except UnicodeError:
+        fail("governed review package is not UTF-8")
+    marker = "## Governed validation evidence\n"
+    if package_text.count(marker) != 1:
+        fail("governed review package lacks one validation evidence record")
+    evidence_line = package_text.split(marker, 1)[1].split("\n", 1)[0]
+    try:
+        validation = json.loads(evidence_line)
+    except ValueError as exc:
+        fail("governed validation evidence is malformed: %s" % exc)
+    required_validation = {
+        "schemaVersion", "authority", "validationStage", "team", "taskId", "taskKey", "attempt", "quarantineRef",
+        "importedCommit", "importedTree", "runtimeManifestSha256", "runtimeProfile", "runtimeImage",
+        "validationConfigSha256", "changedFilesSha256", "changedFilesCount", "network", "mounts",
+        "scopedCapabilities", "canonicalRepositoryMounted", "producerCloneMounted", "results",
+    }
+    if not isinstance(validation, dict) or set(validation) != required_validation:
+        fail("governed validation evidence fields mismatch")
+    imported_tree = run("git", "rev-parse", data["taskBranchHead"] + "^{tree}").strip()
+    expected_validation = {
+        "schemaVersion": 1,
+        "authority": "governed-standalone-validation",
+        "validationStage": "task-head",
+        "team": team,
+        "taskId": task,
+        "taskKey": key,
+        "attempt": attempt,
+        "quarantineRef": source_ref,
+        "importedCommit": data["taskBranchHead"],
+        "importedTree": imported_tree,
+        "runtimeManifestSha256": execution.get("runtimeManifestDigest"),
+        "runtimeProfile": "rootless-podman-5",
+        "network": "none",
+        "mounts": ["validation-clone-rw", "skill-root-ro"],
+        "scopedCapabilities": [],
+        "canonicalRepositoryMounted": False,
+        "producerCloneMounted": False,
+    }
+    for name, value in expected_validation.items():
+        if validation.get(name) != value:
+            fail("governed validation %s binding mismatch" % name)
+    digest_pattern = re.compile(r"sha256:[0-9a-f]{64}")
+    if not digest_pattern.fullmatch(str(validation.get("validationConfigSha256") or "")):
+        fail("governed validation config digest is invalid")
+    changed_raw = run("git", "diff", "--name-only", "-z", "%s..%s" % (data["reviewBaseCommit"], data["taskBranchHead"]))
+    changed = [value for value in changed_raw.split("\0") if value]
+    changed_digest = "sha256:" + hashlib.sha256((json.dumps(changed, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode()).hexdigest()
+    if validation.get("changedFilesSha256") != changed_digest or validation.get("changedFilesCount") != len(changed):
+        fail("governed validation changed-file binding mismatch")
+    image = validation.get("runtimeImage")
+    if not isinstance(image, str) or re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", image) is None:
+        fail("governed validation image identity is invalid")
+    results = validation.get("results")
+    allowed_names = {"VALIDATE_SCRIPT", "VALIDATE_BUILD", "VALIDATE_TEST", "VALIDATE_LINT", "VALIDATE_FORMAT"}
+    if not isinstance(results, list) or not results or len(results) > 4:
+        fail("governed validation result cardinality is invalid")
+    seen = set()
+    for result in results:
+        if not isinstance(result, dict) or set(result) != {"name", "commandSha256", "status"}:
+            fail("governed validation result is malformed")
+        if result.get("name") not in allowed_names or result["name"] in seen or result.get("status") != "passed" or not digest_pattern.fullmatch(str(result.get("commandSha256") or "")):
+            fail("governed validation result binding is invalid")
+        seen.add(result["name"])
+    evidence = json.dumps(validation, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    prefix.extend(["", "## Governed validation evidence", evidence])
+expected_package = "\n".join(prefix + [
     "",
     "## Commits",
     run("git", "log", "--oneline", "%s..%s" % (data["reviewBaseCommit"], data["taskBranchHead"])).rstrip("\n"),
@@ -794,12 +892,93 @@ expected_package = "\n".join([
     "## Diff",
     run("git", "diff", "-U10", "%s..%s" % (data["reviewBaseCommit"], data["taskBranchHead"])).rstrip("\n"),
 ]) + "\n"
-actual_package = review_path.read_bytes()
 if actual_package != expected_package.encode():
     fail("review package does not exactly reproduce the reviewed Git diff")
 review_digest = "sha256:" + hashlib.sha256(actual_package).hexdigest()
 if data.get("reviewPackageSha256") != review_digest:
     fail("review package digest mismatch")
+
+if governed_standalone:
+    digest_re = re.compile(r"sha256:[0-9a-f]{64}")
+    merge_commit = data.get("mergeValidationCommit")
+    merge_tree = data.get("mergeValidationTree")
+    if not isinstance(merge_commit, str) or not hex_re.fullmatch(merge_commit):
+        fail("protected merge-validation commit is invalid")
+    if not isinstance(merge_tree, str) or not hex_re.fullmatch(merge_tree):
+        fail("protected merge-validation tree is invalid")
+    merge_parents = run("git", "show", "-s", "--format=%P", merge_commit).strip().split()
+    if merge_parents != [data["baseCommit"], data["taskBranchHead"]]:
+        fail("protected merge-validation commit parents mismatch")
+    if run("git", "rev-parse", merge_commit + "^{tree}").strip() != merge_tree:
+        fail("protected merge-validation commit/tree mismatch")
+    if run("git", "rev-parse", data["commit"] + "^{tree}").strip() != merge_tree:
+        fail("integrated tree differs from protected merge validation")
+    suffix = hashlib.sha256((team + "\0" + key + "\0" + str(attempt) + "\0" + data["baseCommit"] + "\0" + data["taskBranchHead"] + "\0" + merge_tree).encode()).hexdigest()[:32]
+    merge_ref = "refs/startup-factory/merge-validation/" + suffix
+    if run("git", "rev-parse", "--verify", merge_ref).strip() != merge_commit:
+        fail("protected merge-validation ref moved")
+    merge_path = Path(str(data.get("mergeValidationPath")))
+    expected_parent = workspace / "artifacts" / key
+    if merge_path.parent != expected_parent or not re.fullmatch(
+        r"governed-validation-merged-feature-%s-[0-9a-f]{16}-[0-9a-f]{16}\.json" % re.escape(merge_commit),
+        merge_path.name,
+    ):
+        fail("protected merge-validation evidence path mismatch")
+    regular(merge_path, "protected merge-validation evidence", maximum=1024 * 1024)
+    contained(merge_path, workspace, "protected merge-validation evidence")
+    merge_content = merge_path.read_bytes()
+    merge_digest = "sha256:" + hashlib.sha256(merge_content).hexdigest()
+    if data.get("mergeValidationSha256") != merge_digest:
+        fail("protected merge-validation evidence digest mismatch")
+    try:
+        merge_evidence = json.loads(merge_content)
+    except ValueError as exc:
+        fail("protected merge-validation evidence is malformed: %s" % exc)
+    expected_merge = {
+        "schemaVersion": 1,
+        "authority": "governed-standalone-validation",
+        "validationStage": "merged-feature",
+        "team": team,
+        "taskId": task,
+        "taskKey": key,
+        "attempt": attempt,
+        "quarantineRef": merge_ref,
+        "importedCommit": merge_commit,
+        "importedTree": merge_tree,
+        "runtimeManifestSha256": execution.get("runtimeManifestDigest"),
+        "runtimeProfile": "rootless-podman-5",
+        "network": "none",
+        "mounts": ["validation-clone-rw", "skill-root-ro"],
+        "scopedCapabilities": [],
+        "canonicalRepositoryMounted": False,
+        "producerCloneMounted": False,
+    }
+    if not isinstance(merge_evidence, dict) or set(merge_evidence) != required_validation:
+        fail("protected merge-validation evidence fields mismatch")
+    for name, value in expected_merge.items():
+        if merge_evidence.get(name) != value:
+            fail("protected merge-validation %s binding mismatch" % name)
+    changed_raw = run("git", "diff", "--name-only", "-z", "%s..%s" % (data["reviewBaseCommit"], data["taskBranchHead"]))
+    changed = [value for value in changed_raw.split("\0") if value]
+    changed_digest = "sha256:" + hashlib.sha256((json.dumps(changed, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode()).hexdigest()
+    if merge_evidence.get("changedFilesSha256") != changed_digest or merge_evidence.get("changedFilesCount") != len(changed):
+        fail("protected merge-validation changed-file binding mismatch")
+    if not digest_re.fullmatch(str(merge_evidence.get("validationConfigSha256") or "")):
+        fail("protected merge-validation config digest is invalid")
+    if not isinstance(merge_evidence.get("runtimeImage"), str) or re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", merge_evidence["runtimeImage"]) is None:
+        fail("protected merge-validation image identity is invalid")
+    results = merge_evidence.get("results")
+    if not isinstance(results, list) or not results or len(results) > 4:
+        fail("protected merge-validation result cardinality is invalid")
+    if any(
+        not isinstance(result, dict)
+        or set(result) != {"name", "commandSha256", "status"}
+        or result.get("status") != "passed"
+        or result.get("name") not in {"VALIDATE_SCRIPT", "VALIDATE_BUILD", "VALIDATE_TEST", "VALIDATE_LINT", "VALIDATE_FORMAT"}
+        or not digest_re.fullmatch(str(result.get("commandSha256") or ""))
+        for result in results
+    ):
+        fail("protected merge-validation results are invalid")
 
 body_path = Path(str(data.get("completionBodyPath")))
 expected_body = workspace / "artifacts" / key / "integration-completion.md"
@@ -831,6 +1010,12 @@ expected_trailers = {
     "Review-Package-SHA256": review_digest,
     "Approval-Evidence-SHA256": data["approvalEvidenceDigest"],
 }
+if governed_standalone:
+    expected_trailers.update({
+        "Merge-Validation-Commit": data["mergeValidationCommit"],
+        "Merge-Validation-Tree": data["mergeValidationTree"],
+        "Merge-Validation-SHA256": data["mergeValidationSha256"],
+    })
 
 # The prepared intent is deterministic from immutable integration material and
 # must still exist as broker evidence. This makes the pre-commit authorization
@@ -899,6 +1084,12 @@ tx_material = {
     "reviewPackageSha256": review_digest,
     "approvalEvidenceDigest": data["approvalEvidenceDigest"],
 }
+if governed_standalone:
+    tx_material.update({
+        "mergeValidationCommit": data["mergeValidationCommit"],
+        "mergeValidationTree": data["mergeValidationTree"],
+        "mergeValidationSha256": data["mergeValidationSha256"],
+    })
 tx_canonical = json.dumps(tx_material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 expected_txid = "integration-" + hashlib.sha256(tx_canonical).hexdigest()[:32]
 if data.get("transactionId") != expected_txid:

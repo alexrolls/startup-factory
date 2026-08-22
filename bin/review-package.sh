@@ -67,6 +67,17 @@ else
   head="$(git_unprivileged -C "$repo" rev-parse "$branch")"
   source_ref="$branch"
 fi
+validation_evidence=""
+enforced="$(read_key AGENT_SANDBOX_ENFORCED)"; enforced="${enforced:-false}"
+case "$enforced" in true|false) ;; *) echo "review-package: AGENT_SANDBOX_ENFORCED must be true or false" >&2; exit 1 ;; esac
+if [ "$mode" = standalone-clone ] && [ "$enforced" = true ]; then
+  validation_result="$(python3 "$SKILL_DIR/bin/governed-validation.py" \
+    --repo "$repo" --workspace "$workspace" --execution "$execution" \
+    --team "$team" --task "$task" --task-key "$key" --attempt "$attempt" \
+    --base "$base" --head "$head" --source-ref "$source_ref")" \
+    || { echo "review-package: protected validation of the imported head failed" >&2; exit 1; }
+  validation_evidence="$(printf '%s' "$validation_result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])')"
+fi
 out="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "artifacts/$key/review-$(git_unprivileged -C "$repo" rev-parse --short "$base")..$(git_unprivileged -C "$repo" rev-parse --short "$head").diff")"
 bindings="${out%.diff}.bindings.json"
 mkdir -p "$(dirname "$out")"
@@ -76,6 +87,22 @@ mkdir -p "$(dirname "$out")"
   echo "Base: $base"
   echo "Head: $head"
   if [ "$mode" = standalone-clone ]; then echo "Quarantine ref: $source_ref"; fi
+  if [ -n "$validation_evidence" ]; then
+    echo
+    echo "## Governed validation evidence"
+    python3 - "$validation_evidence" <<'PY'
+import os,stat,sys
+path=sys.argv[1]; fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+try:
+ info=os.fstat(fd)
+ if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_size<=0 or info.st_size>1024*1024:
+  raise SystemExit("review-package: governed validation evidence is unsafe")
+ content=os.read(fd,info.st_size+1)
+ if len(content)!=info.st_size: raise SystemExit("review-package: governed validation evidence changed while reading")
+ sys.stdout.buffer.write(content)
+finally: os.close(fd)
+PY
+  fi
   echo
   echo "## Commits"
   git_unprivileged -C "$repo" log --oneline "$base..$source_ref"
@@ -86,7 +113,7 @@ mkdir -p "$(dirname "$out")"
   echo "## Diff"
   git_unprivileged -C "$repo" diff -U10 "$base..$source_ref"
 } > "$out"
-python3 - "$out" "$bindings" "$base" "$head" <<'PY'
+python3 - "$out" "$bindings" "$base" "$head" "$validation_evidence" <<'PY'
 import hashlib
 import json
 import os
@@ -96,7 +123,7 @@ from pathlib import Path
 
 package = Path(sys.argv[1])
 destination = Path(sys.argv[2])
-base, head = sys.argv[3:]
+base, head, evidence = sys.argv[3:]
 body = package.read_bytes()
 record = {
     "schemaVersion": 1,
@@ -105,6 +132,11 @@ record = {
     "reviewPackagePath": str(package),
     "reviewPackageSha256": "sha256:" + hashlib.sha256(body).hexdigest(),
 }
+if evidence:
+    evidence_path = Path(evidence)
+    evidence_body = evidence_path.read_bytes()
+    record["governedValidationPath"] = str(evidence_path)
+    record["governedValidationSha256"] = "sha256:" + hashlib.sha256(evidence_body).hexdigest()
 temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}.{secrets.token_hex(8)}")
 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
 descriptor = os.open(temporary, flags, 0o600)

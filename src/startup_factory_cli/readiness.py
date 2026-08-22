@@ -557,6 +557,12 @@ def _secure_runtime_configuration(target: Path) -> tuple[bool, str | None] | Non
             _runtime_private_directory(directory, label=label)
         runner_content = _runtime_read(runner, label="runner", mode=0o700, executable=True)
         manifest_content = _runtime_read(manifest_path, label="manifest", mode=0o600)
+        runtime_root = manifest_path.parent.parent.parent
+        if any(
+            os.path.lexists(path)
+            for path in (runtime_root / ".runtime-kit.lock", runtime_root / ".runtime-kit-journal.json")
+        ):
+            raise ValueError("unresolved runtime-kit transaction requires explicit recovery")
         manifest = _runtime_json(manifest_content, label="manifest")
         expected_keys = {
             "schemaVersion", "profile", "sourceAssetsSha256", "engine", "image", "runner",
@@ -629,7 +635,7 @@ def _secure_runtime_configuration(target: Path) -> tuple[bool, str | None] | Non
         desired = {
             "schemaVersion": 1,
             "profile": "rootless-podman-5",
-            "runtimeRoot": str(manifest_path.parent.parent.parent),
+            "runtimeRoot": str(runtime_root),
             "engineSha256": engine_binding["sha256"],
             "engineProofSha256": engine_binding["proofSha256"],
             "image": image_binding["reference"],
@@ -643,7 +649,7 @@ def _secure_runtime_configuration(target: Path) -> tuple[bool, str | None] | Non
             "configAfterSha256": _runtime_digest(config_content),
         }
         installation_digest = _runtime_digest(_runtime_canonical_json(desired))
-        marker = manifest_path.parent.parent.parent / (
+        marker = runtime_root / (
             ".runtime-kit-committed-" + installation_digest.split(":", 1)[1]
         )
         marker_content = _runtime_read(marker, label="commit marker", mode=0o600)

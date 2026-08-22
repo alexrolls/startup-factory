@@ -179,6 +179,11 @@ def create_attempt(
     if result.returncode:
         raise WorkspaceError("standalone clone creation failed")
     try:
+        if COMMIT.fullmatch(base_ref):
+            # Exact quarantined commits are intentionally not advertised as a
+            # normal branch. Import that one broker-selected object before
+            # checkout; no producer ref or shared Git directory is retained.
+            _git(destination, "fetch", "--no-tags", "--no-write-fetch-head", str(repository), base)
         _git(destination, "checkout", "-b", branch, base)
         _git(destination, "remote", "remove", "origin")
         for existing_branch in _git(destination, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines():

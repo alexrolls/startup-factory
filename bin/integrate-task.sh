@@ -248,6 +248,12 @@ worktree="$(printf '%s\n' "$execution_fields" | sed -n '2p')"
 execution_digest="$(printf '%s\n' "$execution_fields" | sed -n '3p')"
 expected_worktree="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "worktrees/$role#$attempt-$key")"
 worktree_mode="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("worktreeMode") or "linked-worktree")' "$execution")"
+enforced_runtime="$(read_key AGENT_SANDBOX_ENFORCED)"; enforced_runtime="${enforced_runtime:-false}"
+case "$enforced_runtime" in true|false) ;; *) die "AGENT_SANDBOX_ENFORCED must be exactly true or false" ;; esac
+governed_standalone=false
+if [ "$worktree_mode" = standalone-clone ] && [ "$enforced_runtime" = true ]; then
+  governed_standalone=true
+fi
 if [ "$worktree_mode" = standalone-clone ]; then
   expected_worktree="$(python3 "$SKILL_DIR/bin/standalone_workspace.py" path --repo "$repo" \
     --root "$(read_key BROKER_TASK_CLONE_ROOT)" --team "$team" --role "$role" \
@@ -389,17 +395,23 @@ PY
 [ -z "$(git_unprivileged -C "$worktree" status --porcelain -uall)" ] \
   || die "task worktree is dirty; checkpoint commits are required before integration"
 merge_ref="$branch"
+package=""
+recorded_base=""
 if [ "$worktree_mode" = standalone-clone ]; then
   recorded_base="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("baseCommit") or "")' "$execution")"
-  clone_head="$(git_unprivileged -C "$worktree" rev-parse HEAD)"
-  quarantine_bundle="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "artifacts/$key/quarantine-$clone_head.bundle")"
-  imported="$(python3 "$SKILL_DIR/bin/standalone_workspace.py" import --repo "$repo" --clone "$worktree" \
-    --branch "$branch" --base "$recorded_base" --team "$team" --task-key "$key" \
-    --attempt "$attempt" --bundle "$quarantine_bundle")" \
-    || die "standalone task could not be imported through the quarantine boundary"
-  merge_ref="$(printf '%s' "$imported" | python3 -c 'import json,sys; print(json.load(sys.stdin)["quarantineRef"])')"
+  package="$("$SKILL_DIR/bin/review-package.sh" "$team" "$task")" \
+    || die "standalone task could not be packaged through the quarantine/validation boundary"
+  bindings="${package%.diff}.bindings.json"
+  clone_head="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["taskBranchHead"])' "$bindings")" \
+    || die "standalone review bindings are malformed"
+  ref_suffix="$(python3 - "$team" "$key" "$attempt" "$clone_head" <<'PY'
+import hashlib,sys
+print(hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest()[:32])
+PY
+)"
+  merge_ref="refs/startup-factory/quarantine/$ref_suffix"
   [ "$(git_unprivileged -C "$repo" rev-parse "$merge_ref")" = "$clone_head" ] \
-    || die "standalone quarantine ref does not bind the exact clone head"
+    || die "standalone quarantine ref does not bind the exact packaged head"
   [ "$(git_unprivileged -C "$repo" merge-base "$recorded_base" "$merge_ref")" = "$recorded_base" ] \
     || die "quarantine import does not descend from the execution base"
 fi
@@ -413,8 +425,19 @@ if [ ! -e "$preparation" ]; then
   review_base_commit="$(git_unprivileged -C "$repo" merge-base "$team" "$merge_ref")"
   git_unprivileged -C "$repo" diff --name-only "$review_base_commit..$task_branch_head" > "$changed_file_list"
   [ -s "$changed_file_list" ] || die "task branch has no changed files"
-  run_validation "$worktree" "$changed_file_list"
-  package="$("$SKILL_DIR/bin/review-package.sh" "$team" "$task")"
+  if [ "$governed_standalone" = true ]; then
+    # review-package validated this exact imported ref through a fresh protected
+    # clone and embedded commit/tree/runtime-bound evidence. Never execute a
+    # producer-controlled checkout on the broker host in governed mode.
+    python3 "$SKILL_DIR/bin/governed-validation.py" \
+      --repo "$repo" --workspace "$workspace" --execution "$execution" \
+      --team "$team" --task "$task" --task-key "$key" --attempt "$attempt" \
+      --base "$recorded_base" --head "$task_branch_head" --source-ref "$merge_ref" >/dev/null \
+      || die "governed validation evidence is stale or invalid"
+  else
+    run_validation "$worktree" "$changed_file_list"
+  fi
+  [ -n "$package" ] || package="$("$SKILL_DIR/bin/review-package.sh" "$team" "$task")"
   [ -f "$package" ] && [ ! -L "$package" ] || die "review package must be a non-symlink regular file"
   package_head="$(sed -n 's/^Head: //p' "$package")"
   [ "$package_head" = "$task_branch_head" ] || die "review package does not bind the current task branch head"
@@ -499,6 +522,46 @@ raise SystemExit(0 if -5 <= age <= 300 else 1)
 PY
 }
 
+merge_validation_path=""
+merge_validation_digest=""
+merge_validation_commit=""
+merge_validation_tree=""
+merge_validation_ref=""
+run_governed_merge_validation() {
+  local tree="$1" suffix existing result
+  merge_validation_tree="$tree"
+  merge_validation_commit="$(/usr/bin/env -i \
+    "PATH=${PATH:-/usr/bin:/bin}" "GIT_CONFIG_GLOBAL=/dev/null" "GIT_CONFIG_NOSYSTEM=1" \
+    "GIT_AUTHOR_NAME=Startup Factory Validation" "GIT_AUTHOR_EMAIL=validation@startup-factory.invalid" \
+    "GIT_COMMITTER_NAME=Startup Factory Validation" "GIT_COMMITTER_EMAIL=validation@startup-factory.invalid" \
+    "GIT_AUTHOR_DATE=1970-01-01T00:00:00 +0000" "GIT_COMMITTER_DATE=1970-01-01T00:00:00 +0000" \
+    git -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "$repo" commit-tree "$tree" \
+      -p "$base_commit" -p "$task_branch_head" -m "Startup Factory protected merge validation")" \
+    || die "could not materialize the exact merged tree for protected validation"
+  suffix="$(python3 - "$team" "$key" "$attempt" "$base_commit" "$task_branch_head" "$tree" <<'PY'
+import hashlib,sys
+print(hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest()[:32])
+PY
+)"
+  merge_validation_ref="refs/startup-factory/merge-validation/$suffix"
+  existing="$(git_unprivileged -C "$repo" rev-parse -q --verify "$merge_validation_ref" 2>/dev/null || true)"
+  if [ -n "$existing" ]; then
+    [ "$existing" = "$merge_validation_commit" ] || die "protected merge-validation ref collision"
+  else
+    git_unprivileged -C "$repo" update-ref "$merge_validation_ref" "$merge_validation_commit" ""
+  fi
+  result="$(python3 "$SKILL_DIR/bin/governed-validation.py" \
+    --repo "$repo" --workspace "$workspace" --execution "$execution" \
+    --team "$team" --task "$task" --task-key "$key" --attempt "$attempt" \
+    --base "$recorded_base" --head "$merge_validation_commit" --source-ref "$merge_validation_ref" \
+    --stage merged-feature --changed-base "$review_base_commit" --changed-ref "$merge_ref")" \
+    || return 1
+  merge_validation_path="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])')" \
+    || return 1
+  merge_validation_digest="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha256"])')" \
+    || return 1
+}
+
 head_now="$(git_unprivileged -C "$repo" rev-parse HEAD)"
 commit=""
 if [ "$head_now" != "$base_commit" ]; then
@@ -522,10 +585,22 @@ else
     fi
     if [ "${INTEGRATION_TEST_CRASH_AT:-}" = "after-merge" ]; then kill -KILL "$$"; fi
   fi
-  if ! run_validation "$repo" "$changed_file_list"; then
-    git_unprivileged -C "$repo" merge --abort >/dev/null 2>&1 || true
-    die "feature-branch validation failed; merge aborted"
+fi
+if [ "$governed_standalone" = true ]; then
+  if [ -n "$commit" ]; then
+    prospective_tree="$(git_unprivileged -C "$repo" rev-parse "$commit^{tree}")"
+  else
+    prospective_tree="$(git_unprivileged -C "$repo" write-tree)"
   fi
+  if ! run_governed_merge_validation "$prospective_tree"; then
+    git_unprivileged -C "$repo" merge --abort >/dev/null 2>&1 || true
+    die "protected validation of the exact merged feature tree failed; merge aborted"
+  fi
+elif [ -z "$commit" ] && ! run_validation "$repo" "$changed_file_list"; then
+  git_unprivileged -C "$repo" merge --abort >/dev/null 2>&1 || true
+  die "feature-branch validation failed; merge aborted"
+fi
+if [ -z "$commit" ]; then
   if ! authorization_current; then
     git_unprivileged -C "$repo" merge --abort >/dev/null 2>&1 || true
     reset_preparation_authorization
@@ -549,6 +624,12 @@ trailers="$(printf '%s\n' \
   "Approval-Evidence-SHA256: $approval_evidence_digest" \
   "Integration-Preparation: $preparation_id" \
   "Authorization-Snapshot-SHA256: $authorization_snapshot_digest")"
+  if [ "$governed_standalone" = true ]; then
+    trailers="$trailers
+Merge-Validation-Commit: $merge_validation_commit
+Merge-Validation-Tree: $merge_validation_tree
+Merge-Validation-SHA256: $merge_validation_digest"
+  fi
   git_unprivileged -C "$repo" commit -m "integrate: $task" -m "$trailers"
   commit="$(git_unprivileged -C "$repo" rev-parse HEAD)"
   if [ "${INTEGRATION_TEST_CRASH_AT:-}" = "after-commit" ]; then kill -KILL "$$"; fi
@@ -556,11 +637,22 @@ fi
 parents="$(git_unprivileged -C "$repo" show -s --format=%P "$commit")"
 [ "$parents" = "$base_commit $task_branch_head" ] \
   || die "integration commit parents do not preserve exact base + reviewed head"
+[ "$governed_standalone" != true ] \
+  || [ "$(git_unprivileged -C "$repo" rev-parse "$commit^{tree}")" = "$merge_validation_tree" ] \
+  || die "integration commit tree differs from the protected merged-tree validation"
 commit_message="$(git_unprivileged -C "$repo" show -s --format=%B "$commit")"
 printf '%s\n' "$commit_message" | grep -Fqx "Integration-Preparation: $preparation_id" \
   || die "recovered integration commit lacks its exact prepared-transaction binding"
 printf '%s\n' "$commit_message" | grep -Fqx "Authorization-Snapshot-SHA256: $authorization_snapshot_digest" \
   || die "recovered integration commit lacks its fresh broker authorization binding"
+if [ "$governed_standalone" = true ]; then
+  printf '%s\n' "$commit_message" | grep -Fqx "Merge-Validation-Commit: $merge_validation_commit" \
+    || die "recovered integration commit lacks its protected validation commit binding"
+  printf '%s\n' "$commit_message" | grep -Fqx "Merge-Validation-Tree: $merge_validation_tree" \
+    || die "recovered integration commit lacks its protected validation tree binding"
+  printf '%s\n' "$commit_message" | grep -Fqx "Merge-Validation-SHA256: $merge_validation_digest" \
+    || die "recovered integration commit lacks its protected validation evidence binding"
+fi
 
 # If a hold landed immediately after the commit, preserve the landed commit as
 # recoverable Git state but stop before publishing completion evidence or the
@@ -582,6 +674,12 @@ else
     echo "Review package: $package"
     echo "Review package digest: $review_package_digest"
     echo "Approval evidence digest: $approval_evidence_digest"
+    if [ "$governed_standalone" = true ]; then
+      echo "Protected merge validation commit: $merge_validation_commit"
+      echo "Protected merge validation tree: $merge_validation_tree"
+      echo "Protected merge validation evidence: $merge_validation_path"
+      echo "Protected merge validation digest: $merge_validation_digest"
+    fi
     echo "Independent feature-branch validation completed."
   } > "$body_temp"
 fi
@@ -594,14 +692,17 @@ print("sha256:" + hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdige
 PY
 )"
 
-transaction_id="$(python3 - "$team" "$feature" "$task" "$attempt" "$execution_digest" "$base_commit" "$review_base_commit" "$task_branch_head" "$commit" "$review_package_digest" "$approval_evidence_digest" <<'PY'
+transaction_id="$(python3 - "$team" "$feature" "$task" "$attempt" "$execution_digest" "$base_commit" "$review_base_commit" "$task_branch_head" "$commit" "$review_package_digest" "$approval_evidence_digest" "$merge_validation_commit" "$merge_validation_tree" "$merge_validation_digest" <<'PY'
 import hashlib, json, sys
-team, feature, task, attempt, execution, base, review_base, head, commit, package, approvals = sys.argv[1:]
+team, feature, task, attempt, execution, base, review_base, head, commit, package, approvals, merge_commit, merge_tree, merge_validation = sys.argv[1:]
 material={
     "team": team, "featureId": feature, "taskId": task, "attempt": int(attempt),
     "executionDigest": execution, "baseCommit": base, "reviewBaseCommit": review_base, "taskBranchHead": head,
     "commit": commit, "reviewPackageSha256": package, "approvalEvidenceDigest": approvals,
 }
+if merge_validation:
+    material.update({"mergeValidationCommit":merge_commit,"mergeValidationTree":merge_tree,
+                     "mergeValidationSha256":merge_validation})
 canonical=json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 print("integration-" + hashlib.sha256(canonical).hexdigest()[:32])
 PY
@@ -611,12 +712,14 @@ assert_task_not_held
 assert_tracker_task_review_authorized
 python3 - "$transaction" "$transaction_id" "$team" "$feature" "$task" "$key" "$role" "$attempt" \
   "$branch" "$worktree" "$base_commit" "$task_branch_head" "$commit" "$execution_digest" \
-  "$review_base_commit" "$package" "$review_package_digest" "$approval_evidence_digest" "$body" "$completion_body_digest" <<'PY'
+  "$review_base_commit" "$package" "$review_package_digest" "$approval_evidence_digest" "$body" "$completion_body_digest" \
+  "$merge_validation_path" "$merge_validation_digest" "$merge_validation_commit" "$merge_validation_tree" <<'PY'
 import json, os, sys
 from datetime import datetime, timezone
 (
     path, txid, team, feature, task, key, role, attempt, branch, worktree, base, branch_head,
     commit, execution_digest, review_base, package, package_digest, approval_digest, body, body_digest,
+    merge_path, merge_digest, merge_commit, merge_tree,
 ) = sys.argv[1:]
 value = {
     "schemaVersion": 2,
@@ -642,6 +745,13 @@ value = {
     "completionBodySha256": body_digest,
     "updatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
 }
+if merge_digest:
+    value.update({
+        "mergeValidationPath": merge_path,
+        "mergeValidationSha256": merge_digest,
+        "mergeValidationCommit": merge_commit,
+        "mergeValidationTree": merge_tree,
+    })
 temp=path+".tmp.%s" % os.getpid()
 fd=os.open(temp, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600)
 with os.fdopen(fd, "w") as handle:

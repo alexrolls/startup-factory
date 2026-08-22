@@ -4,10 +4,12 @@ import contextlib
 import io
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -108,6 +110,220 @@ fi
     def apply_on_linux(self, digest: str) -> tuple[int, str, str]:
         with mock.patch.object(runtime_kit.sys, "platform", "linux"):
             return self.runtime("--apply", "--plan-digest", digest)
+
+    def crash_apply_after_phase(self, phase: str) -> str:
+        digest = self.preview_digest()
+        script = r'''
+import json, os, signal, sys
+from pathlib import Path
+from startup_factory_cli import runtime_kit
+
+target, project, runtime_root, engine, image, expected, phase = sys.argv[1:]
+runtime_kit.sys.platform = "linux"
+plan = runtime_kit.plan_runtime_kit(
+    target=Path(target), project=Path(project), runtime_root=Path(runtime_root),
+    engine=Path(engine), image=image, host_platform="linux",
+)
+if phase in {"locked", "prepared"}:
+    original = runtime_kit._write_exclusive
+    def write(path, content, mode):
+        original(path, content, mode)
+        if (phase == "locked" and path.name == ".runtime-kit.lock") or (
+            phase == "prepared" and path.name == ".runtime-kit-journal.json"
+        ):
+            os.kill(os.getpid(), signal.SIGKILL)
+    runtime_kit._write_exclusive = write
+else:
+    original = runtime_kit._replace_owned_transaction_file
+    def replace(path, before, after):
+        original(path, before, after)
+        if json.loads(after)["phase"] == phase:
+            os.kill(os.getpid(), signal.SIGKILL)
+    runtime_kit._replace_owned_transaction_file = replace
+runtime_kit.apply_runtime_kit(plan, expected_plan_digest=expected)
+'''
+        environment = {
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": str(ROOT / "src"),
+        }
+        crashed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(self.target),
+                str(self.project),
+                str(self.runtime_root),
+                str(self.engine),
+                IMAGE,
+                digest,
+                phase,
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(crashed.returncode, -signal.SIGKILL, crashed.stdout + crashed.stderr)
+        self.assertTrue((self.runtime_root / ".runtime-kit.lock").exists())
+        return digest
+
+    def assert_recovery_round_trip(self, phase: str, expected_action: str) -> None:
+        original_digest = self.crash_apply_after_phase(phase)
+        code, _, error = self.runtime()
+        self.assertEqual(code, 1)
+        self.assertIn("--recover", error)
+        code, output, error = self.runtime("--recover")
+        self.assertEqual((code, error), (0, ""), output + error)
+        recovery = json.loads(output)
+        self.assertEqual(recovery["transactionPhase"], phase)
+        self.assertEqual(recovery["recoveryAction"], expected_action)
+        self.assertRegex(recovery["recoveryDigest"], r"^sha256:[0-9a-f]{64}$")
+        code, _, error = self.runtime(
+            "--recover", "--apply", "--plan-digest", "sha256:" + "0" * 64
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("immutable recovery preview", error)
+        self.assertTrue((self.runtime_root / ".runtime-kit.lock").exists())
+        code, output, error = self.runtime(
+            "--recover", "--apply", "--plan-digest", recovery["recoveryDigest"]
+        )
+        self.assertEqual((code, error), (0, ""), output + error)
+        self.assertFalse((self.runtime_root / ".runtime-kit.lock").exists())
+        self.assertFalse((self.runtime_root / ".runtime-kit-journal.json").exists())
+        if expected_action == "finalize-commit":
+            code, output, error = self.runtime()
+            self.assertEqual((code, error), (0, ""), output + error)
+            self.assertEqual(json.loads(output)["changes"], [])
+            verified = subprocess.run(
+                ["python3", str(self.target / "bin/runtime-static-verify.py"), "--target", str(self.target)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+        else:
+            self.assertEqual((self.target / "config/team.config.md").read_bytes(), TEAM_CONFIG)
+            code, output, error = self.apply_on_linux(self.preview_digest())
+            self.assertEqual((code, error), (0, ""), output + error)
+        self.assertRegex(original_digest, r"^sha256:[0-9a-f]{64}$")
+
+    def test_process_death_after_locked_phase_recovers_by_exact_preview(self) -> None:
+        self.assert_recovery_round_trip("locked", "clear-lock")
+
+    def test_recovery_preserves_a_lock_while_its_exact_owner_is_alive(self) -> None:
+        digest = self.preview_digest()
+        sentinel = self.root / "lock-owner-active"
+        script = r'''
+import os, signal, sys
+from pathlib import Path
+from startup_factory_cli import runtime_kit
+
+target, project, runtime_root, engine, image, expected, sentinel = sys.argv[1:]
+runtime_kit.sys.platform = "linux"
+plan = runtime_kit.plan_runtime_kit(
+    target=Path(target), project=Path(project), runtime_root=Path(runtime_root),
+    engine=Path(engine), image=image, host_platform="linux",
+)
+original = runtime_kit._write_exclusive
+def write(path, content, mode):
+    original(path, content, mode)
+    if path.name == ".runtime-kit.lock":
+        Path(sentinel).touch()
+        signal.pause()
+runtime_kit._write_exclusive = write
+runtime_kit.apply_runtime_kit(plan, expected_plan_digest=expected)
+'''
+        owner = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(self.target),
+                str(self.project),
+                str(self.runtime_root),
+                str(self.engine),
+                IMAGE,
+                digest,
+                str(sentinel),
+            ],
+            env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(ROOT / "src")},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            for _ in range(200):
+                if sentinel.exists():
+                    break
+                time.sleep(0.01)
+            self.assertTrue(sentinel.exists(), "lock owner never reached its durable lock phase")
+            lock = self.runtime_root / ".runtime-kit.lock"
+            before = lock.read_bytes()
+            code, _, error = self.runtime("--recover")
+            self.assertEqual(code, 1)
+            self.assertIn("owner is still active", error)
+            self.assertEqual(lock.read_bytes(), before)
+        finally:
+            owner.kill()
+            owner.communicate(timeout=10)
+        code, output, error = self.runtime("--recover")
+        self.assertEqual((code, error), (0, ""), output + error)
+        recovery = json.loads(output)
+        self.assertEqual(recovery["recoveryAction"], "clear-lock")
+        code, output, error = self.runtime(
+            "--recover", "--apply", "--plan-digest", recovery["recoveryDigest"]
+        )
+        self.assertEqual((code, error), (0, ""), output + error)
+
+    def test_process_death_after_prepared_phase_recovers_by_exact_preview(self) -> None:
+        self.assert_recovery_round_trip("prepared", "rollback")
+
+    def test_process_death_after_assets_written_phase_recovers_by_exact_preview(self) -> None:
+        self.assert_recovery_round_trip("assets-written", "rollback")
+
+    def test_process_death_after_config_replaced_phase_recovers_by_exact_preview(self) -> None:
+        self.assert_recovery_round_trip("config-replaced", "rollback")
+
+    def test_process_death_after_commit_marked_phase_blocks_authority_until_finalized(self) -> None:
+        self.crash_apply_after_phase("commit-marked")
+        static = subprocess.run(
+            ["python3", str(self.target / "bin/runtime-static-verify.py"), "--target", str(self.target)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(static.returncode, 0)
+        self.assertIn("--recover", static.stderr)
+        code, output, _ = invoke(
+            "doctor", "--project", str(self.project), "--install-dir", str(self.target),
+            "--mode", "team", "--json",
+        )
+        self.assertEqual(code, 1)
+        configured = next(
+            item for item in json.loads(output)["checks"] if item["id"] == "secure-runtime.configured"
+        )
+        self.assertEqual(configured["status"], "fail")
+        code, output, error = self.runtime("--recover")
+        self.assertEqual((code, error), (0, ""), output + error)
+        recovery = json.loads(output)
+        self.assertEqual(recovery["recoveryAction"], "finalize-commit")
+        code, output, error = self.runtime(
+            "--recover", "--apply", "--plan-digest", recovery["recoveryDigest"]
+        )
+        self.assertEqual((code, error), (0, ""), output + error)
+        static = subprocess.run(
+            ["python3", str(self.target / "bin/runtime-static-verify.py"), "--target", str(self.target)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(static.returncode, 0, static.stderr)
 
     def test_preview_is_non_mutating_and_proof_remains_unknown(self) -> None:
         before = (self.target / "config/team.config.md").read_bytes()
@@ -246,6 +462,10 @@ fi
         self.assertEqual(code, 1)
         self.assertIn("recovery state", error)
         self.assertEqual(lock.read_bytes(), b"foreign-lock\n")
+        code, _, error = self.runtime("--recover")
+        self.assertEqual(code, 1)
+        self.assertIn("malformed or foreign", error)
+        self.assertEqual(lock.read_bytes(), b"foreign-lock\n")
 
         lock.unlink()
         journal = self.runtime_root / ".runtime-kit-journal.json"
@@ -270,6 +490,24 @@ fi
         self.assertIn("single-link", error)
         self.assertTrue(lock.exists())
         self.assertTrue(alias.exists())
+
+    def test_recovery_preview_and_apply_preserve_changed_assets_and_evidence(self) -> None:
+        self.crash_apply_after_phase("assets-written")
+        code, output, error = self.runtime("--recover")
+        self.assertEqual((code, error), (0, ""), output + error)
+        recovery = json.loads(output)
+        journal = self.runtime_root / ".runtime-kit-journal.json"
+        journal_before = journal.read_bytes()
+        asset = next(self.runtime_root.glob("assets/*/runner"))
+        asset.write_bytes(asset.read_bytes() + b"tamper\n")
+        code, _, error = self.runtime(
+            "--recover", "--apply", "--plan-digest", recovery["recoveryDigest"]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("neither recorded pre-state nor post-image", error)
+        self.assertEqual(journal.read_bytes(), journal_before)
+        self.assertTrue((self.runtime_root / ".runtime-kit.lock").exists())
+        self.assertIn(b"tamper", asset.read_bytes())
 
     def test_idempotent_retry_requires_commit_marker_and_clean_recovery_state(self) -> None:
         digest = self.preview_digest()
