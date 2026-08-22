@@ -120,6 +120,7 @@ class RuntimePlan:
     installation_digest: str
     engine_proof: Mapping[str, Any]
     image_proof: Mapping[str, Any]
+    namespace_pre_states: tuple[Mapping[str, Any], ...]
 
     @property
     def changes(self) -> list[dict[str, Any]]:
@@ -550,6 +551,7 @@ def plan_runtime_kit(
     ):
         if _path_lexists_nofollow(directory, label):
             _validate_private_directory(directory, label)
+    namespace_pre_states = tuple(_runtime_namespace_states(runtime_root))
     if _path_lexists_nofollow(
         runtime_root / ".runtime-kit.lock", "runtime-kit lock"
     ) or _path_lexists_nofollow(
@@ -655,6 +657,7 @@ def plan_runtime_kit(
         "image": image,
         "imageProofSha256": _sha256(_canonical_json(image_proof)),
         "network": network,
+        "namespacePreStates": list(namespace_pre_states),
         "files": [
             {"path": str(item.path), "mode": item.mode, "sha256": _sha256(item.content), "before": item.state.as_dict()}
             for item in planned
@@ -679,7 +682,7 @@ def plan_runtime_kit(
         target, project, runtime_root, clone_root, lifecycle_root, outbox_root, engine, image, network,
         planned, config_path, config_before, config_after, config_state, _plan_material(material),
         _plan_material(desired),
-        engine_proof, image_proof,
+        engine_proof, image_proof, namespace_pre_states,
     )
 
 
@@ -691,7 +694,11 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _mkdir_chain(path: Path, created: list[Path]) -> None:
+def _mkdir_chain(
+    path: Path,
+    created: list[Path],
+    on_created: Any | None = None,
+) -> None:
     path = _normalized_absolute(path, "runtime transaction directory")
     flags = _directory_open_flags()
     descriptor = os.open(path.anchor, flags)
@@ -699,12 +706,13 @@ def _mkdir_chain(path: Path, created: list[Path]) -> None:
     try:
         for part in path.parts[1:]:
             current /= part
+            created_here = False
             try:
                 child = os.open(part, flags, dir_fd=descriptor)
             except FileNotFoundError:
                 try:
                     os.mkdir(part, mode=0o700, dir_fd=descriptor)
-                    created.append(current)
+                    created_here = True
                     os.fsync(descriptor)
                 except FileExistsError:
                     # A concurrent creator or substituted path must still pass
@@ -724,6 +732,10 @@ def _mkdir_chain(path: Path, created: list[Path]) -> None:
                 raise _path_safety_error("runtime transaction directory", current)
             os.close(descriptor)
             descriptor = child
+            if created_here:
+                created.append(current)
+                if on_created is not None:
+                    on_created()
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -739,9 +751,13 @@ def _validate_private_directory(path: Path, label: str) -> None:
         stat.S_ISLNK(info.st_mode)
         or not stat.S_ISDIR(info.st_mode)
         or info.st_uid != os.geteuid()
-        or stat.S_IMODE(info.st_mode) & 0o077
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or info.st_nlink < 1
     ):
-        raise InstallerError(f"{label} must be a caller-owned, non-symlink mode-0700 directory")
+        raise PathSafetyError(
+            f"{label} must be an exact caller-owned, non-symlink mode-0700 directory; preserve "
+            "any durable lock, journal, and unexpected namespace for operator recovery"
+        )
 
 
 def _write_exclusive(path: Path, content: bytes, mode: int) -> None:
@@ -850,7 +866,7 @@ def _validate_recovery_evidence(lock: Path, journal: Path) -> None:
             token = value.get("transactionToken")
             phase = value.get("phase")
             if (
-                value.get("schemaVersion") != 2
+                value.get("schemaVersion") != 3
                 or not isinstance(token, str)
                 or not re.fullmatch(r"[0-9a-f]{64}", token)
                 or phase not in {"locked", "prepared", "assets-written", "config-replaced", "commit-marked"}
@@ -890,16 +906,31 @@ def _state_from_record(value: Any, label: str) -> FileState:
 def _directory_recovery_state(path: Path) -> dict[str, Any]:
     if not _path_lexists_nofollow(path, "runtime recovery directory"):
         return {"exists": False}
-    _validate_existing_components(path, "runtime recovery directory")
-    info = path.lstat()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise InstallerError(f"runtime recovery directory is unsafe: {path}")
+    parent = _open_directory_nofollow(path.parent, "runtime recovery directory parent")
+    try:
+        info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+    except OSError as exc:
+        raise _path_safety_error("runtime recovery directory", path) from exc
+    finally:
+        os.close(parent)
+    if stat.S_ISDIR(info.st_mode):
+        kind = "directory"
+    elif stat.S_ISREG(info.st_mode):
+        kind = "regular"
+    elif stat.S_ISFIFO(info.st_mode):
+        kind = "fifo"
+    elif stat.S_ISSOCK(info.st_mode):
+        kind = "socket"
+    else:
+        kind = "other"
     return {
         "exists": True,
+        "type": kind,
         "device": info.st_dev,
         "inode": info.st_ino,
         "mode": stat.S_IMODE(info.st_mode),
         "owner": info.st_uid,
+        "links": info.st_nlink,
     }
 
 
@@ -913,6 +944,140 @@ def _runtime_namespace_states(runtime_root: Path) -> list[dict[str, Any]]:
             runtime_root / "outbox-ingress",
         )
     ]
+
+
+def _directory_state_from_record(value: Any, label: str) -> dict[str, Any]:
+    if value == {"exists": False}:
+        return {"exists": False}
+    required = {"exists", "type", "device", "inode", "mode", "owner", "links"}
+    if not isinstance(value, dict) or set(value) != required or value.get("exists") is not True:
+        raise InstallerError(f"{label} has an invalid directory-state record")
+    if (
+        value.get("type") != "directory"
+        or any(type(value.get(name)) is not int for name in ("device", "inode", "mode", "owner", "links"))
+        or value["device"] < 0
+        or value["inode"] < 1
+        or value["mode"] != 0o700
+        or value["owner"] != os.geteuid()
+        or value["links"] < 1
+    ):
+        raise InstallerError(
+            f"{label} must bind an exact caller-owned mode-0700 directory identity"
+        )
+    return dict(value)
+
+
+def _namespace_record_map(value: Any, runtime_root: Path, label: str) -> dict[Path, dict[str, Any]]:
+    expected_paths = (
+        runtime_root / "assets",
+        runtime_root / "attempt-clones",
+        runtime_root / "lifecycle",
+        runtime_root / "outbox-ingress",
+    )
+    if not isinstance(value, list) or len(value) != len(expected_paths):
+        raise InstallerError(f"{label} must contain every reserved runtime namespace exactly once")
+    result: dict[Path, dict[str, Any]] = {}
+    for record in value:
+        if not isinstance(record, dict) or set(record) != {"path", "state"}:
+            raise InstallerError(f"{label} contains a malformed namespace record")
+        path = Path(str(record["path"]))
+        if path not in expected_paths or path in result:
+            raise InstallerError(f"{label} contains an unknown or duplicate namespace path")
+        result[path] = _directory_state_from_record(record["state"], f"{label} {path}")
+    if set(result) != set(expected_paths):
+        raise InstallerError(f"{label} is incomplete")
+    return result
+
+
+def _created_directory_records(value: Any, runtime_root: Path) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) > 32:
+        raise InstallerError("runtime-kit created-directory recovery record is malformed")
+    result: list[dict[str, Any]] = []
+    seen: set[Path] = set()
+    for record in value:
+        if not isinstance(record, dict) or set(record) != {"path", "state"}:
+            raise InstallerError("runtime-kit created-directory recovery record is malformed")
+        path = Path(str(record["path"]))
+        if (
+            not path.is_absolute()
+            or path in seen
+            or (path != runtime_root and not _is_within(path, runtime_root))
+        ):
+            raise InstallerError("runtime-kit created-directory recovery path escapes runtime root")
+        state = _directory_state_from_record(record["state"], f"created runtime directory {path}")
+        if not state["exists"]:
+            raise InstallerError("created runtime directory cannot bind an absent state")
+        result.append({"path": str(path), "state": state})
+        seen.add(path)
+    return result
+
+
+def _validate_created_directory_identities(
+    value: Any, runtime_root: Path
+) -> list[dict[str, Any]]:
+    records = _created_directory_records(value, runtime_root)
+    for record in records:
+        path = Path(record["path"])
+        current = _directory_recovery_state(path)
+        if current != record["state"]:
+            raise InstallerError(
+                f"runtime recovery transaction-created directory mismatch at {path}; the lock, "
+                "journal, and unexpected namespace were preserved. Restore the exact recorded "
+                "caller-owned mode-0700 directory identity, then rerun --recover for a new digest"
+            )
+    return records
+
+
+def _namespace_mismatch(path: Path, expected: Mapping[str, Any], observed: Mapping[str, Any]) -> InstallerError:
+    return InstallerError(
+        "runtime recovery reserved namespace mismatch at "
+        f"{path}: expected {dict(expected)}, observed {dict(observed)}; the lock, journal, and "
+        "unexpected namespace were preserved. Inspect the mismatch, restore the exact recorded "
+        "caller-owned mode-0700 directory identity (or remove an unexpected namespace only after "
+        "independent verification), then rerun --recover for a new digest"
+    )
+
+
+def _validate_current_namespaces(expected_value: Any, runtime_root: Path, label: str) -> None:
+    expected = _namespace_record_map(expected_value, runtime_root, label)
+    observed = {
+        Path(record["path"]): record["state"]
+        for record in _runtime_namespace_states(runtime_root)
+    }
+    for path, expected_state in expected.items():
+        current = observed[path]
+        if current != expected_state:
+            raise _namespace_mismatch(path, expected_state, current)
+
+
+def _authorized_namespace_states(
+    pre_value: Any, runtime_root: Path, created_directories: Iterable[Path]
+) -> list[dict[str, Any]]:
+    pre = _namespace_record_map(pre_value, runtime_root, "runtime plan namespace pre-states")
+    current_records = _runtime_namespace_states(runtime_root)
+    current = {Path(record["path"]): record["state"] for record in current_records}
+    created = set(created_directories)
+    identity_fields = ("exists", "type", "device", "inode", "mode", "owner")
+    for path, pre_state in pre.items():
+        observed = current[path]
+        if path in created:
+            try:
+                _directory_state_from_record(observed, f"transaction-created namespace {path}")
+            except InstallerError as exc:
+                raise PathSafetyError(str(exc)) from exc
+            continue
+        if not pre_state["exists"]:
+            if observed != pre_state:
+                raise PathSafetyError(str(_namespace_mismatch(path, pre_state, observed)))
+            continue
+        direct_children = sum(1 for value in created if value.parent == path)
+        expected_links = pre_state["links"] + direct_children
+        if (
+            any(observed.get(name) != pre_state.get(name) for name in identity_fields)
+            or observed.get("links") != expected_links
+        ):
+            raise PathSafetyError(str(_namespace_mismatch(path, pre_state, observed)))
+    return current_records
 
 
 def _recovery_material(
@@ -944,8 +1109,8 @@ def _recovery_material(
         )
         current["commitMarker"] = {"path": str(marker), "state": _state(marker).as_dict()}
         current["directories"] = [
-            {"path": value, "state": _directory_recovery_state(Path(value))}
-            for value in journal_value["createdDirectories"]
+            {"path": record["path"], "state": _directory_recovery_state(Path(record["path"]))}
+            for record in journal_value["createdDirectories"]
         ]
     return {
         "schemaVersion": 1,
@@ -969,8 +1134,9 @@ def plan_runtime_recovery(*, target: Path, runtime_root: Path) -> RuntimeRecover
     _runtime_namespace_states(runtime_root)
     lock = runtime_root / ".runtime-kit.lock"
     journal = runtime_root / ".runtime-kit-journal.json"
+    journal_present = _path_lexists_nofollow(journal, "runtime-kit journal")
     if not _path_lexists_nofollow(lock, "runtime-kit lock"):
-        if _path_lexists_nofollow(journal, "runtime-kit journal"):
+        if journal_present:
             raise InstallerError("runtime recovery journal has no matching lock and is preserved for operator inspection")
         raise InstallerError("runtime-kit recovery found no unresolved lock/journal")
     lock_content = _owned_transaction_content(lock, "runtime-kit lock")
@@ -979,11 +1145,12 @@ def plan_runtime_recovery(*, target: Path, runtime_root: Path) -> RuntimeRecover
     except InstallerError as exc:
         raise InstallerError("runtime-kit lock is malformed or foreign and was preserved") from exc
     required_lock = {
-        "schemaVersion", "phase", "transactionToken", "ownerPid", "planDigest", "installationDigest"
+        "schemaVersion", "phase", "transactionToken", "ownerPid", "planDigest",
+        "installationDigest", "namespaceStates",
     }
     if (
         set(lock_value) != required_lock
-        or lock_value.get("schemaVersion") != 2
+        or lock_value.get("schemaVersion") != 3
         or lock_value.get("phase") != "locked"
         or re.fullmatch(r"[0-9a-f]{64}", str(lock_value.get("transactionToken") or "")) is None
         or type(lock_value.get("ownerPid")) is not int
@@ -992,6 +1159,10 @@ def plan_runtime_recovery(*, target: Path, runtime_root: Path) -> RuntimeRecover
         or DIGEST.fullmatch(str(lock_value.get("installationDigest") or "")) is None
     ):
         raise InstallerError("runtime-kit lock is malformed or foreign and was preserved")
+    if not journal_present:
+        _validate_current_namespaces(
+            lock_value["namespaceStates"], runtime_root, "runtime-kit lock namespace states"
+        )
     try:
         os.kill(lock_value["ownerPid"], 0)
     except ProcessLookupError:
@@ -1007,7 +1178,7 @@ def plan_runtime_recovery(*, target: Path, runtime_root: Path) -> RuntimeRecover
     journal_value: dict[str, Any] | None = None
     action = "clear-lock"
     phase = "locked"
-    if _path_lexists_nofollow(journal, "runtime-kit journal"):
+    if journal_present:
         journal_content = _owned_transaction_content(journal, "runtime-kit journal")
         try:
             journal_value = _strict_object(journal_content, "runtime-kit journal")
@@ -1018,17 +1189,18 @@ def plan_runtime_recovery(*, target: Path, runtime_root: Path) -> RuntimeRecover
         required_journal = {
             "schemaVersion", "phase", "transactionToken", "ownerPid", "planDigest", "installationDigest",
             "configPath", "configBefore", "configBeforeState", "configAfterSha256", "files",
-            "createdDirectories",
+            "createdDirectories", "namespacePreStates", "namespaceStates",
         }
         phase = str(journal_value.get("phase") or "")
         if (
             set(journal_value) != required_journal
-            or journal_value.get("schemaVersion") != 2
+            or journal_value.get("schemaVersion") != 3
             or phase not in {"prepared", "assets-written", "config-replaced", "commit-marked"}
             or journal_value.get("transactionToken") != token
             or journal_value.get("ownerPid") != lock_value["ownerPid"]
             or journal_value.get("planDigest") != lock_value["planDigest"]
             or journal_value.get("installationDigest") != lock_value["installationDigest"]
+            or journal_value.get("namespacePreStates") != lock_value["namespaceStates"]
             or DIGEST.fullmatch(str(journal_value.get("configAfterSha256") or "")) is None
         ):
             raise InstallerError("runtime-kit journal is malformed, foreign, or does not match its lock; evidence was preserved")
@@ -1062,13 +1234,15 @@ def plan_runtime_recovery(*, target: Path, runtime_root: Path) -> RuntimeRecover
                 raise InstallerError("runtime-kit recovery asset identity is unsafe")
             _state_from_record(record["before"], f"runtime-kit asset pre-state {path}")
             seen_paths.add(path)
-        directories = journal_value.get("createdDirectories")
-        if not isinstance(directories, list) or len(directories) > 32 or len(directories) != len(set(directories)):
-            raise InstallerError("runtime-kit created-directory recovery record is malformed")
-        for value in directories:
-            path = Path(str(value))
-            if not path.is_absolute() or not _is_within(path, runtime_root):
-                raise InstallerError("runtime-kit created-directory recovery path escapes runtime root")
+        _namespace_record_map(
+            journal_value["namespacePreStates"], runtime_root, "runtime-kit namespace pre-states"
+        )
+        _validate_current_namespaces(
+            journal_value["namespaceStates"], runtime_root, "runtime-kit journal namespace states"
+        )
+        _validate_created_directory_identities(
+            journal_value.get("createdDirectories"), runtime_root
+        )
         action = "finalize-commit" if phase == "commit-marked" else "rollback"
         current_config = _state(config_path)
         if current_config.digest not in {before_state.digest, journal_value["configAfterSha256"]}:
@@ -1137,6 +1311,39 @@ def _unlink_exact(path: Path, expected: bytes, label: str) -> None:
         raise InstallerError(f"{label} changed after recovery preview and was preserved")
     path.unlink()
     _fsync_directory(path.parent)
+
+
+def _rmdir_created_exact(record: Mapping[str, Any], runtime_root: Path) -> None:
+    path = Path(str(record["path"]))
+    expected = _directory_state_from_record(
+        record["state"], f"transaction-created runtime directory {path}"
+    )
+    current = _directory_recovery_state(path)
+    identity_fields = ("exists", "type", "device", "inode", "mode", "owner")
+    if any(current.get(name) != expected.get(name) for name in identity_fields):
+        raise InstallerError(
+            f"transaction-created runtime directory identity changed before cleanup at {path}; "
+            "the lock and journal were preserved. Restore the exact recorded identity and rerun "
+            "--recover for a new digest"
+        )
+    if type(current.get("links")) is not int or not (1 <= current["links"] <= expected["links"]):
+        raise InstallerError(
+            f"transaction-created runtime directory link state changed before cleanup at {path}; "
+            "the lock and journal were preserved. Inspect the directory and rerun --recover only "
+            "after restoring the recorded namespace"
+        )
+    parent = _open_directory_nofollow(path.parent, "runtime recovery directory parent")
+    try:
+        try:
+            os.rmdir(path.name, dir_fd=parent)
+        except OSError as exc:
+            raise InstallerError(
+                f"transaction-created runtime directory is not empty or removable at {path}; "
+                "the lock and journal were preserved for operator inspection"
+            ) from exc
+        os.fsync(parent)
+    finally:
+        os.close(parent)
 
 
 def recover_runtime_kit(plan: RuntimeRecoveryPlan, *, expected_recovery_digest: str) -> None:
@@ -1218,13 +1425,17 @@ def recover_runtime_kit(plan: RuntimeRecoveryPlan, *, expected_recovery_digest: 
             raise InstallerError("runtime recovery commit marker changed; evidence was preserved")
         marker.unlink()
         _fsync_directory(marker.parent)
+    created_records = _created_directory_records(journal["createdDirectories"], plan.runtime_root)
+    runtime_root_record: Mapping[str, Any] | None = None
+    for record in reversed(created_records):
+        if Path(record["path"]) == plan.runtime_root:
+            runtime_root_record = record
+            continue
+        _rmdir_created_exact(record, plan.runtime_root)
     _unlink_exact(plan.journal, plan.journal_content, "runtime-kit journal")
     _unlink_exact(plan.lock, plan.lock_content, "runtime-kit lock")
-    for value in reversed(journal["createdDirectories"]):
-        try:
-            Path(value).rmdir()
-        except OSError:
-            pass
+    if runtime_root_record is not None:
+        _rmdir_created_exact(runtime_root_record, plan.runtime_root)
 
 
 def _replace_owned_transaction_file(path: Path, before: bytes, after: bytes) -> None:
@@ -1286,16 +1497,17 @@ def apply_runtime_kit(plan: RuntimePlan, *, expected_plan_digest: str) -> None:
     token = secrets.token_hex(32)
     lock_content = _canonical_json(
         {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "phase": "locked",
             "transactionToken": token,
             "ownerPid": os.getpid(),
             "planDigest": plan.plan_digest,
             "installationDigest": plan.installation_digest,
+            "namespaceStates": list(plan.namespace_pre_states),
         }
     )
     journal_value = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "phase": "prepared",
         "transactionToken": token,
         "ownerPid": os.getpid(),
@@ -1315,26 +1527,41 @@ def apply_runtime_kit(plan: RuntimePlan, *, expected_plan_digest: str) -> None:
             for item in plan.files
         ],
         "createdDirectories": [],
+        "namespacePreStates": list(plan.namespace_pre_states),
+        "namespaceStates": list(plan.namespace_pre_states),
     }
     journal_content = _canonical_json(journal_value)
 
     def advance(phase: str) -> None:
         nonlocal journal_content
         journal_value["phase"] = phase
-        journal_value["createdDirectories"] = [str(path) for path in created_dirs]
+        journal_value["createdDirectories"] = [
+            {"path": str(path), "state": _directory_recovery_state(path)}
+            for path in created_dirs
+        ]
+        journal_value["namespaceStates"] = _authorized_namespace_states(
+            list(plan.namespace_pre_states), plan.runtime_root, created_dirs
+        )
         updated = _canonical_json(journal_value)
         _replace_owned_transaction_file(journal, journal_content, updated)
         journal_content = updated
 
+    def persist_directory_identities() -> None:
+        advance(str(journal_value["phase"]))
+
     try:
         _mkdir_chain(plan.runtime_root, created_dirs)
         _validate_private_directory(plan.runtime_root, "runtime root")
+        _validate_current_namespaces(
+            list(plan.namespace_pre_states), plan.runtime_root, "runtime plan namespace states"
+        )
         _write_exclusive(lock, lock_content, 0o600)
         lock_created = True
         _write_exclusive(journal, journal_content, 0o600)
         journal_created = True
+        persist_directory_identities()
         for directory in (plan.clone_root, plan.lifecycle_root, plan.outbox_root, plan.files[0].path.parent):
-            _mkdir_chain(directory, created_dirs)
+            _mkdir_chain(directory, created_dirs, persist_directory_identities)
             _validate_private_directory(directory, "runtime transaction directory")
         for item in plan.files:
             if item.state.exists:

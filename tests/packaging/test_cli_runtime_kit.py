@@ -170,6 +170,59 @@ runtime_kit.apply_runtime_kit(plan, expected_plan_digest=expected)
         self.assertTrue((self.runtime_root / ".runtime-kit.lock").exists())
         return digest
 
+    def crash_after_transaction_created_assets_namespace(self) -> str:
+        digest = self.preview_digest()
+        script = r'''
+import json, os, signal, sys
+from pathlib import Path
+from startup_factory_cli import runtime_kit
+
+target, project, runtime_root, engine, image, expected = sys.argv[1:]
+runtime_kit.sys.platform = "linux"
+plan = runtime_kit.plan_runtime_kit(
+    target=Path(target), project=Path(project), runtime_root=Path(runtime_root),
+    engine=Path(engine), image=image, host_platform="linux",
+)
+original = runtime_kit._replace_owned_transaction_file
+def replace(path, before, after):
+    original(path, before, after)
+    value = json.loads(after)
+    assets = str(Path(runtime_root) / "assets")
+    if (
+        value["phase"] == "prepared"
+        and any(record["path"] == assets for record in value["createdDirectories"])
+    ):
+        os.kill(os.getpid(), signal.SIGKILL)
+runtime_kit._replace_owned_transaction_file = replace
+runtime_kit.apply_runtime_kit(plan, expected_plan_digest=expected)
+'''
+        crashed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(self.target),
+                str(self.project),
+                str(self.runtime_root),
+                str(self.engine),
+                IMAGE,
+                digest,
+            ],
+            env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(ROOT / "src")},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(crashed.returncode, -signal.SIGKILL, crashed.stdout + crashed.stderr)
+        journal = json.loads((self.runtime_root / ".runtime-kit-journal.json").read_text())
+        assets = self.runtime_root / "assets"
+        self.assertEqual(journal["phase"], "prepared")
+        self.assertTrue(any(record["path"] == str(assets) for record in journal["createdDirectories"]))
+        self.assertTrue(assets.is_dir())
+        return digest
+
     def assert_recovery_round_trip(self, phase: str, expected_action: str) -> None:
         original_digest = self.crash_apply_after_phase(phase)
         code, _, error = self.runtime()
@@ -357,6 +410,169 @@ runtime_kit.apply_runtime_kit(plan, expected_plan_digest=expected)
                 self.assertEqual((code, error), (0, ""), output + error)
                 if phase == "locked":
                     self.runtime_root.mkdir(mode=0o700, exist_ok=True)
+
+    def test_real_death_rejects_unbound_namespace_mode_and_type_matrix(self) -> None:
+        cases = ("world-writable", "wrong-private-mode", "unexpected-private", "fifo")
+        for phase in ("locked", "prepared"):
+            for case in cases:
+                with self.subTest(phase=phase, case=case):
+                    self.crash_apply_after_phase(phase)
+                    namespace = self.runtime_root / "assets"
+                    if case == "fifo":
+                        os.mkfifo(namespace, 0o600)
+                    else:
+                        namespace.mkdir(mode=0o700)
+                        if case == "world-writable":
+                            namespace.chmod(0o777)
+                        elif case == "wrong-private-mode":
+                            namespace.chmod(0o500)
+                    lock = self.runtime_root / ".runtime-kit.lock"
+                    journal = self.runtime_root / ".runtime-kit-journal.json"
+                    lock_before = lock.read_bytes()
+                    journal_before = journal.read_bytes() if journal.exists() else None
+
+                    code, _, error = self.runtime("--recover")
+                    self.assertEqual(code, 1)
+                    self.assertIn("reserved namespace mismatch", error)
+                    self.assertIn("lock, journal, and unexpected namespace were preserved", error)
+                    self.assertEqual(lock.read_bytes(), lock_before)
+                    if journal_before is not None:
+                        self.assertEqual(journal.read_bytes(), journal_before)
+                    self.assertTrue(os.path.lexists(namespace))
+
+                    if namespace.is_dir():
+                        namespace.chmod(0o700)
+                        namespace.rmdir()
+                    else:
+                        namespace.unlink()
+                    code, output, error = self.runtime("--recover")
+                    self.assertEqual((code, error), (0, ""), output + error)
+                    recovery = json.loads(output)
+                    code, output, error = self.runtime(
+                        "--recover", "--apply", "--plan-digest", recovery["recoveryDigest"]
+                    )
+                    self.assertEqual((code, error), (0, ""), output + error)
+
+    def test_real_death_rejects_replaced_bound_namespace_inode(self) -> None:
+        for phase in ("locked", "prepared"):
+            with self.subTest(phase=phase):
+                self.runtime_root.mkdir(mode=0o700, exist_ok=True)
+                namespace = self.runtime_root / "assets"
+                namespace.mkdir(mode=0o700)
+                self.crash_apply_after_phase(phase)
+                original = self.runtime_root / "assets-recorded-identity"
+                namespace.rename(original)
+                namespace.mkdir(mode=0o700)
+                lock = self.runtime_root / ".runtime-kit.lock"
+                journal = self.runtime_root / ".runtime-kit-journal.json"
+                lock_before = lock.read_bytes()
+                journal_before = journal.read_bytes() if journal.exists() else None
+
+                code, _, error = self.runtime("--recover")
+                self.assertEqual(code, 1)
+                self.assertIn("reserved namespace mismatch", error)
+                self.assertEqual(lock.read_bytes(), lock_before)
+                if journal_before is not None:
+                    self.assertEqual(journal.read_bytes(), journal_before)
+                namespace.rmdir()
+                original.rename(namespace)
+                code, output, error = self.runtime("--recover")
+                self.assertEqual((code, error), (0, ""), output + error)
+                recovery = json.loads(output)
+                code, output, error = self.runtime(
+                    "--recover", "--apply", "--plan-digest", recovery["recoveryDigest"]
+                )
+                self.assertEqual((code, error), (0, ""), output + error)
+                self.assertTrue(namespace.is_dir(), "authorized pre-state must never be removed")
+                namespace.rmdir()
+                self.runtime_root.rmdir()
+
+    def test_real_death_rejects_bound_namespace_link_count_change(self) -> None:
+        for phase in ("locked", "prepared"):
+            with self.subTest(phase=phase):
+                self.runtime_root.mkdir(mode=0o700, exist_ok=True)
+                namespace = self.runtime_root / "assets"
+                namespace.mkdir(mode=0o700)
+                original_links = namespace.stat().st_nlink
+                self.crash_apply_after_phase(phase)
+                unexpected_child = namespace / "unbound-child"
+                unexpected_child.mkdir(mode=0o700)
+                self.assertNotEqual(namespace.stat().st_nlink, original_links)
+                lock = self.runtime_root / ".runtime-kit.lock"
+                before = lock.read_bytes()
+                code, _, error = self.runtime("--recover")
+                self.assertEqual(code, 1)
+                self.assertIn("reserved namespace mismatch", error)
+                self.assertEqual(lock.read_bytes(), before)
+
+                unexpected_child.rmdir()
+                code, output, error = self.runtime("--recover")
+                self.assertEqual((code, error), (0, ""), output + error)
+                recovery = json.loads(output)
+                code, output, error = self.runtime(
+                    "--recover", "--apply", "--plan-digest", recovery["recoveryDigest"]
+                )
+                self.assertEqual((code, error), (0, ""), output + error)
+                namespace.rmdir()
+                self.runtime_root.rmdir()
+
+    def test_wrong_namespace_owner_is_simulated_without_privileged_chown(self) -> None:
+        for phase in ("locked", "prepared"):
+            with self.subTest(phase=phase):
+                self.runtime_root.mkdir(mode=0o700, exist_ok=True)
+                namespace = self.runtime_root / "assets"
+                namespace.mkdir(mode=0o700)
+                self.crash_apply_after_phase(phase)
+                original_state = runtime_kit._directory_recovery_state
+
+                def simulated_wrong_owner(path: Path) -> dict[str, object]:
+                    state = original_state(path)
+                    if path == namespace and state.get("exists") is True:
+                        state = dict(state)
+                        state["owner"] = os.geteuid() + 1
+                    return state
+
+                lock = self.runtime_root / ".runtime-kit.lock"
+                lock_before = lock.read_bytes()
+                with mock.patch.object(
+                    runtime_kit, "_directory_recovery_state", side_effect=simulated_wrong_owner
+                ):
+                    code, _, error = self.runtime("--recover")
+                self.assertEqual(code, 1)
+                self.assertIn("reserved namespace mismatch", error)
+                self.assertEqual(lock.read_bytes(), lock_before)
+
+                code, output, error = self.runtime("--recover")
+                self.assertEqual((code, error), (0, ""), output + error)
+                recovery = json.loads(output)
+                code, output, error = self.runtime(
+                    "--recover", "--apply", "--plan-digest", recovery["recoveryDigest"]
+                )
+                self.assertEqual((code, error), (0, ""), output + error)
+                self.assertTrue(namespace.is_dir())
+                namespace.rmdir()
+                self.runtime_root.rmdir()
+
+    def test_exact_transaction_created_namespace_is_the_only_created_state_removed(self) -> None:
+        self.crash_after_transaction_created_assets_namespace()
+        namespace = self.runtime_root / "assets"
+        journal = json.loads((self.runtime_root / ".runtime-kit-journal.json").read_text())
+        bound = next(
+            record for record in journal["createdDirectories"] if record["path"] == str(namespace)
+        )
+        self.assertEqual(bound["state"]["inode"], namespace.stat().st_ino)
+        self.assertEqual(bound["state"]["mode"], 0o700)
+        code, output, error = self.runtime("--recover")
+        self.assertEqual((code, error), (0, ""), output + error)
+        recovery = json.loads(output)
+        self.assertEqual(recovery["transactionPhase"], "prepared")
+        code, output, error = self.runtime(
+            "--recover", "--apply", "--plan-digest", recovery["recoveryDigest"]
+        )
+        self.assertEqual((code, error), (0, ""), output + error)
+        self.assertFalse(namespace.exists())
+        self.assertFalse((self.runtime_root / ".runtime-kit.lock").exists())
+        self.assertFalse((self.runtime_root / ".runtime-kit-journal.json").exists())
 
     def test_descriptor_relative_creation_never_follows_raced_assets_symlink(self) -> None:
         digest = self.preview_digest()

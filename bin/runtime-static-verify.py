@@ -110,8 +110,13 @@ def private_directory(path: Path, label: str) -> None:
         if stat.S_ISLNK(info.st_mode):
             fail(f"{label} contains a symlink")
     info = path.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
-        fail(f"{label} is not a caller-owned private directory")
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or info.st_nlink < 1
+    ):
+        fail(f"{label} is not an exact caller-owned mode-0700 directory")
 
 
 def path_present_nofollow(path: Path, label: str) -> bool:

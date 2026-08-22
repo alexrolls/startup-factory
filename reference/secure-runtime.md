@@ -47,6 +47,12 @@ asset pre/post-images, created-directory scope, plan and installation digests,
 commit marker, and every existing component of the reserved runtime namespaces,
 even when the final asset path is absent. Directory and exclusive-file creation
 walk pinned directory descriptors and never follows a substituted ancestor.
+Transaction schema 3 binds each reserved namespace's present/absent state plus
+its type, device, inode, owner, exact mode-0700 policy, and link count in the
+lock; the journal additionally binds each transaction-created directory after
+every durable creation. Safe-looking but unbound directories are substitutions,
+not cleanup candidates. Older unresolved transaction schemas are preserved for
+manual inspection rather than guessed or upgraded in place.
 If an ancestor changes after a process death or preview, recovery/apply preserves
 the lock, journal, and substituted path; inspect the named mismatch, restore the
 exact caller-owned non-symlink namespace, and request a new `--recover` digest.

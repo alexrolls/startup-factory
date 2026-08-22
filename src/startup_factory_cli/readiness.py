@@ -411,9 +411,10 @@ def _runtime_private_directory(path: Path, *, label: str) -> None:
     if (
         not stat.S_ISDIR(info.st_mode)
         or info.st_uid != os.geteuid()
-        or stat.S_IMODE(info.st_mode) & 0o077
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or info.st_nlink < 1
     ):
-        raise ValueError(f"{label} is not a caller-owned private directory")
+        raise ValueError(f"{label} is not an exact caller-owned mode-0700 directory")
 
 
 def _runtime_path_present_nofollow(path: Path, *, label: str) -> bool:
