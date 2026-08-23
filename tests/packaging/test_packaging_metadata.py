@@ -161,6 +161,7 @@ class BundledDefaultsTests(unittest.TestCase):
         self.assertTrue(module.is_file())
         self.assertTrue(fixture.is_file())
         self.assertIn('"tests/beads-protected-runtime-test.py"', spec)
+        self.assertIn('"tests/beads-protected-runtime-hostile-test.py"', spec)
         self.assertIn('"tests/fixtures/beads-protected-runtime-v1.json"', spec)
 
 

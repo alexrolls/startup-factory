@@ -87,6 +87,7 @@
     "tests/retrospective-test.py",
     "tests/delivery-profile-test.py",
     "tests/beads-protected-runtime-test.py",
+    "tests/beads-protected-runtime-hostile-test.py",
     "tests/fixtures/beads-protected-runtime-v1.json",
     "tests/evidence-provider-test.py",
     "tests/runtime-boundary-linux-opt-in.sh",

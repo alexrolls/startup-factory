@@ -141,7 +141,7 @@ sed_i 's|^AGENT_SANDBOX_ENFORCED=.*|AGENT_SANDBOX_ENFORCED=true|' "$CFG_SANDBOX"
 : > "$SANDBOX_RUNNER_LOG"
 
 # -- start: composes prompt, runs stub in background mode ---------------------
-TEAM_RUNNER=background "$LAUNCH" start test-feature FEAT-1 backend
+TEAM_RUNNER=wait "$LAUNCH" start test-feature FEAT-1 backend
 check "prompt file composed"        test -f .teamwork/test-feature/prompts/backend.md
 check "prompt contains role brief"  grep -q "Role: backend" .teamwork/test-feature/prompts/backend.md
 check "prompt contains protocol"    grep -q "Orchestration — The Multi-Agent Protocol" .teamwork/test-feature/prompts/backend.md
@@ -154,12 +154,7 @@ if grep -q "Claude + obra/superpowers planning" .teamwork/test-feature/prompts/b
 else
   echo "ok: non-Claude command excludes Superpowers planning instructions"
 fi
-check "pid file written"            test -f .teamwork/test-feature/pids/backend.pid
-check "workspace process marker contains no PID" grep -qx managed .teamwork/test-feature/pids/backend.pid
-for i in $(seq 1 20); do
-  [ -f backend-received.txt ] && grep -Fq "$PWD|/usr/bin/env|-i" "$SANDBOX_RUNNER_LOG" && break
-  sleep 0.1
-done
+check "synchronous managed launch retires process marker" test ! -e .teamwork/test-feature/pids/backend.pid
 check "enforced gate launch uses protected runner argv" grep -Fq "$PWD|/usr/bin/env|-i" "$SANDBOX_RUNNER_LOG"
 check "stub agent ran with prompt"  grep -q "Role: backend" backend-received.txt
 check "mailbox dir created"         test -d .teamwork/test-feature/mailbox/backend

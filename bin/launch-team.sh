@@ -419,6 +419,27 @@ os.execvp(command[0], command)
   LAUNCHED_PID="$pid"
 }
 
+wait_managed_background() { # marker team category instance
+  local marker="$1" team="$2" category="$3" instance="$4" rc=0 probe_rc=0
+  # TEAM_RUNNER=wait is an explicit synchronous batch mode.  Unlike polling
+  # repository output, wait(2) observes the exact child created above; the
+  # authenticated lifecycle record is retired only after that child exits.
+  wait "$LAUNCHED_PID" || rc=$?
+  if lifecycle_probe "$team" "$category" "$instance"; then
+    die "managed child $team/$instance exited but its protected process group is still live"
+  else
+    probe_rc=$?
+  fi
+  [ "$probe_rc" -eq 3 ] \
+    || die "protected lifecycle state became invalid while waiting for $team/$instance"
+  python3 "$SKILL_DIR/bin/process-lifecycle.py" forget \
+    --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
+    --team "$team" --category "$category" --instance "$instance" >/dev/null \
+    || die "could not retire completed lifecycle record $team/$instance"
+  rm -f -- "$marker"
+  return "$rc"
+}
+
 spawn_managed_tmux() { # workdir marker team category instance env-command
   local workdir="$1" marker="$2" team="$3" category="$4" instance="$5" env_cmd="$6"
   local session="team-$team" quoted_workdir quoted_marker quoted_barrier quoted_group_file
@@ -1819,7 +1840,7 @@ launch_one() { # launch_one <team> <featureId> <role> [preset]
     fi
   fi
 
-  if [ "${TEAM_RUNNER:-auto}" != "background" ] && command -v tmux >/dev/null 2>&1; then
+  if [ "${TEAM_RUNNER:-auto}" != "background" ] && [ "${TEAM_RUNNER:-auto}" != "wait" ] && command -v tmux >/dev/null 2>&1; then
     env_cmd="$(execution_shell_command)"
     if [ "$LIFECYCLE_ENABLED" = true ]; then
       spawn_managed_tmux "$workdir" "$pidfile" "$team" gate "$role" "$env_cmd"
@@ -1836,6 +1857,10 @@ launch_one() { # launch_one <team> <featureId> <role> [preset]
     if [ "$LIFECYCLE_ENABLED" = true ]; then
       spawn_managed_background "$workdir" "$logfile" "$pidfile" "$team" gate "$role"
       echo "launched $role in background (protected pid $LAUNCHED_PID)"
+      if [ "${TEAM_RUNNER:-auto}" = wait ]; then
+        wait_managed_background "$pidfile" "$team" gate "$role"
+        echo "completed $role in synchronous managed mode"
+      fi
     else
       ( cd "$workdir" && exec "${EXECUTION_ARGS[@]}" >"$logfile" 2>&1 ) &
       LAUNCHED_PID=$!
@@ -1944,7 +1969,7 @@ launch_task() { # launch_task <team> <featureId> <role> <taskId> <attempt> [pres
   prepare_outbox_ingress
   prepare_execution "$wt" "$cmd" "$role" "$team" "$fid" "$preset" task "$task" "$attempt"
 
-  if [ "${TEAM_RUNNER:-auto}" != "background" ] && command -v tmux >/dev/null 2>&1; then
+  if [ "${TEAM_RUNNER:-auto}" != "background" ] && [ "${TEAM_RUNNER:-auto}" != "wait" ] && command -v tmux >/dev/null 2>&1; then
     env_cmd="$(execution_shell_command)"
     if [ "$LIFECYCLE_ENABLED" = true ]; then
       spawn_managed_tmux "$wt" "$pidfile" "$team" task "$instance" "$env_cmd"
@@ -1961,6 +1986,10 @@ launch_task() { # launch_task <team> <featureId> <role> <taskId> <attempt> [pres
     if [ "$LIFECYCLE_ENABLED" = true ]; then
       spawn_managed_background "$wt" "$logfile" "$pidfile" "$team" task "$instance"
       echo "launched task $task as $instance in background (protected pid $LAUNCHED_PID)"
+      if [ "${TEAM_RUNNER:-auto}" = wait ]; then
+        wait_managed_background "$pidfile" "$team" task "$instance"
+        echo "completed task $task as $instance in synchronous managed mode"
+      fi
     else
       ( cd "$wt" && exec "${EXECUTION_ARGS[@]}" >"$logfile" 2>&1 ) &
       LAUNCHED_PID=$!

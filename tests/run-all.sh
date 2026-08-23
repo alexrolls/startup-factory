@@ -38,6 +38,7 @@ FULL_PYTHON_TESTS=(
   ticket-content-security-test.py
   execution-graph-test.py
   beads-protected-runtime-test.py
+  beads-protected-runtime-hostile-test.py
   retrospective-test.py
   product-acceptance-test.py
   superpowers-planning-test.py
@@ -73,6 +74,7 @@ SMOKE_PYTHON_TESTS=(
   evidence-provider-test.py
   tracker-adapter-pagination-test.py
   beads-protected-runtime-test.py
+  beads-protected-runtime-hostile-test.py
   task-hold-test.py
 )
 SMOKE_SHELL_TESTS=(

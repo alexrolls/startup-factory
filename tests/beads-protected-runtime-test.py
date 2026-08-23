@@ -25,7 +25,7 @@ def digest(label: str) -> str:
 class ProtectedRuntimeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name) / "protected"
+        self.root = Path(self.temporary.name).resolve() / "protected"
         self.root.mkdir(mode=0o700)
         self.key = self.root / "beads-runtime.hmac"
         self.key.write_bytes(b"offline-fixture-key-material-32b")
@@ -136,6 +136,8 @@ class ProtectedRuntimeTest(unittest.TestCase):
         )
         observation = {
             "bootstrapRuntimeCoreSha256": core.payload["bootstrapRuntimeCoreSha256"],
+            "adapterReleaseCoreSha256": core.payload["adapterReleaseCoreSha256"],
+            "runtimeApiManifestRecordSha256": runtime_manifest.record_sha256,
             "adapterPayloadSha256": digest("adapter-payload"),
             "remediationEvidenceSha256": None,
         }
@@ -275,11 +277,59 @@ class ProtectedRuntimeTest(unittest.TestCase):
         revoked = self.bootstrap_revoked()
         core, runtime_manifest, release_manifest = self.create_runtime_and_release_manifests()
         sequence = self.sequence("create")
+        repository_path = Path(self.temporary.name).resolve() / "repository"
+        repository_path.mkdir(mode=0o700)
+        binary_directory = Path(self.temporary.name).resolve() / "bin"
+        binary_directory.mkdir(mode=0o700)
+        executable_path = binary_directory / "bd"
+        executable_bytes = b"""#!/bin/sh
+set -eu
+if [ "${1-}" = version ]; then
+    printf '{"commit":"20e493e569c922d1253bdeff068c5e56c94957fb","version":"1.1.2"}\\n'
+    exit 0
+fi
+database=$2
+if [ "${5-}" = init ]; then
+    mkdir -p "$database/.dolt"
+    chmod 700 "$database" "$database/.dolt"
+    printf '{"initialized":true}\\n' >"$database/state.json"
+    chmod 600 "$database/state.json"
+    printf '{"initialized":true}\\n'
+    exit 0
+fi
+if [ "${5-}:${6-}" = config:set ]; then
+    printf '{"statuses":"%s"}\\n' "$8" >"$database/status.json"
+    chmod 600 "$database/status.json"
+    printf '{"updated":true}\\n'
+    exit 0
+fi
+if [ "${5-}:${6-}" = config:list ]; then
+    printf '{"statuses":["open","closed"]}\\n'
+    exit 0
+fi
+exit 64
+"""
+        executable_path.write_bytes(executable_bytes)
+        executable_path.chmod(0o700)
+        install_path = repository_path / ".beads" / "embeddeddolt" / "sf"
+        install_path.parent.mkdir(parents=True, mode=0o700)
+        (repository_path / ".beads").chmod(0o700)
+        install_path.parent.chmod(0o700)
+        cleanup_parent = Path(self.temporary.name).resolve() / "cleanup-parent"
+        cleanup_parent.mkdir(mode=0o700)
+        cleanup_path = cleanup_parent / "stage-scaffold"
+        cleanup_path.mkdir(mode=0o700)
+        (cleanup_path / ".gitignore").write_bytes(b"*\n")
+        (cleanup_path / ".gitignore").chmod(0o600)
+        stage_path = cleanup_path / "sf"
+        sequence["createStageDatabasePathLocatorSha256"] = runtime.sha256(
+            runtime.canonical_bytes(runtime._observe_path_locator(stage_path, "test stage path"))
+        )
         authorization = runtime.authorize_beads_preparation_v1(
             self.request(
                 "AuthorizeBeadsPreparationRequestV1",
                 planSha256=digest("plan"),
-                executableSha256=digest("bd"),
+                executableSha256=runtime.sha256(executable_bytes),
                 operatorIdentitySha256=digest("operator"),
                 authorizationNonce="preparation-auth",
                 expiresAtUnix=self.expires,
@@ -287,8 +337,13 @@ class ProtectedRuntimeTest(unittest.TestCase):
                 adapterReleaseManifestRecordSha256=release_manifest.record_sha256,
                 bootstrapRuntimeCoreSha256=core.payload["bootstrapRuntimeCoreSha256"],
                 adapterReleaseCoreSha256=core.payload["adapterReleaseCoreSha256"],
-                createStageDatabasePath="/protected/stage-db",
-                executablePath="/protected/bin/bd",
+                createStageDatabasePath=str(stage_path),
+                executablePath=str(executable_path),
+                repositoryPath=str(repository_path),
+                databaseName="sf",
+                installPath=str(install_path),
+                cleanupPath=str(cleanup_path),
+                statusConfigValue="open,closed",
                 **sequence,
             )
         )
@@ -300,20 +355,44 @@ class ProtectedRuntimeTest(unittest.TestCase):
                 expiresAtUnix=self.expires,
             )
         )
-        commands = ("binary-proof", "initialize", "status-config-write", "status-config-readback")
-        for ordinal, command in enumerate(commands):
+        commands = (
+            ("binary-proof", [str(executable_path), "version", "--json"]),
+            ("initialize", [str(executable_path), "--db", str(stage_path), "--json", "--sandbox", "init"]),
+            (
+                "status-config-write",
+                [
+                    str(executable_path), "--db", str(stage_path), "--json", "--sandbox",
+                    "config", "set", "status.custom", "open,closed",
+                ],
+            ),
+            (
+                "status-config-readback",
+                [str(executable_path), "--db", str(stage_path), "--json", "--sandbox", "config", "list"],
+            ),
+        )
+        readback_step = None
+        pre = None
+        for ordinal, (command, argv) in enumerate(commands):
+            if command == "status-config-readback":
+                pre = runtime.observe_beads_store_v1(
+                    self.request(
+                        "ObserveBeadsStoreRequestV1",
+                        leaseRecordSha256=lease.record_sha256,
+                        observationPhase="pre",
+                    )
+                )
             step = runtime.advance_beads_preparation_v1(
                 self.request(
                     "AdvanceBeadsPreparationRequestV1",
                     leaseRecordSha256=lease.record_sha256,
                     commandOrdinal=ordinal,
                     commandKind=command,
-                    argv=["/protected/bin/bd", command, "/protected/stage-db"],
-                    outcome="succeeded",
-                    stdoutSha256=digest(f"stdout-{ordinal}"),
-                    stderrSha256=digest("empty"),
+                    argv=argv,
                 )
             )
+            self.assertEqual("succeeded", step.payload["outcome"])
+            if command == "status-config-readback":
+                readback_step = step
             lease = runtime._load_record(
                 runtime._Store(self.request("ObserveBeadsStoreRequestV1").payload),
                 "BeadsPreparationLeaseV1",
@@ -321,28 +400,21 @@ class ProtectedRuntimeTest(unittest.TestCase):
                 "preparation-leases",
                 step.payload["successorLeaseRecordSha256"],
             )
-        pre = runtime.observe_beads_store_v1(
-            self.request(
-                "ObserveBeadsStoreRequestV1",
-                leaseRecordSha256=lease.record_sha256,
-                observationPhase="pre",
-                stateProjection={"databaseName": "sf", "storeSha256": digest("store")},
-            )
-        )
-        config_digest = digest("config-envelope")
+        assert pre is not None and readback_step is not None
+        config_digest = readback_step.payload["stdoutSha256"]
         post = runtime.observe_beads_store_v1(
             self.request(
                 "ObserveBeadsStoreRequestV1",
                 leaseRecordSha256=lease.record_sha256,
                 observationPhase="post",
-                stateProjection={"databaseName": "sf", "storeSha256": digest("store")},
                 acceptedConfigEnvelopeSha256=config_digest,
                 predecessorObservationRecordSha256=pre.record_sha256,
+                configReadbackStepRecordSha256=readback_step.record_sha256,
             )
         )
-        dynamic = runtime.derive_beads_status_profile_dynamic_bindings_v1(lease, pre, post, config_digest)
-        finished = runtime.finish_beads_preparation_v1(
-            self.request(
+        with runtime.use_beads_protected_runtime_v1(str(self.root), str(self.key)):
+            dynamic = runtime.derive_beads_status_profile_dynamic_bindings_v1(lease, pre, post, config_digest)
+        finish_request = self.request(
                 "FinishBeadsPreparationRequestV1",
                 leaseRecordSha256=lease.record_sha256,
                 preObservationRecordSha256=pre.record_sha256,
@@ -351,14 +423,31 @@ class ProtectedRuntimeTest(unittest.TestCase):
                 statusProfilePayloadCanonicalJson='{"allowed":["open","closed"],"schemaVersion":1}',
                 preparedStorePayloadCanonicalJson='{"database":"sf","schemaVersion":1}',
                 expectedCurrentPointerFullBytesSha256=None,
-            )
         )
+        with runtime._inject_fault("preparation-install-renamed"), self.assertRaises(SystemExit):
+            runtime.finish_beads_preparation_v1(finish_request)
+        finished = runtime.finish_beads_preparation_v1(finish_request)
+        self.assertTrue((install_path / ".dolt").is_dir())
+        self.assertFalse(stage_path.exists())
+        self.assertFalse(cleanup_path.exists())
+        for field in (
+            "installIntentRecordSha256", "installObservedRecordSha256",
+            "cleanupIntentRecordSha256", "cleanupObservedRecordSha256",
+        ):
+            self.assertRegex(finished.payload[field], r"^sha256:[0-9a-f]{64}$")
         candidate = {
             "preparationPointerRecordSha256": finished.payload["pointerRecordSha256"],
+            "preparationActivationReceiptRecordSha256": finished.payload["activationReceiptRecordSha256"],
             "adapterReleaseManifestRecordSha256": release_manifest.record_sha256,
             "runtimeApiManifestRecordSha256": runtime_manifest.record_sha256,
+            "repositoryPath": str(repository_path),
+            "databaseName": "sf",
         }
         stage_auth = self.authorize_transition("stage", revoked.full_bytes_sha256, candidate)
+        with runtime._inject_fault("stage-authority-current-written"), self.assertRaises(SystemExit):
+            runtime.stage_beads_authority_epoch_v1(
+                self.request("StageBeadsAuthorityEpochRequestV1", authorizationRecordSha256=stage_auth.record_sha256)
+            )
         pending = runtime.stage_beads_authority_epoch_v1(
             self.request("StageBeadsAuthorityEpochRequestV1", authorizationRecordSha256=stage_auth.record_sha256)
         )
@@ -414,6 +503,7 @@ class ProtectedRuntimeTest(unittest.TestCase):
                 mutationNonce="mutation-1",
                 commandArgv=["bd", "update", "task-42", "--json"],
                 expiresAtUnix=self.expires,
+                launchAuthorizationRecordSha256=launch.record_sha256,
             )
         )
         result = runtime.finish_beads_mutation_v1(
@@ -428,6 +518,11 @@ class ProtectedRuntimeTest(unittest.TestCase):
             )
         )
         self.assertEqual("ordinary", result.payload["mutationClass"])
+        executable_path.write_bytes(executable_bytes + b"# changed after activation\n")
+        executable_path.chmod(0o700)
+        with runtime.use_beads_protected_runtime_v1(str(self.root), str(self.key)):
+            with self.assertRaises(runtime.BeadsProtectedRuntimeError):
+                runtime.verify_active_beads_authority_v1(self.repository)
 
     def test_reattest_argv_gate_rejects_every_variant_before_recording(self) -> None:
         lease = runtime.BeadsPreparationLeaseV1(
