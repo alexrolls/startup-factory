@@ -1,16 +1,17 @@
 [Unit]
 Description=Startup Factory protected Beads boundary controller
-Requires=startup-factory-beads-controller.socket
-After=local-fs.target startup-factory-beads-controller.socket
+Requires=systemd-tmpfiles-setup.service
+After=local-fs.target systemd-tmpfiles-setup.service
 
 [Service]
 Type=simple
-User=startup-factory-controller
-Group=startup-factory-controller
-SupplementaryGroups=startup-factory-beads-transport
+# The process starts as root only to create/chown/chmod the socket inside the
+# root:transport 0750 tmpfiles directory, then irreversibly drops itself to the
+# closed controller UID and transport GID before listen().
 ExecStart=/usr/local/bin/startup-factory-beads-controller serve
 Restart=on-failure
 RestartSec=2s
+CapabilityBoundingSet=CAP_CHOWN CAP_SETGID CAP_SETUID
 NoNewPrivileges=true
 PrivateDevices=true
 PrivateTmp=true
@@ -20,7 +21,7 @@ ProtectKernelLogs=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/startup-factory/beads-boundary-controller/v1
+ReadWritePaths=/run/startup-factory /var/lib/startup-factory/beads-boundary-controller/v1
 RestrictAddressFamilies=AF_UNIX
 RestrictSUIDSGID=true
 SystemCallArchitectures=native

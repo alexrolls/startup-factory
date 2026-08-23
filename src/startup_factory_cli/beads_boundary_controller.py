@@ -37,6 +37,8 @@ PRODUCTION_PROVENANCE: Final = "startup-factory/beads-boundary-controller/produc
 MAX_MESSAGE_BYTES: Final = 1_048_576
 MAX_CLOCK_SKEW_SECONDS: Final = 30
 MAX_OPERATION_SECONDS: Final = 300
+CONNECTION_DEADLINE_SECONDS: Final = 5.0
+LISTEN_BACKLOG: Final = 128
 _DIGEST = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 _NONCE = re.compile(r"\A[a-zA-Z0-9][a-zA-Z0-9._:-]{15,255}\Z")
 _OPERATION_ID = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -463,7 +465,7 @@ def _endpoint_metadata(config: ControllerConfig) -> None:
         raise ControllerProtocolError(f"fixed controller endpoint is unavailable: {exc}") from exc
     if (
         not stat.S_ISSOCK(info.st_mode)
-        or info.st_uid != 0
+        or info.st_uid != config.controller_uid
         or info.st_gid != config.transport_gid
         or stat.S_IMODE(info.st_mode) != 0o660
     ):
@@ -1406,6 +1408,11 @@ def _serve_connection(
 
     try:
         try:
+            # Bound both the first packet and the response write.  A broker
+            # that connects and idles, stops reading, or supplies malformed
+            # bytes is contained to this connection and cannot pin the
+            # single-threaded controller indefinitely.
+            connection.settimeout(CONNECTION_DEADLINE_SECONDS)
             _, peer_uid, _ = _peer_credentials(connection)
             packet = connection.recv(MAX_MESSAGE_BYTES + 1)
             if not packet or len(packet) > MAX_MESSAGE_BYTES:
@@ -1435,28 +1442,76 @@ def _serve_connection(
         connection.close()
 
 
-def _systemd_listener(config: ControllerConfig) -> socket.socket:
+def _remove_stale_endpoint(config: ControllerConfig) -> None:
+    """Remove only the fixed controller-owned socket from the root-only parent."""
+
     try:
-        listen_pid = int(os.environ.get("LISTEN_PID", ""))
-        listen_fds = int(os.environ.get("LISTEN_FDS", ""))
-    except ValueError as exc:
-        raise ControllerProtocolError("systemd socket-activation metadata is malformed") from exc
-    if listen_pid != os.getpid() or listen_fds != 1:
+        info = os.lstat(ENDPOINT_PATH)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
         raise ControllerProtocolError(
-            "controller requires exactly one systemd-activated SOCK_SEQPACKET endpoint"
+            f"cannot inspect fixed controller endpoint before bind: {exc}"
+        ) from exc
+    if (
+        not stat.S_ISSOCK(info.st_mode)
+        or info.st_uid != config.controller_uid
+        or info.st_gid != config.transport_gid
+        or stat.S_IMODE(info.st_mode) != 0o660
+    ):
+        raise ControllerProtocolError(
+            "fixed controller endpoint collision is not the exact stale controller socket"
         )
-    listener = socket.fromfd(3, socket.AF_UNIX, socket.SOCK_SEQPACKET)
     try:
+        os.unlink(ENDPOINT_PATH)
+    except OSError as exc:
+        raise ControllerProtocolError(
+            f"cannot retire exact stale controller endpoint: {exc}"
+        ) from exc
+
+
+def _create_listener(config: ControllerConfig) -> socket.socket:
+    """Bind as root, fix ownership/mode, then irreversibly become controller.
+
+    The returned socket is deliberately not listening yet.  The dropped
+    controller identity must first read its own private key and state root;
+    only a completely successful preflight may expose listener readiness.
+    """
+
+    if os.geteuid() != 0:
+        raise ControllerProtocolError(
+            "controller service must start as root to create the fixed root-parented endpoint"
+        )
+    _validate_endpoint_parent(config)
+    _remove_stale_endpoint(config)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        listener.bind(str(ENDPOINT_PATH))
+        os.chown(
+            ENDPOINT_PATH,
+            config.controller_uid,
+            config.transport_gid,
+            follow_symlinks=False,
+        )
+        # The fixed parent is root-owned mode 0750 and only root can mutate
+        # names within it, so this pathname cannot be substituted by either
+        # controller, broker or worker while the root bootstrap runs.
+        os.chmod(ENDPOINT_PATH, 0o660)
+
+        # Drop before listen so every connecting client observes the distinct
+        # configured controller UID through SO_PEERCRED.  The transport group
+        # is the only supplementary and primary group retained.
+        os.setgroups([config.transport_gid])
+        os.setgid(config.transport_gid)
+        os.setuid(config.controller_uid)
         if (
-            listener.family != socket.AF_UNIX
-            or listener.type & 0xF != socket.SOCK_SEQPACKET
-            or listener.getsockname() != str(ENDPOINT_PATH)
-            or not listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+            os.geteuid() != config.controller_uid
+            or os.getegid() != config.transport_gid
+            or set(os.getgroups()) != {config.transport_gid}
         ):
             raise ControllerProtocolError(
-                "activated descriptor is not the fixed listening SOCK_SEQPACKET endpoint"
+                "controller could not enter the exact configured controller/transport identity"
             )
-        _validate_endpoint_parent(config)
         _endpoint_metadata(config)
         return listener
     except Exception:
@@ -1468,44 +1523,48 @@ def serve_forever() -> None:
     if not sys.platform.startswith("linux"):
         raise ControllerProtocolError("controller service requires Linux")
     config = load_controller_config()
-    if os.geteuid() != config.controller_uid:
-        raise ControllerProtocolError("controller process does not run as configured controller UID")
-    _validate_transport_group(config)
-    _verify_installed_artifacts(config)
-    try:
-        key_info = os.lstat(CONTROLLER_KEY_PATH)
-        if (
-            stat.S_ISLNK(key_info.st_mode)
-            or not stat.S_ISREG(key_info.st_mode)
-            or key_info.st_uid != config.controller_uid
-            or key_info.st_nlink != 1
-            or stat.S_IMODE(key_info.st_mode) & 0o077
-        ):
-            raise ControllerProtocolError(
-                "controller HMAC key must be a controller-owned private regular file"
-            )
-        key_fd = os.open(
-            CONTROLLER_KEY_PATH,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    if os.geteuid() != 0:
+        raise ControllerProtocolError(
+            "controller service must start as root and drop to the configured controller UID"
         )
-        try:
-            opened = os.fstat(key_fd)
-            if (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_mode) != (
-                key_info.st_dev, key_info.st_ino, key_info.st_uid, key_info.st_mode
-            ):
-                raise ControllerProtocolError("controller HMAC key changed before open")
-            key = os.read(key_fd, 4097)
-        finally:
-            os.close(key_fd)
-    except ControllerProtocolError:
-        raise
-    except OSError as exc:
-        raise ControllerProtocolError(f"cannot read controller HMAC key: {exc}") from exc
-    if len(key) < 32 or len(key) > 4096:
-        raise ControllerProtocolError("controller HMAC key must contain 32..4096 bytes")
-    _validate_controller_directory(STATE_ROOT, config, "controller state root")
-    listener = _systemd_listener(config)
+    _validate_transport_group(config)
+    _validate_endpoint_parent(config)
+    _verify_installed_artifacts(config)
+    listener = _create_listener(config)
     try:
+        try:
+            key_info = os.lstat(CONTROLLER_KEY_PATH)
+            if (
+                stat.S_ISLNK(key_info.st_mode)
+                or not stat.S_ISREG(key_info.st_mode)
+                or key_info.st_uid != config.controller_uid
+                or key_info.st_nlink != 1
+                or stat.S_IMODE(key_info.st_mode) & 0o077
+            ):
+                raise ControllerProtocolError(
+                    "controller HMAC key must be a controller-owned private regular file"
+                )
+            key_fd = os.open(
+                CONTROLLER_KEY_PATH,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                opened = os.fstat(key_fd)
+                if (opened.st_dev, opened.st_ino, opened.st_uid, opened.st_mode) != (
+                    key_info.st_dev, key_info.st_ino, key_info.st_uid, key_info.st_mode
+                ):
+                    raise ControllerProtocolError("controller HMAC key changed before open")
+                key = os.read(key_fd, 4097)
+            finally:
+                os.close(key_fd)
+        except ControllerProtocolError:
+            raise
+        except OSError as exc:
+            raise ControllerProtocolError(f"cannot read controller HMAC key: {exc}") from exc
+        if len(key) < 32 or len(key) > 4096:
+            raise ControllerProtocolError("controller HMAC key must contain 32..4096 bytes")
+        _validate_controller_directory(STATE_ROOT, config, "controller state root")
+        listener.listen(LISTEN_BACKLOG)
         while True:
             connection, _ = listener.accept()
             _serve_connection(connection, config, key)

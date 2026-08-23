@@ -45,10 +45,6 @@ def base_payload(version: str = "1") -> dict[str, tuple[bytes, int]]:
             f"# fixture service {version}\n".encode(),
             0o644,
         ),
-        "runtime/startup-factory-beads-controller.socket.example": (
-            f"# fixture socket {version}\n".encode(),
-            0o644,
-        ),
         "adapters/_TEMPLATE.md": (b"adapter-template\n", 0o644),
         "adapters/Retired.md": (b"retired-v1\n", 0o644),
         "extensions/tracker-backends/README.md": (b"backend-contract\n", 0o644),
@@ -57,6 +53,16 @@ def base_payload(version: str = "1") -> dict[str, tuple[bytes, int]]:
         "teams/_PLAYBOOK.md": (b"playbook\n", 0o644),
         "tests/run-all.sh": (b"#!/bin/sh\necho ALL TESTS PASS\n", 0o755),
     }
+    if version == "1":
+        payload["runtime/startup-factory-beads-controller.socket.example"] = (
+            b"# obsolete fixture socket 1\n",
+            0o644,
+        )
+    else:
+        payload["runtime/startup-factory-beads-controller.tmpfiles.example"] = (
+            f"# fixture tmpfiles {version}\n".encode(),
+            0o644,
+        )
     for path in CONFIG_PATHS:
         payload[path] = (f"default-{version}:{path}\n".encode(), 0o644)
     return payload

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib
 import json
@@ -221,14 +222,103 @@ class BoundaryControllerTest(unittest.TestCase):
         service = (
             ROOT / "runtime/startup-factory-beads-controller.service.example"
         ).read_text()
-        socket_unit = (
-            ROOT / "runtime/startup-factory-beads-controller.socket.example"
+        tmpfiles = (
+            ROOT / "runtime/startup-factory-beads-controller.tmpfiles.example"
         ).read_text()
         self.assertIn("Restart=on-failure", service)
         self.assertIn("UMask=0007", service)
-        self.assertIn("SocketMode=0660", socket_unit)
-        self.assertIn("DirectoryMode=0750", socket_unit)
-        self.assertIn("SocketGroup=startup-factory-beads-transport", socket_unit)
+        self.assertIn("Requires=systemd-tmpfiles-setup.service", service)
+        self.assertIn(
+            "ReadWritePaths=/run/startup-factory /var/lib/startup-factory/beads-boundary-controller/v1",
+            service,
+        )
+        self.assertNotIn(".socket", service)
+        self.assertNotIn("User=", service)
+        self.assertEqual(
+            "d /run/startup-factory 0750 root startup-factory-beads-transport -\n",
+            tmpfiles,
+        )
+        self.assertFalse(
+            (ROOT / "runtime/startup-factory-beads-controller.socket.example").exists()
+        )
+
+    def test_linux_probe_pins_registered_operation_set_and_active_verifier(self) -> None:
+        probe_path = ROOT / "tests/beads-boundary-controller-linux-opt-in.py"
+        source = probe_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        assignment = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "EXPECTED_OPERATIONS"
+                for target in node.targets
+            )
+        )
+        self.assertEqual(controller.ALLOWED_OPERATIONS, ast.literal_eval(assignment.value))
+        self.assertIn(
+            'controller.open_operation(\n    "verify_active_beads_authority_v1",',
+            source,
+        )
+        self.assertNotIn("verify_current_beads_authority_epoch_v1", source)
+
+    def test_controller_binds_socket_then_drops_to_distinct_identity(self) -> None:
+        class FakeListener:
+            def __init__(self) -> None:
+                self.bound = None
+                self.backlog = None
+                self.closed = False
+
+            def bind(self, path):
+                self.bound = path
+
+            def listen(self, backlog):
+                self.backlog = backlog
+
+            def close(self):
+                self.closed = True
+
+        listener = FakeListener()
+        with mock.patch.object(controller.os, "geteuid", side_effect=[0, self.config.controller_uid]), mock.patch.object(
+            controller.os, "getegid", return_value=self.config.transport_gid
+        ), mock.patch.object(
+            controller.os, "getgroups", return_value=[self.config.transport_gid]
+        ), mock.patch.object(
+            controller, "_validate_endpoint_parent"
+        ), mock.patch.object(
+            controller, "_remove_stale_endpoint"
+        ) as removed, mock.patch.object(
+            controller.socket, "socket", return_value=listener
+        ), mock.patch.object(
+            controller.os, "chown"
+        ) as chown, mock.patch.object(
+            controller.os, "chmod"
+        ) as chmod, mock.patch.object(
+            controller.os, "setgroups"
+        ) as setgroups, mock.patch.object(
+            controller.os, "setgid"
+        ) as setgid, mock.patch.object(
+            controller.os, "setuid"
+        ) as setuid, mock.patch.object(
+            controller, "_endpoint_metadata"
+        ) as endpoint_metadata:
+            observed = controller._create_listener(self.config)
+
+        self.assertIs(listener, observed)
+        self.assertEqual(str(controller.ENDPOINT_PATH), listener.bound)
+        self.assertIsNone(listener.backlog)
+        removed.assert_called_once_with(self.config)
+        chown.assert_called_once_with(
+            controller.ENDPOINT_PATH,
+            self.config.controller_uid,
+            self.config.transport_gid,
+            follow_symlinks=False,
+        )
+        chmod.assert_called_once_with(controller.ENDPOINT_PATH, 0o660)
+        setgroups.assert_called_once_with([self.config.transport_gid])
+        setgid.assert_called_once_with(self.config.transport_gid)
+        setuid.assert_called_once_with(self.config.controller_uid)
+        endpoint_metadata.assert_called_once_with(self.config)
 
     def test_durable_one_operation_lineage_and_fresh_validation(self) -> None:
         opened = self.exchange("OPEN", self.open_request())
@@ -510,6 +600,10 @@ class BoundaryControllerTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.sent = []
                 self.closed = False
+                self.timeout = None
+
+            def settimeout(self, value):
+                self.timeout = value
 
             def recv(self, _size, *_flags):
                 return controller._canonical(
@@ -534,6 +628,47 @@ class BoundaryControllerTest(unittest.TestCase):
             controller._serve_connection(connection, self.config, self.key)
         self.assertEqual([], connection.sent)
         self.assertTrue(connection.closed)
+        self.assertEqual(controller.CONNECTION_DEADLINE_SECONDS, connection.timeout)
+
+        class IdleConnection(BadConnection):
+            def recv(self, _size, *_flags):
+                raise TimeoutError("idle client")
+
+        idle = IdleConnection()
+        with mock.patch.object(
+            controller, "_peer_credentials", return_value=(1, self.config.broker_uid, 1)
+        ):
+            controller._serve_connection(idle, self.config, self.key)
+        self.assertEqual([], idle.sent)
+        self.assertTrue(idle.closed)
+        self.assertEqual(controller.CONNECTION_DEADLINE_SECONDS, idle.timeout)
+
+        packet = controller._canonical(
+            {
+                "schemaVersion": 1,
+                "protocol": controller.PROTOCOL,
+                "action": "OPEN",
+                "request": self.open_request(client_nonce="post-idle-client-nonce-0001"),
+            }
+        )
+
+        class GoodConnection(BadConnection):
+            def __init__(self) -> None:
+                super().__init__()
+                self.reads = 0
+
+            def recv(self, _size, *_flags):
+                self.reads += 1
+                return packet if self.reads == 1 else b""
+
+        good = GoodConnection()
+        with mock.patch.object(
+            controller, "_peer_credentials", return_value=(1, self.config.broker_uid, 1)
+        ):
+            controller._serve_connection(good, self.config, self.key)
+        self.assertEqual(1, len(good.sent))
+        self.assertEqual("accepted", json.loads(good.sent[0])["state"])
+        self.assertTrue(good.closed)
 
     def test_serve_preflight_observes_exact_root_owned_artifacts(self) -> None:
         values = {

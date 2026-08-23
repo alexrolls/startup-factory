@@ -1113,9 +1113,15 @@ runtime_kit.apply_runtime_kit(plan, expected_plan_digest=expected)
         self.assertEqual(
             (
                 self.target
-                / "runtime/startup-factory-beads-controller.socket.example"
+                / "runtime/startup-factory-beads-controller.tmpfiles.example"
             ).read_text(),
-            "# fixture socket 2\n",
+            "# fixture tmpfiles 2\n",
+        )
+        self.assertFalse(
+            (
+                self.target
+                / "runtime/startup-factory-beads-controller.socket.example"
+            ).exists()
         )
 
         digest = self.preview_digest()

@@ -164,7 +164,7 @@ class BundledDefaultsTests(unittest.TestCase):
         fixture = ROOT / "tests" / "fixtures" / "beads-protected-runtime-v1.json"
         config_example = ROOT / "runtime" / "beads-boundary-controller-v1.example.json"
         service_example = ROOT / "runtime" / "startup-factory-beads-controller.service.example"
-        socket_example = ROOT / "runtime" / "startup-factory-beads-controller.socket.example"
+        tmpfiles_example = ROOT / "runtime" / "startup-factory-beads-controller.tmpfiles.example"
         linux_probe = ROOT / "tests" / "beads-boundary-controller-linux-opt-in.py"
         spec = (ROOT / "packaging" / "bundle-spec.json").read_text(encoding="utf-8")
         self.assertTrue(module.is_file())
@@ -172,7 +172,10 @@ class BundledDefaultsTests(unittest.TestCase):
         self.assertTrue(fixture.is_file())
         self.assertTrue(config_example.is_file())
         self.assertTrue(service_example.is_file())
-        self.assertTrue(socket_example.is_file())
+        self.assertTrue(tmpfiles_example.is_file())
+        self.assertFalse(
+            (ROOT / "runtime" / "startup-factory-beads-controller.socket.example").exists()
+        )
         self.assertTrue(linux_probe.is_file())
         self.assertIn('"tests/beads-protected-runtime-test.py"', spec)
         self.assertIn('"tests/beads-protected-runtime-hostile-test.py"', spec)
@@ -181,7 +184,8 @@ class BundledDefaultsTests(unittest.TestCase):
         self.assertIn('"tests/fixtures/beads-protected-runtime-v1.json"', spec)
         self.assertIn('"runtime/beads-boundary-controller-v1.example.json"', spec)
         self.assertIn('"runtime/startup-factory-beads-controller.service.example"', spec)
-        self.assertIn('"runtime/startup-factory-beads-controller.socket.example"', spec)
+        self.assertIn('"runtime/startup-factory-beads-controller.tmpfiles.example"', spec)
+        self.assertNotIn('"runtime/startup-factory-beads-controller.socket.example"', spec)
         self.assertIn('"tests/beads-boundary-controller-linux-opt-in.py"', spec)
 
 

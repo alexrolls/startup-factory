@@ -841,21 +841,25 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         requests = [
             (
                 fault_phase,
+                fault_occurrence,
                 runtime.RecordBeadsChangePlanCoreRequestV1(
                     payload={
                         "protectedRoot": str(self.root),
                         "hmacKeyPath": str(self.key),
                         "repositoryLocatorSha256": digest(
-                            f"integrated-recovery:{fault_phase}"
+                            f"integrated-recovery:{fault_phase}:{fault_occurrence}"
                         ),
                         "bootstrapRuntimeCoreCanonicalJson": bootstrap.decode(),
                         "adapterReleaseCoreCanonicalJson": adapter.decode(),
                     }
                 ),
             )
-            for fault_phase in (
-                "object-publication-object-written",
-                "object-publication-receipt-written",
+            for fault_phase, fault_occurrence in (
+                ("object-publication-object-written", 1),
+                # The first publication is already terminal.  Recovery must
+                # read-only verify and skip it, then authorize only this
+                # second exact incomplete publication.
+                ("object-publication-object-written", 2),
             )
         ]
         controller = runtime._boundary_controller
@@ -929,27 +933,61 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 "_spawn_verified_executable_v1",
                 side_effect=AssertionError("publication recovery must never spawn bd"),
             ):
-                for ordinal, (fault_phase, request) in enumerate(requests, 1):
-                    with self.subTest(fault_phase=fault_phase):
-                        with runtime._inject_fault(fault_phase):
-                            child = os.fork()
-                            if child == 0:
-                                try:
+                for ordinal, (fault_phase, fault_occurrence, request) in enumerate(requests, 1):
+                    with self.subTest(
+                        fault_phase=fault_phase,
+                        fault_occurrence=fault_occurrence,
+                    ):
+                        child = os.fork()
+                        if child == 0:
+                            try:
+                                if fault_occurrence == 1:
+                                    with runtime._inject_fault(fault_phase):
+                                        runtime.record_beads_change_plan_core_v1(request)
+                                else:
+                                    original_fault = runtime._fault
+                                    seen = 0
+
+                                    def kill_at_later_publication(phase):
+                                        nonlocal seen
+                                        if phase == fault_phase:
+                                            seen += 1
+                                            if seen == fault_occurrence:
+                                                raise SystemExit(137)
+                                        original_fault(phase)
+
+                                    runtime._fault = kill_at_later_publication
                                     runtime.record_beads_change_plan_core_v1(request)
-                                except SystemExit:
-                                    os._exit(91)
-                                except BaseException:
-                                    os._exit(93)
-                                os._exit(92)
-                            _, status = os.waitpid(child, 0)
+                            except SystemExit:
+                                os._exit(91)
+                            except BaseException:
+                                os._exit(93)
+                            os._exit(92)
+                        _, status = os.waitpid(child, 0)
                         self.assertTrue(os.WIFEXITED(status))
                         self.assertEqual(91, os.WEXITSTATUS(status))
+
+                        publication_root = (
+                            self.root
+                            / runtime.REPOSITORY_NAMESPACE
+                            / request.payload["repositoryLocatorSha256"].removeprefix("sha256:")
+                            / "object-publications"
+                        )
+                        before_receipts = sorted(publication_root.glob("*/receipt.json"))
+                        if fault_occurrence == 2:
+                            self.assertEqual(1, len(before_receipts))
 
                         with self.assertRaisesRegex(
                             runtime.BeadsProtectedRuntimeError,
                             "exact publication suffix recovered; original operation outcome remains uncertain",
                         ):
                             runtime.record_beads_change_plan_core_v1(request)
+
+                        if fault_occurrence == 2:
+                            self.assertEqual(
+                                2,
+                                len(list(publication_root.glob("*/receipt.json"))),
+                            )
 
                         state_files = sorted(state_root.glob("*.json"))
                         self.assertEqual(ordinal, len(state_files))
@@ -970,7 +1008,9 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                         "*/object-publications/*/receipt.json"
                     )
                 )
-                self.assertEqual(len(requests), len(receipts))
+                # The later-publication case has two durable publications;
+                # each first-publication fixture has one.
+                self.assertEqual(len(requests) + 1, len(receipts))
         finally:
             self.logic_harness = logic_harness(
                 runtime, self.root, self.key, self.repository

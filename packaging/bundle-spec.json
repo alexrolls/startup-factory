@@ -82,7 +82,7 @@
     "runtime/runner-linux-container.sh",
     "runtime/beads-boundary-controller-v1.example.json",
     "runtime/startup-factory-beads-controller.service.example",
-    "runtime/startup-factory-beads-controller.socket.example",
+    "runtime/startup-factory-beads-controller.tmpfiles.example",
     "reference/superpowers-planning.md",
     "roles/team-lead.md",
     "teams/_PLAYBOOK.md",

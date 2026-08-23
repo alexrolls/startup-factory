@@ -117,31 +117,37 @@ environment variable, plugin, or tracker record cannot select another root,
 key, endpoint, controller, or verifier.
 
 The shipped `startup-factory-beads-controller` is a Linux-only,
-systemd-socket-activated `AF_UNIX/SOCK_SEQPACKET` service at the fixed endpoint
+`AF_UNIX/SOCK_SEQPACKET` service at the fixed endpoint
 `/run/startup-factory/beads-boundary-controller-v1.sock`. The controller,
 broker, and worker UIDs must be distinct. A dedicated transport group must
 resolve to exactly the controller and broker accounts; the worker must not be
 a member. The root-owned endpoint parent is exactly root:transport mode 0750
-and the socket is exactly root:transport mode 0660. Client and server both check
-`SO_PEERCRED`; the broker process must run as the configured broker UID and the
-service as the configured controller UID. The controller alone holds its HMAC
+and the socket is exactly controller:transport mode 0660. The service starts as
+root only to bind, chown, and chmod that socket inside the root-only parent,
+then irreversibly drops to the configured controller UID and transport GID
+before `listen()`. Client and server both check `SO_PEERCRED`; the broker
+process must run as the configured broker UID and the live service peer is the
+configured controller UID. The controller alone holds its HMAC
 key and durably advances each request through `accepted`, `intent-bound`,
 `effect-authorized`, `result-stored`, and `completed`. Each OPEN, STEP, and
 VALIDATE nonce is one-use, one connection carries one request, and a stored
 receipt is never a reusable bearer capability: current use requires a fresh
-controller connection and current-state validation.
+controller connection and current-state validation. Accepted connections have
+a bounded receive/send deadline; an idle or malformed client is closed without
+a signed response and cannot terminate or indefinitely occupy the service.
 
 If the broker dies only after `effect-authorized`, the controller does not
 repeat the uncertain command. Its separate RECOVER action can inspect the same
-request/transaction/effect receipt, authorize one exact existing publication
-intent, and complete only that object's immutable object, journal, live
-provenance, and receipt suffix. Completion records the exact recovery result
-and leaves the original operation outcome explicitly uncertain. A different
-intent, ordinary STEP, expiry, replay, or missing authenticated intent refuses
-without spawning `bd` or resuming other filesystem effects.
+request/transaction/effect receipt, read-only verify and skip every fully
+complete earlier publication, authorize the first exact incomplete later
+publication intent, and complete only that object's immutable object, journal,
+live provenance, and receipt suffix. Completion records the exact recovery
+result and leaves the original operation outcome explicitly uncertain. A
+different intent, ordinary STEP, expiry, replay, or missing authenticated
+intent refuses without spawning `bd` or resuming other filesystem effects.
 
 `runtime/beads-boundary-controller-v1.example.json` and
-the paired `runtime/startup-factory-beads-controller.socket.example` and
+the paired `runtime/startup-factory-beads-controller.tmpfiles.example` and
 `runtime/startup-factory-beads-controller.service.example` are operator
 templates, not an auto-provisioner or security proof. Replace every zero digest
 or sentinel digest, example UID/GID, and artifact path with the exact installed
@@ -152,11 +158,15 @@ a receipt. Install the canonical JSON at the fixed config
 path as a root-owned non-writable regular file; install the controller HMAC key
 as a controller-owned mode-0600 single-link regular file; pre-create the fixed
 state directory for the controller and the protected runtime root/key for the
-broker with mode 0700/0600. Install and enable the socket unit before the service;
-systemd's `DirectoryMode=0750`, `SocketMode=0660`, socket group, and service
-`UMask=0007` are part of the closed transport setup. Do not replace the socket
-unit's root-owned runtime-directory creation with `RuntimeDirectory=` on the
-non-root service, which would assign the wrong owner. `startup-factory-beads-controller validate-config` validates only the
+broker with mode 0700/0600. Install the tmpfiles example as
+`/usr/lib/tmpfiles.d/startup-factory-beads-controller.conf`, run
+`systemd-tmpfiles --create`, then enable the service. The tmpfiles root:transport
+0750 parent, controller-created controller:transport 0660 socket, service
+`UMask=0007`, and explicit writable `/run/startup-factory` path are part of the
+closed setup. There is deliberately no systemd socket unit: socket activation
+would make `SO_PEERCRED` identify systemd instead of the configured controller.
+Do not replace tmpfiles with `RuntimeDirectory=` because it would assign the
+wrong owner. `startup-factory-beads-controller validate-config` validates only the
 closed configuration and reports `configured_unproved`; it does not make the
 host ready. Native macOS, a missing service, unsafe ownership/modes, a path or
 UID mismatch, or a stale controller state refuses before the protected

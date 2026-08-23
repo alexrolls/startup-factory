@@ -1503,7 +1503,13 @@ _JOURNAL_APPEND_INTENT_FIELDS = {
 
 
 def _directory_json_names(store: _Store, parts: tuple[str, ...]) -> set[str]:
-    descriptor = store._open_directory(parts, create=True)
+    operation = _BOUNDARY_OPERATION_CONTEXT.get()
+    read_only_recovery = (
+        isinstance(operation, Mapping)
+        and operation.get("recoveryMode")
+        and _PUBLICATION_RECOVERY_SCOPE.get() is None
+    )
+    descriptor = store._open_directory(parts, create=not read_only_recovery)
     try:
         names = {entry.name for entry in os.scandir(descriptor)}
     finally:
@@ -1774,6 +1780,8 @@ def _publish_authenticated_record(
         "beads-object-publication-intent", payload
     )
     intent_path = directory / "intent.json"
+    recovery_scope = None
+    publication_complete = False
     if recovery:
         if not store.exists(intent_path):
             raise _boundary_refusal(
@@ -1786,38 +1794,50 @@ def _publish_authenticated_record(
             raise _boundary_refusal(
                 "uncertain operation publication intent differs from exact retry"
             )
+        # Replay can traverse more than one authenticated publication.  Every
+        # already-complete predecessor is verified read-only and skipped while
+        # the controller remains effect-authorized.  Only the first exact
+        # incomplete publication may consume the one RECOVER authorization.
         try:
-            session.response = _boundary_controller.recover_publication_operation(
-                session.config,
-                session.operation,
-                {
-                    "repositoryLocatorSha256": session.repository_locator_sha256,
-                    "requestSha256": session.request_sha256,
-                },
-                phase="authorize-publication",
-                prior=session.response,
-                publication_intent_sha256=intent_digest,
+            _verify_authenticated_publication(
+                store, target, kind, record_digest, full_digest
             )
-        except _boundary_controller.ControllerProtocolError as exc:
+            publication_complete = True
+        except BeadsProtectedRuntimeError:
+            publication_complete = False
+
+        selected = session.response.get("recoveryPublicationIntentSha256")
+        if selected is not None and selected != intent_digest:
+            if publication_complete:
+                return
             raise _boundary_refusal(
-                f"controller refused exact publication recovery: {exc}"
-            ) from exc
-        recovery_scope = _PUBLICATION_RECOVERY_SCOPE.set(intent_digest)
-    else:
-        recovery_scope = None
-    try:
-        publication_complete = False
-        if recovery:
+                "an earlier incomplete publication precedes the controller-selected recovery intent"
+            )
+        if publication_complete and selected is None:
+            return
+        if selected is None:
             try:
-                _verify_authenticated_publication(
-                    store, target, kind, record_digest, full_digest
+                session.response = _boundary_controller.recover_publication_operation(
+                    session.config,
+                    session.operation,
+                    {
+                        "repositoryLocatorSha256": session.repository_locator_sha256,
+                        "requestSha256": session.request_sha256,
+                    },
+                    phase="authorize-publication",
+                    prior=session.response,
+                    publication_intent_sha256=intent_digest,
                 )
-                publication_complete = True
-            except BeadsProtectedRuntimeError:
-                # Only the exact existing intent opens the recovery branch.
-                # Every present suffix component remains independently
-                # authenticated by the ordinary idempotent recovery writes.
-                pass
+            except _boundary_controller.ControllerProtocolError as exc:
+                raise _boundary_refusal(
+                    f"controller refused exact publication recovery: {exc}"
+                ) from exc
+        elif session.response.get("state") != "publication-recovery-authorized":
+            raise _boundary_refusal(
+                "controller-selected publication recovery is not mutation-authorized"
+            )
+        recovery_scope = _PUBLICATION_RECOVERY_SCOPE.set(intent_digest)
+    try:
         if publication_complete:
             receipt = store.read_json(
                 directory / "receipt.json", "completed object publication receipt"
@@ -2162,7 +2182,14 @@ def _transaction_intent(store: _Store, operation: str, payload: Mapping[str, Any
         or any(body.get(key) != item for key, item in intent_payload.items())
     ):
         raise BeadsProtectedRuntimeError("transaction intent recovery mismatch")
-    _ensure_boundary_operation_gate(store, transaction_intent_sha256=intent_digest)
+    operation = _BOUNDARY_OPERATION_CONTEXT.get()
+    _ensure_boundary_operation_gate(
+        store,
+        transaction_intent_sha256=intent_digest,
+        verify_only=bool(
+            isinstance(operation, Mapping) and operation.get("recoveryMode")
+        ),
+    )
     return intent_digest, directory
 
 

@@ -1020,7 +1020,27 @@ job=os.path.join(sys.argv[2],'release-jobs',entry['releaseJob']['identity']['job
 assert stat.S_IMODE(os.lstat(job).st_mode)==0o700
 assert stat.S_IMODE(os.lstat(os.path.join(job,'result.json')).st_mode)==0o600
 PY
-sleep 3
+# Wait for the protected detached worker to publish a terminal result instead
+# of racing its configured three-second release duration.  The following PM
+# tick still performs all authenticated identity/authority validation; this
+# polling loop grants no success authority and is bounded fail-closed.
+python3 - "$STATE" "$PM_LIFECYCLE_ROOT" <<'PY'
+import json,os,sys,time
+state_path,lifecycle_root=sys.argv[1:]
+job_id=json.load(open(state_path))['features']['F-ASYNC']['releaseJob']['identity']['jobId']
+result=os.path.join(lifecycle_root,'release-jobs',job_id,'result.json')
+deadline=time.monotonic()+10
+while time.monotonic()<deadline:
+    try:
+        observed=json.load(open(result))
+    except (FileNotFoundError,json.JSONDecodeError):
+        observed={}
+    if observed.get('state') in {'completed','cancelled'}:
+        break
+    time.sleep(.05)
+else:
+    raise SystemExit('detached release did not publish a terminal result within 10 seconds')
+PY
 monitor >/dev/null
 check "later tick consumes detached release success" python3 - "$STATE" <<'PY'
 import json,sys
