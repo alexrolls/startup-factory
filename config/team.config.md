@@ -25,11 +25,11 @@ exceptions: they require and roster Security for every task.
 ```
 TEAM_LEAD_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
 PRINCIPAL_ARCHITECT_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
-SCEPTICAL_ARCHITECT_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
-SENIOR_SECURITY_ENGINEER_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
+SCEPTICAL_ARCHITECT_CMD="codex exec --approve-for-me \"$(cat '{prompt_file}')\""
+SENIOR_SECURITY_ENGINEER_CMD="codex exec --approve-for-me \"$(cat '{prompt_file}')\""
 INTEGRATOR_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
-BACKEND_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
-FRONTEND_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
+BACKEND_CMD="codex exec --approve-for-me \"$(cat '{prompt_file}')\""
+FRONTEND_CMD="codex exec --approve-for-me \"$(cat '{prompt_file}')\""
 QA_CMD=null
 REVIEWER_CMD="gemini --yolo \"$(cat '{prompt_file}')\""
 TEAM_DEFAULT_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"

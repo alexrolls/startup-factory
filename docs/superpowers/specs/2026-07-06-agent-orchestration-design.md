@@ -206,7 +206,7 @@ interactive user prompt; it uses the escalation channel instead.
 
   ```
   TEAM_LEAD_CMD="claude -p --dangerously-skip-permissions {prompt_file}"
-  BACKEND_CMD="codex exec --full-auto {prompt_file}"
+  BACKEND_CMD="codex exec --approve-for-me {prompt_file}"
   REVIEWER_CMD="gemini --yolo {prompt_file}"
   ```
 
