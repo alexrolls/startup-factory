@@ -24,6 +24,8 @@ def digest(label: str) -> str:
 
 class ProtectedRuntimeTest(unittest.TestCase):
     def setUp(self) -> None:
+        self.offline_logic = runtime._offline_logic_only_v1()
+        self.offline_logic.__enter__()
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve() / "protected"
         self.root.mkdir(mode=0o700)
@@ -34,7 +36,10 @@ class ProtectedRuntimeTest(unittest.TestCase):
         self.expires = int(time.time()) + 3600
 
     def tearDown(self) -> None:
-        self.temporary.cleanup()
+        try:
+            self.temporary.cleanup()
+        finally:
+            self.offline_logic.__exit__(None, None, None)
 
     def request(self, name: str, **values):
         payload = {
@@ -450,14 +455,18 @@ exit 64
         self.assertFalse(install_path.exists())
         with runtime._inject_fault("preparation-install-renamed"), self.assertRaises(SystemExit):
             runtime.finish_beads_preparation_v1(finish_request)
-        with runtime._inject_fault("preparation-cleanup-file-quarantined"), self.assertRaises(SystemExit):
+        with runtime._inject_fault("preparation-cleanup-retired"), self.assertRaises(SystemExit):
             runtime.finish_beads_preparation_v1(finish_request)
-        with runtime._inject_fault("preparation-cleanup-directory-quarantined"), self.assertRaises(SystemExit):
+        self.assertFalse(cleanup_path.exists())
+        retained = list(cleanup_path.parent.glob("startup-factory-retained-beads-*"))
+        self.assertEqual(len(retained), 1)
+        with runtime._inject_fault("preparation-cleanup-retirement-recorded"), self.assertRaises(SystemExit):
             runtime.finish_beads_preparation_v1(finish_request)
         finished = runtime.finish_beads_preparation_v1(finish_request)
         self.assertTrue((install_path / ".dolt").is_dir())
         self.assertFalse(stage_path.exists())
         self.assertFalse(cleanup_path.exists())
+        self.assertTrue((retained[0] / ".gitignore").is_file())
         for field in (
             "installIntentRecordSha256", "installObservedRecordSha256",
             "cleanupIntentRecordSha256", "cleanupObservedRecordSha256",

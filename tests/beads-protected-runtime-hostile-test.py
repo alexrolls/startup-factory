@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import os
 import sys
@@ -25,6 +26,8 @@ def digest(label: str) -> str:
 
 class ProtectedRuntimeHostileTest(unittest.TestCase):
     def setUp(self) -> None:
+        self.offline_logic = runtime._offline_logic_only_v1()
+        self.offline_logic.__enter__()
         self.temporary = tempfile.TemporaryDirectory()
         self.base = Path(self.temporary.name).resolve()
         self.root = self.base / "protected"
@@ -36,7 +39,10 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         self.expires = int(time.time()) + 3600
 
     def tearDown(self) -> None:
-        self.temporary.cleanup()
+        try:
+            self.temporary.cleanup()
+        finally:
+            self.offline_logic.__exit__(None, None, None)
 
     def request(self, name: str, **values):
         payload = {
@@ -81,6 +87,125 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         }
         payload.update(values)
         return payload
+
+    def test_all_protected_public_entries_refuse_without_live_external_session_before_effects(self) -> None:
+        before_names = sorted(path.name for path in self.root.iterdir())
+        before_key = self.key.read_bytes()
+        before_mode = self.root.stat().st_mode
+        self.offline_logic.__exit__(None, None, None)
+        try:
+            for name in runtime._FUNCTION_EXPORTS:
+                if name in runtime._PURE_OFFLINE_FUNCTIONS:
+                    continue
+                function = getattr(runtime, name)
+                signature = inspect.signature(function)
+                arguments = [
+                    None
+                    for parameter in signature.parameters.values()
+                    if parameter.default is inspect.Parameter.empty
+                    and parameter.kind
+                    in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    )
+                ]
+                with self.subTest(function=name), self.assertRaisesRegex(
+                    runtime.BeadsProtectedRuntimeError,
+                    "external Linux boundary session required",
+                ):
+                    function(*arguments)
+        finally:
+            self.offline_logic = runtime._offline_logic_only_v1()
+            self.offline_logic.__enter__()
+        self.assertEqual(sorted(path.name for path in self.root.iterdir()), before_names)
+        self.assertEqual(self.key.read_bytes(), before_key)
+        self.assertEqual(self.root.stat().st_mode, before_mode)
+        self.assertFalse((self.root / runtime.REPOSITORY_NAMESPACE).exists())
+
+    def test_darwin_and_unproved_boundary_session_providers_are_deterministically_ineligible(self) -> None:
+        now = int(time.time())
+        receipt = {
+            "schemaVersion": 1,
+            "provider": "configured_unproved",
+            "proofState": "configured_unproved",
+            "hostKernel": "darwin",
+            "repositoryLocatorSha256": self.repository,
+            "rootSetSha256": digest("root-set"),
+            "runtimeManifestSha256": digest("runtime-manifest"),
+            "moduleSha256": digest("module"),
+            "verifierIdentitySha256": digest("verifier"),
+            "sessionNonce": "configured-unproved-session",
+            "issuedAtUnix": now,
+            "expiresAtUnix": now + 60,
+            "externalReceiptSha256": digest("external-receipt"),
+        }
+        verifier_called = False
+
+        def verifier(_receipt):
+            nonlocal verifier_called
+            verifier_called = True
+            return {}
+
+        self.offline_logic.__exit__(None, None, None)
+        try:
+            with mock.patch.object(runtime.sys, "platform", "darwin"):
+                with self.assertRaisesRegex(
+                    runtime.BeadsProtectedRuntimeError,
+                    "host platform 'darwin' is not Linux",
+                ):
+                    runtime._accept_verified_external_boundary_session_v1(
+                        receipt, verifier
+                    )
+            with mock.patch.object(runtime.sys, "platform", "linux"):
+                with self.assertRaisesRegex(
+                    runtime.BeadsProtectedRuntimeError,
+                    "provider is unproved",
+                ):
+                    runtime._accept_verified_external_boundary_session_v1(
+                        receipt, verifier
+                    )
+        finally:
+            self.offline_logic = runtime._offline_logic_only_v1()
+            self.offline_logic.__enter__()
+        self.assertFalse(verifier_called)
+        self.assertFalse((self.root / runtime.REPOSITORY_NAMESPACE).exists())
+
+    def test_native_mutation_refuses_without_session_before_hook_or_syscall(self) -> None:
+        parent_path = self.base / "native-refusal"
+        parent_path.mkdir(mode=0o700)
+        source = parent_path / "source"
+        target = parent_path / "target"
+        source.mkdir(mode=0o700)
+        parent, source_leaf = runtime._open_absolute_parent(
+            source, "native refusal source"
+        )
+        hook_called = False
+
+        def hook(*_args):
+            nonlocal hook_called
+            hook_called = True
+
+        self.offline_logic.__exit__(None, None, None)
+        try:
+            with mock.patch.object(runtime, "_NATIVE_MUTATION_HOOK", hook):
+                with self.assertRaisesRegex(
+                    runtime.BeadsProtectedRuntimeError,
+                    "external Linux boundary session required",
+                ):
+                    runtime._native_rename_noreplace(
+                        parent,
+                        source_leaf,
+                        parent,
+                        target.name,
+                        phase="native-refusal-fixture",
+                    )
+        finally:
+            os.close(parent)
+            self.offline_logic = runtime._offline_logic_only_v1()
+            self.offline_logic.__enter__()
+        self.assertFalse(hook_called)
+        self.assertTrue(source.is_dir())
+        self.assertFalse(target.exists())
 
     def seed_current_manifests(self):
         core_payload = {
@@ -590,6 +715,97 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
             )
         )
 
+    def test_joint_preparation_consumption_recovers_after_first_successor(self) -> None:
+        lease, argv = self.create_authorized_create_lease("joint-consumption-crash")
+        command, transaction = self.sign_preparation_command(
+            lease, argv, "joint-consumption-crash"
+        )
+        store = self.store()
+        with runtime._inject_fault("preparation-joint-lease-consumed"), self.assertRaises(
+            SystemExit
+        ):
+            runtime._consume_preparation_command_v1(store, lease, command, argv)
+        self.assertTrue(
+            runtime._capability_consumed_by(
+                store, "preparation-lease-successors", lease, transaction
+            )
+        )
+        self.assertFalse(
+            runtime._capability_consumed_by(
+                store, "preparation-command-intents", command, transaction
+            )
+        )
+        mutation = runtime._consume_preparation_command_v1(
+            store, lease, command, argv
+        )
+        self.assertTrue(
+            runtime._capability_consumed_by(
+                store, "preparation-command-intents", command, transaction
+            )
+        )
+        self.assertEqual(transaction, mutation.payload["transactionIntentSha256"])
+        receipt = (
+            store.directory(
+                "preparation-joint-consumptions",
+                transaction.removeprefix("sha256:"),
+            )
+            / "receipt.json"
+        )
+        body, _, _, _ = store.verify(
+            store.read_json(receipt, "joint consumption receipt"),
+            "beads-preparation-joint-consumption-receipt",
+        )
+        self.assertEqual(command.record_sha256, body["commandRecordSha256"])
+
+    def test_authenticated_object_publication_recovers_every_write_ahead_boundary(self) -> None:
+        phases = (
+            "object-publication-intent-written",
+            "object-publication-object-written",
+            "object-publication-journal-written",
+            "object-publication-receipt-written",
+        )
+        for phase in phases:
+            with self.subTest(phase=phase):
+                store = self.store()
+                kind = "beads-hostile-publication-fixture"
+                envelope, _, record_digest, full_digest = store.sign(
+                    kind,
+                    {
+                        "repositoryLocatorSha256": self.repository,
+                        "phase": phase,
+                    },
+                )
+                target = (
+                    store.directory("hostile-publication-fixtures")
+                    / f"{record_digest.removeprefix('sha256:')}.json"
+                )
+                with runtime._inject_fault(phase), self.assertRaises(SystemExit):
+                    runtime._publish_authenticated_record(
+                        store,
+                        target,
+                        envelope,
+                        kind,
+                        record_digest,
+                        full_digest,
+                    )
+                runtime._publish_authenticated_record(
+                    store,
+                    target,
+                    envelope,
+                    kind,
+                    record_digest,
+                    full_digest,
+                )
+                self.assertEqual(
+                    runtime.canonical_bytes(envelope),
+                    runtime.canonical_bytes(
+                        store.read_json(target, "recovered publication fixture")
+                    ),
+                )
+                runtime._verify_journal(
+                    store, kind, record_digest, full_digest
+                )
+
         self.repository = digest("stale-core-preparation-command")
         stale_lease, stale_argv = self.create_authorized_create_lease("stale-core-command")
         stale_store = self.store()
@@ -1081,85 +1297,134 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertFalse((target / "unauthorized").exists())
 
-    def test_cleanup_unlink_and_rmdir_swaps_preserve_quarantined_evidence(self) -> None:
-        cleanup = self.base / "cleanup-file-boundary"
-        cleanup.mkdir(mode=0o700)
-        cleanup_file = cleanup / ".gitignore"
-        cleanup_file.write_bytes(b"*\n")
-        cleanup_file.chmod(0o600)
-        file_metadata = cleanup_file.lstat()
-        expected_entry = {
-            **runtime._regular_file_identity(file_metadata),
-            "bytesSha256": runtime.sha256(b"*\n"),
-        }
-        replacement = cleanup / "replacement"
-        replacement.write_bytes(b"unauthorized")
-        replacement.chmod(0o600)
-        saved = cleanup / "saved-approved"
-        parent = os.open(
-            cleanup,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    def test_quarantined_install_tree_is_rechecked_at_native_publish_boundary(self) -> None:
+        source_parent = self.base / "tree-source-parent"
+        target_parent = self.base / "tree-target-parent"
+        source_parent.mkdir(mode=0o700)
+        target_parent.mkdir(mode=0o700)
+        source = source_parent / "database"
+        target = target_parent / "database"
+        source.mkdir(mode=0o700)
+        approved = source / "approved"
+        approved.write_bytes(b"approved")
+        approved.chmod(0o600)
+        expected_tree = runtime._observe_directory_tree(
+            source, "approved install tree"
         )
-        file_hook_ran = False
+        expected_identity = expected_tree["rootIdentity"]
+        source_fd, source_leaf = runtime._open_absolute_parent(
+            source, "tree source"
+        )
+        target_fd, target_leaf = runtime._open_absolute_parent(
+            target, "tree target"
+        )
+        hook_ran = False
 
-        def swap_before_cleanup_mutation(phase, parent_fd, source_name, _target_fd, _target_name):
-            nonlocal file_hook_ran
-            if phase == "cleanup-file-unlink" and not file_hook_ran:
-                file_hook_ran = True
-                os.rename(source_name, "saved-approved", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-                os.rename("replacement", source_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        def mutate_quarantine_at_publish(
+            phase, quarantine_parent, quarantine_name, _target_parent, _target_name
+        ):
+            nonlocal hook_ran
+            if phase == "install-quarantine-to-target" and not hook_ran:
+                hook_ran = True
+                directory = os.open(
+                    quarantine_name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    dir_fd=quarantine_parent,
+                )
+                try:
+                    descriptor = os.open(
+                        "approved", os.O_WRONLY | os.O_TRUNC, dir_fd=directory
+                    )
+                    try:
+                        os.write(descriptor, b"changed!")
+                    finally:
+                        os.close(descriptor)
+                finally:
+                    os.close(directory)
 
         try:
-            with mock.patch.object(runtime, "_NATIVE_MUTATION_HOOK", swap_before_cleanup_mutation):
-                with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "identity"):
-                    runtime._remove_identity_bound_file(
-                        parent, ".gitignore", expected_entry, "bound cleanup file"
+            with mock.patch.object(
+                runtime, "_NATIVE_MUTATION_HOOK", mutate_quarantine_at_publish
+            ):
+                with self.assertRaisesRegex(
+                    runtime.BeadsProtectedRuntimeError,
+                    "source tree changed immediately before atomic rename",
+                ):
+                    runtime._rename_directory_noreplace(
+                        source_fd,
+                        source_leaf,
+                        target_fd,
+                        target_leaf,
+                        expected_source_identity=expected_identity,
+                        expected_source_tree=expected_tree,
                     )
         finally:
-            os.close(parent)
-        self.assertTrue(file_hook_ran)
-        self.assertTrue(saved.exists())
-        self.assertTrue(
-            any(path.name.startswith(".startup-factory-cleanup-file-") for path in cleanup.iterdir())
+            os.close(source_fd)
+            os.close(target_fd)
+        self.assertTrue(hook_ran)
+        self.assertFalse(target.exists())
+        quarantine = target_parent / runtime._install_quarantine_leaf(
+            target_leaf, expected_identity
         )
+        self.assertTrue(quarantine.is_dir())
 
-        parent_path = self.base / "cleanup-directory-parent"
+    def test_cleanup_retirement_swap_never_moves_replacement_or_deletes_evidence(self) -> None:
+        parent_path = self.base / "cleanup-retirement-parent"
         parent_path.mkdir(mode=0o700)
-        root = parent_path / "root"
-        replacement_root = parent_path / "replacement-root"
-        saved_root = parent_path / "saved-root"
-        root.mkdir(mode=0o700)
-        replacement_root.mkdir(mode=0o700)
-        expected_root = runtime._directory_identity(root.lstat())
-        parent = os.open(
-            parent_path,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        cleanup = parent_path / "cleanup"
+        replacement = parent_path / "replacement"
+        saved = parent_path / "saved-approved"
+        retained = parent_path / ("startup-factory-retained-beads-" + "a" * 64)
+        cleanup.mkdir(mode=0o700)
+        replacement.mkdir(mode=0o700)
+        (cleanup / ".gitignore").write_bytes(b"*\n")
+        (replacement / "unauthorized").write_bytes(b"unauthorized")
+        expected = runtime._directory_identity(cleanup.lstat())
+        parent, cleanup_leaf = runtime._open_absolute_parent(
+            cleanup, "cleanup retirement source"
         )
-        directory_hook_ran = False
+        hook_ran = False
 
-        def swap_before_rmdir(phase, parent_fd, source_name, _target_fd, _target_name):
-            nonlocal directory_hook_ran
-            if phase == "cleanup-directory-rmdir" and not directory_hook_ran:
-                directory_hook_ran = True
-                os.rename(source_name, "saved-root", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-                os.rename("replacement-root", source_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        def swap_at_retirement_boundary(
+            phase, parent_fd, source_name, _target_fd, _target_name
+        ):
+            nonlocal hook_ran
+            if phase == "cleanup-active-to-retained" and not hook_ran:
+                hook_ran = True
+                os.rename(
+                    source_name,
+                    saved.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                os.rename(
+                    replacement.name,
+                    source_name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
 
         try:
-            with mock.patch.object(runtime, "_NATIVE_MUTATION_HOOK", swap_before_rmdir):
-                with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "identity"):
-                    runtime._remove_identity_bound_directory(
-                        parent, "root", expected_root, "bound cleanup root"
+            with mock.patch.object(runtime, "_NATIVE_MUTATION_HOOK", swap_at_retirement_boundary):
+                with self.assertRaisesRegex(
+                    runtime.BeadsProtectedRuntimeError,
+                    "source identity changed immediately before atomic rename",
+                ):
+                    runtime._native_rename_noreplace(
+                        parent,
+                        cleanup_leaf,
+                        parent,
+                        retained.name,
+                        phase="cleanup-active-to-retained",
+                        expected_immediate_identity=expected,
                     )
         finally:
             os.close(parent)
-        self.assertTrue(directory_hook_ran)
-        self.assertTrue(saved_root.exists())
-        self.assertTrue(
-            any(
-                path.name.startswith(".startup-factory-cleanup-directory-")
-                for path in parent_path.iterdir()
-            )
-        )
+        self.assertTrue(hook_ran)
+        self.assertTrue(saved.is_dir())
+        self.assertTrue((saved / ".gitignore").is_file())
+        self.assertTrue((cleanup / "unauthorized").is_file())
+        self.assertFalse(retained.exists())
 
     def test_open_directory_rebinds_every_final_name_after_traversal(self) -> None:
         parent = self.base / "traversal-parent"

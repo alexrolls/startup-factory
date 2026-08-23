@@ -16,6 +16,7 @@ import ctypes
 import dataclasses
 import errno
 import fcntl
+import functools
 import hashlib
 import hmac
 import json
@@ -24,6 +25,7 @@ import re
 import secrets
 import stat
 import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -45,6 +47,21 @@ _HEX_DIGEST = re.compile(r"\A[0-9a-f]{64}\Z")
 _SAFE_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
 _BROKER_CONTEXT: ContextVar[tuple[str, str] | None] = ContextVar("beads-protected-runtime", default=None)
 _FAULT_PHASE: ContextVar[str | None] = ContextVar("beads-protected-runtime-fault", default=None)
+_BOUNDARY_SESSION_CONTEXT: ContextVar["_VerifiedExternalBoundarySessionV1 | None"] = ContextVar(
+    "beads-external-boundary-session", default=None
+)
+_BOUNDARY_OPERATION_CONTEXT: ContextVar[Mapping[str, Any] | None] = ContextVar(
+    "beads-boundary-operation", default=None
+)
+_OFFLINE_LOGIC_CONTEXT: ContextVar[bool] = ContextVar(
+    "beads-offline-logic-only", default=False
+)
+_BOUNDARY_SESSION_SEAL = object()
+_BOUNDARY_REMEDIATION: Final = (
+    "external Linux boundary session required; run the broker/controller inside "
+    "the supported Linux guest with the rootless Podman 5 runtime, obtain a live "
+    "externally verified session, and retry the exact operation"
+)
 # Deterministic hostile-test seam invoked at the final native mutation
 # boundary.  Production leaves it unset; it is never populated from input or
 # environment state.
@@ -61,6 +78,180 @@ class BeadsStaleAuthorityError(BeadsProtectedRuntimeError):
 
 class BeadsCapabilityConsumedError(BeadsProtectedRuntimeError):
     """A one-use protected capability was already consumed."""
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _VerifiedExternalBoundarySessionV1:
+    """Opaque broker-internal proof of a live external Linux boundary.
+
+    This deliberately is not part of the 92-type public wire surface.  Merely
+    constructing a look-alike dataclass or mapping cannot satisfy a boundary
+    check: accepted instances carry the module-private seal and the complete
+    externally verified receipt bytes.
+    """
+
+    receipt: Mapping[str, Any]
+    receipt_sha256: str
+    _seal: Any = dataclasses.field(repr=False, compare=False)
+
+
+_BOUNDARY_SESSION_FIELDS = {
+    "schemaVersion",
+    "provider",
+    "proofState",
+    "hostKernel",
+    "repositoryLocatorSha256",
+    "rootSetSha256",
+    "runtimeManifestSha256",
+    "moduleSha256",
+    "verifierIdentitySha256",
+    "sessionNonce",
+    "issuedAtUnix",
+    "expiresAtUnix",
+    "externalReceiptSha256",
+}
+_BOUNDARY_VERIFICATION_FIELDS = {
+    "accepted",
+    "receiptSha256",
+    "provider",
+    "hostKernel",
+    "verifierIdentitySha256",
+}
+
+
+def _boundary_refusal(reason: str) -> BeadsProtectedRuntimeError:
+    return BeadsProtectedRuntimeError(f"{_BOUNDARY_REMEDIATION} ({reason})")
+
+
+def _accept_verified_external_boundary_session_v1(
+    receipt: Mapping[str, Any],
+    external_verifier: Any,
+) -> _VerifiedExternalBoundarySessionV1:
+    """Accept a live receipt only after an external controller verifies it.
+
+    The callback is an integration seam for the out-of-process Linux
+    controller.  This offline module does not implement, emulate, or promote
+    that controller.  A real integration must return the exact closed result
+    bound to the receipt bytes; fixture/test providers are always ineligible.
+    """
+
+    if not sys.platform.startswith("linux"):
+        raise _boundary_refusal(f"host platform {sys.platform!r} is not Linux")
+    body = _plain(receipt)
+    if not isinstance(body, dict) or set(body) != _BOUNDARY_SESSION_FIELDS:
+        raise _boundary_refusal("external session receipt has an unknown or missing field")
+    if (
+        body.get("schemaVersion") != 1
+        or body.get("provider") != "external-linux-controller"
+        or body.get("proofState") != "verified"
+        or body.get("hostKernel") != "linux"
+    ):
+        raise _boundary_refusal("provider is unproved, configured_unproved, fixture, or test-only")
+    for field in (
+        "repositoryLocatorSha256",
+        "rootSetSha256",
+        "runtimeManifestSha256",
+        "moduleSha256",
+        "verifierIdentitySha256",
+        "externalReceiptSha256",
+    ):
+        _digest(body.get(field), f"boundary session {field}")
+    _identifier(body.get("sessionNonce"), "boundary sessionNonce")
+    now = int(time.time())
+    issued = body.get("issuedAtUnix")
+    expires = body.get("expiresAtUnix")
+    if (
+        not isinstance(issued, int)
+        or isinstance(issued, bool)
+        or not isinstance(expires, int)
+        or isinstance(expires, bool)
+        or issued > now
+        or expires <= now
+        or expires - issued > 300
+    ):
+        raise _boundary_refusal("external session is absent, expired, future-dated, or longer than five minutes")
+    receipt_digest = sha256(canonical_bytes(body))
+    if not callable(external_verifier):
+        raise _boundary_refusal("external verifier is unavailable")
+    result = _plain(external_verifier(canonical_bytes(body)))
+    expected = {
+        "accepted": True,
+        "receiptSha256": receipt_digest,
+        "provider": "external-linux-controller",
+        "hostKernel": "linux",
+        "verifierIdentitySha256": body["verifierIdentitySha256"],
+    }
+    if not isinstance(result, dict) or set(result) != _BOUNDARY_VERIFICATION_FIELDS or result != expected:
+        raise _boundary_refusal("external controller did not verify the exact receipt bytes")
+    return _VerifiedExternalBoundarySessionV1(
+        receipt=_freeze(body),
+        receipt_sha256=receipt_digest,
+        _seal=_BOUNDARY_SESSION_SEAL,
+    )
+
+
+@contextmanager
+def _use_verified_external_boundary_session_v1(session: _VerifiedExternalBoundarySessionV1):
+    """Bind an accepted opaque session to one broker lexical request context."""
+
+    _validate_live_boundary_session(session)
+    token = _BOUNDARY_SESSION_CONTEXT.set(session)
+    try:
+        yield
+    finally:
+        _BOUNDARY_SESSION_CONTEXT.reset(token)
+
+
+@contextmanager
+def _offline_logic_only_v1():
+    """Exercise deterministic protocol logic without producing readiness.
+
+    This private harness exists solely for offline unit/hostile tests.  It
+    cannot create a boundary session, gate, readiness result, or external
+    attestation and must never be exposed by a broker entry point.
+    """
+
+    token = _OFFLINE_LOGIC_CONTEXT.set(True)
+    try:
+        yield
+    finally:
+        _OFFLINE_LOGIC_CONTEXT.reset(token)
+
+
+def _validate_live_boundary_session(
+    session: _VerifiedExternalBoundarySessionV1 | None = None,
+) -> _VerifiedExternalBoundarySessionV1:
+    candidate = _BOUNDARY_SESSION_CONTEXT.get() if session is None else session
+    if (
+        not isinstance(candidate, _VerifiedExternalBoundarySessionV1)
+        or candidate._seal is not _BOUNDARY_SESSION_SEAL
+    ):
+        raise _boundary_refusal("no opaque externally verified session is bound")
+    if not sys.platform.startswith("linux"):
+        raise _boundary_refusal(f"host platform {sys.platform!r} is not Linux")
+    receipt = _plain(candidate.receipt)
+    if (
+        set(receipt) != _BOUNDARY_SESSION_FIELDS
+        or receipt.get("provider") != "external-linux-controller"
+        or receipt.get("proofState") != "verified"
+        or receipt.get("hostKernel") != "linux"
+        or receipt.get("expiresAtUnix", 0) <= int(time.time())
+        or sha256(canonical_bytes(receipt)) != candidate.receipt_sha256
+    ):
+        raise _boundary_refusal("bound external session is stale, malformed, or no longer exact")
+    return candidate
+
+
+def _require_boundary_operation() -> Mapping[str, Any] | None:
+    if _OFFLINE_LOGIC_CONTEXT.get():
+        return None
+    session = _validate_live_boundary_session()
+    operation = _BOUNDARY_OPERATION_CONTEXT.get()
+    if not isinstance(operation, Mapping) or operation.get("sessionReceiptSha256") != session.receipt_sha256:
+        raise _boundary_refusal("no exact boundary operation is bound")
+    if operation.get("repositoryLocatorSha256") != session.receipt.get("repositoryLocatorSha256"):
+        raise _boundary_refusal("boundary operation repository does not match the live session")
+    return operation
 
 
 @contextmanager
@@ -932,9 +1123,15 @@ def _safe_join(root: Path, *parts: str) -> Path:
 
 class _Store:
     def __init__(self, payload: Mapping[str, Any]) -> None:
+        # Refuse before opening the protected root, key, namespace or lock.
+        # Offline tests enter a private logic-only context which cannot mint
+        # readiness or boundary evidence.
+        operation = _require_boundary_operation()
         _required(payload, "protectedRoot", "hmacKeyPath", "repositoryLocatorSha256")
         repository_digest = _digest(payload["repositoryLocatorSha256"], "repositoryLocatorSha256")
         assert repository_digest is not None
+        if operation is not None and operation.get("repositoryLocatorSha256") != repository_digest:
+            raise _boundary_refusal("protected store repository differs from the exact operation")
         self.repository_digest = repository_digest
         self.root = Path(str(payload["protectedRoot"]))
         self.key_path = Path(str(payload["hmacKeyPath"]))
@@ -1010,6 +1207,8 @@ class _Store:
         return parts
 
     def _open_directory(self, parts: Sequence[str], *, create: bool) -> int:
+        if create:
+            _require_boundary_operation()
         descriptor = os.dup(self._repository_fd)
         try:
             for part in parts:
@@ -1115,6 +1314,7 @@ class _Store:
         return value
 
     def write_immutable(self, path: Path, value: Mapping[str, Any], mode: int = 0o600) -> None:
+        _require_boundary_operation()
         encoded = canonical_bytes(value)
         parent, leaf = self._open_parent(path, create=True)
         try:
@@ -1146,6 +1346,7 @@ class _Store:
         *,
         max_bytes: int = MAX_CANONICAL_BYTES,
     ) -> None:
+        _require_boundary_operation()
         if not encoded or len(encoded) > max_bytes:
             raise BeadsProtectedRuntimeError("immutable protected bytes are empty or oversized")
         parent, leaf = self._open_parent(path, create=True)
@@ -1181,6 +1382,7 @@ class _Store:
             os.close(parent)
 
     def unlink_exact(self, path: Path, expected: bytes, label: str) -> None:
+        _require_boundary_operation()
         parent, leaf = self._open_parent(path)
         try:
             if self._read_bytes(path, label) != expected:
@@ -1191,6 +1393,7 @@ class _Store:
             os.close(parent)
 
     def replace_current(self, path: Path, value: Mapping[str, Any], expected_full_digest: str | None) -> str:
+        _require_boundary_operation()
         encoded = canonical_bytes(value)
         current_digest: str | None = None
         if self.exists(path):
@@ -1230,6 +1433,7 @@ class _RepositoryLock:
         self.descriptor: int | None = None
 
     def __enter__(self) -> _Store:
+        _require_boundary_operation()
         self.descriptor = os.open(
             "repository.lock",
             os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
@@ -1240,6 +1444,7 @@ class _RepositoryLock:
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
             raise BeadsProtectedRuntimeError("repository authority lock is unsafe")
         fcntl.flock(self.descriptor, fcntl.LOCK_EX)
+        _ensure_boundary_operation_gate(self.store, transaction_intent_sha256=None)
         return self.store
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
@@ -1250,6 +1455,66 @@ class _RepositoryLock:
 
 def _record_result(type_name: str, body: Mapping[str, Any], auth: str, record_digest: str, full_digest: str) -> _WireRecord:
     return globals()[type_name](payload=body, auth=auth, record_sha256=record_digest, full_bytes_sha256=full_digest)
+
+
+def _current_authority_digest_for_gate(store: _Store) -> str | None:
+    path = store.directory("authority") / "current.json"
+    if not store.exists(path):
+        return None
+    envelope = store.read_json(path, "boundary-gate current authority")
+    _, _, record_digest, _ = store.verify(envelope, "beads-authority-epoch-state")
+    return record_digest
+
+
+def _ensure_boundary_operation_gate(
+    store: _Store,
+    transaction_intent_sha256: str | None,
+) -> None:
+    """Write the internal HMAC gate joining the live session to this effect.
+
+    The initial lock gate has its own authenticated write-ahead intent.  Once
+    an exported operation publishes its registered transaction intent, a
+    successor gate is written against that exact digest as well.
+    """
+
+    if _OFFLINE_LOGIC_CONTEXT.get():
+        return
+    session = _validate_live_boundary_session()
+    operation = _require_boundary_operation()
+    assert operation is not None
+    if transaction_intent_sha256 is not None:
+        _digest(transaction_intent_sha256, "boundary transactionIntentSha256")
+    bootstrap_payload = {
+        "repositoryLocatorSha256": store.repository_digest,
+        "operation": operation["operation"],
+        "requestSha256": operation["requestSha256"],
+        "sessionReceiptSha256": session.receipt_sha256,
+        "rootSetSha256": operation["rootSetSha256"],
+        "runtimeManifestSha256": operation["runtimeManifestSha256"],
+        "moduleSha256": operation["moduleSha256"],
+        "verifierIdentitySha256": operation["verifierIdentitySha256"],
+        "expiresAtUnix": operation["expiresAtUnix"],
+        "transactionIntentSha256": transaction_intent_sha256,
+        "authorityRecordSha256": _current_authority_digest_for_gate(store),
+    }
+    operation_id = sha256(canonical_bytes(bootstrap_payload)).removeprefix("sha256:")
+    directory = store.directory("boundary-operations", operation_id)
+    intent, _, intent_digest, _ = store.sign(
+        "beads-boundary-operation-transaction-intent",
+        {**bootstrap_payload, "operationId": operation_id},
+    )
+    store.write_immutable(directory / "intent.json", intent)
+    _fault("boundary-operation-intent-written")
+    gate, _, _, _ = store.sign(
+        "beads-boundary-operation-gate",
+        {
+            **bootstrap_payload,
+            "operationId": operation_id,
+            "boundaryTransactionIntentSha256": intent_digest,
+        },
+    )
+    store.write_immutable(directory / "gate.json", gate)
+    _fault("boundary-operation-gate-written")
 
 
 _JOURNAL_BODY_FIELDS = {
@@ -1500,6 +1765,68 @@ def _journal_binding_for_record(
     return binding[0], binding[1]
 
 
+def _publish_authenticated_record(
+    store: _Store,
+    target: Path,
+    envelope: Mapping[str, Any],
+    kind: str,
+    record_digest: str,
+    full_digest: str,
+) -> None:
+    """Publish one HMAC object with recoverable write-ahead evidence.
+
+    The publication intent is itself immutable and authenticated, and embeds
+    the exact target envelope.  A retry after death at any boundary can only
+    finish that same object/journal/receipt chain; it cannot silently accept a
+    different orphan at the target path.
+    """
+
+    relative = "/".join(store._relative_parts(target))
+    payload = {
+        "repositoryLocatorSha256": store.repository_digest,
+        "targetRelativePath": relative,
+        "recordKind": kind,
+        "recordSha256": record_digest,
+        "recordFullBytesSha256": full_digest,
+        "envelope": _plain(envelope),
+    }
+    publication_id = sha256(canonical_bytes(payload)).removeprefix("sha256:")
+    directory = store.directory("object-publications", publication_id)
+    intent, _, intent_digest, intent_full = store.sign(
+        "beads-object-publication-intent", payload
+    )
+    intent_path = directory / "intent.json"
+    store.write_immutable(intent_path, intent)
+    observed_intent = store.read_json(intent_path, "object publication intent")
+    _, _, observed_intent_digest, observed_intent_full = store.verify(
+        observed_intent, "beads-object-publication-intent"
+    )
+    if (
+        canonical_bytes(observed_intent) != canonical_bytes(intent)
+        or observed_intent_digest != intent_digest
+        or observed_intent_full != intent_full
+    ):
+        raise BeadsProtectedRuntimeError("object publication intent recovery mismatch")
+    _fault("object-publication-intent-written")
+    store.write_immutable(target, envelope)
+    _fault("object-publication-object-written")
+    _journal_record(store, kind, record_digest, full_digest)
+    _fault("object-publication-journal-written")
+    receipt, _, _, _ = store.sign(
+        "beads-object-publication-receipt",
+        {
+            "repositoryLocatorSha256": store.repository_digest,
+            "publicationIntentSha256": intent_digest,
+            "recordKind": kind,
+            "recordSha256": record_digest,
+            "recordFullBytesSha256": full_digest,
+            "targetRelativePath": relative,
+        },
+    )
+    store.write_immutable(directory / "receipt.json", receipt)
+    _fault("object-publication-receipt-written")
+
+
 def _signed_record(store: _Store, type_name: str, kind: str, payload: Mapping[str, Any], category: str) -> _WireRecord:
     completed = _complete_wire_payload(type_name, {"kind": kind, "schemaVersion": 1, **_plain(payload)})
     envelope, auth, record_digest, full_digest = store.sign(
@@ -1507,8 +1834,14 @@ def _signed_record(store: _Store, type_name: str, kind: str, payload: Mapping[st
         {key: value for key, value in completed.items() if key not in {"kind", "schemaVersion"}},
     )
     directory = store.directory(category, "history")
-    store.write_immutable(directory / f"{record_digest.removeprefix('sha256:')}.json", envelope)
-    _journal_record(store, kind, record_digest, full_digest)
+    _publish_authenticated_record(
+        store,
+        directory / f"{record_digest.removeprefix('sha256:')}.json",
+        envelope,
+        kind,
+        record_digest,
+        full_digest,
+    )
     return _record_result(type_name, envelope["payload"], auth, record_digest, full_digest)
 
 
@@ -1551,8 +1884,9 @@ def _write_current(
         {key: value for key, value in completed.items() if key not in {"kind", "schemaVersion"}},
     )
     history = store.directory(category, "history") / f"{record_digest.removeprefix('sha256:')}.json"
-    store.write_immutable(history, envelope)
-    _journal_record(store, kind, record_digest, full_digest)
+    _publish_authenticated_record(
+        store, history, envelope, kind, record_digest, full_digest
+    )
     observed = store.replace_current(store.directory(category) / "current.json", envelope, expected_full_digest)
     if observed != full_digest:
         raise BeadsProtectedRuntimeError("protected current exact-byte digest mismatch")
@@ -1586,8 +1920,9 @@ def _consume_capability(store: _Store, category: str, capability: _WireRecord, i
         ):
             raise BeadsCapabilityConsumedError("capability was consumed by another transaction")
         return
-    store.write_immutable(consumed, value)
-    _journal_record(store, kind, record_digest, full_digest)
+    _publish_authenticated_record(
+        store, consumed, value, kind, record_digest, full_digest
+    )
 
 
 def _capability_consumed_by(
@@ -1635,7 +1970,9 @@ def _transaction_intent(store: _Store, operation: str, payload: Mapping[str, Any
     kind = f"beads-{operation}-transaction-intent"
     intent, _, intent_digest, intent_full = store.sign(kind, intent_payload)
     path = directory / "intent.json"
-    store.write_immutable(path, intent)
+    _publish_authenticated_record(
+        store, path, intent, kind, intent_digest, intent_full
+    )
     observed = store.read_json(path, "transaction intent")
     body, _, observed_digest, observed_full = store.verify(observed, kind)
     if (
@@ -1645,7 +1982,7 @@ def _transaction_intent(store: _Store, operation: str, payload: Mapping[str, Any
         or any(body.get(key) != item for key, item in intent_payload.items())
     ):
         raise BeadsProtectedRuntimeError("transaction intent recovery mismatch")
-    _journal_record(store, kind, intent_digest, intent_full)
+    _ensure_boundary_operation_gate(store, transaction_intent_sha256=intent_digest)
     return intent_digest, directory
 
 
@@ -1662,8 +1999,14 @@ def _transaction_receipt(store: _Store, directory: Path, operation: str, result:
     }
     kind = f"beads-{operation}-transaction-receipt"
     receipt, _, receipt_digest, receipt_full = store.sign(kind, receipt_payload)
-    store.write_immutable(directory / "receipt.json", receipt)
-    _journal_record(store, kind, receipt_digest, receipt_full)
+    _publish_authenticated_record(
+        store,
+        directory / "receipt.json",
+        receipt,
+        kind,
+        receipt_digest,
+        receipt_full,
+    )
 
 
 def _resume_transaction_result(
@@ -2213,6 +2556,7 @@ def _spawn_verified_executable_v1(
     env: Mapping[str, str],
     logical_path: Path | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
+    _require_boundary_operation()
     """Spawn the already verified inode, never the mutable pathname."""
 
     expected_argv_path = logical_path if logical_path is not None else path
@@ -2341,8 +2685,11 @@ def _hash_regular_at(parent: int, name: str, metadata: os.stat_result, label: st
     return "sha256:" + hasher.hexdigest()
 
 
-def _observe_directory_tree(path: Path, label: str) -> dict[str, Any]:
-    root, ancestry = _open_absolute_directory(path, label, private=True)
+def _observe_open_directory_contents(
+    root: int, label: str
+) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    """Observe a descriptor-pinned tree, rebinding every child after walk."""
+
     entries: list[dict[str, Any]] = []
 
     def walk(descriptor: int, prefix: str, depth: int) -> None:
@@ -2408,14 +2755,40 @@ def _observe_directory_tree(path: Path, label: str) -> dict[str, Any]:
             else:
                 raise BeadsProtectedRuntimeError(f"{label} contains a special file")
 
+    root_metadata = os.fstat(root)
+    walk(root, "", 0)
+    return _directory_identity(root_metadata), entries
+
+
+def _observe_directory_tree(path: Path, label: str) -> dict[str, Any]:
+    root, ancestry = _open_absolute_directory(path, label, private=True)
     try:
-        root_metadata = os.fstat(root)
-        walk(root, "", 0)
+        root_identity, entries = _observe_open_directory_contents(root, label)
+        # Re-resolve the complete root name after the entire recursive walk.
+        # A parent/root swap late in traversal must not leave a valid-looking
+        # projection for a directory the authorized path no longer names.
+        root_parent, root_leaf = _open_absolute_parent(path, label)
+        try:
+            named_root = os.stat(
+                root_leaf, dir_fd=root_parent, follow_symlinks=False
+            )
+            pinned_root = os.fstat(root)
+            if (
+                canonical_bytes(_directory_identity(named_root))
+                != canonical_bytes(root_identity)
+                or canonical_bytes(_directory_identity(pinned_root))
+                != canonical_bytes(root_identity)
+            ):
+                raise BeadsProtectedRuntimeError(
+                    f"{label} root name changed after complete tree traversal"
+                )
+        finally:
+            os.close(root_parent)
     finally:
         os.close(root)
     projection = {
         "pathSha256": sha256(os.fsencode(str(path))),
-        "rootIdentity": _directory_identity(root_metadata),
+        "rootIdentity": root_identity,
         "ancestrySha256": sha256(canonical_bytes(ancestry)),
         "entries": entries,
     }
@@ -2430,9 +2803,11 @@ def _native_rename_noreplace(
     *,
     phase: str,
     expected_immediate_identity: Mapping[str, Any] | None = None,
+    expected_immediate_tree: Mapping[str, Any] | None = None,
 ) -> None:
     """Invoke the supported native exclusive rename at one audited seam."""
 
+    _require_boundary_operation()
     libc = ctypes.CDLL(None, use_errno=True)
     function: Any
     if hasattr(libc, "renameat2"):
@@ -2464,6 +2839,42 @@ def _native_rename_noreplace(
             raise BeadsProtectedRuntimeError(
                 f"{phase} source identity changed immediately before atomic rename"
             )
+    if expected_immediate_tree is not None:
+        descriptor = os.open(
+            source_leaf,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=source_parent,
+        )
+        try:
+            immediate_root, immediate_entries = _observe_open_directory_contents(
+                descriptor, f"{phase} source tree at native boundary"
+            )
+            named_after_walk = os.stat(
+                source_leaf, dir_fd=source_parent, follow_symlinks=False
+            )
+            pinned_after_walk = os.fstat(descriptor)
+            if (
+                canonical_bytes(_directory_identity(named_after_walk))
+                != canonical_bytes(immediate_root)
+                or canonical_bytes(_directory_identity(pinned_after_walk))
+                != canonical_bytes(immediate_root)
+            ):
+                raise BeadsProtectedRuntimeError(
+                    f"{phase} source root name changed after complete native-boundary traversal"
+                )
+        finally:
+            os.close(descriptor)
+        if (
+            canonical_bytes(immediate_root)
+            != canonical_bytes(expected_immediate_tree.get("rootIdentity"))
+            or canonical_bytes(immediate_entries)
+            != canonical_bytes(expected_immediate_tree.get("entries"))
+        ):
+            raise BeadsProtectedRuntimeError(
+                f"{phase} source tree changed immediately before atomic rename"
+            )
     result = function(
         source_parent,
         os.fsencode(source_leaf),
@@ -2492,6 +2903,7 @@ def _rename_directory_noreplace(
     target_leaf: str,
     *,
     expected_source_identity: Mapping[str, Any] | None = None,
+    expected_source_tree: Mapping[str, Any] | None = None,
 ) -> None:
     """Install through a recoverable quarantine without exposing wrong data.
 
@@ -2561,6 +2973,18 @@ def _rename_directory_noreplace(
             raise BeadsProtectedRuntimeError(
                 "quarantined install source identity differs from the authorized directory; target remains absent"
             )
+        quarantined_root, quarantined_entries = _observe_open_directory_contents(
+            quarantine_descriptor, "quarantined install tree"
+        )
+        if expected_source_tree is not None and (
+            canonical_bytes(quarantined_root)
+            != canonical_bytes(expected_source_tree.get("rootIdentity"))
+            or canonical_bytes(quarantined_entries)
+            != canonical_bytes(expected_source_tree.get("entries"))
+        ):
+            raise BeadsProtectedRuntimeError(
+                "quarantined install tree differs from the complete authorized stage tree; target remains absent"
+            )
         try:
             os.stat(target_leaf, dir_fd=target_parent, follow_symlinks=False)
         except FileNotFoundError:
@@ -2574,6 +2998,7 @@ def _rename_directory_noreplace(
             target_leaf,
             phase="install-quarantine-to-target",
             expected_immediate_identity=quarantined_identity,
+            expected_immediate_tree=expected_source_tree,
         )
         pinned_after = os.fstat(quarantine_descriptor)
     finally:
@@ -2588,185 +3013,6 @@ def _rename_directory_noreplace(
         or canonical_bytes(_directory_identity(target_after)) != canonical_bytes(expected)
     ):
         raise BeadsProtectedRuntimeError("atomic no-clobber install changed the authorized directory identity")
-
-
-def _regular_file_identity(metadata: os.stat_result) -> dict[str, int]:
-    return {
-        "device": metadata.st_dev,
-        "inode": metadata.st_ino,
-        "owner": metadata.st_uid,
-        "mode": stat.S_IMODE(metadata.st_mode),
-        "linkCount": metadata.st_nlink,
-        "size": metadata.st_size,
-    }
-
-
-def _cleanup_quarantine_leaf(kind: str, expected: Mapping[str, Any]) -> str:
-    binding = sha256(
-        canonical_bytes({"kind": f"cleanup-{kind}-quarantine", "expected": expected})
-    ).removeprefix("sha256:")
-    return f".startup-factory-cleanup-{kind}-{binding}"
-
-
-def _remove_identity_bound_file(
-    parent: int,
-    leaf: str,
-    expected_entry: Mapping[str, Any],
-    label: str,
-) -> None:
-    """Quarantine, verify, then remove exactly one authenticated file."""
-
-    expected_identity = {
-        key: expected_entry.get(key)
-        for key in ("device", "inode", "owner", "mode", "linkCount", "size")
-    }
-    expected_digest = expected_entry.get("bytesSha256")
-    quarantine_leaf = _cleanup_quarantine_leaf(
-        "file", {**expected_identity, "bytesSha256": expected_digest}
-    )
-    leaf_present = True
-    quarantine_present = True
-    try:
-        os.stat(leaf, dir_fd=parent, follow_symlinks=False)
-    except FileNotFoundError:
-        leaf_present = False
-    try:
-        os.stat(quarantine_leaf, dir_fd=parent, follow_symlinks=False)
-    except FileNotFoundError:
-        quarantine_present = False
-    if leaf_present and quarantine_present:
-        raise BeadsProtectedRuntimeError(f"{label} and its quarantine are both present")
-    if not leaf_present and not quarantine_present:
-        return
-    if leaf_present:
-        _native_rename_noreplace(
-            parent,
-            leaf,
-            parent,
-            quarantine_leaf,
-            phase="cleanup-file-to-quarantine",
-        )
-        _fault("preparation-cleanup-file-quarantined")
-    metadata = os.stat(quarantine_leaf, dir_fd=parent, follow_symlinks=False)
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or canonical_bytes(_regular_file_identity(metadata)) != canonical_bytes(expected_identity)
-    ):
-        raise BeadsProtectedRuntimeError(
-            f"{label} quarantine identity differs from signed cleanup evidence"
-        )
-    observed_digest = _hash_regular_at(parent, quarantine_leaf, metadata, label)
-    if observed_digest != expected_digest:
-        raise BeadsProtectedRuntimeError(
-            f"{label} quarantine bytes differ from signed cleanup evidence"
-        )
-    if _NATIVE_MUTATION_HOOK is not None:
-        _NATIVE_MUTATION_HOOK(
-            "cleanup-file-unlink", parent, quarantine_leaf, parent, quarantine_leaf
-        )
-    immediate = os.stat(quarantine_leaf, dir_fd=parent, follow_symlinks=False)
-    if canonical_bytes(_regular_file_identity(immediate)) != canonical_bytes(expected_identity):
-        raise BeadsProtectedRuntimeError(f"{label} identity changed immediately before unlink")
-    os.unlink(quarantine_leaf, dir_fd=parent)
-    os.fsync(parent)
-
-
-def _remove_identity_bound_directory(
-    parent: int,
-    leaf: str,
-    expected_identity: Mapping[str, Any],
-    label: str,
-    *,
-    expected_file_entry: Mapping[str, Any] | None = None,
-) -> None:
-    """Quarantine, verify, clean, then rmdir one authenticated root.
-
-    When the signed scaffold file is supplied, the root moves to quarantine
-    *before* any unlink.  Thus every unlink crash window remains inside the
-    already identity-bound broker quarantine rather than at an attacker-
-    replaceable authorized pathname.
-    """
-
-    expected = _plain(expected_identity)
-    expected_stable = {
-        key: expected.get(key) for key in ("device", "inode", "owner", "mode")
-    }
-    quarantine_leaf = _cleanup_quarantine_leaf("directory", expected_stable)
-    leaf_present = True
-    quarantine_present = True
-    try:
-        os.stat(leaf, dir_fd=parent, follow_symlinks=False)
-    except FileNotFoundError:
-        leaf_present = False
-    try:
-        os.stat(quarantine_leaf, dir_fd=parent, follow_symlinks=False)
-    except FileNotFoundError:
-        quarantine_present = False
-    if leaf_present and quarantine_present:
-        raise BeadsProtectedRuntimeError(f"{label} and its quarantine are both present")
-    if not leaf_present and not quarantine_present:
-        return
-    if leaf_present:
-        _native_rename_noreplace(
-            parent,
-            leaf,
-            parent,
-            quarantine_leaf,
-            phase="cleanup-directory-to-quarantine",
-        )
-    _fault("preparation-cleanup-directory-quarantined")
-    descriptor = os.open(
-        quarantine_leaf,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-        dir_fd=parent,
-    )
-    try:
-        opened = os.fstat(descriptor)
-        named = os.stat(quarantine_leaf, dir_fd=parent, follow_symlinks=False)
-        if (
-            canonical_bytes(_ancestry_identity(opened)) != canonical_bytes(expected_stable)
-            or canonical_bytes(_ancestry_identity(named)) != canonical_bytes(expected_stable)
-        ):
-            raise BeadsProtectedRuntimeError(
-                f"{label} quarantine identity differs from signed cleanup evidence"
-            )
-        if expected_file_entry is not None:
-            expected_file_quarantine = _cleanup_quarantine_leaf(
-                "file",
-                {
-                    **{
-                        key: expected_file_entry.get(key)
-                        for key in ("device", "inode", "owner", "mode", "linkCount", "size")
-                    },
-                    "bytesSha256": expected_file_entry.get("bytesSha256"),
-                },
-            )
-            entries = sorted(entry.name for entry in os.scandir(descriptor))
-            if entries not in ([".gitignore"], [expected_file_quarantine], []):
-                raise BeadsProtectedRuntimeError(
-                    f"{label} quarantine contains an unbound cleanup entry"
-                )
-            _remove_identity_bound_file(
-                descriptor,
-                ".gitignore",
-                expected_file_entry,
-                f"{label} .gitignore",
-            )
-        if list(os.scandir(descriptor)):
-            raise BeadsProtectedRuntimeError(f"{label} quarantine is not empty")
-        if _NATIVE_MUTATION_HOOK is not None:
-            _NATIVE_MUTATION_HOOK(
-                "cleanup-directory-rmdir", parent, quarantine_leaf, parent, quarantine_leaf
-            )
-        immediate = os.stat(quarantine_leaf, dir_fd=parent, follow_symlinks=False)
-        if canonical_bytes(_ancestry_identity(immediate)) != canonical_bytes(expected_stable):
-            raise BeadsProtectedRuntimeError(
-                f"{label} identity changed immediately before rmdir"
-            )
-        os.rmdir(quarantine_leaf, dir_fd=parent)
-        os.fsync(parent)
-    finally:
-        os.close(descriptor)
 
 
 def _capture_directory(path: Path, label: str) -> dict[str, Any]:
@@ -3338,8 +3584,51 @@ def _consume_preparation_command_v1(
     exact_argv, revoked, command_transaction, _, _ = _validate_preparation_command_v1(
         store, lease, command, argv
     )
+    joint_payload = {
+        "repositoryLocatorSha256": store.repository_digest,
+        "transactionIntentSha256": command_transaction,
+        "leaseRecordSha256": lease.record_sha256,
+        "leaseFullBytesSha256": lease.full_bytes_sha256,
+        "commandRecordSha256": command.record_sha256,
+        "commandFullBytesSha256": command.full_bytes_sha256,
+        "argvSha256": sha256(canonical_bytes(list(exact_argv))),
+    }
+    joint_directory = store.directory(
+        "preparation-joint-consumptions",
+        command_transaction.removeprefix("sha256:"),
+    )
+    joint_intent, _, joint_intent_digest, joint_intent_full = store.sign(
+        "beads-preparation-joint-consumption-intent", joint_payload
+    )
+    _publish_authenticated_record(
+        store,
+        joint_directory / "intent.json",
+        joint_intent,
+        "beads-preparation-joint-consumption-intent",
+        joint_intent_digest,
+        joint_intent_full,
+    )
+    _fault("preparation-joint-consumption-intent-written")
     _consume_capability(store, "preparation-lease-successors", lease, command_transaction)
+    _fault("preparation-joint-lease-consumed")
     _consume_capability(store, "preparation-command-intents", command, command_transaction)
+    _fault("preparation-joint-command-consumed")
+    joint_receipt, _, joint_receipt_digest, joint_receipt_full = store.sign(
+        "beads-preparation-joint-consumption-receipt",
+        {
+            **joint_payload,
+            "jointConsumptionIntentSha256": joint_intent_digest,
+        },
+    )
+    _publish_authenticated_record(
+        store,
+        joint_directory / "receipt.json",
+        joint_receipt,
+        "beads-preparation-joint-consumption-receipt",
+        joint_receipt_digest,
+        joint_receipt_full,
+    )
+    _fault("preparation-joint-consumption-receipt-written")
     mutation_payload = {
         "repositoryLocatorSha256": store.repository_digest,
         "mutationClass": "preparation",
@@ -3403,9 +3692,9 @@ def advance_beads_preparation_v1(request: AdvanceBeadsPreparationRequestV1) -> B
             if not _capability_consumed_by(
                 store, "preparation-command-intents", command, intent_digest
             ):
-                raise BeadsProtectedRuntimeError(
-                    "preparation lease was consumed without its canonical command consumption"
-                )
+                # Complete the exact authenticated joint consumption after a
+                # crash between the two one-use successor writes.
+                _consume_preparation_command_v1(store, lease, command, exact_argv)
             uncertain = _signed_record(
                 store,
                 "BeadsPreparationStepV1",
@@ -3765,6 +4054,7 @@ def _install_and_cleanup_create(
                 target_parent,
                 target_leaf,
                 expected_source_identity=expected_source_identity,
+                expected_source_tree=expected_stage_tree,
             )
             os.fsync(source_parent)
             os.fsync(target_parent)
@@ -3810,61 +4100,101 @@ def _install_and_cleanup_create(
         "preparation-cleanup-intents",
     )
     cleanup_locator = _observe_path_locator(cleanup, "create cleanup scaffold")
-    expected_entries = lease.payload.get("cleanupTreeObservationA", {}).get("entries", ())
-    expected_entry = expected_entries[0] if len(expected_entries) == 1 else None
+    expected_cleanup_tree = lease.payload.get("cleanupTreeObservationA")
     expected_cleanup_identity = lease.payload.get("cleanupObservationA", {}).get("identity")
-    if not isinstance(expected_entry, Mapping) or not isinstance(expected_cleanup_identity, Mapping):
-        raise BeadsProtectedRuntimeError("cleanup lacks signed file/root identity evidence")
-    file_quarantine_leaf = _cleanup_quarantine_leaf(
-        "file",
-        {
-            **{
-                key: expected_entry.get(key)
-                for key in ("device", "inode", "owner", "mode", "linkCount", "size")
-            },
-            "bytesSha256": expected_entry.get("bytesSha256"),
-        },
+    if not isinstance(expected_cleanup_tree, Mapping) or not isinstance(expected_cleanup_identity, Mapping):
+        raise BeadsProtectedRuntimeError("cleanup lacks signed full-tree/root identity evidence")
+    retirement_digest = sha256(canonical_bytes(expected_cleanup_tree)).removeprefix("sha256:")
+    retirement = cleanup.parent / f"startup-factory-retained-beads-{retirement_digest}"
+    retirement_locator = _observe_path_locator(
+        retirement, "retained cleanup evidence"
     )
     if cleanup_locator.get("present") is True:
-        descriptor, _ = _open_absolute_directory(cleanup, "create cleanup scaffold", private=True)
+        if retirement_locator.get("present") is not False:
+            raise BeadsProtectedRuntimeError(
+                "active cleanup and retained evidence are both present; recovery is ambiguous"
+            )
+        observed_cleanup_tree = _observe_directory_tree(
+            cleanup, "create cleanup scaffold before retirement"
+        )
+        if canonical_bytes(observed_cleanup_tree) != canonical_bytes(expected_cleanup_tree):
+            raise BeadsProtectedRuntimeError(
+                "cleanup scaffold differs from its complete signed tree before retirement"
+            )
+        cleanup_parent, cleanup_leaf = _open_absolute_parent(
+            cleanup, "create cleanup scaffold"
+        )
         try:
-            entries = sorted(entry.name for entry in os.scandir(descriptor))
-            if entries not in ([".gitignore"], [file_quarantine_leaf], []):
-                raise BeadsProtectedRuntimeError("cleanup scaffold contains an unbound entry after install")
-            expected_cleanup_stable = {
-                key: expected_cleanup_identity.get(key)
-                for key in ("device", "inode", "owner", "mode")
-            }
-            if canonical_bytes(_ancestry_identity(os.fstat(descriptor))) != canonical_bytes(
-                expected_cleanup_stable
+            if canonical_bytes(_directory_identity(os.fstat(cleanup_parent))) != canonical_bytes(
+                cleanup_locator.get("parentIdentity")
             ):
-                raise BeadsProtectedRuntimeError("cleanup root identity changed after authorization")
+                raise BeadsProtectedRuntimeError(
+                    "cleanup parent identity changed before retained-evidence rename"
+                )
             _require_current_authority_record(
                 store, lease.payload.get("revokedAuthorityRecordSha256"), "revoked"
             )
             _verify_current_preparation_core_bindings(store, lease.payload)
+            _native_rename_noreplace(
+                cleanup_parent,
+                cleanup_leaf,
+                cleanup_parent,
+                retirement.name,
+                phase="cleanup-active-to-retained",
+                expected_immediate_identity=expected_cleanup_identity,
+                expected_immediate_tree=expected_cleanup_tree,
+            )
+            os.fsync(cleanup_parent)
         finally:
-            os.close(descriptor)
-    elif cleanup_locator.get("present") is not False:
-        raise BeadsProtectedRuntimeError("cleanup scaffold recovery state is ambiguous")
-    cleanup_parent, cleanup_leaf = _open_absolute_parent(cleanup, "create cleanup scaffold")
-    try:
-        _require_current_authority_record(
-            store, lease.payload.get("revokedAuthorityRecordSha256"), "revoked"
+            os.close(cleanup_parent)
+        _fault("preparation-cleanup-retired")
+    elif not (
+        cleanup_locator.get("present") is False
+        and retirement_locator.get("present") is True
+    ):
+        raise BeadsProtectedRuntimeError(
+            "cleanup retirement recovery state is ambiguous"
         )
-        _verify_current_preparation_core_bindings(store, lease.payload)
-        _remove_identity_bound_directory(
-            cleanup_parent,
-            cleanup_leaf,
-            expected_cleanup_identity,
-            "create cleanup scaffold",
-            expected_file_entry=expected_entry,
-        )
-    finally:
-        os.close(cleanup_parent)
-    _fault("preparation-cleanup-removed")
     if _observe_path_locator(cleanup, "create cleanup scaffold").get("present") is not False:
-        raise BeadsProtectedRuntimeError("cleanup scaffold remains after protected cleanup")
+        raise BeadsProtectedRuntimeError("active cleanup path remains after protected retirement")
+    retained_tree = _observe_directory_tree(
+        retirement, "retained cleanup evidence tree"
+    )
+    if (
+        canonical_bytes(retained_tree.get("rootIdentity"))
+        != canonical_bytes(expected_cleanup_tree.get("rootIdentity"))
+        or canonical_bytes(retained_tree.get("entries"))
+        != canonical_bytes(expected_cleanup_tree.get("entries"))
+    ):
+        raise BeadsProtectedRuntimeError(
+            "retained cleanup evidence differs from the complete signed cleanup tree"
+        )
+    retirement_receipt, _, retirement_record, retirement_full = store.sign(
+        "beads-preparation-cleanup-retirement-receipt",
+        {
+            "repositoryLocatorSha256": store.repository_digest,
+            "transactionIntentSha256": transaction_intent_sha256,
+            "cleanupIntentRecordSha256": cleanup_intent.record_sha256,
+            "activeCleanupPathSha256": sha256(os.fsencode(str(cleanup))),
+            "retainedEvidencePathSha256": sha256(os.fsencode(str(retirement))),
+            "retainedEvidenceTreeSha256": retained_tree["treeSha256"],
+            "authorizedCleanupTreeSha256": expected_cleanup_tree.get("treeSha256"),
+        },
+    )
+    _publish_authenticated_record(
+        store,
+        store.directory("preparation-cleanup-retirements")
+        / f"{retirement_record.removeprefix('sha256:')}.json",
+        retirement_receipt,
+        "beads-preparation-cleanup-retirement-receipt",
+        retirement_record,
+        retirement_full,
+    )
+    _fault("preparation-cleanup-retirement-recorded")
+    _require_current_authority_record(
+        store, lease.payload.get("revokedAuthorityRecordSha256"), "revoked"
+    )
+    _verify_current_preparation_core_bindings(store, lease.payload)
     cleanup_observed = _signed_record(
         store,
         "BeadsPreparationStepV1",
@@ -5390,6 +5720,127 @@ def verify_current_beads_adapter_release_manifest_v1(
                 if observation.get(field) != manifest.payload.get(field):
                     raise BeadsProtectedRuntimeError("current adapter release observation join mismatch")
         return VerifiedBeadsAdapterReleaseManifestV1(payload=manifest.payload, auth=manifest.auth, record_sha256=manifest.record_sha256, full_bytes_sha256=manifest.full_bytes_sha256)
+
+
+_PURE_OFFLINE_FUNCTIONS = {
+    "build_beads_bootstrap_runtime_core_v1",
+    "build_beads_adapter_release_core_v1",
+    "project_beads_authority_predecessor_locator_v1",
+}
+
+
+def _boundary_call_value(value: Any) -> Any:
+    if isinstance(value, _WireRecord):
+        return {
+            "type": type(value).__name__,
+            "payload": _plain(value.payload),
+            "auth": value.auth,
+            "recordSha256": value.record_sha256,
+            "fullBytesSha256": value.full_bytes_sha256,
+        }
+    return _plain(value)
+
+
+def _boundary_call_repository(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> str:
+    for value in (*args, *kwargs.values()):
+        if isinstance(value, _WireRecord):
+            payload = value.payload
+            repository = payload.get("repositoryLocatorSha256")
+            if repository is not None:
+                digest = _digest(repository, "boundary operation repositoryLocatorSha256")
+                assert digest is not None
+                return digest
+        elif isinstance(value, Mapping) and value.get("repositoryLocatorSha256") is not None:
+            digest = _digest(value.get("repositoryLocatorSha256"), "boundary operation repositoryLocatorSha256")
+            assert digest is not None
+            return digest
+        elif isinstance(value, str) and _DIGEST.fullmatch(value):
+            return value
+    raise _boundary_refusal("exact operation has no repository locator")
+
+
+def _boundary_call_root_set(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> str:
+    for value in (*args, *kwargs.values()):
+        payload = value.payload if isinstance(value, _WireRecord) else value
+        if isinstance(payload, Mapping) and {
+            "protectedRoot", "hmacKeyPath"
+        }.issubset(payload):
+            return sha256(
+                canonical_bytes(
+                    {
+                        "protectedRoot": payload["protectedRoot"],
+                        "hmacKeyPath": payload["hmacKeyPath"],
+                    }
+                )
+            )
+    locator = _BROKER_CONTEXT.get()
+    if locator is not None:
+        return sha256(
+            canonical_bytes(
+                {"protectedRoot": locator[0], "hmacKeyPath": locator[1]}
+            )
+        )
+    raise _boundary_refusal("exact operation has no explicit protected root set")
+
+
+def _boundary_guarded(function: Any, operation: str) -> Any:
+    @functools.wraps(function)
+    def guarded(*args: Any, **kwargs: Any) -> Any:
+        if _OFFLINE_LOGIC_CONTEXT.get():
+            return function(*args, **kwargs)
+        # Check the opaque live session before decoding request objects or
+        # resolving any caller-supplied path.
+        session = _validate_live_boundary_session()
+        repository = _boundary_call_repository(args, kwargs)
+        if session.receipt.get("repositoryLocatorSha256") != repository:
+            raise _boundary_refusal("session repository differs from the exact call")
+        root_set = _boundary_call_root_set(args, kwargs)
+        if session.receipt.get("rootSetSha256") != root_set:
+            raise _boundary_refusal("session protected root set differs from the exact call")
+        request_digest = sha256(
+            canonical_bytes(
+                {
+                    "operation": operation,
+                    "args": [_boundary_call_value(value) for value in args],
+                    "kwargs": {
+                        key: _boundary_call_value(kwargs[key]) for key in sorted(kwargs)
+                    },
+                }
+            )
+        )
+        operation_record = MappingProxyType(
+            {
+                "schemaVersion": 1,
+                "operation": operation,
+                "requestSha256": request_digest,
+                "repositoryLocatorSha256": repository,
+                "rootSetSha256": root_set,
+                "sessionReceiptSha256": session.receipt_sha256,
+                "runtimeManifestSha256": session.receipt["runtimeManifestSha256"],
+                "moduleSha256": session.receipt["moduleSha256"],
+                "verifierIdentitySha256": session.receipt["verifierIdentitySha256"],
+                "expiresAtUnix": session.receipt["expiresAtUnix"],
+            }
+        )
+        token = _BOUNDARY_OPERATION_CONTEXT.set(operation_record)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _BOUNDARY_OPERATION_CONTEXT.reset(token)
+
+    return guarded
+
+
+# Preserve the registered 92 types, 33 names, and inspectable public
+# signatures while applying the external boundary check to every non-pure
+# exported entry point.  Historical reads are also gated because the current
+# filesystem implementation opens the protected namespace; they remain
+# explicitly historical and never promote authority.
+for _function_name in _FUNCTION_EXPORTS:
+    if _function_name not in _PURE_OFFLINE_FUNCTIONS:
+        globals()[_function_name] = _boundary_guarded(
+            globals()[_function_name], _function_name
+        )
 
 
 __all__ = [
