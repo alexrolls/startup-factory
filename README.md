@@ -58,8 +58,8 @@ licensed**
 Start with one agent and the local Markdown tracker. You do not need a tracker
 account, API key, application server, or coordinator database.
 
-1. **Install Startup Factory from your project root.** Codex and Aider use the
-   shared Agent Skills project directory:
+1. **Install Startup Factory from your project root.** Codex, Aider, and
+   DeepSeek Harness use the shared Agent Skills project directory:
 
    ```bash
    uvx startup-factory@latest install --agent codex
@@ -68,7 +68,7 @@ account, API key, application server, or coordinator database.
    ```
 
    For Claude Code, use `--agent claude-code`. Pin a release in controlled
-   environments, for example `startup-factory@0.1.11`. For a Git checkout or an
+   environments, for example `startup-factory@0.1.12`. For a Git checkout or an
    offline installation, use the
    [auditable shell compatibility path](#shell-compatibility-path).
 
@@ -677,6 +677,9 @@ uvx startup-factory@latest install --agent codex
 
 # Claude Code
 uvx startup-factory@latest install --agent claude-code
+
+# DeepSeek Harness
+uvx startup-factory@latest install --agent deepseek-harness
 
 # Alternative isolated runner
 pipx run startup-factory install --agent codex
