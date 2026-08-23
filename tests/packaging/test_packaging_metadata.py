@@ -25,6 +25,8 @@ except ModuleNotFoundError:  # pragma: no cover - metadata tests run on 3.11+
 ROOT = Path(__file__).resolve().parents[2]
 PYPROJECT = ROOT / "pyproject.toml"
 PROJECT_MANAGEMENT_CONFIG = ROOT / "config" / "project-management.config.md"
+TEAM_CONFIG = ROOT / "config" / "team.config.md"
+README = ROOT / "README.md"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 RESOURCE_ARCHIVE = "startup_factory_cli/resources/startup-factory.tar.gz"
 RESOURCE_CHECKSUM = f"{RESOURCE_ARCHIVE}.sha256"
@@ -119,6 +121,31 @@ class ProjectMetadataTests(unittest.TestCase):
         build_system = self.config["build-system"]
         self.assertEqual(build_system["build-backend"], "setuptools.build_meta")
         self.assertEqual(build_system["requires"], ["setuptools==83.0.0"])
+
+    def test_codex_command_templates_use_automatic_review(self) -> None:
+        team_config = TEAM_CONFIG.read_text(encoding="utf-8")
+        readme = README.read_text(encoding="utf-8")
+        codex_commands = [
+            line
+            for line in team_config.splitlines()
+            if line.startswith(
+                (
+                    "SCEPTICAL_ARCHITECT_CMD=",
+                    "SENIOR_SECURITY_ENGINEER_CMD=",
+                    "BACKEND_CMD=",
+                    "FRONTEND_CMD=",
+                )
+            )
+            and "codex exec" in line
+        ]
+
+        self.assertEqual(len(codex_commands), 4)
+        self.assertTrue(
+            all("--approve-for-me" in command for command in codex_commands)
+        )
+        self.assertNotIn("--full-auto", team_config)
+        self.assertIn("codex exec --approve-for-me", readme)
+        self.assertNotIn("codex exec --full-auto", readme)
 
     def test_public_package_metadata(self) -> None:
         project = self.config["project"]

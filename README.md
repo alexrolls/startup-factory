@@ -927,8 +927,8 @@ opt-out.
 ```
 TEAM_LEAD_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
 PRINCIPAL_ARCHITECT_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
-SCEPTICAL_ARCHITECT_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
-BACKEND_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
+SCEPTICAL_ARCHITECT_CMD="codex exec --approve-for-me \"$(cat '{prompt_file}')\""
+BACKEND_CMD="codex exec --approve-for-me \"$(cat '{prompt_file}')\""
 REVIEWER_CMD="gemini --yolo \"$(cat '{prompt_file}')\""
 TEAM_DEFAULT_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
 ```
@@ -938,7 +938,7 @@ Command templates for common CLIs:
 | LLM / CLI | Command template |
 |---|---|
 | Claude Code | `claude -p "$(cat '{prompt_file}')" --permission-mode acceptEdits` |
-| Codex CLI | `codex exec --full-auto "$(cat '{prompt_file}')"` |
+| Codex CLI | `codex exec --approve-for-me "$(cat '{prompt_file}')"` |
 | Gemini CLI | `gemini --yolo "$(cat '{prompt_file}')"` |
 | Any file-reading CLI | `yourcli --prompt-file {prompt_file}` |
 
@@ -1007,8 +1007,9 @@ Omit the variable for Codex, Gemini, and other runtimes.
 why the many specialized preset-team roles need no per-role keys — set
 `TEAM_DEFAULT_CMD` once and only override the roles you want on a different model.
 
-> ⚠️ **Safety:** those templates use auto-approve flags (`acceptEdits`,
-> `--full-auto`, `--yolo`) so agents can work unattended. Workers may commit
+> ⚠️ **Safety:** those templates use unattended execution modes (`acceptEdits`,
+> `--approve-for-me`, `--yolo`). Codex keeps its workspace-write sandbox and
+> routes approval requests through automatic review. Workers may commit
 > untrusted checkpoints only to task branches; only the integrator writes the
 > feature branch. Every implementer is isolated in its own git worktree — but still run teams on a branch you can
 > throw away, and review the tracker before merging to your main branch.
