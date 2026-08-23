@@ -100,6 +100,38 @@ canonical repository, `.git`, `.teamwork`, lifecycle, or broker state.
 The first release has no uninstall command and never removes operator-modified
 assets or old versioned runtime bundles.
 
+## Protected Beads authority protocol
+
+`startup_factory_cli.beads_protected_runtime` is the broker-side protected
+authority surface for the optional Beads backend. It does not implement tracker
+semantics and it is never an alternative tracker source of truth. When Beads is
+selected, ordinary claim, mutation, and launch capabilities require one current
+active authority epoch. Preparation is allowed only while that epoch is
+revoked, through one-use HMAC capabilities and immutable intent, consumption,
+history, current-pointer, step, and receipt records under an external mode-0700
+protected root. Requests contain the protected-root and HMAC-key locations;
+key bytes are read only by the broker and are never returned or passed to an
+agent process.
+
+The compatibility baseline is `gastownhall/beads` v1.1.2 at full commit
+`20e493e569c922d1253bdeff068c5e56c94957fb`. Re-attestation admits only the
+literal ordered child argv `[B,"--db",S,"--json","--sandbox","config","list"]`,
+where `S=P/.beads/embeddeddolt`. The selected `D=S/DB` directory and `D/.dolt`
+are separate no-follow physical observations and are never substituted into
+argv. The deterministic offline fixture is
+`tests/fixtures/beads-protected-runtime-v1.json`; genuine binary/source
+conformance remains a release gate and a missing or skipped proof is non-green.
+
+Repository-only verification functions require the broker to establish the
+explicit lexical `use_beads_protected_runtime_v1(...)` locator context. They do
+not consult environment variables or discover roots. Historical verification
+is audit-only. A stale current pointer, generation overflow, reused capability,
+unknown transition, malformed canonical payload, HMAC mismatch, unsafe mode,
+link, type, owner, or exact-byte CAS mismatch fails closed and preserves the
+append-only records for operator inspection. These Python and same-UID file
+controls are governance evidence inside the external runner boundary; they are
+not themselves an operating-system security boundary.
+
 After apply, `startup-factory runtime-kit ... --probe --json` creates a
 disposable standalone clone and executes fixed positive and negative controls
 through the configured runner. It records worktree write/commit observations

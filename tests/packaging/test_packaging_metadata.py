@@ -154,6 +154,15 @@ class BundledDefaultsTests(unittest.TestCase):
         self.assertRegex(config, r"(?m)^TEAM_MODE=true(?:\s|$)")
         self.assertNotRegex(config, r"(?m)^TEAM_MODE=false(?:\s|$)")
 
+    def test_protected_beads_runtime_module_and_fixture_are_shipped(self) -> None:
+        module = ROOT / "src" / "startup_factory_cli" / "beads_protected_runtime.py"
+        fixture = ROOT / "tests" / "fixtures" / "beads-protected-runtime-v1.json"
+        spec = (ROOT / "packaging" / "bundle-spec.json").read_text(encoding="utf-8")
+        self.assertTrue(module.is_file())
+        self.assertTrue(fixture.is_file())
+        self.assertIn('"tests/beads-protected-runtime-test.py"', spec)
+        self.assertIn('"tests/fixtures/beads-protected-runtime-v1.json"', spec)
+
 
 class ReleaseWorkflowTests(unittest.TestCase):
     def test_release_runs_for_merged_main_commits(self) -> None:
