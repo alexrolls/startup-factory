@@ -503,6 +503,7 @@ def resolve_target(
         "aider": Path(".agents/skills/startup-factory"),
         "claude": Path(".claude/skills/startup-factory"),
         "claude-code": Path(".claude/skills/startup-factory"),
+        "deepseek-harness": Path(".agents/skills/startup-factory"),
     }
     if normalized_agent:
         try:

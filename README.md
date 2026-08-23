@@ -663,6 +663,7 @@ Choose the project path your agent supports:
 | **Codex** | `.agents/skills/startup-factory` | Native project skill path |
 | **Claude Code** | `.claude/skills/startup-factory` | Native project skill path |
 | **Aider** | `.agents/skills/startup-factory` | Start with `aider --read .agents/skills/startup-factory/SKILL.md` |
+| **DeepSeek Harness** | `.agents/skills/startup-factory` | Reads `AGENTS.md` natively; add a pointer there or paste `SKILL.md` as the task |
 | **Other agents** | Their native project skill directory | Use native discovery or point the agent at `SKILL.md` |
 
 The release package embeds one deterministic bundle built from an exact Git
@@ -807,7 +808,7 @@ installation into a partial one. Its main operator options are:
 
 | Option | Purpose |
 |---|---|
-| `--agent codex\|claude-code\|aider` | Select the native project skill directory. |
+| `--agent codex\|claude-code\|aider\|deepseek-harness` | Select the native project skill directory. |
 | `--project PATH` | Resolve the agent directory relative to another project. |
 | `--install-dir PATH` | Override the mapped installation directory. |
 | `--bundle PATH` | For install/update, use an explicitly supplied local canonical archive. |
