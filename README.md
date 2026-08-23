@@ -940,6 +940,7 @@ Command templates for common CLIs:
 | Claude Code | `claude -p "$(cat '{prompt_file}')" --permission-mode acceptEdits` |
 | Codex CLI | `codex exec --full-auto "$(cat '{prompt_file}')"` |
 | Gemini CLI | `gemini --yolo "$(cat '{prompt_file}')"` |
+| DeepSeek Harness | `dsh --profile headless "$(cat '{prompt_file}')"` |
 | Any file-reading CLI | `yourcli --prompt-file {prompt_file}` |
 
 Direct `claude` commands are detected automatically. If Claude is behind a
@@ -948,6 +949,18 @@ wrapper, mark only that command template so mixed-model teams remain precise:
 ```bash
 FRONTEND_CMD="STARTUP_FACTORY_LLM_RUNTIME=claude /path/to/claude-wrapper {prompt_file}"
 ```
+
+DeepSeek Harness (`dsh`) needs Node.js and a one-time global install —
+`npm install -g @deepseek-ai/dsh` (pin a version; the project is in developer
+preview with breaking changes). Its one-shot mode prints only the final answer
+on stdout and exits non-zero on failure, so `doctor` and task dispatch work
+unchanged. It needs no auto-approve flag: headless sessions run under dsh's own
+`workspace-write` sandbox (writes confined to the working directory). Credentials
+and model defaults live under `$DSH_HOME` (default: under `$HOME`) —
+`.credentials.yaml` / `settings.yaml` — so when `AGENT_SANDBOX_HOME` is
+configured, place the reviewed dsh state inside that sandbox home (or allowlist
+a `DSH_HOME` pointing at reviewed state outside it). dsh is classified as
+runtime family `other`, like Codex and Gemini.
 
 **Mixing LLMs is the design intent** — e.g. Claude to lead and own the primary
 architecture position, Codex to challenge it independently and implement, and
