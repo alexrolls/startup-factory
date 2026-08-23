@@ -42,6 +42,16 @@ class LogicHarness:
             controller_uid=91_001,
             broker_uid=91_002,
             worker_uid=91_003,
+            transport_gid=91_004,
+            runtime_manifest_path=Path(
+                "/usr/lib/startup-factory/test-runtime-manifest.json"
+            ),
+            module_path=Path(
+                "/usr/lib/startup-factory/test-controller-module.py"
+            ),
+            schema_path=Path(
+                "/usr/lib/startup-factory/test-runtime-schema.json"
+            ),
             runtime_manifest_sha256=digest(b"test-runtime-manifest"),
             module_sha256=digest(b"test-module"),
             schema_sha256=digest(b"test-schema"),
@@ -81,6 +91,7 @@ class LogicHarness:
             operation=operation,
             request_sha256=request_sha256,
             repository_locator_sha256=repository,
+            effect_authorization_receipt_sha256=receipt,
         )
         operation_record = MappingProxyType(
             {

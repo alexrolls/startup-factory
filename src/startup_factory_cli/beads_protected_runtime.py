@@ -56,6 +56,9 @@ _BOUNDARY_SESSION_CONTEXT: ContextVar["_ControllerBoundarySessionV1 | None"] = C
 _BOUNDARY_OPERATION_CONTEXT: ContextVar[Mapping[str, Any] | None] = ContextVar(
     "beads-boundary-operation", default=None
 )
+_PUBLICATION_RECOVERY_SCOPE: ContextVar[str | None] = ContextVar(
+    "beads-publication-recovery-scope", default=None
+)
 _BOUNDARY_REMEDIATION: Final = (
     "fixed root-managed Linux Beads boundary controller required; install and start "
     "startup-factory-beads-controller with distinct controller/broker/worker UIDs, "
@@ -82,6 +85,10 @@ class BeadsCapabilityConsumedError(BeadsProtectedRuntimeError):
     """A one-use protected capability was already consumed."""
 
 
+class _PublicationRecoveryCompleted(BeadsProtectedRuntimeError):
+    """One exact publication suffix was recovered; the outer outcome stays unknown."""
+
+
 @dataclasses.dataclass(slots=True)
 class _ControllerBoundarySessionV1:
     """One request-scoped live controller connection lineage.
@@ -96,6 +103,8 @@ class _ControllerBoundarySessionV1:
     operation: str
     request_sha256: str
     repository_locator_sha256: str
+    effect_authorization_receipt_sha256: str
+    recovery_mode: bool = False
     completed: bool = False
 
 
@@ -112,13 +121,33 @@ def _validate_live_boundary_session(
     if not sys.platform.startswith("linux"):
         raise _boundary_refusal(f"host platform {sys.platform!r} is not Linux")
     try:
-        validated = _boundary_controller.validate_stored_receipt(
-            candidate.config,
-            operation_id=str(candidate.response["operationId"]),
-            stored_receipt_sha256=str(candidate.response["receiptSha256"]),
-            expected_state=str(candidate.response["state"]),
-            expected_result_sha256=candidate.response.get("resultSha256"),
-        )
+        if candidate.recovery_mode:
+            validated = _boundary_controller.recover_publication_operation(
+                candidate.config,
+                candidate.operation,
+                {
+                    "repositoryLocatorSha256": candidate.repository_locator_sha256,
+                    "requestSha256": candidate.request_sha256,
+                },
+                phase="inspect",
+                prior=candidate.response,
+            )
+            if (
+                validated.get("effectAuthorizationReceiptSha256")
+                != candidate.effect_authorization_receipt_sha256
+            ):
+                raise _boundary_controller.ControllerProtocolError(
+                    "recovery validation changed the effect authorization"
+                )
+            candidate.response = validated
+        else:
+            validated = _boundary_controller.validate_stored_receipt(
+                candidate.config,
+                operation_id=str(candidate.response["operationId"]),
+                stored_receipt_sha256=str(candidate.response["receiptSha256"]),
+                expected_state=str(candidate.response["state"]),
+                expected_result_sha256=candidate.response.get("resultSha256"),
+            )
     except (_boundary_controller.ControllerProtocolError, KeyError, TypeError) as exc:
         raise _boundary_refusal(f"fresh controller validation failed: {exc}") from exc
     if validated.get("operationId") != candidate.response.get("operationId"):
@@ -126,13 +155,28 @@ def _validate_live_boundary_session(
     return candidate
 
 
-def _require_boundary_operation() -> Mapping[str, Any]:
+def _require_boundary_operation(*, mutation: bool = False) -> Mapping[str, Any]:
     session = _validate_live_boundary_session()
     operation = _BOUNDARY_OPERATION_CONTEXT.get()
-    if not isinstance(operation, Mapping) or operation.get("sessionReceiptSha256") != session.response.get("receiptSha256"):
+    expected_receipt = (
+        session.effect_authorization_receipt_sha256
+        if session.recovery_mode
+        else session.response.get("receiptSha256")
+    )
+    if not isinstance(operation, Mapping) or operation.get("sessionReceiptSha256") != expected_receipt:
         raise _boundary_refusal("no exact boundary operation is bound")
     if operation.get("repositoryLocatorSha256") != session.repository_locator_sha256:
         raise _boundary_refusal("boundary operation repository does not match the live session")
+    if mutation and session.recovery_mode:
+        publication = session.response.get("recoveryPublicationIntentSha256")
+        if (
+            session.response.get("state") != "publication-recovery-authorized"
+            or publication is None
+            or _PUBLICATION_RECOVERY_SCOPE.get() != publication
+        ):
+            raise _boundary_refusal(
+                "publication recovery cannot perform this filesystem, spawn or command effect"
+            )
     return operation
 
 
@@ -893,8 +937,8 @@ def _open_absolute_directory(path: Path, label: str, *, private: bool = False) -
         # has finished, while every parent descriptor remains pinned.  This
         # closes swaps of an already-open child or the absolute root name.
         named_root = os.stat(path.anchor, follow_symlinks=False)
-        if canonical_bytes(_directory_identity(named_root)) != canonical_bytes(
-            _directory_identity(root_metadata)
+        if canonical_bytes(_ancestry_identity(named_root)) != canonical_bytes(
+            _ancestry_identity(root_metadata)
         ):
             raise BeadsProtectedRuntimeError(f"{label} root name identity changed during traversal")
         for parent, child, name, opened in zip(
@@ -906,10 +950,10 @@ def _open_absolute_directory(path: Path, label: str, *, private: bool = False) -
             named = os.stat(name, dir_fd=parent, follow_symlinks=False)
             pinned = os.fstat(child)
             if (
-                canonical_bytes(_directory_identity(named))
-                != canonical_bytes(_directory_identity(opened))
-                or canonical_bytes(_directory_identity(pinned))
-                != canonical_bytes(_directory_identity(opened))
+                canonical_bytes(_ancestry_identity(named))
+                != canonical_bytes(_ancestry_identity(opened))
+                or canonical_bytes(_ancestry_identity(pinned))
+                != canonical_bytes(_ancestry_identity(opened))
             ):
                 raise BeadsProtectedRuntimeError(
                     f"{label} child name identity changed after complete traversal"
@@ -1024,6 +1068,7 @@ class _Store:
         if requested_paths != configured_paths:
             raise _boundary_refusal("protected store paths differ from fixed controller configuration")
         self.repository_digest = repository_digest
+        recovery = bool(operation.get("recoveryMode"))
         self.root = session.config.protected_root
         self.key_path = session.config.record_hmac_key_path
         self._root_fd, self.root_ancestry = _open_absolute_directory(self.root, "protected root", private=True)
@@ -1046,11 +1091,13 @@ class _Store:
         if len(self.key) < 32 or len(self.key) > 4096:
             raise BeadsProtectedRuntimeError("Beads HMAC key must contain 32..4096 bytes")
         namespace = self.root / REPOSITORY_NAMESPACE
-        try:
-            os.mkdir(REPOSITORY_NAMESPACE, mode=0o700, dir_fd=self._root_fd)
-            os.fsync(self._root_fd)
-        except FileExistsError:
-            pass
+        if not recovery:
+            _require_boundary_operation(mutation=True)
+            try:
+                os.mkdir(REPOSITORY_NAMESPACE, mode=0o700, dir_fd=self._root_fd)
+                os.fsync(self._root_fd)
+            except FileExistsError:
+                pass
         namespace_fd = os.open(
             REPOSITORY_NAMESPACE,
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
@@ -1059,11 +1106,13 @@ class _Store:
         _validate_directory_metadata(os.fstat(namespace_fd), "Beads authority namespace", private=True)
         self.repository = namespace / repository_digest.removeprefix("sha256:")
         repository_name = repository_digest.removeprefix("sha256:")
-        try:
-            os.mkdir(repository_name, mode=0o700, dir_fd=namespace_fd)
-            os.fsync(namespace_fd)
-        except FileExistsError:
-            pass
+        if not recovery:
+            _require_boundary_operation(mutation=True)
+            try:
+                os.mkdir(repository_name, mode=0o700, dir_fd=namespace_fd)
+                os.fsync(namespace_fd)
+            except FileExistsError:
+                pass
         self._repository_fd = os.open(
             repository_name,
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
@@ -1099,7 +1148,7 @@ class _Store:
 
     def _open_directory(self, parts: Sequence[str], *, create: bool) -> int:
         if create:
-            _require_boundary_operation()
+            _require_boundary_operation(mutation=True)
         descriptor = os.dup(self._repository_fd)
         try:
             for part in parts:
@@ -1186,9 +1235,17 @@ class _Store:
             raise BeadsProtectedRuntimeError("protected envelope authentication failed")
         return body, auth, record_digest, full_digest
 
-    def directory(self, *parts: str) -> Path:
+    def directory(self, *parts: str, create: bool = True) -> Path:
         current = self.repository
-        descriptor = self._open_directory(parts, create=True)
+        operation = _BOUNDARY_OPERATION_CONTEXT.get()
+        if (
+            create
+            and isinstance(operation, Mapping)
+            and operation.get("recoveryMode")
+            and _PUBLICATION_RECOVERY_SCOPE.get() is None
+        ):
+            create = False
+        descriptor = self._open_directory(parts, create=create)
         os.close(descriptor)
         for part in parts:
             current = _safe_join(current, part)
@@ -1205,7 +1262,7 @@ class _Store:
         return value
 
     def write_immutable(self, path: Path, value: Mapping[str, Any], mode: int = 0o600) -> None:
-        _require_boundary_operation()
+        _require_boundary_operation(mutation=True)
         encoded = canonical_bytes(value)
         parent, leaf = self._open_parent(path, create=True)
         try:
@@ -1237,7 +1294,7 @@ class _Store:
         *,
         max_bytes: int = MAX_CANONICAL_BYTES,
     ) -> None:
-        _require_boundary_operation()
+        _require_boundary_operation(mutation=True)
         if not encoded or len(encoded) > max_bytes:
             raise BeadsProtectedRuntimeError("immutable protected bytes are empty or oversized")
         parent, leaf = self._open_parent(path, create=True)
@@ -1273,7 +1330,7 @@ class _Store:
             os.close(parent)
 
     def unlink_exact(self, path: Path, expected: bytes, label: str) -> None:
-        _require_boundary_operation()
+        _require_boundary_operation(mutation=True)
         parent, leaf = self._open_parent(path)
         try:
             if self._read_bytes(path, label) != expected:
@@ -1284,7 +1341,7 @@ class _Store:
             os.close(parent)
 
     def replace_current(self, path: Path, value: Mapping[str, Any], expected_full_digest: str | None) -> str:
-        _require_boundary_operation()
+        _require_boundary_operation(mutation=True)
         encoded = canonical_bytes(value)
         current_digest: str | None = None
         if self.exists(path):
@@ -1324,10 +1381,13 @@ class _RepositoryLock:
         self.descriptor: int | None = None
 
     def __enter__(self) -> _Store:
-        _require_boundary_operation()
+        operation = _require_boundary_operation()
+        recovery = bool(operation.get("recoveryMode"))
         self.descriptor = os.open(
             "repository.lock",
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDWR
+            | (0 if recovery else os.O_CREAT)
+            | getattr(os, "O_NOFOLLOW", 0),
             0o600,
             dir_fd=self.store._repository_fd,
         )
@@ -1335,7 +1395,11 @@ class _RepositoryLock:
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
             raise BeadsProtectedRuntimeError("repository authority lock is unsafe")
         fcntl.flock(self.descriptor, fcntl.LOCK_EX)
-        _ensure_boundary_operation_gate(self.store, transaction_intent_sha256=None)
+        _ensure_boundary_operation_gate(
+            self.store,
+            transaction_intent_sha256=None,
+            verify_only=recovery,
+        )
         return self.store
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
@@ -1360,6 +1424,8 @@ def _current_authority_digest_for_gate(store: _Store) -> str | None:
 def _ensure_boundary_operation_gate(
     store: _Store,
     transaction_intent_sha256: str | None,
+    *,
+    verify_only: bool = False,
 ) -> None:
     """Write the internal HMAC gate joining the live session to this effect.
 
@@ -1376,7 +1442,7 @@ def _ensure_boundary_operation_gate(
         "repositoryLocatorSha256": store.repository_digest,
         "operation": operation["operation"],
         "requestSha256": operation["requestSha256"],
-        "sessionReceiptSha256": session.response["receiptSha256"],
+        "sessionReceiptSha256": session.effect_authorization_receipt_sha256,
         "rootSetSha256": operation["rootSetSha256"],
         "runtimeManifestSha256": operation["runtimeManifestSha256"],
         "moduleSha256": operation["moduleSha256"],
@@ -1386,12 +1452,23 @@ def _ensure_boundary_operation_gate(
         "authorityRecordSha256": _current_authority_digest_for_gate(store),
     }
     operation_id = sha256(canonical_bytes(bootstrap_payload)).removeprefix("sha256:")
-    directory = store.directory("boundary-operations", operation_id)
+    directory = store.directory(
+        "boundary-operations", operation_id, create=not verify_only
+    )
     intent, _, intent_digest, _ = store.sign(
         "beads-boundary-operation-transaction-intent",
         {**bootstrap_payload, "operationId": operation_id},
     )
-    store.write_immutable(directory / "intent.json", intent)
+    if verify_only:
+        observed_intent = store.read_json(
+            directory / "intent.json", "recovery boundary operation intent"
+        )
+        if canonical_bytes(observed_intent) != canonical_bytes(intent):
+            raise _boundary_refusal(
+                "publication recovery is not bound to the original operation intent"
+            )
+    else:
+        store.write_immutable(directory / "intent.json", intent)
     _fault("boundary-operation-intent-written")
     gate, _, _, _ = store.sign(
         "beads-boundary-operation-gate",
@@ -1401,7 +1478,16 @@ def _ensure_boundary_operation_gate(
             "boundaryTransactionIntentSha256": intent_digest,
         },
     )
-    store.write_immutable(directory / "gate.json", gate)
+    if verify_only:
+        observed_gate = store.read_json(
+            directory / "gate.json", "recovery boundary operation gate"
+        )
+        if canonical_bytes(observed_gate) != canonical_bytes(gate):
+            raise _boundary_refusal(
+                "publication recovery is not bound to the original operation gate"
+            )
+    else:
+        store.write_immutable(directory / "gate.json", gate)
     _fault("boundary-operation-gate-written")
 
 
@@ -1679,82 +1765,173 @@ def _publish_authenticated_record(
         "envelope": _plain(envelope),
     }
     publication_id = sha256(canonical_bytes(payload)).removeprefix("sha256:")
-    directory = store.directory("object-publications", publication_id)
+    session = _validate_live_boundary_session()
+    recovery = session.recovery_mode
+    directory = store.directory(
+        "object-publications", publication_id, create=not recovery
+    )
     intent, _, intent_digest, intent_full = store.sign(
         "beads-object-publication-intent", payload
     )
     intent_path = directory / "intent.json"
-    store.write_immutable(intent_path, intent)
-    observed_intent = store.read_json(intent_path, "object publication intent")
-    _, _, observed_intent_digest, observed_intent_full = store.verify(
-        observed_intent, "beads-object-publication-intent"
-    )
-    if (
-        canonical_bytes(observed_intent) != canonical_bytes(intent)
-        or observed_intent_digest != intent_digest
-        or observed_intent_full != intent_full
-    ):
-        raise BeadsProtectedRuntimeError("object publication intent recovery mismatch")
-    _fault("object-publication-intent-written")
-    store.write_immutable(target, envelope)
-    _fault("object-publication-object-written")
-    _journal_record(store, kind, record_digest, full_digest)
-    _fault("object-publication-journal-written")
-    operation = _require_boundary_operation()
-    provenance, _, provenance_digest, provenance_full = store.sign(
-        "beads-object-publication-live-provenance",
-        {
-            "repositoryLocatorSha256": store.repository_digest,
-            "publicationIntentSha256": intent_digest,
-            "recordKind": kind,
-            "recordSha256": record_digest,
-            "recordFullBytesSha256": full_digest,
-            "targetRelativePath": relative,
-            "controllerOperationId": operation["controllerOperationId"],
-            "controllerReceiptSha256": operation["sessionReceiptSha256"],
-            "provenanceDomain": operation["controllerProvenanceDomain"],
-        },
-    )
-    provenance_path = directory / "provenance.json"
-    if store.exists(provenance_path):
-        existing_provenance = store.read_json(
-            provenance_path, "object publication live provenance"
-        )
-        existing_body, _, existing_digest, existing_full = store.verify(
-            existing_provenance, "beads-object-publication-live-provenance"
-        )
-        if (
-            existing_body.get("repositoryLocatorSha256") != store.repository_digest
-            or existing_body.get("publicationIntentSha256") != intent_digest
-            or existing_body.get("recordKind") != kind
-            or existing_body.get("recordSha256") != record_digest
-            or existing_body.get("recordFullBytesSha256") != full_digest
-            or existing_body.get("targetRelativePath") != relative
-            or existing_body.get("provenanceDomain") != _REQUIRED_PROVENANCE_DOMAIN
-        ):
-            raise BeadsProtectedRuntimeError(
-                "existing object publication provenance does not bind the exact object"
+    if recovery:
+        if not store.exists(intent_path):
+            raise _boundary_refusal(
+                "uncertain operation has no exact publication intent to recover"
             )
-        provenance_digest = existing_digest
-        provenance_full = existing_full
+        existing_intent = store.read_json(
+            intent_path, "recovery object publication intent"
+        )
+        if canonical_bytes(existing_intent) != canonical_bytes(intent):
+            raise _boundary_refusal(
+                "uncertain operation publication intent differs from exact retry"
+            )
+        try:
+            session.response = _boundary_controller.recover_publication_operation(
+                session.config,
+                session.operation,
+                {
+                    "repositoryLocatorSha256": session.repository_locator_sha256,
+                    "requestSha256": session.request_sha256,
+                },
+                phase="authorize-publication",
+                prior=session.response,
+                publication_intent_sha256=intent_digest,
+            )
+        except _boundary_controller.ControllerProtocolError as exc:
+            raise _boundary_refusal(
+                f"controller refused exact publication recovery: {exc}"
+            ) from exc
+        recovery_scope = _PUBLICATION_RECOVERY_SCOPE.set(intent_digest)
     else:
-        store.write_immutable(provenance_path, provenance)
-    _fault("object-publication-provenance-written")
-    receipt, _, _, _ = store.sign(
-        "beads-object-publication-receipt",
-        {
-            "repositoryLocatorSha256": store.repository_digest,
-            "publicationIntentSha256": intent_digest,
-            "recordKind": kind,
-            "recordSha256": record_digest,
-            "recordFullBytesSha256": full_digest,
-            "targetRelativePath": relative,
-            "liveProvenanceRecordSha256": provenance_digest,
-            "liveProvenanceFullBytesSha256": provenance_full,
-        },
-    )
-    store.write_immutable(directory / "receipt.json", receipt)
-    _fault("object-publication-receipt-written")
+        recovery_scope = None
+    try:
+        publication_complete = False
+        if recovery:
+            try:
+                _verify_authenticated_publication(
+                    store, target, kind, record_digest, full_digest
+                )
+                publication_complete = True
+            except BeadsProtectedRuntimeError:
+                # Only the exact existing intent opens the recovery branch.
+                # Every present suffix component remains independently
+                # authenticated by the ordinary idempotent recovery writes.
+                pass
+        if publication_complete:
+            receipt = store.read_json(
+                directory / "receipt.json", "completed object publication receipt"
+            )
+            _, _, receipt_digest, receipt_full = store.verify(
+                receipt, "beads-object-publication-receipt"
+            )
+        else:
+            store.write_immutable(intent_path, intent)
+            observed_intent = store.read_json(intent_path, "object publication intent")
+            _, _, observed_intent_digest, observed_intent_full = store.verify(
+                observed_intent, "beads-object-publication-intent"
+            )
+            if (
+                canonical_bytes(observed_intent) != canonical_bytes(intent)
+                or observed_intent_digest != intent_digest
+                or observed_intent_full != intent_full
+            ):
+                raise BeadsProtectedRuntimeError("object publication intent recovery mismatch")
+            _fault("object-publication-intent-written")
+            store.write_immutable(target, envelope)
+            _fault("object-publication-object-written")
+            _journal_record(store, kind, record_digest, full_digest)
+            _fault("object-publication-journal-written")
+            operation = _require_boundary_operation()
+            provenance, _, provenance_digest, provenance_full = store.sign(
+                "beads-object-publication-live-provenance",
+                {
+                    "repositoryLocatorSha256": store.repository_digest,
+                    "publicationIntentSha256": intent_digest,
+                    "recordKind": kind,
+                    "recordSha256": record_digest,
+                    "recordFullBytesSha256": full_digest,
+                    "targetRelativePath": relative,
+                    "controllerOperationId": operation["controllerOperationId"],
+                    "controllerReceiptSha256": operation["sessionReceiptSha256"],
+                    "provenanceDomain": operation["controllerProvenanceDomain"],
+                },
+            )
+            provenance_path = directory / "provenance.json"
+            if store.exists(provenance_path):
+                existing_provenance = store.read_json(
+                    provenance_path, "object publication live provenance"
+                )
+                existing_body, _, existing_digest, existing_full = store.verify(
+                    existing_provenance, "beads-object-publication-live-provenance"
+                )
+                if (
+                    existing_body.get("repositoryLocatorSha256")
+                    != store.repository_digest
+                    or existing_body.get("publicationIntentSha256") != intent_digest
+                    or existing_body.get("recordKind") != kind
+                    or existing_body.get("recordSha256") != record_digest
+                    or existing_body.get("recordFullBytesSha256") != full_digest
+                    or existing_body.get("targetRelativePath") != relative
+                    or existing_body.get("provenanceDomain")
+                    != _REQUIRED_PROVENANCE_DOMAIN
+                ):
+                    raise BeadsProtectedRuntimeError(
+                        "existing object publication provenance does not bind the exact object"
+                    )
+                provenance_digest = existing_digest
+                provenance_full = existing_full
+            else:
+                store.write_immutable(provenance_path, provenance)
+            _fault("object-publication-provenance-written")
+            receipt, _, receipt_digest, receipt_full = store.sign(
+                "beads-object-publication-receipt",
+                {
+                    "repositoryLocatorSha256": store.repository_digest,
+                    "publicationIntentSha256": intent_digest,
+                    "recordKind": kind,
+                    "recordSha256": record_digest,
+                    "recordFullBytesSha256": full_digest,
+                    "targetRelativePath": relative,
+                    "liveProvenanceRecordSha256": provenance_digest,
+                    "liveProvenanceFullBytesSha256": provenance_full,
+                },
+            )
+            store.write_immutable(directory / "receipt.json", receipt)
+            _fault("object-publication-receipt-written")
+        if recovery:
+            try:
+                session.response = (
+                    _boundary_controller.recover_publication_operation(
+                        session.config,
+                        session.operation,
+                        {
+                            "repositoryLocatorSha256": session.repository_locator_sha256,
+                            "requestSha256": session.request_sha256,
+                        },
+                        phase="complete-publication",
+                        prior=session.response,
+                        publication_intent_sha256=intent_digest,
+                        recovery_result_sha256=sha256(
+                            canonical_bytes(
+                                {
+                                    "receiptRecordSha256": receipt_digest,
+                                    "receiptFullBytesSha256": receipt_full,
+                                }
+                            )
+                        ),
+                    )
+                )
+            except _boundary_controller.ControllerProtocolError as exc:
+                raise _boundary_refusal(
+                    f"controller could not complete publication recovery: {exc}"
+                ) from exc
+            raise _PublicationRecoveryCompleted(
+                "exact publication suffix recovered; original operation outcome remains uncertain"
+            )
+    finally:
+        if recovery_scope is not None:
+            _PUBLICATION_RECOVERY_SCOPE.reset(recovery_scope)
 
 
 def _verify_authenticated_publication(
@@ -1785,7 +1962,9 @@ def _verify_authenticated_publication(
         "envelope": _plain(envelope),
     }
     publication_id = sha256(canonical_bytes(payload)).removeprefix("sha256:")
-    directory = _safe_join(store.repository, "object-publications", publication_id)
+    directory = store.directory(
+        "object-publications", publication_id, create=False
+    )
     intent = store.read_json(directory / "intent.json", "object publication intent")
     _, _, intent_digest, _ = store.verify(intent, "beads-object-publication-intent")
     if canonical_bytes(intent["payload"]) != canonical_bytes(
@@ -2562,7 +2741,7 @@ def _spawn_verified_executable_v1(
     env: Mapping[str, str],
     logical_path: Path | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    _require_boundary_operation()
+    _require_boundary_operation(mutation=True)
     """Spawn the already verified inode, never the mutable pathname."""
 
     expected_argv_path = logical_path if logical_path is not None else path
@@ -2847,7 +3026,7 @@ def _native_rename_noreplace(
 ) -> None:
     """Invoke the supported native exclusive rename at one audited seam."""
 
-    _require_boundary_operation()
+    _require_boundary_operation(mutation=True)
     libc = ctypes.CDLL(None, use_errno=True)
     function: Any
     if hasattr(libc, "renameat2"):
@@ -5889,6 +6068,8 @@ def _controller_operation(
 
     if not sys.platform.startswith("linux"):
         raise _boundary_refusal(f"host platform {sys.platform!r} is not Linux")
+    recovery_mode = False
+    open_error: _boundary_controller.ControllerProtocolError | None = None
     try:
         config, response = _boundary_controller.open_operation(
             operation,
@@ -5898,7 +6079,21 @@ def _controller_operation(
             },
         )
     except _boundary_controller.ControllerProtocolError as exc:
-        raise _boundary_refusal(str(exc)) from exc
+        open_error = exc
+        try:
+            config = _boundary_controller.load_controller_config()
+            response = _boundary_controller.recover_publication_operation(
+                config,
+                operation,
+                {
+                    "repositoryLocatorSha256": repository,
+                    "requestSha256": request_digest,
+                },
+                phase="inspect",
+            )
+            recovery_mode = True
+        except _boundary_controller.ControllerProtocolError:
+            raise _boundary_refusal(str(open_error)) from open_error
     configured_paths = (str(config.protected_root), str(config.record_hmac_key_path))
     if requested_paths != configured_paths:
         raise _boundary_refusal("caller/request protected paths differ from fixed root-owned configuration")
@@ -5908,8 +6103,14 @@ def _controller_operation(
         operation=operation,
         request_sha256=request_digest,
         repository_locator_sha256=repository,
+        effect_authorization_receipt_sha256=(
+            str(response["effectAuthorizationReceiptSha256"])
+            if recovery_mode
+            else str(response["receiptSha256"])
+        ),
+        recovery_mode=recovery_mode,
     )
-    if response.get("state") == "completed":
+    if not recovery_mode and response.get("state") == "completed":
         raise _boundary_refusal(
             "the identical controller operation already completed with stored result "
             f"{response.get('resultSha256')}; inspect the protected result before issuing a new request"
@@ -5919,7 +6120,21 @@ def _controller_operation(
         # controller durably authorizes effects before this module can create
         # the protected namespace, key handle, lock, journal or filesystem
         # mutation.  Inner registered intents are joined by HMAC gates.
-        if session.response.get("state") == "accepted":
+        if recovery_mode:
+            if session.response.get("state") not in {
+                "effect-authorized",
+                "publication-recovery-authorized",
+                "publication-recovered",
+            }:
+                raise _boundary_controller.ControllerProtocolError(
+                    "controller recovery returned an ineligible state"
+                )
+            if session.response.get("state") == "publication-recovered":
+                raise _boundary_refusal(
+                    "the exact publication suffix was already recovered with stored result "
+                    f"{session.response.get('resultSha256')}; the original operation outcome remains uncertain"
+                )
+        elif session.response.get("state") == "accepted":
             session.response = _boundary_controller.step_operation(
                 config,
                 session.response,
@@ -5931,13 +6146,17 @@ def _controller_operation(
             raise _boundary_controller.ControllerProtocolError(
                 "OPEN recovery returned an ineligible pre-effect state"
             )
-        session.response = _boundary_controller.step_operation(
-            config,
-            session.response,
-            "effect-authorized",
-            transaction_intent_sha256=request_digest,
-            result_sha256=None,
-        )
+        if not recovery_mode:
+            session.response = _boundary_controller.step_operation(
+                config,
+                session.response,
+                "effect-authorized",
+                transaction_intent_sha256=request_digest,
+                result_sha256=None,
+            )
+            session.effect_authorization_receipt_sha256 = str(
+                session.response["receiptSha256"]
+            )
     except _boundary_controller.ControllerProtocolError as exc:
         raise _boundary_refusal(f"controller did not authorize the exact effect: {exc}") from exc
     session_token = _BOUNDARY_SESSION_CONTEXT.set(session)
@@ -5948,7 +6167,7 @@ def _controller_operation(
             "requestSha256": request_digest,
             "repositoryLocatorSha256": repository,
             "rootSetSha256": config.root_set_sha256,
-            "sessionReceiptSha256": session.response["receiptSha256"],
+            "sessionReceiptSha256": session.effect_authorization_receipt_sha256,
             "runtimeManifestSha256": config.runtime_manifest_sha256,
             "moduleSha256": config.module_sha256,
             "verifierIdentitySha256": sha256(
@@ -5958,14 +6177,21 @@ def _controller_operation(
                         "controllerUid": config.controller_uid,
                         "brokerUid": config.broker_uid,
                         "workerUid": config.worker_uid,
+                        "transportGid": config.transport_gid,
                         "configEpoch": config.config_epoch,
                         "keyEpoch": config.key_epoch,
                     }
                 )
             ),
-            "expiresAtUnix": int(time.time()) + _boundary_controller.MAX_OPERATION_SECONDS,
+            "expiresAtUnix": (
+                int(response["operationExpiresAtUnix"])
+                if recovery_mode
+                else int(time.time())
+                + _boundary_controller.MAX_OPERATION_SECONDS
+            ),
             "controllerOperationId": session.response["operationId"],
             "controllerProvenanceDomain": _boundary_controller.PRODUCTION_PROVENANCE,
+            "recoveryMode": recovery_mode,
         }
     )
     operation_token = _BOUNDARY_OPERATION_CONTEXT.set(operation_record)
@@ -5977,6 +6203,10 @@ def _controller_operation(
 
 
 def _complete_controller_operation(session: _ControllerBoundarySessionV1, result: Any) -> None:
+    if session.recovery_mode:
+        raise _boundary_refusal(
+            "publication recovery cannot complete or replay the original operation"
+        )
     result_digest = sha256(canonical_bytes(_boundary_call_value(result)))
     try:
         session.response = _boundary_controller.step_operation(
@@ -6014,12 +6244,15 @@ def _boundary_guarded(function: Any, operation: str) -> Any:
             )
         )
         requested_paths = _boundary_call_paths(args, kwargs)
-        with _controller_operation(
-            operation, repository, request_digest, requested_paths
-        ) as session:
-            result = function(*args, **kwargs)
-            _complete_controller_operation(session, result)
-            return result
+        try:
+            with _controller_operation(
+                operation, repository, request_digest, requested_paths
+            ) as session:
+                result = function(*args, **kwargs)
+                _complete_controller_operation(session, result)
+                return result
+        except _PublicationRecoveryCompleted as recovered:
+            raise _boundary_refusal(str(recovered)) from recovered
 
     return guarded
 

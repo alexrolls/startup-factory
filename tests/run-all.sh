@@ -38,6 +38,7 @@ FULL_PYTHON_TESTS=(
   ticket-content-security-test.py
   execution-graph-test.py
   beads-boundary-controller-test.py
+  beads-boundary-controller-linux-opt-in.py
   beads-protected-runtime-test.py
   beads-protected-runtime-hostile-test.py
   retrospective-test.py

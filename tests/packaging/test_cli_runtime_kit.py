@@ -1110,6 +1110,13 @@ runtime_kit.apply_runtime_kit(plan, expected_plan_digest=expected)
             ).read_text(),
             "# fixture service 2\n",
         )
+        self.assertEqual(
+            (
+                self.target
+                / "runtime/startup-factory-beads-controller.socket.example"
+            ).read_text(),
+            "# fixture socket 2\n",
+        )
 
         digest = self.preview_digest()
         code, output, error = self.apply_on_linux(digest)

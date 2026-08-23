@@ -45,6 +45,10 @@ def base_payload(version: str = "1") -> dict[str, tuple[bytes, int]]:
             f"# fixture service {version}\n".encode(),
             0o644,
         ),
+        "runtime/startup-factory-beads-controller.socket.example": (
+            f"# fixture socket {version}\n".encode(),
+            0o644,
+        ),
         "adapters/_TEMPLATE.md": (b"adapter-template\n", 0o644),
         "adapters/Retired.md": (b"retired-v1\n", 0o644),
         "extensions/tracker-backends/README.md": (b"backend-contract\n", 0o644),

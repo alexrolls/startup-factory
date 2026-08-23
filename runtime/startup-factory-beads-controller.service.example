@@ -1,12 +1,16 @@
 [Unit]
 Description=Startup Factory protected Beads boundary controller
-After=local-fs.target
+Requires=startup-factory-beads-controller.socket
+After=local-fs.target startup-factory-beads-controller.socket
 
 [Service]
 Type=simple
 User=startup-factory-controller
 Group=startup-factory-controller
+SupplementaryGroups=startup-factory-beads-transport
 ExecStart=/usr/local/bin/startup-factory-beads-controller serve
+Restart=on-failure
+RestartSec=2s
 NoNewPrivileges=true
 PrivateDevices=true
 PrivateTmp=true
@@ -16,11 +20,11 @@ ProtectKernelLogs=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectSystem=strict
-ReadWritePaths=/run/startup-factory /var/lib/startup-factory/beads-boundary-controller/v1
+ReadWritePaths=/var/lib/startup-factory/beads-boundary-controller/v1
 RestrictAddressFamilies=AF_UNIX
 RestrictSUIDSGID=true
 SystemCallArchitectures=native
-UMask=0077
+UMask=0007
 
 [Install]
 WantedBy=multi-user.target

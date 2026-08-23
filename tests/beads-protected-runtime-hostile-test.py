@@ -7,6 +7,7 @@ import importlib
 import inspect
 import json
 import os
+import socket
 import sys
 import tempfile
 import time
@@ -813,6 +814,168 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 runtime._verify_journal(
                     store, kind, record_digest, full_digest
                 )
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX process death")
+    def test_real_controller_process_death_repairs_only_publication_suffix(self) -> None:
+        """An actual dead broker resumes through the production controller protocol.
+
+        This deliberately does not use the logic harness: the public runtime,
+        client response validation, and real durable controller state machine
+        all execute.  Only the AF_UNIX transport is replaced with an in-process
+        packet carrier so the offline suite does not claim a Linux service
+        installation or peer-credential proof.
+        """
+
+        core_payload = {
+            "bootstrapChangeKind": "create",
+            "adapterChangeKind": "create",
+            "remediationEvidenceSha256": None,
+            "baselineCommit": runtime.BEADS_BASELINE_COMMIT,
+        }
+        bootstrap = runtime.build_beads_bootstrap_runtime_core_v1(
+            runtime.BeadsBootstrapRuntimeCoreInputsV1(payload=core_payload)
+        )
+        adapter = runtime.build_beads_adapter_release_core_v1(
+            runtime.BeadsAdapterReleaseCoreInputsV1(payload=core_payload)
+        )
+        requests = [
+            (
+                fault_phase,
+                runtime.RecordBeadsChangePlanCoreRequestV1(
+                    payload={
+                        "protectedRoot": str(self.root),
+                        "hmacKeyPath": str(self.key),
+                        "repositoryLocatorSha256": digest(
+                            f"integrated-recovery:{fault_phase}"
+                        ),
+                        "bootstrapRuntimeCoreCanonicalJson": bootstrap.decode(),
+                        "adapterReleaseCoreCanonicalJson": adapter.decode(),
+                    }
+                ),
+            )
+            for fault_phase in (
+                "object-publication-object-written",
+                "object-publication-receipt-written",
+            )
+        ]
+        controller = runtime._boundary_controller
+        state_root = self.base / "real-controller-state"
+        state_root.mkdir(mode=0o700)
+        controller_key = b"integrated-controller-domain-key-32bytes"
+        config = controller.ControllerConfig(
+            protected_root=self.root,
+            record_hmac_key_path=self.key,
+            controller_uid=91_001,
+            broker_uid=91_002,
+            worker_uid=91_003,
+            transport_gid=91_004,
+            runtime_manifest_path=Path("/usr/lib/startup-factory/runtime.json"),
+            module_path=Path("/usr/lib/startup-factory/controller.py"),
+            schema_path=Path("/usr/lib/startup-factory/schema.json"),
+            runtime_manifest_sha256=digest("integrated-runtime"),
+            module_sha256=digest("integrated-module"),
+            schema_sha256=digest("integrated-schema"),
+            config_epoch=11,
+            key_epoch=13,
+        )
+
+        class PacketCarrier:
+            def __init__(self, *args, **kwargs):
+                if args[:2] != (socket.AF_UNIX, socket.SOCK_SEQPACKET):
+                    raise AssertionError("unexpected integrated transport family/type")
+                self.response = b""
+                self.received = False
+
+            def settimeout(self, _seconds):
+                return None
+
+            def connect(self, _endpoint):
+                return None
+
+            def sendall(self, packet):
+                self.response = controller._serve_packet(
+                    packet, config.broker_uid, config, controller_key
+                )
+
+            def recv(self, _size):
+                if self.received:
+                    return b""
+                self.received = True
+                return self.response
+
+            def close(self):
+                return None
+
+        self.logic_harness.__exit__(None, None, None)
+        try:
+            with mock.patch.object(runtime.sys, "platform", "linux"), mock.patch.object(
+                controller, "STATE_ROOT", state_root
+            ), mock.patch.object(
+                controller, "load_controller_config", return_value=config
+            ), mock.patch.object(
+                controller.os, "geteuid", return_value=config.broker_uid
+            ), mock.patch.object(
+                controller, "_validate_transport_group"
+            ), mock.patch.object(
+                controller, "_validate_endpoint_parent"
+            ), mock.patch.object(
+                controller, "_endpoint_metadata"
+            ), mock.patch.object(
+                controller, "_peer_credentials", return_value=(123, config.controller_uid, config.transport_gid)
+            ), mock.patch.object(
+                controller.socket, "socket", PacketCarrier
+            ), mock.patch.object(
+                runtime,
+                "_spawn_verified_executable_v1",
+                side_effect=AssertionError("publication recovery must never spawn bd"),
+            ):
+                for ordinal, (fault_phase, request) in enumerate(requests, 1):
+                    with self.subTest(fault_phase=fault_phase):
+                        with runtime._inject_fault(fault_phase):
+                            child = os.fork()
+                            if child == 0:
+                                try:
+                                    runtime.record_beads_change_plan_core_v1(request)
+                                except SystemExit:
+                                    os._exit(91)
+                                except BaseException:
+                                    os._exit(93)
+                                os._exit(92)
+                            _, status = os.waitpid(child, 0)
+                        self.assertTrue(os.WIFEXITED(status))
+                        self.assertEqual(91, os.WEXITSTATUS(status))
+
+                        with self.assertRaisesRegex(
+                            runtime.BeadsProtectedRuntimeError,
+                            "exact publication suffix recovered; original operation outcome remains uncertain",
+                        ):
+                            runtime.record_beads_change_plan_core_v1(request)
+
+                        state_files = sorted(state_root.glob("*.json"))
+                        self.assertEqual(ordinal, len(state_files))
+                        states = [
+                            controller._load_state(path, controller_key)
+                            for path in state_files
+                        ]
+                        self.assertTrue(all(state is not None for state in states))
+                        for state in states:
+                            assert state is not None
+                            self.assertEqual("publication-recovered", state[1]["state"])
+                            self.assertIsNotNone(
+                                state[1]["recoveryPublicationIntentSha256"]
+                            )
+                            self.assertIsNotNone(state[1]["response"]["resultSha256"])
+                receipts = sorted(
+                    (self.root / runtime.REPOSITORY_NAMESPACE).glob(
+                        "*/object-publications/*/receipt.json"
+                    )
+                )
+                self.assertEqual(len(requests), len(receipts))
+        finally:
+            self.logic_harness = logic_harness(
+                runtime, self.root, self.key, self.repository
+            )
+            self.logic_harness.__enter__()
 
         self.repository = digest("stale-core-preparation-command")
         stale_lease, stale_argv = self.create_authorized_create_lease("stale-core-command")

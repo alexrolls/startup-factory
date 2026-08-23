@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import grp
 import hashlib
 import hmac
 import json
 import os
+import pwd
 import re
 import secrets
 import socket
@@ -39,6 +41,7 @@ _DIGEST = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 _NONCE = re.compile(r"\A[a-zA-Z0-9][a-zA-Z0-9._:-]{15,255}\Z")
 _OPERATION_ID = re.compile(r"\A[0-9a-f]{64}\Z")
 _HMAC = re.compile(r"\Ahmac-sha256:[0-9a-f]{64}\Z")
+_EMPTY_SHA256 = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 ALLOWED_OPERATIONS: Final = (
     "prepare_atomic_claim_v1",
@@ -84,6 +87,10 @@ _CONFIG_FIELDS = {
     "controllerUid",
     "brokerUid",
     "workerUid",
+    "transportGid",
+    "runtimeManifestPath",
+    "modulePath",
+    "schemaPath",
     "runtimeManifestSha256",
     "moduleSha256",
     "schemaSha256",
@@ -123,6 +130,26 @@ _VALIDATE_FIELDS = {
     "expectedState",
     "expectedResultSha256",
 }
+_RECOVER_FIELDS = {
+    "operationId",
+    "recoveryNonce",
+    "recoveryPhase",
+    "operation",
+    "repositoryLocatorSha256",
+    "rootSetSha256",
+    "requestSha256",
+    "transactionIntentSha256",
+    "runtimeManifestSha256",
+    "moduleSha256",
+    "schemaSha256",
+    "configEpoch",
+    "keyEpoch",
+    "sessionNonce",
+    "predecessorReceiptSha256",
+    "effectAuthorizationReceiptSha256",
+    "publicationIntentSha256",
+    "recoveryResultSha256",
+}
 _RESPONSE_FIELDS = {
     "schemaVersion",
     "protocol",
@@ -137,7 +164,23 @@ _RESPONSE_FIELDS = {
     "controllerHmac",
     "receiptSha256",
 }
-_STATES = ("accepted", "intent-bound", "effect-authorized", "result-stored", "completed")
+_RECOVERY_RESPONSE_EXTRA_FIELDS = {
+    "effectAuthorizationReceiptSha256",
+    "operationExpiresAtUnix",
+    "recoveryPublicationIntentSha256",
+}
+_NORMAL_STATES = (
+    "accepted",
+    "intent-bound",
+    "effect-authorized",
+    "result-stored",
+    "completed",
+)
+_RECOVERY_STATES = (
+    "publication-recovery-authorized",
+    "publication-recovered",
+)
+_STATES = _NORMAL_STATES + _RECOVERY_STATES
 
 
 class ControllerProtocolError(RuntimeError):
@@ -172,6 +215,44 @@ def _digest(value: Any, label: str, *, nullable: bool = False) -> str | None:
     return value
 
 
+def _installed_digest(value: Any, label: str) -> str:
+    observed = _digest(value, label)
+    assert observed is not None
+    hexadecimal = observed.removeprefix("sha256:")
+    if observed == _EMPTY_SHA256 or len(set(hexadecimal)) == 1:
+        raise ControllerProtocolError(f"{label} is a forbidden sentinel digest")
+    return observed
+
+
+def _string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ControllerProtocolError(f"{label} must be a non-empty string")
+    return value
+
+
+def _nonce(value: Any, label: str, *, nullable: bool = False) -> str | None:
+    if value is None and nullable:
+        return None
+    if not isinstance(value, str) or not _NONCE.fullmatch(value):
+        raise ControllerProtocolError(f"{label} is invalid")
+    return value
+
+
+def _operation_id(value: Any, label: str = "operationId") -> str:
+    if not isinstance(value, str) or not _OPERATION_ID.fullmatch(value):
+        raise ControllerProtocolError(f"{label} is invalid")
+    return value
+
+
+def _absolute_path(value: Any, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ControllerProtocolError(f"{label} must be a normalized absolute path")
+    path = Path(value)
+    if not path.is_absolute() or str(path) != os.path.normpath(str(path)):
+        raise ControllerProtocolError(f"{label} must be a normalized absolute path")
+    return path
+
+
 def _positive_int(value: Any, label: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1 or value > 99_999_999_999_999_999_999:
         raise ControllerProtocolError(f"{label} must be a bounded positive integer")
@@ -185,6 +266,10 @@ class ControllerConfig:
     controller_uid: int
     broker_uid: int
     worker_uid: int
+    transport_gid: int
+    runtime_manifest_path: Path
+    module_path: Path
+    schema_path: Path
     runtime_manifest_sha256: str
     module_sha256: str
     schema_sha256: str
@@ -201,18 +286,19 @@ class ControllerConfig:
 
 def _parse_config(value: Any) -> ControllerConfig:
     data = _closed_mapping(value, _CONFIG_FIELDS, "controller configuration")
-    if data["schemaVersion"] != 1 or data["protocol"] != PROTOCOL:
+    if (
+        type(data["schemaVersion"]) is not int
+        or data["schemaVersion"] != 1
+        or not isinstance(data["protocol"], str)
+        or data["protocol"] != PROTOCOL
+    ):
         raise ControllerProtocolError("controller configuration schema/protocol mismatch")
     if data["endpointPath"] != str(ENDPOINT_PATH) or data["stateRoot"] != str(STATE_ROOT) or data["controllerKeyPath"] != str(CONTROLLER_KEY_PATH):
         raise ControllerProtocolError("controller configuration changed a fixed path")
-    protected = Path(str(data["protectedRoot"]))
-    record_key = Path(str(data["recordHmacKeyPath"]))
+    protected = _absolute_path(data["protectedRoot"], "protectedRoot")
+    record_key = _absolute_path(data["recordHmacKeyPath"], "recordHmacKeyPath")
     if (
-        not protected.is_absolute()
-        or str(protected) != os.path.normpath(str(protected))
-        or not record_key.is_absolute()
-        or str(record_key) != os.path.normpath(str(record_key))
-        or record_key.parent != protected
+        record_key.parent != protected
     ):
         raise ControllerProtocolError("protected root/key must be normalized absolute configured paths")
     identities = tuple(_positive_int(data[name], name) for name in ("controllerUid", "brokerUid", "workerUid"))
@@ -221,23 +307,68 @@ def _parse_config(value: Any) -> ControllerConfig:
     operations = data["allowedOperations"]
     if not isinstance(operations, list) or tuple(operations) != ALLOWED_OPERATIONS:
         raise ControllerProtocolError("controller operation set differs from the closed production set")
+    transport_gid = _positive_int(data["transportGid"], "transportGid")
+    artifacts = (
+        _absolute_path(data["runtimeManifestPath"], "runtimeManifestPath"),
+        _absolute_path(data["modulePath"], "modulePath"),
+        _absolute_path(data["schemaPath"], "schemaPath"),
+    )
+    if len(set(artifacts)) != 3 or any(
+        path in {CONFIG_PATH, CONTROLLER_KEY_PATH, record_key}
+        or path == protected
+        or protected in path.parents
+        for path in artifacts
+    ):
+        raise ControllerProtocolError(
+            "installed artifact paths must be distinct root-owned files outside protected state"
+        )
     return ControllerConfig(
         protected_root=protected,
         record_hmac_key_path=record_key,
         controller_uid=identities[0],
         broker_uid=identities[1],
         worker_uid=identities[2],
-        runtime_manifest_sha256=str(_digest(data["runtimeManifestSha256"], "runtimeManifestSha256")),
-        module_sha256=str(_digest(data["moduleSha256"], "moduleSha256")),
-        schema_sha256=str(_digest(data["schemaSha256"], "schemaSha256")),
+        transport_gid=transport_gid,
+        runtime_manifest_path=artifacts[0],
+        module_path=artifacts[1],
+        schema_path=artifacts[2],
+        runtime_manifest_sha256=_installed_digest(data["runtimeManifestSha256"], "runtimeManifestSha256"),
+        module_sha256=_installed_digest(data["moduleSha256"], "moduleSha256"),
+        schema_sha256=_installed_digest(data["schemaSha256"], "schemaSha256"),
         config_epoch=_positive_int(data["configEpoch"], "configEpoch"),
         key_epoch=_positive_int(data["keyEpoch"], "keyEpoch"),
     )
 
 
 def _read_root_owned(path: Path, label: str, *, max_bytes: int = MAX_MESSAGE_BYTES, executable: bool = False) -> bytes:
+    if not path.is_absolute() or str(path) != os.path.normpath(str(path)):
+        raise ControllerProtocolError(f"{label} path is not normalized and absolute")
+    parent = os.open("/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
-        before = os.lstat(path)
+        for component in path.parts[1:-1]:
+            child = os.open(
+                component,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent,
+            )
+            try:
+                metadata = os.fstat(child)
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != 0
+                    or stat.S_IMODE(metadata.st_mode) & 0o022
+                ):
+                    raise ControllerProtocolError(
+                        f"{label} ancestry must be root-owned and non-writable"
+                    )
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(parent)
+            parent = child
+        before = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
         if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_nlink != 1:
             raise ControllerProtocolError(f"{label} must be a root-owned single-link regular file")
         # Root-owned public configuration/source may be readable by the
@@ -246,7 +377,13 @@ def _read_root_owned(path: Path, label: str, *, max_bytes: int = MAX_MESSAGE_BYT
         forbidden = 0o022
         if stat.S_IMODE(before.st_mode) & forbidden:
             raise ControllerProtocolError(f"{label} permissions are unsafe")
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        if executable and not stat.S_IMODE(before.st_mode) & 0o500:
+            raise ControllerProtocolError(f"{label} is not root-executable")
+        fd = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent,
+        )
         try:
             opened = os.fstat(fd)
             if (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_nlink, opened.st_size) != (
@@ -260,8 +397,32 @@ def _read_root_owned(path: Path, label: str, *, max_bytes: int = MAX_MESSAGE_BYT
                     break
                 data.extend(chunk)
             after = os.fstat(fd)
-            if len(data) > max_bytes or (after.st_dev, after.st_ino, after.st_size, after.st_mode) != (
-                opened.st_dev, opened.st_ino, opened.st_size, opened.st_mode
+            rebound = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            identity = (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mode,
+                opened.st_uid,
+                opened.st_gid,
+                opened.st_nlink,
+            )
+            if len(data) > max_bytes or identity != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mode,
+                after.st_uid,
+                after.st_gid,
+                after.st_nlink,
+            ) or identity != (
+                rebound.st_dev,
+                rebound.st_ino,
+                rebound.st_size,
+                rebound.st_mode,
+                rebound.st_uid,
+                rebound.st_gid,
+                rebound.st_nlink,
             ):
                 raise ControllerProtocolError(f"{label} is oversized or changed while read")
             return bytes(data)
@@ -271,6 +432,8 @@ def _read_root_owned(path: Path, label: str, *, max_bytes: int = MAX_MESSAGE_BYT
         raise
     except OSError as exc:
         raise ControllerProtocolError(f"cannot read {label}: {exc}") from exc
+    finally:
+        os.close(parent)
 
 
 def load_controller_config() -> ControllerConfig:
@@ -298,8 +461,92 @@ def _endpoint_metadata(config: ControllerConfig) -> None:
         info = os.lstat(ENDPOINT_PATH)
     except OSError as exc:
         raise ControllerProtocolError(f"fixed controller endpoint is unavailable: {exc}") from exc
-    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != config.controller_uid or stat.S_IMODE(info.st_mode) & 0o077:
+    if (
+        not stat.S_ISSOCK(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != config.transport_gid
+        or stat.S_IMODE(info.st_mode) != 0o660
+    ):
         raise ControllerProtocolError("fixed controller endpoint owner/mode/type is unsafe")
+
+
+def _transport_group_members(config: ControllerConfig) -> set[int]:
+    try:
+        group = grp.getgrgid(config.transport_gid)
+        named_members = set(group.gr_mem)
+        members = {
+            entry.pw_uid
+            for entry in pwd.getpwall()
+            if entry.pw_gid == config.transport_gid or entry.pw_name in named_members
+        }
+    except (KeyError, OSError) as exc:
+        raise ControllerProtocolError(
+            "configured Beads transport group cannot be resolved"
+        ) from exc
+    return members
+
+
+def _validate_transport_group(config: ControllerConfig) -> None:
+    members = _transport_group_members(config)
+    expected = {config.controller_uid, config.broker_uid}
+    if members != expected or config.worker_uid in members:
+        raise ControllerProtocolError(
+            "transport group must contain exactly the distinct controller and broker UIDs"
+        )
+
+
+def _verify_installed_artifacts(config: ControllerConfig) -> None:
+    observations = (
+        (
+            config.runtime_manifest_path,
+            "installed protected runtime manifest",
+            config.runtime_manifest_sha256,
+        ),
+        (config.module_path, "installed boundary controller module", config.module_sha256),
+        (config.schema_path, "installed protected runtime schema", config.schema_sha256),
+    )
+    for path, label, expected in observations:
+        observed = _sha(_read_root_owned(path, label))
+        if observed != expected:
+            raise ControllerProtocolError(
+                f"{label} installed artifact digest does not match closed configuration"
+            )
+
+
+def _validate_endpoint_parent(config: ControllerConfig) -> None:
+    path = ENDPOINT_PATH.parent
+    if not path.is_absolute() or str(path) != os.path.normpath(str(path)):
+        raise ControllerProtocolError("controller endpoint parent is not normalized")
+    descriptor = os.open("/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        for component in path.parts[1:]:
+            child = os.open(
+                component,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != config.transport_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o750
+        ):
+            raise ControllerProtocolError(
+                "controller endpoint parent must be root:transport mode 0750"
+            )
+    except ControllerProtocolError:
+        raise
+    except OSError as exc:
+        raise ControllerProtocolError(
+            f"cannot open fixed controller endpoint parent: {exc}"
+        ) from exc
+    finally:
+        os.close(descriptor)
 
 
 def _validate_controller_directory(path: Path, config: ControllerConfig, label: str) -> None:
@@ -335,12 +582,16 @@ def _validate_controller_directory(path: Path, config: ControllerConfig, label: 
 
 
 def _request(action: str, request: Mapping[str, Any], config: ControllerConfig) -> dict[str, Any]:
+    if action not in {"OPEN", "STEP", "VALIDATE", "RECOVER"}:
+        raise ControllerProtocolError("client requested an unknown controller action")
     if not sys.platform.startswith("linux"):
         raise ControllerProtocolError("fixed Beads boundary controller requires Linux")
     if os.geteuid() != config.broker_uid:
         raise ControllerProtocolError(
             "client process is not the distinct configured broker UID"
         )
+    _validate_transport_group(config)
+    _validate_endpoint_parent(config)
     _endpoint_metadata(config)
     packet = {"schemaVersion": 1, "protocol": PROTOCOL, "action": action, "request": dict(request)}
     encoded = _canonical(packet)
@@ -368,24 +619,40 @@ def _request(action: str, request: Mapping[str, Any], config: ControllerConfig) 
         value = json.loads(response)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ControllerProtocolError("controller returned malformed JSON") from exc
-    if not isinstance(value, dict) or set(value) != _RESPONSE_FIELDS or _canonical(value) != response:
+    expected_response_fields = (
+        _RESPONSE_FIELDS | _RECOVERY_RESPONSE_EXTRA_FIELDS
+        if action == "RECOVER"
+        else _RESPONSE_FIELDS
+    )
+    if not isinstance(value, dict) or set(value) != expected_response_fields or _canonical(value) != response:
         raise ControllerProtocolError("controller response is not a canonical closed object")
     if value.get("schemaVersion") != 1 or value.get("protocol") != PROTOCOL or value.get("action") != action or value.get("requestSha256") != _sha(encoded):
         raise ControllerProtocolError("controller response does not bind the exact request")
-    if value.get("provenanceDomain") != PRODUCTION_PROVENANCE or value.get("status") not in {"accepted", "completed", "validated"}:
+    if value.get("provenanceDomain") != PRODUCTION_PROVENANCE or value.get("status") not in {"accepted", "completed", "validated", "recovered"}:
         raise ControllerProtocolError("controller response is not live production provenance")
     _digest(value.get("receiptSha256"), "receiptSha256")
-    if not isinstance(value.get("controllerHmac"), str) or not value["controllerHmac"].startswith("hmac-sha256:"):
+    if not isinstance(value.get("controllerHmac"), str) or not _HMAC.fullmatch(value["controllerHmac"]):
         raise ControllerProtocolError("controller response lacks controller-only HMAC evidence")
     receipt_material = dict(value)
     receipt_sha256 = receipt_material.pop("receiptSha256")
     if receipt_sha256 != _sha(_canonical(receipt_material)):
         raise ControllerProtocolError("controller response receipt digest is invalid")
-    if not _OPERATION_ID.fullmatch(str(value.get("operationId", ""))):
-        raise ControllerProtocolError("controller response operationId is invalid")
-    if not isinstance(value.get("sessionNonce"), str) or not _NONCE.fullmatch(value["sessionNonce"]):
-        raise ControllerProtocolError("controller response session nonce is invalid")
+    _operation_id(value.get("operationId"), "controller response operationId")
+    _nonce(value.get("sessionNonce"), "controller response session nonce")
     _digest(value.get("resultSha256"), "resultSha256", nullable=True)
+    if value.get("state") not in _STATES:
+        raise ControllerProtocolError("controller response state is invalid")
+    if action == "RECOVER":
+        _digest(
+            value.get("effectAuthorizationReceiptSha256"),
+            "effectAuthorizationReceiptSha256",
+        )
+        _positive_int(value.get("operationExpiresAtUnix"), "operationExpiresAtUnix")
+        _digest(
+            value.get("recoveryPublicationIntentSha256"),
+            "recoveryPublicationIntentSha256",
+            nullable=True,
+        )
     return value
 
 
@@ -464,6 +731,86 @@ def validate_stored_receipt(config: ControllerConfig, *, operation_id: str, stor
         raise ControllerProtocolError(
             "VALIDATE response changed the exact stored controller result"
         )
+    return response
+
+
+def recover_publication_operation(
+    config: ControllerConfig,
+    operation: str,
+    binding: Mapping[str, Any],
+    *,
+    phase: str,
+    prior: Mapping[str, Any] | None = None,
+    publication_intent_sha256: str | None = None,
+    recovery_result_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Inspect/authorize/complete only an exact publication suffix recovery."""
+
+    if operation not in ALLOWED_OPERATIONS:
+        raise ControllerProtocolError("recovery operation is outside the fixed set")
+    if phase not in {"inspect", "authorize-publication", "complete-publication"}:
+        raise ControllerProtocolError("unknown publication recovery phase")
+    request_digest = _digest(binding.get("requestSha256"), "recovery requestSha256")
+    repository = _digest(
+        binding.get("repositoryLocatorSha256"),
+        "recovery repositoryLocatorSha256",
+    )
+    assert request_digest is not None and repository is not None
+    operation_id = hashlib.sha256(
+        _canonical(
+            {
+                "operation": operation,
+                "binding": {
+                    "repositoryLocatorSha256": repository,
+                    "requestSha256": request_digest,
+                },
+            }
+        )
+    ).hexdigest()
+    request = {
+        "operationId": operation_id,
+        "recoveryNonce": secrets.token_hex(32),
+        "recoveryPhase": phase,
+        "operation": operation,
+        "repositoryLocatorSha256": repository,
+        "rootSetSha256": config.root_set_sha256,
+        "requestSha256": request_digest,
+        "transactionIntentSha256": request_digest,
+        "runtimeManifestSha256": config.runtime_manifest_sha256,
+        "moduleSha256": config.module_sha256,
+        "schemaSha256": config.schema_sha256,
+        "configEpoch": config.config_epoch,
+        "keyEpoch": config.key_epoch,
+        "sessionNonce": None if prior is None else prior.get("sessionNonce"),
+        "predecessorReceiptSha256": (
+            None if prior is None else prior.get("receiptSha256")
+        ),
+        "effectAuthorizationReceiptSha256": (
+            None
+            if prior is None
+            else prior.get("effectAuthorizationReceiptSha256")
+        ),
+        "publicationIntentSha256": publication_intent_sha256,
+        "recoveryResultSha256": recovery_result_sha256,
+    }
+    response = _request("RECOVER", request, config)
+    if (
+        response.get("operationId") != operation_id
+        or response.get("sessionNonce") is None
+        or response.get("effectAuthorizationReceiptSha256") is None
+    ):
+        raise ControllerProtocolError("RECOVER response changed operation authority")
+    expected_state = {
+        "inspect": {
+            "effect-authorized",
+            "publication-recovery-authorized",
+            "publication-recovered",
+        },
+        "authorize-publication": {"publication-recovery-authorized"},
+        "complete-publication": {"publication-recovered"},
+    }[phase]
+    if response.get("state") not in expected_state:
+        raise ControllerProtocolError("RECOVER response changed the requested recovery state")
     return response
 
 
@@ -551,6 +898,16 @@ def _load_state(
     }
     if state != "accepted":
         fields.add("transactionIntentSha256")
+    if state in {
+        "effect-authorized",
+        "result-stored",
+        "completed",
+        "publication-recovery-authorized",
+        "publication-recovered",
+    }:
+        fields.add("effectAuthorizationReceiptSha256")
+    if state in _RECOVERY_STATES:
+        fields.add("recoveryPublicationIntentSha256")
     data = _closed_mapping(value, fields, "controller durable state")
     _digest(data["openBindingSha256"], "state openBindingSha256")
     _positive_int(data["expiresAtUnix"], "state expiresAtUnix")
@@ -558,20 +915,42 @@ def _load_state(
         raise ControllerProtocolError("controller durable state has an unknown state")
     if state != "accepted":
         _digest(data["transactionIntentSha256"], "state transactionIntentSha256")
+    if "effectAuthorizationReceiptSha256" in fields:
+        _digest(
+            data["effectAuthorizationReceiptSha256"],
+            "state effectAuthorizationReceiptSha256",
+        )
+    if state in _RECOVERY_STATES:
+        _digest(
+            data["recoveryPublicationIntentSha256"],
+            "state recoveryPublicationIntentSha256",
+        )
     nonces = data["usedNonces"]
     if (
         not isinstance(nonces, list)
         or not nonces
+        or len(nonces) > 4096
         or len(nonces) != len(set(nonces))
         or any(not isinstance(nonce, str) or not _NONCE.fullmatch(nonce) for nonce in nonces)
     ):
         raise ControllerProtocolError("controller durable state has an invalid nonce set")
-    response = _closed_mapping(data["response"], _RESPONSE_FIELDS, "stored controller response")
+    response_value = data["response"]
+    response_action = (
+        response_value.get("action") if isinstance(response_value, dict) else None
+    )
+    response_fields = (
+        _RESPONSE_FIELDS | _RECOVERY_RESPONSE_EXTRA_FIELDS
+        if response_action == "RECOVER"
+        else _RESPONSE_FIELDS
+    )
+    response = _closed_mapping(
+        response_value, response_fields, "stored controller response"
+    )
     if (
         response["schemaVersion"] != 1
         or response["protocol"] != PROTOCOL
         or response["provenanceDomain"] != PRODUCTION_PROVENANCE
-        or response["action"] not in {"OPEN", "STEP"}
+        or response["action"] not in {"OPEN", "STEP", "RECOVER"}
         or response["state"] != state
         or response["operationId"] != path.stem
         or not isinstance(response["sessionNonce"], str)
@@ -583,13 +962,35 @@ def _load_state(
     _digest(response["requestSha256"], "stored response requestSha256")
     _digest(response["receiptSha256"], "stored response receiptSha256")
     _digest(response["resultSha256"], "stored response resultSha256", nullable=True)
-    expected_status = "completed" if state == "completed" else "accepted"
+    expected_status = (
+        "completed"
+        if state == "completed"
+        else "recovered"
+        if state == "publication-recovered"
+        else "accepted"
+    )
     if response["status"] != expected_status:
         raise ControllerProtocolError("stored controller response status is invalid")
-    if (state in {"accepted", "intent-bound", "effect-authorized"}) != (
+    if (state in {
+        "accepted",
+        "intent-bound",
+        "effect-authorized",
+        "publication-recovery-authorized",
+    }) != (
         response["resultSha256"] is None
     ):
         raise ControllerProtocolError("stored controller result/state relation is invalid")
+    if response["action"] == "RECOVER":
+        if (
+            response["effectAuthorizationReceiptSha256"]
+            != data.get("effectAuthorizationReceiptSha256")
+            or response["operationExpiresAtUnix"] != data["expiresAtUnix"]
+            or response["recoveryPublicationIntentSha256"]
+            != data.get("recoveryPublicationIntentSha256")
+        ):
+            raise ControllerProtocolError(
+                "stored recovery response does not bind durable recovery authority"
+            )
     receipt_material = dict(response)
     receipt_sha256 = receipt_material.pop("receiptSha256")
     if receipt_sha256 != _sha(_canonical(receipt_material)):
@@ -633,21 +1034,34 @@ def _serve_packet(packet: bytes, peer_uid: int, config: ControllerConfig, key: b
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ControllerProtocolError("controller request contains malformed JSON") from exc
     data = _closed_mapping(value, _REQUEST_FIELDS, "controller request")
-    if _canonical(data) != packet or data["schemaVersion"] != 1 or data["protocol"] != PROTOCOL:
+    if (
+        _canonical(data) != packet
+        or type(data["schemaVersion"]) is not int
+        or data["schemaVersion"] != 1
+        or not isinstance(data["protocol"], str)
+        or data["protocol"] != PROTOCOL
+    ):
         raise ControllerProtocolError("controller request is not exact canonical protocol v1")
     if peer_uid != config.broker_uid or peer_uid in {config.controller_uid, config.worker_uid}:
         raise ControllerProtocolError("request peer is not the distinct configured broker UID")
-    action = data["action"]
+    action = _string(data["action"], "controller action")
+    if action not in {"OPEN", "STEP", "VALIDATE", "RECOVER"}:
+        raise ControllerProtocolError("unknown controller action")
     request = data["request"]
     request_sha = _sha(packet)
     if action == "OPEN":
         opened = _closed_mapping(request, _OPEN_FIELDS, "OPEN request")
+        _operation_id(opened["operationId"])
         for field in ("repositoryLocatorSha256", "rootSetSha256", "requestSha256", "runtimeManifestSha256", "moduleSha256", "schemaSha256"):
             _digest(opened[field], field)
-        if opened["operation"] not in ALLOWED_OPERATIONS or opened["rootSetSha256"] != config.root_set_sha256:
+        operation = _string(opened["operation"], "OPEN operation")
+        _positive_int(opened["configEpoch"], "OPEN configEpoch")
+        _positive_int(opened["keyEpoch"], "OPEN keyEpoch")
+        _positive_int(opened["issuedAtUnix"], "OPEN issuedAtUnix")
+        _positive_int(opened["expiresAtUnix"], "OPEN expiresAtUnix")
+        if operation not in ALLOWED_OPERATIONS or opened["rootSetSha256"] != config.root_set_sha256:
             raise ControllerProtocolError("OPEN request operation/root set mismatch")
-        if not isinstance(opened["clientNonce"], str) or not _NONCE.fullmatch(opened["clientNonce"]):
-            raise ControllerProtocolError("OPEN client nonce is invalid")
+        _nonce(opened["clientNonce"], "OPEN client nonce")
         if opened["operationId"] != hashlib.sha256(
             _canonical(
                 {
@@ -684,7 +1098,12 @@ def _serve_packet(packet: bytes, peer_uid: int, config: ControllerConfig, key: b
                 raise ControllerProtocolError("operationId was rebound to a different OPEN request")
             if opened["clientNonce"] in prior.get("usedNonces", []):
                 raise ControllerProtocolError("OPEN nonce was already consumed")
-            if prior.get("state") in {"effect-authorized", "result-stored"}:
+            if prior.get("state") in {
+                "effect-authorized",
+                "result-stored",
+                "publication-recovery-authorized",
+                "publication-recovered",
+            }:
                 raise ControllerProtocolError("operation outcome is uncertain; inspect durable controller state")
             state = str(prior.get("state"))
             if state != "completed" and int(prior.get("expiresAtUnix", 0)) <= now:
@@ -720,8 +1139,17 @@ def _serve_packet(packet: bytes, peer_uid: int, config: ControllerConfig, key: b
         return _canonical(response)
     if action == "STEP":
         step = _closed_mapping(request, _STEP_FIELDS, "STEP request")
-        if not isinstance(step["stepNonce"], str) or not _NONCE.fullmatch(step["stepNonce"]):
-            raise ControllerProtocolError("STEP nonce is invalid")
+        _operation_id(step["operationId"])
+        _nonce(step["sessionNonce"], "STEP session nonce")
+        _nonce(step["stepNonce"], "STEP nonce")
+        _digest(step["predecessorReceiptSha256"], "STEP predecessorReceiptSha256")
+        target = _string(step["targetState"], "STEP targetState")
+        _digest(
+            step["transactionIntentSha256"],
+            "STEP transactionIntentSha256",
+            nullable=True,
+        )
+        _digest(step["resultSha256"], "STEP resultSha256", nullable=True)
         path = _state_file(step["operationId"])
         loaded = _load_state(path, key)
         assert loaded is not None
@@ -731,8 +1159,11 @@ def _serve_packet(packet: bytes, peer_uid: int, config: ControllerConfig, key: b
         if step["stepNonce"] in prior.get("usedNonces", []):
             raise ControllerProtocolError("STEP nonce was already consumed")
         current = prior["state"]
-        target = step["targetState"]
-        if target not in _STATES or _STATES.index(target) != _STATES.index(current) + 1:
+        if (
+            current not in _NORMAL_STATES
+            or target not in _NORMAL_STATES
+            or _NORMAL_STATES.index(target) != _NORMAL_STATES.index(current) + 1
+        ):
             raise ControllerProtocolError("STEP is not the unique state successor")
         if step["sessionNonce"] != prior["response"]["sessionNonce"] or step["predecessorReceiptSha256"] != prior["response"]["receiptSha256"]:
             raise ControllerProtocolError("STEP predecessor/session mismatch")
@@ -762,13 +1193,20 @@ def _serve_packet(packet: bytes, peer_uid: int, config: ControllerConfig, key: b
         }
         if target == "intent-bound":
             successor["transactionIntentSha256"] = step["transactionIntentSha256"]
+        if target == "effect-authorized":
+            successor["effectAuthorizationReceiptSha256"] = response[
+                "receiptSha256"
+            ]
         _write_state(path, successor, prior_bytes)
         return _canonical(response)
     if action == "VALIDATE":
         validation = _closed_mapping(request, _VALIDATE_FIELDS, "VALIDATE request")
-        if not isinstance(validation["validationNonce"], str) or not _NONCE.fullmatch(validation["validationNonce"]):
-            raise ControllerProtocolError("VALIDATE nonce is invalid")
-        if validation["expectedState"] not in _STATES:
+        _operation_id(validation["operationId"])
+        _nonce(validation["validationNonce"], "VALIDATE nonce")
+        expected_state = _string(
+            validation["expectedState"], "VALIDATE expectedState"
+        )
+        if expected_state not in _STATES:
             raise ControllerProtocolError("VALIDATE state is invalid")
         _digest(validation["storedReceiptSha256"], "storedReceiptSha256")
         _digest(validation["expectedResultSha256"], "expectedResultSha256", nullable=True)
@@ -789,7 +1227,241 @@ def _serve_packet(packet: bytes, peer_uid: int, config: ControllerConfig, key: b
         })
         _write_state(path, {**prior, "usedNonces": [*prior["usedNonces"], validation["validationNonce"]]}, prior_bytes)
         return _canonical(response)
-    raise ControllerProtocolError("unknown controller action")
+    recovery = _closed_mapping(request, _RECOVER_FIELDS, "RECOVER request")
+    _operation_id(recovery["operationId"])
+    _nonce(recovery["recoveryNonce"], "RECOVER nonce")
+    phase = _string(recovery["recoveryPhase"], "RECOVER phase")
+    operation = _string(recovery["operation"], "RECOVER operation")
+    if phase not in {"inspect", "authorize-publication", "complete-publication"}:
+        raise ControllerProtocolError("RECOVER phase is invalid")
+    if operation not in ALLOWED_OPERATIONS:
+        raise ControllerProtocolError("RECOVER operation is outside the fixed set")
+    for field in (
+        "repositoryLocatorSha256",
+        "rootSetSha256",
+        "requestSha256",
+        "transactionIntentSha256",
+        "runtimeManifestSha256",
+        "moduleSha256",
+        "schemaSha256",
+    ):
+        _digest(recovery[field], f"RECOVER {field}")
+    _positive_int(recovery["configEpoch"], "RECOVER configEpoch")
+    _positive_int(recovery["keyEpoch"], "RECOVER keyEpoch")
+    _nonce(recovery["sessionNonce"], "RECOVER sessionNonce", nullable=True)
+    _digest(
+        recovery["predecessorReceiptSha256"],
+        "RECOVER predecessorReceiptSha256",
+        nullable=True,
+    )
+    _digest(
+        recovery["effectAuthorizationReceiptSha256"],
+        "RECOVER effectAuthorizationReceiptSha256",
+        nullable=True,
+    )
+    _digest(
+        recovery["publicationIntentSha256"],
+        "RECOVER publicationIntentSha256",
+        nullable=True,
+    )
+    _digest(
+        recovery["recoveryResultSha256"],
+        "RECOVER recoveryResultSha256",
+        nullable=True,
+    )
+    expected_operation_id = hashlib.sha256(
+        _canonical(
+            {
+                "operation": operation,
+                "binding": {
+                    "repositoryLocatorSha256": recovery[
+                        "repositoryLocatorSha256"
+                    ],
+                    "requestSha256": recovery["requestSha256"],
+                },
+            }
+        )
+    ).hexdigest()
+    if recovery["operationId"] != expected_operation_id:
+        raise ControllerProtocolError("RECOVER operationId changed the exact request")
+    if recovery["transactionIntentSha256"] != recovery["requestSha256"]:
+        raise ControllerProtocolError("RECOVER changed the outer transaction intent")
+    if (
+        recovery["rootSetSha256"],
+        recovery["runtimeManifestSha256"],
+        recovery["moduleSha256"],
+        recovery["schemaSha256"],
+        recovery["configEpoch"],
+        recovery["keyEpoch"],
+    ) != (
+        config.root_set_sha256,
+        config.runtime_manifest_sha256,
+        config.module_sha256,
+        config.schema_sha256,
+        config.config_epoch,
+        config.key_epoch,
+    ):
+        raise ControllerProtocolError("RECOVER configured identity mismatch")
+    path = _state_file(recovery["operationId"])
+    loaded = _load_state(path, key)
+    assert loaded is not None
+    prior_bytes, prior = loaded
+    if int(prior["expiresAtUnix"]) <= int(time.time()):
+        raise ControllerProtocolError("controller operation expired before recovery")
+    open_binding = {
+        "operationId": recovery["operationId"],
+        "operation": recovery["operation"],
+        "repositoryLocatorSha256": recovery["repositoryLocatorSha256"],
+        "rootSetSha256": recovery["rootSetSha256"],
+        "requestSha256": recovery["requestSha256"],
+        "runtimeManifestSha256": recovery["runtimeManifestSha256"],
+        "moduleSha256": recovery["moduleSha256"],
+        "schemaSha256": recovery["schemaSha256"],
+        "configEpoch": recovery["configEpoch"],
+        "keyEpoch": recovery["keyEpoch"],
+    }
+    if prior["openBindingSha256"] != _sha(_canonical(open_binding)):
+        raise ControllerProtocolError("RECOVER changed the exact OPEN binding")
+    if prior.get("transactionIntentSha256") != recovery["transactionIntentSha256"]:
+        raise ControllerProtocolError("RECOVER transaction intent mismatch")
+    if recovery["recoveryNonce"] in prior["usedNonces"]:
+        raise ControllerProtocolError("RECOVER nonce was already consumed")
+    if prior["state"] not in {
+        "effect-authorized",
+        "publication-recovery-authorized",
+        "publication-recovered",
+    }:
+        raise ControllerProtocolError(
+            "only an uncertain effect-authorized publication may recover"
+        )
+    current_response = prior["response"]
+    if recovery["sessionNonce"] is not None and recovery["sessionNonce"] != current_response["sessionNonce"]:
+        raise ControllerProtocolError("RECOVER session mismatch")
+    if recovery["predecessorReceiptSha256"] is not None and recovery["predecessorReceiptSha256"] != current_response["receiptSha256"]:
+        raise ControllerProtocolError("RECOVER predecessor mismatch")
+    effect_receipt = prior["effectAuthorizationReceiptSha256"]
+    if recovery["effectAuthorizationReceiptSha256"] is not None and recovery["effectAuthorizationReceiptSha256"] != effect_receipt:
+        raise ControllerProtocolError("RECOVER changed effect authorization")
+    publication_intent = prior.get("recoveryPublicationIntentSha256")
+    if phase == "inspect":
+        if recovery["publicationIntentSha256"] is not None or recovery["recoveryResultSha256"] is not None:
+            raise ControllerProtocolError("RECOVER inspection cannot authorize mutation")
+        target_state = prior["state"]
+        result_digest = prior["response"].get("resultSha256")
+    elif phase == "authorize-publication":
+        if prior["state"] == "publication-recovered":
+            raise ControllerProtocolError(
+                "completed publication recovery cannot authorize another mutation"
+            )
+        requested_publication = recovery["publicationIntentSha256"]
+        if requested_publication is None or recovery["recoveryResultSha256"] is not None:
+            raise ControllerProtocolError("RECOVER authorization needs one publication intent")
+        if publication_intent is not None and publication_intent != requested_publication:
+            raise ControllerProtocolError("RECOVER attempted a different publication")
+        publication_intent = requested_publication
+        target_state = "publication-recovery-authorized"
+        result_digest = None
+    else:
+        if (
+            prior["state"] != "publication-recovery-authorized"
+            or recovery["publicationIntentSha256"] != publication_intent
+            or recovery["recoveryResultSha256"] is None
+        ):
+            raise ControllerProtocolError("RECOVER completion changed publication authority")
+        target_state = "publication-recovered"
+        result_digest = recovery["recoveryResultSha256"]
+    response = _sign_response(
+        key,
+        action,
+        {
+            "status": "recovered" if target_state == "publication-recovered" else "accepted",
+            "state": target_state,
+            "requestSha256": request_sha,
+            "operationId": recovery["operationId"],
+            "sessionNonce": current_response["sessionNonce"],
+            "resultSha256": result_digest,
+            "effectAuthorizationReceiptSha256": effect_receipt,
+            "operationExpiresAtUnix": prior["expiresAtUnix"],
+            "recoveryPublicationIntentSha256": publication_intent,
+        },
+    )
+    successor = {
+        **prior,
+        "state": target_state,
+        "usedNonces": [*prior["usedNonces"], recovery["recoveryNonce"]],
+        "response": response,
+    }
+    if publication_intent is not None:
+        successor["recoveryPublicationIntentSha256"] = publication_intent
+    _write_state(path, successor, prior_bytes)
+    return _canonical(response)
+
+
+def _serve_connection(
+    connection: socket.socket,
+    config: ControllerConfig,
+    key: bytes,
+) -> None:
+    """Contain every untrusted connection failure and emit no error oracle."""
+
+    try:
+        try:
+            _, peer_uid, _ = _peer_credentials(connection)
+            packet = connection.recv(MAX_MESSAGE_BYTES + 1)
+            if not packet or len(packet) > MAX_MESSAGE_BYTES:
+                raise ControllerProtocolError(
+                    "controller connection supplied an empty or oversized packet"
+                )
+            try:
+                extra = connection.recv(
+                    1,
+                    getattr(socket, "MSG_PEEK", 0)
+                    | getattr(socket, "MSG_DONTWAIT", 0),
+                )
+            except BlockingIOError:
+                extra = b""
+            if extra:
+                raise ControllerProtocolError(
+                    "controller connection supplied more than one request packet"
+                )
+            response = _serve_packet(packet, peer_uid, config, key)
+            connection.sendall(response)
+        except Exception:
+            # Protocol, type, parser, filesystem and unexpected per-client
+            # failures are connection-scoped.  Invalid clients receive no
+            # signed response and cannot terminate the accept loop.
+            return
+    finally:
+        connection.close()
+
+
+def _systemd_listener(config: ControllerConfig) -> socket.socket:
+    try:
+        listen_pid = int(os.environ.get("LISTEN_PID", ""))
+        listen_fds = int(os.environ.get("LISTEN_FDS", ""))
+    except ValueError as exc:
+        raise ControllerProtocolError("systemd socket-activation metadata is malformed") from exc
+    if listen_pid != os.getpid() or listen_fds != 1:
+        raise ControllerProtocolError(
+            "controller requires exactly one systemd-activated SOCK_SEQPACKET endpoint"
+        )
+    listener = socket.fromfd(3, socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        if (
+            listener.family != socket.AF_UNIX
+            or listener.type & 0xF != socket.SOCK_SEQPACKET
+            or listener.getsockname() != str(ENDPOINT_PATH)
+            or not listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+        ):
+            raise ControllerProtocolError(
+                "activated descriptor is not the fixed listening SOCK_SEQPACKET endpoint"
+            )
+        _validate_endpoint_parent(config)
+        _endpoint_metadata(config)
+        return listener
+    except Exception:
+        listener.close()
+        raise
 
 
 def serve_forever() -> None:
@@ -798,6 +1470,8 @@ def serve_forever() -> None:
     config = load_controller_config()
     if os.geteuid() != config.controller_uid:
         raise ControllerProtocolError("controller process does not run as configured controller UID")
+    _validate_transport_group(config)
+    _verify_installed_artifacts(config)
     try:
         key_info = os.lstat(CONTROLLER_KEY_PATH)
         if (
@@ -830,46 +1504,11 @@ def serve_forever() -> None:
     if len(key) < 32 or len(key) > 4096:
         raise ControllerProtocolError("controller HMAC key must contain 32..4096 bytes")
     _validate_controller_directory(STATE_ROOT, config, "controller state root")
-    _validate_controller_directory(
-        ENDPOINT_PATH.parent, config, "controller endpoint parent"
-    )
-    if ENDPOINT_PATH.exists() or ENDPOINT_PATH.is_symlink():
-        raise ControllerProtocolError("controller endpoint already exists; operator must reconcile it")
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    listener.bind(str(ENDPOINT_PATH))
-    os.chmod(ENDPOINT_PATH, 0o600)
-    listener.listen(16)
+    listener = _systemd_listener(config)
     try:
         while True:
             connection, _ = listener.accept()
-            try:
-                try:
-                    _, peer_uid, _ = _peer_credentials(connection)
-                    packet = connection.recv(MAX_MESSAGE_BYTES + 1)
-                    if not packet or len(packet) > MAX_MESSAGE_BYTES:
-                        raise ControllerProtocolError(
-                            "controller connection supplied an empty or oversized packet"
-                        )
-                    try:
-                        extra = connection.recv(
-                            1,
-                            getattr(socket, "MSG_PEEK", 0)
-                            | getattr(socket, "MSG_DONTWAIT", 0),
-                        )
-                    except BlockingIOError:
-                        extra = b""
-                    if extra:
-                        raise ControllerProtocolError(
-                            "controller connection supplied more than one request packet"
-                        )
-                    response = _serve_packet(packet, peer_uid, config, key)
-                    connection.sendall(response)
-                except ControllerProtocolError:
-                    # Invalid clients receive no signed oracle response and
-                    # cannot terminate the controller accept loop.
-                    pass
-            finally:
-                connection.close()
+            _serve_connection(connection, config, key)
     finally:
         listener.close()
 
