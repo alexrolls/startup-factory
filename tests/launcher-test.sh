@@ -181,7 +181,11 @@ cat > custom-wrapper <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
-chmod +x claude codex gemini custom-wrapper
+cat > dsh <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x claude codex gemini custom-wrapper dsh
 
 sed_i 's|^FRONTEND_CMD=.*|FRONTEND_CMD="./claude {prompt_file}"|' "$CFG_SANDBOX"
 unmarked_harness_prompt="$("$LAUNCH" compose native-harness FEAT-NATIVE-HARNESS frontend)"
@@ -210,6 +214,16 @@ if grep -q "Claude + obra/superpowers planning" "$gemini_prompt"; then
   echo "FAIL: Gemini CLI command received Superpowers planning instructions"; FAILURES=$((FAILURES+1))
 else
   echo "ok: Gemini CLI command excludes Superpowers planning instructions"
+fi
+
+sed_i 's|^FRONTEND_CMD=.*|FRONTEND_CMD="./dsh --profile headless \"$(cat '\''{prompt_file}'\'')\""|' "$CFG_SANDBOX"
+TEAM_RUNNER=background "$LAUNCH" start dsh-planning FEAT-DSH frontend
+dsh_prompt=.teamwork/dsh-planning/prompts/frontend.md
+check "DeepSeek Harness command is classified as non-Claude" grep -q "LLM runtime family: other" "$dsh_prompt"
+if grep -q "Claude + obra/superpowers planning" "$dsh_prompt"; then
+  echo "FAIL: DeepSeek Harness command received Superpowers planning instructions"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: DeepSeek Harness command excludes Superpowers planning instructions"
 fi
 
 sed_i 's|^FRONTEND_CMD=.*|FRONTEND_CMD="./custom-wrapper {prompt_file}"|' "$CFG_SANDBOX"
