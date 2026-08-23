@@ -45,6 +45,10 @@ _HEX_DIGEST = re.compile(r"\A[0-9a-f]{64}\Z")
 _SAFE_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
 _BROKER_CONTEXT: ContextVar[tuple[str, str] | None] = ContextVar("beads-protected-runtime", default=None)
 _FAULT_PHASE: ContextVar[str | None] = ContextVar("beads-protected-runtime-fault", default=None)
+# Deterministic hostile-test seam invoked at the final native mutation
+# boundary.  Production leaves it unset; it is never populated from input or
+# environment state.
+_NATIVE_MUTATION_HOOK: Any = None
 
 
 class BeadsProtectedRuntimeError(RuntimeError):
@@ -453,7 +457,7 @@ _RESULT_FIELDS: dict[str, set[str]] = {
     "BeadsPreparationStepV1": _PREPARATION_STEP,
     "BeadsStatusProfileDynamicBindingsV1": {"schemaVersion", "repositoryLocatorSha256", "preparationLeaseRecordSha256", "preObservationRecordSha256", "postObservationRecordSha256", "storeStateSha256", "acceptedConfigEnvelopeCanonicalSha256"} | _SEQUENCE_FIELDS,
     "VerifiedBeadsStatusProfileDynamicBindingsV1": {"schemaVersion", "repositoryLocatorSha256", "preparationLeaseRecordSha256", "preObservationRecordSha256", "postObservationRecordSha256", "storeStateSha256", "acceptedConfigEnvelopeCanonicalSha256"} | _SEQUENCE_FIELDS,
-    "FinishBeadsPreparationResultV1": _PREPARATION_TERMINAL | {"resultStoredJournalHeadSha256", "pointerRecordSha256", "currentPointerFullBytesSha256", "activationReceiptRecordSha256"},
+    "FinishBeadsPreparationResultV1": _PREPARATION_TERMINAL,
     "BeadsStatusProfileV1": _SEQUENCED | {"repositoryLocatorSha256", "leaseRecordSha256", "payloadCanonicalSha256", "payloadCanonicalJson", "dynamicBindingsCanonicalSha256", "transactionIntentSha256"},
     "BeadsPreparationCurrentV1": _SEQUENCED | {"repositoryLocatorSha256", "generation", "predecessorCurrentFullBytesSha256", "leaseRecordSha256", "resultRecordSha256", "resultStoredJournalHeadSha256", "statusProfileRecordSha256", "transactionIntentSha256", "installIntentRecordSha256", "installObservedRecordSha256", "cleanupIntentRecordSha256", "cleanupObservedRecordSha256"},
     "BeadsPreparationActivationReceiptV1": _SEQUENCED | {"repositoryLocatorSha256", "pointerRecordSha256", "pointerFullBytesSha256", "resultRecordSha256", "resultStoredJournalHeadSha256", "statusProfileRecordSha256", "installIntentRecordSha256", "installObservedRecordSha256", "cleanupIntentRecordSha256", "cleanupObservedRecordSha256"},
@@ -577,10 +581,7 @@ _TYPE_NULLABLE_FIELDS.update({
     "BeadsStatusProfileDynamicBindingsV1": set(_SEQUENCE_NULLABLE),
     "VerifiedBeadsStatusProfileDynamicBindingsV1": set(_SEQUENCE_NULLABLE),
     "FinishBeadsPreparationRequestV1": {"expectedCurrentPointerFullBytesSha256"},
-    "FinishBeadsPreparationResultV1": set(_SEQUENCE_NULLABLE) | set(_TERMINAL_INSTALL_NULLABLE) | {
-        "resultStoredJournalHeadSha256", "pointerRecordSha256",
-        "currentPointerFullBytesSha256", "activationReceiptRecordSha256",
-    },
+    "FinishBeadsPreparationResultV1": set(_SEQUENCE_NULLABLE) | set(_TERMINAL_INSTALL_NULLABLE),
     "BeadsStatusProfileV1": set(_SEQUENCE_NULLABLE),
     "BeadsPreparationCurrentV1": set(_SEQUENCE_NULLABLE) | set(_TERMINAL_INSTALL_NULLABLE) | {
         "predecessorCurrentFullBytesSha256",
@@ -790,6 +791,9 @@ def _open_absolute_directory(path: Path, label: str, *, private: bool = False) -
         raise BeadsProtectedRuntimeError(f"{label} must be a normalized absolute path")
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path.anchor, flags)
+    descriptors = [descriptor]
+    component_names: list[str] = []
+    component_metadata: list[os.stat_result] = []
     identities: list[dict[str, int]] = []
     try:
         root_metadata = os.fstat(descriptor)
@@ -806,11 +810,47 @@ def _open_absolute_directory(path: Path, label: str, *, private: bool = False) -
                 private=private and index == len(path.parts[1:]) - 1,
             )
             identities.append(_ancestry_identity(metadata))
-            os.close(descriptor)
             descriptor = child
-        return descriptor, identities
+            descriptors.append(child)
+            component_names.append(part)
+            component_metadata.append(metadata)
+
+        # A no-follow open pins objects, but authority is attached to their
+        # names as well.  Re-resolve the complete chain only after traversal
+        # has finished, while every parent descriptor remains pinned.  This
+        # closes swaps of an already-open child or the absolute root name.
+        named_root = os.stat(path.anchor, follow_symlinks=False)
+        if canonical_bytes(_directory_identity(named_root)) != canonical_bytes(
+            _directory_identity(root_metadata)
+        ):
+            raise BeadsProtectedRuntimeError(f"{label} root name identity changed during traversal")
+        for parent, child, name, opened in zip(
+            descriptors,
+            descriptors[1:],
+            component_names,
+            component_metadata,
+        ):
+            named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            pinned = os.fstat(child)
+            if (
+                canonical_bytes(_directory_identity(named))
+                != canonical_bytes(_directory_identity(opened))
+                or canonical_bytes(_directory_identity(pinned))
+                != canonical_bytes(_directory_identity(opened))
+            ):
+                raise BeadsProtectedRuntimeError(
+                    f"{label} child name identity changed after complete traversal"
+                )
+        result = os.dup(descriptors[-1])
+        for opened_descriptor in reversed(descriptors):
+            os.close(opened_descriptor)
+        return result, identities
     except (OSError, BeadsProtectedRuntimeError) as exc:
-        os.close(descriptor)
+        for opened_descriptor in reversed(descriptors):
+            try:
+                os.close(opened_descriptor)
+            except OSError:
+                pass
         if isinstance(exc, BeadsProtectedRuntimeError):
             raise
         raise BeadsProtectedRuntimeError(f"cannot open {label} without following links: {exc}") from exc
@@ -1914,6 +1954,43 @@ def begin_beads_mutation_v1(request: BeginBeadsMutationRequestV1) -> BeadsMutati
         raise BeadsProtectedRuntimeError("mutationClass must be ordinary or preparation")
     store = _Store(payload)
     with store.locked():
+        preparation_lease: _WireRecord | None = None
+        preparation_command: _WireRecord | None = None
+        if mutation_class == "preparation":
+            _required(payload, "preparationLeaseRecordSha256", "preparationCommandIntentRecordSha256")
+            preparation_lease = _load_record(
+                store,
+                "BeadsPreparationLeaseV1",
+                "beads-preparation-lease",
+                "preparation-leases",
+                payload["preparationLeaseRecordSha256"],
+            )
+            preparation_command = _load_record(
+                store,
+                "BeadsPreparationCommandIntentV1",
+                "beads-preparation-command-intent",
+                "preparation-commands",
+                payload["preparationCommandIntentRecordSha256"],
+            )
+            canonical_nonce = str(
+                preparation_command.payload["transactionIntentSha256"]
+            ).removeprefix("sha256:")
+            if (
+                payload["mutationNonce"] != canonical_nonce
+                or payload["expiresAtUnix"]
+                != preparation_lease.payload.get("expiresAtUnix")
+            ):
+                raise BeadsProtectedRuntimeError(
+                    "preparation mutation request differs from the canonical command intent"
+                )
+            # Public preparation admission must be zero-effect on an expired,
+            # stale-core, stale-authority, stale-sequence, or physically stale
+            # request.  Perform the canonical validation before even creating
+            # this public API transaction intent, then repeat it atomically in
+            # the shared consumer immediately before its one-use writes.
+            _validate_preparation_command_v1(
+                store, preparation_lease, preparation_command, payload["commandArgv"]
+            )
         intent_digest, directory = _transaction_intent(store, "begin-beads-mutation", payload)
         resumed = _resume_transaction_result(
             store, directory, "begin-beads-mutation", "BeadsMutationIntentV1",
@@ -1938,23 +2015,15 @@ def begin_beads_mutation_v1(request: BeginBeadsMutationRequestV1) -> BeadsMutati
                 "launchAuthorizationRecordSha256": launch.record_sha256,
             }
         else:
-            _required(payload, "preparationLeaseRecordSha256", "preparationCommandIntentRecordSha256")
-            lease = _load_record(store, "BeadsPreparationLeaseV1", "beads-preparation-lease", "preparation-leases", payload["preparationLeaseRecordSha256"])
-            command = _load_record(store, "BeadsPreparationCommandIntentV1", "beads-preparation-command-intent", "preparation-commands", payload["preparationCommandIntentRecordSha256"])
-            if command.payload.get("leaseRecordSha256") != lease.record_sha256:
-                raise BeadsProtectedRuntimeError("preparation mutation command/lease chain mismatch")
-            if tuple(payload["commandArgv"]) != tuple(command.payload.get("argv", ())):
-                raise BeadsProtectedRuntimeError("preparation mutation argv differs from authorized command intent")
-            revoked = _require_current_authority_record(
-                store, lease.payload.get("revokedAuthorityRecordSha256"), "revoked"
+            assert preparation_lease is not None and preparation_command is not None
+            result = _consume_preparation_command_v1(
+                store,
+                preparation_lease,
+                preparation_command,
+                payload["commandArgv"],
             )
-            _consume_capability(store, "preparation-command-intents", command, intent_digest)
-            binding = {
-                "preparationLeaseRecordSha256": lease.record_sha256,
-                "preparationCommandIntentRecordSha256": command.record_sha256,
-                "revokedAuthorityRecordSha256": revoked.record_sha256,
-                **_preparation_sequence_fields(lease.payload),
-            }
+            _transaction_receipt(store, directory, "begin-beads-mutation", result)
+            return result
         intent_payload = {
             "repositoryLocatorSha256": store.repository_digest,
             "mutationClass": mutation_class,
@@ -2318,7 +2387,22 @@ def _observe_directory_tree(path: Path, label: str) -> dict[str, Any]:
                 try:
                     walk(child, relative, depth + 1)
                 finally:
-                    os.close(child)
+                    try:
+                        named_after = os.stat(
+                            name, dir_fd=descriptor, follow_symlinks=False
+                        )
+                        pinned_after = os.fstat(child)
+                        if (
+                            canonical_bytes(_directory_identity(named_after))
+                            != canonical_bytes(_directory_identity(opened))
+                            or canonical_bytes(_directory_identity(pinned_after))
+                            != canonical_bytes(_directory_identity(opened))
+                        ):
+                            raise BeadsProtectedRuntimeError(
+                                f"{label} child name changed after recursive traversal"
+                            )
+                    finally:
+                        os.close(child)
             elif stat.S_ISREG(metadata.st_mode):
                 entries.append({**common, "kind": "regular", "bytesSha256": _hash_regular_at(descriptor, name, metadata, label)})
             else:
@@ -2338,6 +2422,69 @@ def _observe_directory_tree(path: Path, label: str) -> dict[str, Any]:
     return {**projection, "treeSha256": sha256(canonical_bytes(projection))}
 
 
+def _native_rename_noreplace(
+    source_parent: int,
+    source_leaf: str,
+    target_parent: int,
+    target_leaf: str,
+    *,
+    phase: str,
+    expected_immediate_identity: Mapping[str, Any] | None = None,
+) -> None:
+    """Invoke the supported native exclusive rename at one audited seam."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    function: Any
+    if hasattr(libc, "renameat2"):
+        function = libc.renameat2
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        function.restype = ctypes.c_int
+        rename_flag = 1
+    elif hasattr(libc, "renameatx_np"):
+        function = libc.renameatx_np
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        function.restype = ctypes.c_int
+        rename_flag = 0x00000004
+    else:
+        raise BeadsProtectedRuntimeError(
+            "host lacks an atomic no-clobber directory rename; use Linux renameat2 or Darwin renameatx_np"
+        )
+    if _NATIVE_MUTATION_HOOK is not None:
+        _NATIVE_MUTATION_HOOK(phase, source_parent, source_leaf, target_parent, target_leaf)
+    if expected_immediate_identity is not None:
+        try:
+            immediate = os.stat(source_leaf, dir_fd=source_parent, follow_symlinks=False)
+        except OSError as exc:
+            raise BeadsProtectedRuntimeError(
+                f"{phase} source name changed immediately before atomic rename: {exc}"
+            ) from exc
+        if canonical_bytes(_directory_identity(immediate)) != canonical_bytes(
+            expected_immediate_identity
+        ):
+            raise BeadsProtectedRuntimeError(
+                f"{phase} source identity changed immediately before atomic rename"
+            )
+    result = function(
+        source_parent,
+        os.fsencode(source_leaf),
+        target_parent,
+        os.fsencode(target_leaf),
+        rename_flag,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        if error in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise BeadsProtectedRuntimeError(f"{phase} target appeared before atomic no-clobber rename")
+        raise BeadsProtectedRuntimeError(f"{phase} atomic no-clobber rename failed: {os.strerror(error)}")
+
+
+def _install_quarantine_leaf(target_leaf: str, source_identity: Mapping[str, Any]) -> str:
+    binding = sha256(
+        canonical_bytes({"kind": "install-quarantine", "targetLeaf": target_leaf, "sourceIdentity": source_identity})
+    ).removeprefix("sha256:")
+    return f".startup-factory-install-quarantine-{binding}"
+
+
 def _rename_directory_noreplace(
     source_parent: int,
     source_leaf: str,
@@ -2346,113 +2493,280 @@ def _rename_directory_noreplace(
     *,
     expected_source_identity: Mapping[str, Any] | None = None,
 ) -> None:
-    """Atomically move one directory while refusing an existing target.
+    """Install through a recoverable quarantine without exposing wrong data.
 
-    Linux uses renameat2(RENAME_NOREPLACE), Darwin uses
-    renameatx_np(RENAME_EXCL).  Other hosts fail closed because the portable
-    POSIX rename primitive is allowed to clobber the destination.
+    The first pathname mutation can race, so it targets a deterministic
+    quarantine name, never the authorized target.  Only after the quarantined
+    directory is reopened and proven to be the authorized inode may a second
+    exclusive rename publish it.  A raced replacement therefore remains
+    preserved in quarantine and the authorized target stays absent.
     """
 
-    try:
-        source_before = os.stat(source_leaf, dir_fd=source_parent, follow_symlinks=False)
-    except OSError as exc:
-        raise BeadsProtectedRuntimeError(f"cannot inspect no-clobber install source: {exc}") from exc
-    if not stat.S_ISDIR(source_before.st_mode):
-        raise BeadsProtectedRuntimeError("no-clobber install source must be a directory")
-    source_descriptor = -1
-    try:
-        source_descriptor = os.open(
-            source_leaf,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=source_parent,
-        )
-        source_opened = os.fstat(source_descriptor)
-    except OSError as exc:
-        if source_descriptor >= 0:
-            os.close(source_descriptor)
-        raise BeadsProtectedRuntimeError(
-            f"cannot pin no-clobber install source identity: {exc}"
-        ) from exc
-    source_identity = _directory_identity(source_before)
-    if (
-        canonical_bytes(source_identity) != canonical_bytes(_directory_identity(source_opened))
-        or (
-            expected_source_identity is not None
-            and canonical_bytes(source_identity) != canonical_bytes(expected_source_identity)
-        )
-    ):
-        os.close(source_descriptor)
-        raise BeadsProtectedRuntimeError(
-            "no-clobber install source identity changed before atomic rename"
-        )
-    source_name = os.fsencode(source_leaf)
-    target_name = os.fsencode(target_leaf)
-    libc = ctypes.CDLL(None, use_errno=True)
-    function: Any
-    try:
-        if hasattr(libc, "renameat2"):
-            function = libc.renameat2
-            function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-            function.restype = ctypes.c_int
-            rename_flag = 1
-        elif hasattr(libc, "renameatx_np"):
-            function = libc.renameatx_np
-            function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-            function.restype = ctypes.c_int
-            rename_flag = 0x00000004
-        else:
-            raise BeadsProtectedRuntimeError(
-                "host lacks an atomic no-clobber directory rename; use Linux renameat2 or Darwin renameatx_np"
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if expected_source_identity is None:
+        try:
+            expected_source_identity = _directory_identity(
+                os.stat(source_leaf, dir_fd=source_parent, follow_symlinks=False)
             )
-        source_immediate = os.stat(
-            source_leaf,
-            dir_fd=source_parent,
-            follow_symlinks=False,
+        except OSError as exc:
+            raise BeadsProtectedRuntimeError(f"cannot inspect no-clobber install source: {exc}") from exc
+    expected = _plain(expected_source_identity)
+    quarantine_leaf = _install_quarantine_leaf(target_leaf, expected)
+    try:
+        os.stat(target_leaf, dir_fd=target_parent, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise BeadsProtectedRuntimeError(
+            "create install target appeared before atomic no-clobber install"
         )
+    source_present = True
+    quarantine_present = True
+    try:
+        os.stat(source_leaf, dir_fd=source_parent, follow_symlinks=False)
+    except FileNotFoundError:
+        source_present = False
+    try:
+        os.stat(quarantine_leaf, dir_fd=target_parent, follow_symlinks=False)
+    except FileNotFoundError:
+        quarantine_present = False
+    if source_present and quarantine_present:
+        raise BeadsProtectedRuntimeError("install source and quarantine are both present; recovery is ambiguous")
+    if not source_present and not quarantine_present:
+        raise BeadsProtectedRuntimeError("install source and quarantine are both absent; recovery is ambiguous")
+    if source_present:
+        source_descriptor = os.open(source_leaf, flags, dir_fd=source_parent)
+        try:
+            opened = os.fstat(source_descriptor)
+            if canonical_bytes(_directory_identity(opened)) != canonical_bytes(expected):
+                raise BeadsProtectedRuntimeError(
+                    "no-clobber install source identity changed before quarantine"
+                )
+            _native_rename_noreplace(
+                source_parent,
+                source_leaf,
+                target_parent,
+                quarantine_leaf,
+                phase="install-source-to-quarantine",
+            )
+        finally:
+            os.close(source_descriptor)
+        _fault("preparation-install-quarantined")
+
+    quarantine_descriptor = os.open(quarantine_leaf, flags, dir_fd=target_parent)
+    try:
+        quarantined = os.fstat(quarantine_descriptor)
+        quarantined_identity = _directory_identity(quarantined)
+        if canonical_bytes(quarantined_identity) != canonical_bytes(expected):
+            raise BeadsProtectedRuntimeError(
+                "quarantined install source identity differs from the authorized directory; target remains absent"
+            )
+        try:
+            os.stat(target_leaf, dir_fd=target_parent, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise BeadsProtectedRuntimeError("create install target appeared before quarantine publication")
+        _native_rename_noreplace(
+            target_parent,
+            quarantine_leaf,
+            target_parent,
+            target_leaf,
+            phase="install-quarantine-to-target",
+            expected_immediate_identity=quarantined_identity,
+        )
+        pinned_after = os.fstat(quarantine_descriptor)
+    finally:
+        os.close(quarantine_descriptor)
+    target_descriptor = os.open(target_leaf, flags, dir_fd=target_parent)
+    try:
+        target_after = os.fstat(target_descriptor)
+    finally:
+        os.close(target_descriptor)
+    if (
+        canonical_bytes(_directory_identity(pinned_after)) != canonical_bytes(expected)
+        or canonical_bytes(_directory_identity(target_after)) != canonical_bytes(expected)
+    ):
+        raise BeadsProtectedRuntimeError("atomic no-clobber install changed the authorized directory identity")
+
+
+def _regular_file_identity(metadata: os.stat_result) -> dict[str, int]:
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "owner": metadata.st_uid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "linkCount": metadata.st_nlink,
+        "size": metadata.st_size,
+    }
+
+
+def _cleanup_quarantine_leaf(kind: str, expected: Mapping[str, Any]) -> str:
+    binding = sha256(
+        canonical_bytes({"kind": f"cleanup-{kind}-quarantine", "expected": expected})
+    ).removeprefix("sha256:")
+    return f".startup-factory-cleanup-{kind}-{binding}"
+
+
+def _remove_identity_bound_file(
+    parent: int,
+    leaf: str,
+    expected_entry: Mapping[str, Any],
+    label: str,
+) -> None:
+    """Quarantine, verify, then remove exactly one authenticated file."""
+
+    expected_identity = {
+        key: expected_entry.get(key)
+        for key in ("device", "inode", "owner", "mode", "linkCount", "size")
+    }
+    expected_digest = expected_entry.get("bytesSha256")
+    quarantine_leaf = _cleanup_quarantine_leaf(
+        "file", {**expected_identity, "bytesSha256": expected_digest}
+    )
+    leaf_present = True
+    quarantine_present = True
+    try:
+        os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        leaf_present = False
+    try:
+        os.stat(quarantine_leaf, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        quarantine_present = False
+    if leaf_present and quarantine_present:
+        raise BeadsProtectedRuntimeError(f"{label} and its quarantine are both present")
+    if not leaf_present and not quarantine_present:
+        return
+    if leaf_present:
+        _native_rename_noreplace(
+            parent,
+            leaf,
+            parent,
+            quarantine_leaf,
+            phase="cleanup-file-to-quarantine",
+        )
+        _fault("preparation-cleanup-file-quarantined")
+    metadata = os.stat(quarantine_leaf, dir_fd=parent, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or canonical_bytes(_regular_file_identity(metadata)) != canonical_bytes(expected_identity)
+    ):
+        raise BeadsProtectedRuntimeError(
+            f"{label} quarantine identity differs from signed cleanup evidence"
+        )
+    observed_digest = _hash_regular_at(parent, quarantine_leaf, metadata, label)
+    if observed_digest != expected_digest:
+        raise BeadsProtectedRuntimeError(
+            f"{label} quarantine bytes differ from signed cleanup evidence"
+        )
+    if _NATIVE_MUTATION_HOOK is not None:
+        _NATIVE_MUTATION_HOOK(
+            "cleanup-file-unlink", parent, quarantine_leaf, parent, quarantine_leaf
+        )
+    immediate = os.stat(quarantine_leaf, dir_fd=parent, follow_symlinks=False)
+    if canonical_bytes(_regular_file_identity(immediate)) != canonical_bytes(expected_identity):
+        raise BeadsProtectedRuntimeError(f"{label} identity changed immediately before unlink")
+    os.unlink(quarantine_leaf, dir_fd=parent)
+    os.fsync(parent)
+
+
+def _remove_identity_bound_directory(
+    parent: int,
+    leaf: str,
+    expected_identity: Mapping[str, Any],
+    label: str,
+    *,
+    expected_file_entry: Mapping[str, Any] | None = None,
+) -> None:
+    """Quarantine, verify, clean, then rmdir one authenticated root.
+
+    When the signed scaffold file is supplied, the root moves to quarantine
+    *before* any unlink.  Thus every unlink crash window remains inside the
+    already identity-bound broker quarantine rather than at an attacker-
+    replaceable authorized pathname.
+    """
+
+    expected = _plain(expected_identity)
+    expected_stable = {
+        key: expected.get(key) for key in ("device", "inode", "owner", "mode")
+    }
+    quarantine_leaf = _cleanup_quarantine_leaf("directory", expected_stable)
+    leaf_present = True
+    quarantine_present = True
+    try:
+        os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        leaf_present = False
+    try:
+        os.stat(quarantine_leaf, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        quarantine_present = False
+    if leaf_present and quarantine_present:
+        raise BeadsProtectedRuntimeError(f"{label} and its quarantine are both present")
+    if not leaf_present and not quarantine_present:
+        return
+    if leaf_present:
+        _native_rename_noreplace(
+            parent,
+            leaf,
+            parent,
+            quarantine_leaf,
+            phase="cleanup-directory-to-quarantine",
+        )
+    _fault("preparation-cleanup-directory-quarantined")
+    descriptor = os.open(
+        quarantine_leaf,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        named = os.stat(quarantine_leaf, dir_fd=parent, follow_symlinks=False)
         if (
-            canonical_bytes(_directory_identity(source_immediate))
-            != canonical_bytes(_directory_identity(source_opened))
+            canonical_bytes(_ancestry_identity(opened)) != canonical_bytes(expected_stable)
+            or canonical_bytes(_ancestry_identity(named)) != canonical_bytes(expected_stable)
         ):
             raise BeadsProtectedRuntimeError(
-                "no-clobber install source identity changed immediately before atomic rename"
+                f"{label} quarantine identity differs from signed cleanup evidence"
             )
-        result = function(
-            source_parent,
-            source_name,
-            target_parent,
-            target_name,
-            rename_flag,
-        )
-    except Exception:
-        os.close(source_descriptor)
-        raise
-    if result != 0:
-        os.close(source_descriptor)
-        error = ctypes.get_errno()
-        if error in {errno.EEXIST, errno.ENOTEMPTY}:
-            raise BeadsProtectedRuntimeError("create install target appeared before atomic no-clobber install")
-        raise BeadsProtectedRuntimeError(f"atomic no-clobber directory install failed: {os.strerror(error)}")
-    try:
-        target_descriptor = os.open(
-            target_leaf,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=target_parent,
-        )
-        try:
-            target_after = os.fstat(target_descriptor)
-        finally:
-            os.close(target_descriptor)
-    except OSError as exc:
-        os.close(source_descriptor)
-        raise BeadsProtectedRuntimeError(f"cannot reopen installed directory after atomic move: {exc}") from exc
-    source_pinned_after = os.fstat(source_descriptor)
-    os.close(source_descriptor)
-    if (
-        canonical_bytes(_directory_identity(source_opened))
-        != canonical_bytes(_directory_identity(source_pinned_after))
-        or (source_before.st_dev, source_before.st_ino) != (target_after.st_dev, target_after.st_ino)
-    ):
-        raise BeadsProtectedRuntimeError("atomic no-clobber install changed the source directory identity")
+        if expected_file_entry is not None:
+            expected_file_quarantine = _cleanup_quarantine_leaf(
+                "file",
+                {
+                    **{
+                        key: expected_file_entry.get(key)
+                        for key in ("device", "inode", "owner", "mode", "linkCount", "size")
+                    },
+                    "bytesSha256": expected_file_entry.get("bytesSha256"),
+                },
+            )
+            entries = sorted(entry.name for entry in os.scandir(descriptor))
+            if entries not in ([".gitignore"], [expected_file_quarantine], []):
+                raise BeadsProtectedRuntimeError(
+                    f"{label} quarantine contains an unbound cleanup entry"
+                )
+            _remove_identity_bound_file(
+                descriptor,
+                ".gitignore",
+                expected_file_entry,
+                f"{label} .gitignore",
+            )
+        if list(os.scandir(descriptor)):
+            raise BeadsProtectedRuntimeError(f"{label} quarantine is not empty")
+        if _NATIVE_MUTATION_HOOK is not None:
+            _NATIVE_MUTATION_HOOK(
+                "cleanup-directory-rmdir", parent, quarantine_leaf, parent, quarantine_leaf
+            )
+        immediate = os.stat(quarantine_leaf, dir_fd=parent, follow_symlinks=False)
+        if canonical_bytes(_ancestry_identity(immediate)) != canonical_bytes(expected_stable):
+            raise BeadsProtectedRuntimeError(
+                f"{label} identity changed immediately before rmdir"
+            )
+        os.rmdir(quarantine_leaf, dir_fd=parent)
+        os.fsync(parent)
+    finally:
+        os.close(descriptor)
 
 
 def _capture_directory(path: Path, label: str) -> dict[str, Any]:
@@ -2956,6 +3270,98 @@ def _frozen_preparation_environment(store: _Store, lease: _WireRecord, intent_di
     }
 
 
+def _validate_preparation_command_v1(
+    store: _Store,
+    lease: _WireRecord,
+    command: _WireRecord,
+    argv: Sequence[Any],
+) -> tuple[tuple[str, ...], _WireRecord, str, bool, bool]:
+    """Validate canonical preparation admission without mutating protected state."""
+    _expiry(lease.payload)
+    _same_repository(store, lease.payload)
+    if command.payload.get("leaseRecordSha256") != lease.record_sha256:
+        raise BeadsProtectedRuntimeError("preparation mutation command/lease chain mismatch")
+    command_ordinal = command.payload.get("commandOrdinal")
+    if command_ordinal != lease.payload.get("nextCommandOrdinal"):
+        raise BeadsStaleAuthorityError("preparation command lease successor is stale")
+    exact_argv = _expected_preparation_command(
+        lease, str(command.payload.get("commandKind")), argv
+    )
+    if (
+        list(exact_argv) != list(command.payload.get("argv", ()))
+        or command.payload.get("argvSha256") != sha256(canonical_bytes(list(exact_argv)))
+        or any(
+            command.payload.get(key) != value
+            for key, value in _preparation_sequence_fields(lease.payload).items()
+        )
+    ):
+        raise BeadsProtectedRuntimeError(
+            "preparation command does not reproduce its exact lease sequence and argv"
+        )
+    revoked = _require_current_authority_record(
+        store, lease.payload.get("revokedAuthorityRecordSha256"), "revoked"
+    )
+    _verify_current_preparation_core_bindings(store, lease.payload)
+    _revalidate_preparation_physical(lease)
+    command_transaction = _digest(
+        command.payload.get("transactionIntentSha256"), "transactionIntentSha256"
+    )
+    assert command_transaction is not None
+    lease_consumed = _capability_consumed_by(
+        store, "preparation-lease-successors", lease, command_transaction
+    )
+    command_consumed = _capability_consumed_by(
+        store, "preparation-command-intents", command, command_transaction
+    )
+    if command_consumed and not lease_consumed:
+        raise BeadsProtectedRuntimeError(
+            "preparation command consumption exists without its lease successor"
+        )
+    return exact_argv, revoked, command_transaction, lease_consumed, command_consumed
+
+
+def _consume_preparation_command_v1(
+    store: _Store,
+    lease: _WireRecord,
+    command: _WireRecord,
+    argv: Sequence[Any],
+) -> BeadsMutationIntentV1:
+    """Canonical one-use preparation command admission and consumption.
+
+    Both the broker execution path and the public preparation-mutation API use
+    this exact routine.  Every authority/core/physical/sequence check happens
+    before either one-use marker is written, and the resulting mutation intent
+    is deterministic from the command transaction rather than from a caller's
+    retry envelope.
+    """
+
+    exact_argv, revoked, command_transaction, _, _ = _validate_preparation_command_v1(
+        store, lease, command, argv
+    )
+    _consume_capability(store, "preparation-lease-successors", lease, command_transaction)
+    _consume_capability(store, "preparation-command-intents", command, command_transaction)
+    mutation_payload = {
+        "repositoryLocatorSha256": store.repository_digest,
+        "mutationClass": "preparation",
+        "mutationNonce": command_transaction.removeprefix("sha256:"),
+        "argv": list(exact_argv),
+        "argvSha256": sha256(canonical_bytes(list(exact_argv))),
+        "expiresAtUnix": lease.payload["expiresAtUnix"],
+        "preparationLeaseRecordSha256": lease.record_sha256,
+        "preparationCommandIntentRecordSha256": command.record_sha256,
+        "revokedAuthorityRecordSha256": revoked.record_sha256,
+        "transactionIntentSha256": command_transaction,
+        **_preparation_sequence_fields(lease.payload),
+    }
+    return _signed_record(
+        store,
+        "BeadsMutationIntentV1",
+        "beads-mutation-intent",
+        mutation_payload,
+        "mutation-intents",
+    )
+
+
 def advance_beads_preparation_v1(request: AdvanceBeadsPreparationRequestV1) -> BeadsPreparationStepV1:
     payload = _request(request, "AdvanceBeadsPreparationRequestV1")
     _required(payload, "leaseRecordSha256", "commandOrdinal", "commandKind", "argv")
@@ -2994,6 +3400,12 @@ def advance_beads_preparation_v1(request: AdvanceBeadsPreparationRequestV1) -> B
                 store, "BeadsPreparationCommandIntentV1", "beads-preparation-command-intent",
                 "preparation-commands", sha256(canonical_bytes({"kind": "beads-preparation-command-intent", "schemaVersion": 1, **command_payload})),
             )
+            if not _capability_consumed_by(
+                store, "preparation-command-intents", command, intent_digest
+            ):
+                raise BeadsProtectedRuntimeError(
+                    "preparation lease was consumed without its canonical command consumption"
+                )
             uncertain = _signed_record(
                 store,
                 "BeadsPreparationStepV1",
@@ -3012,26 +3424,19 @@ def advance_beads_preparation_v1(request: AdvanceBeadsPreparationRequestV1) -> B
             _transaction_receipt(store, directory, "advance-beads-preparation", uncertain)
             return uncertain
         command = _signed_record(store, "BeadsPreparationCommandIntentV1", "beads-preparation-command-intent", command_payload, "preparation-commands")
-        _consume_capability(store, "preparation-lease-successors", lease, intent_digest)
-        mutation_intent = _signed_record(
-            store,
-            "BeadsMutationIntentV1",
-            "beads-mutation-intent",
-            {
-                "repositoryLocatorSha256": store.repository_digest,
-                "mutationClass": "preparation",
-                "mutationNonce": intent_digest.removeprefix("sha256:"),
-                "argv": list(exact_argv),
-                "argvSha256": sha256(canonical_bytes(list(exact_argv))),
-                "expiresAtUnix": lease.payload["expiresAtUnix"],
-                "preparationLeaseRecordSha256": lease.record_sha256,
-                "preparationCommandIntentRecordSha256": command.record_sha256,
-                "transactionIntentSha256": intent_digest,
-                **_preparation_sequence_fields(lease.payload),
-            },
-            "mutation-intents",
+        mutation_intent = _consume_preparation_command_v1(
+            store, lease, command, exact_argv
         )
         _fault("preparation-command-intent-written")
+        _expiry(lease.payload)
+        if not _capability_consumed_by(
+            store, "preparation-lease-successors", lease, intent_digest
+        ) or not _capability_consumed_by(
+            store, "preparation-command-intents", command, intent_digest
+        ):
+            raise BeadsProtectedRuntimeError(
+                "preparation command is not backed by the complete one-use sequence"
+            )
         _require_current_authority_record(
             store, lease.payload.get("revokedAuthorityRecordSha256"), "revoked"
         )
@@ -3317,12 +3722,28 @@ def _install_and_cleanup_create(
         },
         "preparation-install-intents",
     )
-    stage_locator = _observe_path_locator(stage, "create stage database path")
     install_locator = _observe_path_locator(install, "create install path")
-    if stage_locator.get("present") is True and install_locator.get("present") is False:
-        current_stage_tree = _observe_directory_tree(stage, "create stage database before install")
-        if canonical_bytes(current_stage_tree) != canonical_bytes(expected_stage_tree):
-            raise BeadsProtectedRuntimeError("create stage tree changed after protected post observation")
+    expected_source_identity = expected_stage_tree.get("rootIdentity")
+    if not isinstance(expected_source_identity, Mapping):
+        raise BeadsProtectedRuntimeError("create installation lacks an identity-bound stage root")
+    quarantine = install.parent / _install_quarantine_leaf(install.name, expected_source_identity)
+    quarantine_locator = _observe_path_locator(quarantine, "create install quarantine")
+    stage_locator = (
+        {"present": False}
+        if install_locator.get("present") is True
+        else _observe_path_locator(stage, "create stage database path")
+    )
+    if (
+        install_locator.get("present") is False
+        and (
+            stage_locator.get("present") is True
+            or quarantine_locator.get("present") is True
+        )
+    ):
+        if stage_locator.get("present") is True:
+            current_stage_tree = _observe_directory_tree(stage, "create stage database before install")
+            if canonical_bytes(current_stage_tree) != canonical_bytes(expected_stage_tree):
+                raise BeadsProtectedRuntimeError("create stage tree changed after protected post observation")
         source_parent, source_leaf = _open_absolute_parent(stage, "create stage database")
         target_parent, target_leaf = _open_absolute_parent(install, "create install database")
         try:
@@ -3343,7 +3764,7 @@ def _install_and_cleanup_create(
                 source_leaf,
                 target_parent,
                 target_leaf,
-                expected_source_identity=stage_locator.get("identity"),
+                expected_source_identity=expected_source_identity,
             )
             os.fsync(source_parent)
             os.fsync(target_parent)
@@ -3389,41 +3810,59 @@ def _install_and_cleanup_create(
         "preparation-cleanup-intents",
     )
     cleanup_locator = _observe_path_locator(cleanup, "create cleanup scaffold")
+    expected_entries = lease.payload.get("cleanupTreeObservationA", {}).get("entries", ())
+    expected_entry = expected_entries[0] if len(expected_entries) == 1 else None
+    expected_cleanup_identity = lease.payload.get("cleanupObservationA", {}).get("identity")
+    if not isinstance(expected_entry, Mapping) or not isinstance(expected_cleanup_identity, Mapping):
+        raise BeadsProtectedRuntimeError("cleanup lacks signed file/root identity evidence")
+    file_quarantine_leaf = _cleanup_quarantine_leaf(
+        "file",
+        {
+            **{
+                key: expected_entry.get(key)
+                for key in ("device", "inode", "owner", "mode", "linkCount", "size")
+            },
+            "bytesSha256": expected_entry.get("bytesSha256"),
+        },
+    )
     if cleanup_locator.get("present") is True:
         descriptor, _ = _open_absolute_directory(cleanup, "create cleanup scaffold", private=True)
         try:
             entries = sorted(entry.name for entry in os.scandir(descriptor))
-            if entries != [".gitignore"]:
+            if entries not in ([".gitignore"], [file_quarantine_leaf], []):
                 raise BeadsProtectedRuntimeError("cleanup scaffold contains an unbound entry after install")
-            metadata = os.stat(".gitignore", dir_fd=descriptor, follow_symlinks=False)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise BeadsProtectedRuntimeError("cleanup .gitignore changed type")
-            expected_entries = lease.payload.get("cleanupTreeObservationA", {}).get("entries", ())
-            expected_entry = expected_entries[0] if len(expected_entries) == 1 else None
-            observed_digest = _hash_regular_at(descriptor, ".gitignore", metadata, "cleanup .gitignore")
-            if not isinstance(expected_entry, Mapping) or observed_digest != expected_entry.get("bytesSha256"):
-                raise BeadsProtectedRuntimeError("cleanup .gitignore changed after authorization")
+            expected_cleanup_stable = {
+                key: expected_cleanup_identity.get(key)
+                for key in ("device", "inode", "owner", "mode")
+            }
+            if canonical_bytes(_ancestry_identity(os.fstat(descriptor))) != canonical_bytes(
+                expected_cleanup_stable
+            ):
+                raise BeadsProtectedRuntimeError("cleanup root identity changed after authorization")
             _require_current_authority_record(
                 store, lease.payload.get("revokedAuthorityRecordSha256"), "revoked"
             )
             _verify_current_preparation_core_bindings(store, lease.payload)
-            os.unlink(".gitignore", dir_fd=descriptor)
-            os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        cleanup_parent, cleanup_leaf = _open_absolute_parent(cleanup, "create cleanup scaffold")
-        try:
-            _require_current_authority_record(
-                store, lease.payload.get("revokedAuthorityRecordSha256"), "revoked"
-            )
-            _verify_current_preparation_core_bindings(store, lease.payload)
-            os.rmdir(cleanup_leaf, dir_fd=cleanup_parent)
-            os.fsync(cleanup_parent)
-        finally:
-            os.close(cleanup_parent)
-        _fault("preparation-cleanup-removed")
     elif cleanup_locator.get("present") is not False:
         raise BeadsProtectedRuntimeError("cleanup scaffold recovery state is ambiguous")
+    cleanup_parent, cleanup_leaf = _open_absolute_parent(cleanup, "create cleanup scaffold")
+    try:
+        _require_current_authority_record(
+            store, lease.payload.get("revokedAuthorityRecordSha256"), "revoked"
+        )
+        _verify_current_preparation_core_bindings(store, lease.payload)
+        _remove_identity_bound_directory(
+            cleanup_parent,
+            cleanup_leaf,
+            expected_cleanup_identity,
+            "create cleanup scaffold",
+            expected_file_entry=expected_entry,
+        )
+    finally:
+        os.close(cleanup_parent)
+    _fault("preparation-cleanup-removed")
     if _observe_path_locator(cleanup, "create cleanup scaffold").get("present") is not False:
         raise BeadsProtectedRuntimeError("cleanup scaffold remains after protected cleanup")
     cleanup_observed = _signed_record(
@@ -3494,15 +3933,34 @@ def finish_beads_preparation_v1(request: FinishBeadsPreparationRequestV1) -> Fin
             )
         if resumed_pointer is not None:
             return _finish_preparation_projection(store, resumed_pointer)
-        recovering_create_install = (
-            lease.payload.get("preparationMode") == "create"
-            and _observe_path_locator(
-                Path(str(lease.payload.get("createStageDatabasePath"))), "create stage database path"
-            ).get("present") is False
-            and _observe_path_locator(
-                Path(str(lease.payload.get("installPath"))), "create install path"
-            ).get("present") is True
-        )
+        pre = _load_record(store, "BeadsStoreObservationV1", "beads-store-observation", "store-observations", payload["preObservationRecordSha256"])
+        post = _load_record(store, "BeadsStoreObservationV1", "beads-store-observation", "store-observations", payload["postObservationRecordSha256"])
+        expected_stage_identity = post.payload.get("stateProjection", {}).get(
+            "primaryStore", {}
+        ).get("rootIdentity")
+        recovering_create_install = False
+        if lease.payload.get("preparationMode") == "create":
+            install_path = Path(str(lease.payload.get("installPath")))
+            install_quarantine = (
+                install_path.parent
+                / _install_quarantine_leaf(install_path.name, expected_stage_identity)
+                if isinstance(expected_stage_identity, Mapping)
+                else install_path.parent / ".invalid-install-quarantine"
+            )
+            install_now = _observe_path_locator(install_path, "create install path")
+            install_quarantine_now = _observe_path_locator(
+                install_quarantine, "create install quarantine"
+            )
+            recovering_create_install = (
+                install_now.get("present") is True
+                or (
+                    install_quarantine_now.get("present") is True
+                    and _observe_path_locator(
+                        Path(str(lease.payload.get("createStageDatabasePath"))),
+                        "create stage database path",
+                    ).get("present") is False
+                )
+            )
         if recovering_create_install:
             _observe_executable(
                 Path(str(lease.payload.get("executablePath"))),
@@ -3510,8 +3968,6 @@ def finish_beads_preparation_v1(request: FinishBeadsPreparationRequestV1) -> Fin
             )
         else:
             _revalidate_preparation_physical(lease)
-        pre = _load_record(store, "BeadsStoreObservationV1", "beads-store-observation", "store-observations", payload["preObservationRecordSha256"])
-        post = _load_record(store, "BeadsStoreObservationV1", "beads-store-observation", "store-observations", payload["postObservationRecordSha256"])
         with use_beads_protected_runtime_v1(str(payload["protectedRoot"]), str(payload["hmacKeyPath"])):
             dynamic = derive_beads_status_profile_dynamic_bindings_v1(
                 lease,
@@ -3618,15 +4074,13 @@ def finish_beads_preparation_v1(request: FinishBeadsPreparationRequestV1) -> Fin
             "preparation-activation-receipts",
         )
         _transaction_receipt(store, directory, "finish-beads-preparation", pointer)
-        result_body = {
-            **_plain(prepared_record.payload),
-            "resultStoredJournalHeadSha256": result_stored_journal_head,
-            "pointerRecordSha256": pointer.record_sha256,
-            "currentPointerFullBytesSha256": pointer.full_bytes_sha256,
-            "activationReceiptRecordSha256": activation.record_sha256,
-        }
+        # The accepted finish result is the immutable authenticated result
+        # record itself.  Pointer and activation evidence are deliberately
+        # available only through the registered current/historical verifier
+        # types; never graft fields onto an already authenticated envelope.
+        _ = activation
         return FinishBeadsPreparationResultV1(
-            payload=result_body,
+            payload=_plain(prepared_record.payload),
             auth=prepared_record.auth,
             record_sha256=prepared_record.record_sha256,
             full_bytes_sha256=prepared_record.full_bytes_sha256,
@@ -3654,18 +4108,9 @@ def _finish_preparation_projection(store: _Store, pointer: _WireRecord) -> Finis
         "cleanupObservedRecordSha256": result.payload.get("cleanupObservedRecordSha256"),
         **_preparation_sequence_fields(pointer.payload),
     }
-    _, _, activation_digest, _ = store.sign(
-        "beads-preparation-activation-receipt", expected_activation_payload
-    )
     _verify_preparation_pointer(store, pointer, historical=True)
     return FinishBeadsPreparationResultV1(
-        payload={
-            **_plain(result.payload),
-            "resultStoredJournalHeadSha256": pointer.payload.get("resultStoredJournalHeadSha256"),
-            "pointerRecordSha256": pointer.record_sha256,
-            "currentPointerFullBytesSha256": pointer.full_bytes_sha256,
-            "activationReceiptRecordSha256": activation_digest,
-        },
+        payload=_plain(result.payload),
         auth=result.auth,
         record_sha256=result.record_sha256,
         full_bytes_sha256=result.full_bytes_sha256,
@@ -3744,9 +4189,33 @@ def verify_current_beads_preparation_v1(repository_locator_sha256: str) -> Verif
     with store.locked():
         pointer = _load_current(store, "BeadsPreparationCurrentV1", "beads-preparation-current", "preparation-current")
         verified = _verify_preparation_pointer(store, pointer, historical=False)
-        authority = _current_authority(store, require_active=True)
-        if authority.payload.get("preparationPointerRecordSha256") != pointer.record_sha256:
-            raise BeadsProtectedRuntimeError("active authority does not join the current preparation pointer")
+        authority = _current_authority(store, require_active=False)
+        if authority.payload.get("authorityState") == "active":
+            if authority.payload.get("preparationPointerRecordSha256") != pointer.record_sha256:
+                raise BeadsProtectedRuntimeError("active authority does not join the current preparation pointer")
+        elif authority.payload.get("authorityState") == "revoked":
+            result = _load_record(
+                store,
+                "FinishBeadsPreparationResultV1",
+                "beads-preparation-result",
+                "preparation-results",
+                str(pointer.payload.get("resultRecordSha256")),
+            )
+            lease = _load_record(
+                store,
+                "BeadsPreparationLeaseV1",
+                "beads-preparation-lease",
+                "preparation-leases",
+                str(result.payload.get("leaseRecordSha256")),
+            )
+            if lease.payload.get("revokedAuthorityRecordSha256") != authority.record_sha256:
+                raise BeadsStaleAuthorityError(
+                    "current preparation was not finished under the current revoked authority"
+                )
+        else:
+            raise BeadsStaleAuthorityError(
+                "current preparation verification requires its revoked source or active successor authority"
+            )
         return verified
 
 

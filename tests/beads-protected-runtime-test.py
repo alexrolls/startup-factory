@@ -445,7 +445,14 @@ exit 64
                 preparedStorePayloadCanonicalJson='{"database":"sf","schemaVersion":1}',
                 expectedCurrentPointerFullBytesSha256=None,
         )
+        with runtime._inject_fault("preparation-install-quarantined"), self.assertRaises(SystemExit):
+            runtime.finish_beads_preparation_v1(finish_request)
+        self.assertFalse(install_path.exists())
         with runtime._inject_fault("preparation-install-renamed"), self.assertRaises(SystemExit):
+            runtime.finish_beads_preparation_v1(finish_request)
+        with runtime._inject_fault("preparation-cleanup-file-quarantined"), self.assertRaises(SystemExit):
+            runtime.finish_beads_preparation_v1(finish_request)
+        with runtime._inject_fault("preparation-cleanup-directory-quarantined"), self.assertRaises(SystemExit):
             runtime.finish_beads_preparation_v1(finish_request)
         finished = runtime.finish_beads_preparation_v1(finish_request)
         self.assertTrue((install_path / ".dolt").is_dir())
@@ -456,9 +463,11 @@ exit 64
             "cleanupIntentRecordSha256", "cleanupObservedRecordSha256",
         ):
             self.assertRegex(finished.payload[field], r"^sha256:[0-9a-f]{64}$")
+        with runtime.use_beads_protected_runtime_v1(str(self.root), str(self.key)):
+            finished_verification = runtime.verify_current_beads_preparation_v1(self.repository)
         candidate = {
-            "preparationPointerRecordSha256": finished.payload["pointerRecordSha256"],
-            "preparationActivationReceiptRecordSha256": finished.payload["activationReceiptRecordSha256"],
+            "preparationPointerRecordSha256": finished_verification.payload["pointerRecordSha256"],
+            "preparationActivationReceiptRecordSha256": finished_verification.payload["activationReceiptRecordSha256"],
             "adapterReleaseManifestRecordSha256": release_manifest.record_sha256,
             "runtimeApiManifestRecordSha256": runtime_manifest.record_sha256,
             "repositoryPath": str(repository_path),
@@ -480,7 +489,10 @@ exit 64
             verified = runtime.verify_active_beads_authority_v1(self.repository)
             self.assertEqual(active.record_sha256, verified.record_sha256)
             current_preparation = runtime.verify_current_beads_preparation_v1(self.repository)
-            self.assertEqual(finished.payload["pointerRecordSha256"], current_preparation.payload["pointerRecordSha256"])
+            self.assertEqual(
+                finished_verification.payload["pointerRecordSha256"],
+                current_preparation.payload["pointerRecordSha256"],
+            )
         claim = runtime.prepare_atomic_claim_v1(
             self.request(
                 "PrepareAtomicClaimRequestV1",

@@ -132,6 +132,21 @@ append-only records for operator inspection. These Python and same-UID file
 controls are governance evidence inside the external runner boundary; they are
 not themselves an operating-system security boundary.
 
+Preparation execution and the public preparation-mutation API consume the same
+command intent and lease successor. Expiry, current revoked authority, current
+runtime/release/core manifests, literal argv, physical observations, and the
+contiguous command ordinal are rechecked before execution. Create installation
+first moves the candidate to a deterministic transaction quarantine, reopens
+and verifies its signed identity/tree, and only then publishes it with an
+exclusive rename; a mismatched candidate is preserved in quarantine and never
+appears at the authorized target. Cleanup similarly quarantines the signed root
+before unlink/rmdir, so crash recovery or a mismatch preserves evidence. These
+quarantines are recovery mechanisms within the governed broker transaction,
+not a same-UID operating-system boundary. `FinishBeadsPreparationResultV1`
+returns only its unchanged HMAC-authenticated result envelope; pointer and
+activation evidence is obtained through the registered current or historical
+verification result types.
+
 After apply, `startup-factory runtime-kit ... --probe --json` creates a
 disposable standalone clone and executes fixed positive and negative controls
 through the configured runner. It records worktree write/commit observations

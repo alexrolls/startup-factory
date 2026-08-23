@@ -253,6 +253,84 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         )
         return store, pointer, activation
 
+    def create_authorized_create_lease(self, suffix: str):
+        revoked = self.seed_authority("revoked")
+        core, runtime_manifest, release_manifest = self.seed_current_manifests()
+        repository = self.base / f"repository-{suffix}"
+        repository.mkdir(mode=0o700)
+        install = repository / ".beads" / "embeddeddolt" / "db"
+        install.parent.mkdir(parents=True, mode=0o700)
+        (repository / ".beads").chmod(0o700)
+        install.parent.chmod(0o700)
+        cleanup = self.base / f"cleanup-{suffix}"
+        cleanup.mkdir(mode=0o700)
+        (cleanup / ".gitignore").write_bytes(b"*\n")
+        (cleanup / ".gitignore").chmod(0o600)
+        stage = cleanup / "db"
+        executable = self.base / f"bd-{suffix}"
+        executable_bytes = b"#!/bin/sh\nexit 0\n"
+        executable.write_bytes(executable_bytes)
+        executable.chmod(0o700)
+        sequence = self.sequence()
+        sequence["createStageDatabasePathLocatorSha256"] = runtime.sha256(
+            runtime.canonical_bytes(
+                runtime._observe_path_locator(stage, f"{suffix} stage")
+            )
+        )
+        authorization = runtime.authorize_beads_preparation_v1(
+            self.request(
+                "AuthorizeBeadsPreparationRequestV1",
+                planSha256=digest(f"plan:{suffix}"),
+                executableSha256=runtime.sha256(executable_bytes),
+                operatorIdentitySha256=digest(f"operator:{suffix}"),
+                authorizationNonce=f"authorization-{suffix}",
+                expiresAtUnix=self.expires,
+                runtimeApiManifestRecordSha256=runtime_manifest.record_sha256,
+                adapterReleaseManifestRecordSha256=release_manifest.record_sha256,
+                bootstrapRuntimeCoreSha256=core.payload["bootstrapRuntimeCoreSha256"],
+                adapterReleaseCoreSha256=core.payload["adapterReleaseCoreSha256"],
+                createStageDatabasePath=str(stage),
+                executablePath=str(executable),
+                repositoryPath=str(repository),
+                databaseName="db",
+                installPath=str(install),
+                cleanupPath=str(cleanup),
+                statusConfigValue="open,closed",
+                **sequence,
+            )
+        )
+        lease = runtime.begin_beads_preparation_v1(
+            self.request(
+                "BeginBeadsPreparationRequestV1",
+                authorizationRecordSha256=authorization.record_sha256,
+                leaseNonce=f"lease-{suffix}",
+                expiresAtUnix=self.expires,
+            )
+        )
+        argv = [str(executable), "version", "--json"]
+        self.assertEqual(revoked.record_sha256, lease.payload["revokedAuthorityRecordSha256"])
+        return lease, argv
+
+    def sign_preparation_command(self, lease, argv, suffix: str):
+        transaction = digest(f"command-transaction:{suffix}")
+        command = runtime._signed_record(
+            self.store(),
+            "BeadsPreparationCommandIntentV1",
+            "beads-preparation-command-intent",
+            {
+                "repositoryLocatorSha256": self.repository,
+                "leaseRecordSha256": lease.record_sha256,
+                "commandOrdinal": lease.payload["nextCommandOrdinal"],
+                "commandKind": "binary-proof",
+                "argv": argv,
+                "argvSha256": runtime.sha256(runtime.canonical_bytes(argv)),
+                "transactionIntentSha256": transaction,
+                **runtime._preparation_sequence_fields(lease.payload),
+            },
+            "preparation-commands",
+        )
+        return command, transaction
+
     def test_activation_receipt_requires_deterministic_filename_and_journal(self) -> None:
         store, pointer, activation = self.seed_preparation_pointer("rename")
         history = store.directory("preparation-activation-receipts", "history")
@@ -411,6 +489,145 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         with self.assertRaises((runtime.BeadsCapabilityConsumedError, runtime.BeadsStaleAuthorityError)):
             runtime.finish_beads_mutation_v1(self.request("FinishBeadsMutationRequestV1", **finish))
         self.assertEqual("active", active.payload["authorityState"])
+
+    def test_preparation_execution_and_public_mutation_share_one_consumption_path(self) -> None:
+        lease, argv = self.create_authorized_create_lease("canonical-consumption")
+        step = runtime.advance_beads_preparation_v1(
+            self.request(
+                "AdvanceBeadsPreparationRequestV1",
+                leaseRecordSha256=lease.record_sha256,
+                commandOrdinal=0,
+                commandKind="binary-proof",
+                argv=argv,
+            )
+        )
+        command = runtime._load_record(
+            self.store(),
+            "BeadsPreparationCommandIntentV1",
+            "beads-preparation-command-intent",
+            "preparation-commands",
+            step.payload["commandIntentRecordSha256"],
+        )
+        transaction = command.payload["transactionIntentSha256"]
+        store = self.store()
+        self.assertTrue(
+            runtime._capability_consumed_by(
+                store, "preparation-lease-successors", lease, transaction
+            )
+        )
+        self.assertTrue(
+            runtime._capability_consumed_by(
+                store, "preparation-command-intents", command, transaction
+            )
+        )
+        before = sorted(
+            path.name for path in store.directory("mutation-intents", "history").iterdir()
+        )
+        replay = runtime.begin_beads_mutation_v1(
+            self.request(
+                "BeginBeadsMutationRequestV1",
+                mutationClass="preparation",
+                mutationNonce=transaction.removeprefix("sha256:"),
+                commandArgv=argv,
+                expiresAtUnix=lease.payload["expiresAtUnix"],
+                preparationLeaseRecordSha256=lease.record_sha256,
+                preparationCommandIntentRecordSha256=command.record_sha256,
+            )
+        )
+        self.assertEqual(step.payload["mutationIntentRecordSha256"], replay.record_sha256)
+        self.assertEqual(
+            before,
+            sorted(path.name for path in store.directory("mutation-intents", "history").iterdir()),
+        )
+
+        self.repository = digest("expired-preparation-command")
+        expired_lease, expired_argv = self.create_authorized_create_lease("expired-command")
+        expired_store = self.store()
+        expired_payload = {
+            key: value
+            for key, value in expired_lease.payload.items()
+            if key not in {"kind", "schemaVersion"}
+        }
+        expired_payload["expiresAtUnix"] = int(time.time()) - 1
+        expired = runtime._signed_record(
+            expired_store,
+            "BeadsPreparationLeaseV1",
+            "beads-preparation-lease",
+            expired_payload,
+            "preparation-leases",
+        )
+        expired_command, expired_transaction = self.sign_preparation_command(
+            expired, expired_argv, "expired"
+        )
+        expired_transactions = expired_store.repository / "transactions"
+        expired_before = sorted(
+            str(path.relative_to(expired_transactions))
+            for path in expired_transactions.rglob("intent.json")
+        ) if expired_transactions.exists() else []
+        with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "expired|expiry"):
+            runtime.begin_beads_mutation_v1(
+                self.request(
+                    "BeginBeadsMutationRequestV1",
+                    mutationClass="preparation",
+                    mutationNonce=expired_transaction.removeprefix("sha256:"),
+                    commandArgv=expired_argv,
+                    expiresAtUnix=expired.payload["expiresAtUnix"],
+                    preparationLeaseRecordSha256=expired.record_sha256,
+                    preparationCommandIntentRecordSha256=expired_command.record_sha256,
+                )
+            )
+        expired_after = sorted(
+            str(path.relative_to(expired_transactions))
+            for path in expired_transactions.rglob("intent.json")
+        ) if expired_transactions.exists() else []
+        self.assertEqual(expired_before, expired_after)
+        self.assertFalse(
+            runtime._capability_consumed_by(
+                expired_store,
+                "preparation-command-intents",
+                expired_command,
+                expired_transaction,
+            )
+        )
+
+        self.repository = digest("stale-core-preparation-command")
+        stale_lease, stale_argv = self.create_authorized_create_lease("stale-core-command")
+        stale_store = self.store()
+        stale_command, stale_transaction = self.sign_preparation_command(
+            stale_lease, stale_argv, "stale-core"
+        )
+        current_runtime = stale_store.directory("runtime-api-manifests") / "current.json"
+        current_runtime.rename(current_runtime.with_suffix(".saved"))
+        stale_transactions = stale_store.repository / "transactions"
+        stale_before = sorted(
+            str(path.relative_to(stale_transactions))
+            for path in stale_transactions.rglob("intent.json")
+        ) if stale_transactions.exists() else []
+        with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "current|core"):
+            runtime.begin_beads_mutation_v1(
+                self.request(
+                    "BeginBeadsMutationRequestV1",
+                    mutationClass="preparation",
+                    mutationNonce=stale_transaction.removeprefix("sha256:"),
+                    commandArgv=stale_argv,
+                    expiresAtUnix=stale_lease.payload["expiresAtUnix"],
+                    preparationLeaseRecordSha256=stale_lease.record_sha256,
+                    preparationCommandIntentRecordSha256=stale_command.record_sha256,
+                )
+            )
+        stale_after = sorted(
+            str(path.relative_to(stale_transactions))
+            for path in stale_transactions.rglob("intent.json")
+        ) if stale_transactions.exists() else []
+        self.assertEqual(stale_before, stale_after)
+        self.assertFalse(
+            runtime._capability_consumed_by(
+                stale_store,
+                "preparation-command-intents",
+                stale_command,
+                stale_transaction,
+            )
+        )
 
     def test_create_argv_and_wire_shapes_are_closed_before_spawn(self) -> None:
         lease = runtime.BeadsPreparationLeaseV1(
@@ -803,7 +1020,7 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     runtime.BeadsProtectedRuntimeError,
-                    "immediately before atomic rename",
+                    "quarantine|identity",
                 ):
                     runtime._rename_directory_noreplace(
                         source_fd,
@@ -816,7 +1033,184 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
             os.close(source_fd)
             os.close(target_fd)
         self.assertFalse(target.exists())
-        self.assertTrue(source.exists())
+        self.assertTrue(raced_saved.exists())
+        quarantine = target_parent / runtime._install_quarantine_leaf(
+            target_leaf, expected
+        )
+        self.assertTrue(quarantine.exists())
+
+    def test_native_rename_swap_never_exposes_replacement_at_authorized_target(self) -> None:
+        source_parent = self.base / "native-source-parent"
+        target_parent = self.base / "native-target-parent"
+        source_parent.mkdir(mode=0o700)
+        target_parent.mkdir(mode=0o700)
+        source = source_parent / "database"
+        replacement = source_parent / "replacement"
+        target = target_parent / "database"
+        source.mkdir(mode=0o700)
+        replacement.mkdir(mode=0o700)
+        (source / "approved").write_bytes(b"approved")
+        (replacement / "unauthorized").write_bytes(b"unauthorized")
+        expected = runtime._directory_identity(source.lstat())
+        source_fd, source_leaf = runtime._open_absolute_parent(source, "native source")
+        target_fd, target_leaf = runtime._open_absolute_parent(target, "native target")
+        saved = source_parent / "saved-approved"
+        invoked = False
+
+        def swap_at_native_boundary(phase, _source_parent, source_name, _target_parent, _target_name):
+            nonlocal invoked
+            if phase == "install-source-to-quarantine" and not invoked:
+                invoked = True
+                source.rename(saved)
+                replacement.rename(source)
+
+        try:
+            with mock.patch.object(runtime, "_NATIVE_MUTATION_HOOK", swap_at_native_boundary):
+                with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "quarantine|identity"):
+                    runtime._rename_directory_noreplace(
+                        source_fd,
+                        source_leaf,
+                        target_fd,
+                        target_leaf,
+                        expected_source_identity=expected,
+                    )
+        finally:
+            os.close(source_fd)
+            os.close(target_fd)
+        self.assertTrue(invoked)
+        self.assertFalse(target.exists())
+        self.assertFalse((target / "unauthorized").exists())
+
+    def test_cleanup_unlink_and_rmdir_swaps_preserve_quarantined_evidence(self) -> None:
+        cleanup = self.base / "cleanup-file-boundary"
+        cleanup.mkdir(mode=0o700)
+        cleanup_file = cleanup / ".gitignore"
+        cleanup_file.write_bytes(b"*\n")
+        cleanup_file.chmod(0o600)
+        file_metadata = cleanup_file.lstat()
+        expected_entry = {
+            **runtime._regular_file_identity(file_metadata),
+            "bytesSha256": runtime.sha256(b"*\n"),
+        }
+        replacement = cleanup / "replacement"
+        replacement.write_bytes(b"unauthorized")
+        replacement.chmod(0o600)
+        saved = cleanup / "saved-approved"
+        parent = os.open(
+            cleanup,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        file_hook_ran = False
+
+        def swap_before_cleanup_mutation(phase, parent_fd, source_name, _target_fd, _target_name):
+            nonlocal file_hook_ran
+            if phase == "cleanup-file-unlink" and not file_hook_ran:
+                file_hook_ran = True
+                os.rename(source_name, "saved-approved", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                os.rename("replacement", source_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+
+        try:
+            with mock.patch.object(runtime, "_NATIVE_MUTATION_HOOK", swap_before_cleanup_mutation):
+                with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "identity"):
+                    runtime._remove_identity_bound_file(
+                        parent, ".gitignore", expected_entry, "bound cleanup file"
+                    )
+        finally:
+            os.close(parent)
+        self.assertTrue(file_hook_ran)
+        self.assertTrue(saved.exists())
+        self.assertTrue(
+            any(path.name.startswith(".startup-factory-cleanup-file-") for path in cleanup.iterdir())
+        )
+
+        parent_path = self.base / "cleanup-directory-parent"
+        parent_path.mkdir(mode=0o700)
+        root = parent_path / "root"
+        replacement_root = parent_path / "replacement-root"
+        saved_root = parent_path / "saved-root"
+        root.mkdir(mode=0o700)
+        replacement_root.mkdir(mode=0o700)
+        expected_root = runtime._directory_identity(root.lstat())
+        parent = os.open(
+            parent_path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        directory_hook_ran = False
+
+        def swap_before_rmdir(phase, parent_fd, source_name, _target_fd, _target_name):
+            nonlocal directory_hook_ran
+            if phase == "cleanup-directory-rmdir" and not directory_hook_ran:
+                directory_hook_ran = True
+                os.rename(source_name, "saved-root", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                os.rename("replacement-root", source_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+
+        try:
+            with mock.patch.object(runtime, "_NATIVE_MUTATION_HOOK", swap_before_rmdir):
+                with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "identity"):
+                    runtime._remove_identity_bound_directory(
+                        parent, "root", expected_root, "bound cleanup root"
+                    )
+        finally:
+            os.close(parent)
+        self.assertTrue(directory_hook_ran)
+        self.assertTrue(saved_root.exists())
+        self.assertTrue(
+            any(
+                path.name.startswith(".startup-factory-cleanup-directory-")
+                for path in parent_path.iterdir()
+            )
+        )
+
+    def test_open_directory_rebinds_every_final_name_after_traversal(self) -> None:
+        parent = self.base / "traversal-parent"
+        target = parent / "target"
+        replacement = parent / "replacement"
+        saved = parent / "saved-target"
+        parent.mkdir(mode=0o700)
+        target.mkdir(mode=0o700)
+        replacement.mkdir(mode=0o700)
+        real_validate = runtime._validate_directory_metadata
+        switched = False
+
+        def swap_after_open(metadata, label, *, private):
+            nonlocal switched
+            real_validate(metadata, label, private=private)
+            if label == "bound traversal target" and not switched:
+                switched = True
+                target.rename(saved)
+                replacement.rename(target)
+
+        with mock.patch.object(
+            runtime,
+            "_validate_directory_metadata",
+            side_effect=swap_after_open,
+        ):
+            with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "name|identity|changed"):
+                descriptor, _ = runtime._open_absolute_directory(
+                    target, "bound traversal target", private=True
+                )
+                os.close(descriptor)
+        self.assertTrue(switched)
+
+    def test_finish_projection_is_the_unchanged_authenticated_result(self) -> None:
+        store, pointer, _ = self.seed_preparation_pointer("authenticated-finish")
+        returned = runtime._finish_preparation_projection(store, pointer)
+        self.assertEqual(runtime._PREPARATION_TERMINAL, set(returned.payload))
+        body, auth, record_sha, full_sha = store.verify(
+            {"payload": returned.payload, "auth": returned.auth},
+            "beads-preparation-result",
+        )
+        historical = runtime._load_record(
+            store,
+            "FinishBeadsPreparationResultV1",
+            "beads-preparation-result",
+            "preparation-results",
+            returned.record_sha256,
+        )
+        self.assertEqual(historical.payload, body)
+        self.assertEqual(historical.auth, auth)
+        self.assertEqual(historical.record_sha256, record_sha)
+        self.assertEqual(historical.full_bytes_sha256, full_sha)
 
     def test_journal_append_recovers_each_unique_crash_boundary(self) -> None:
         for phase in ("journal-history-written", "journal-index-written", "journal-current-written"):
