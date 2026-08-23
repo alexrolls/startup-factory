@@ -43,6 +43,9 @@ class ProtectedRuntimeTest(unittest.TestCase):
             "repositoryLocatorSha256": self.repository,
             **values,
         }
+        schema = runtime._TYPE_SCHEMAS[name]
+        for field in schema["nullable"]:
+            payload.setdefault(field, None)
         return getattr(runtime, name)(payload=payload)
 
     def sequence(self, mode: str = "create") -> dict:
@@ -59,6 +62,24 @@ class ProtectedRuntimeTest(unittest.TestCase):
             "selectorObservationASha256": None if create else digest("selector-a"),
             "selectedStoreObservationASha256": None if create else digest("store-a"),
         }
+
+    def closed_payload(self, name: str, **values):
+        schema = runtime._TYPE_SCHEMAS[name]
+        payload = {
+            field: (None if field in schema["nullable"] else f"fixture:{field}")
+            for field in schema["fields"]
+        }
+        payload.update(values)
+        return payload
+
+    def store(self):
+        return runtime._Store(
+            {
+                "protectedRoot": str(self.root),
+                "hmacKeyPath": str(self.key),
+                "repositoryLocatorSha256": self.repository,
+            }
+        )
 
     def authorize_transition(self, command: str, expected: str | None, candidate=None, mode="create"):
         return runtime.authorize_beads_authority_transition_v1(
@@ -206,7 +227,7 @@ class ProtectedRuntimeTest(unittest.TestCase):
                 expiresAtUnix=self.expires,
                 expectedCurrentFullBytesSha256=(
                     runtime._load_current(
-                        runtime._Store(self.request("VerifyBeadsProtectedRuntimeApiManifestRequestV1").payload),
+                        self.store(),
                         "BeadsProtectedRuntimeApiManifestV1",
                         "beads-protected-runtime-api-manifest",
                         "runtime-api-manifests",
@@ -263,7 +284,7 @@ class ProtectedRuntimeTest(unittest.TestCase):
 
     def test_hmac_tamper_is_never_repaired_or_accepted(self) -> None:
         self.bootstrap_revoked()
-        store = runtime._Store(self.request("VerifyBeadsProtectedRuntimeApiManifestRequestV1").payload)
+        store = self.store()
         current = store.directory("authority") / "current.json"
         envelope = json.loads(current.read_bytes())
         envelope["payload"]["authorityState"] = "active"
@@ -394,7 +415,7 @@ exit 64
             if command == "status-config-readback":
                 readback_step = step
             lease = runtime._load_record(
-                runtime._Store(self.request("ObserveBeadsStoreRequestV1").payload),
+                self.store(),
                 "BeadsPreparationLeaseV1",
                 "beads-preparation-lease",
                 "preparation-leases",
@@ -526,12 +547,13 @@ exit 64
 
     def test_reattest_argv_gate_rejects_every_variant_before_recording(self) -> None:
         lease = runtime.BeadsPreparationLeaseV1(
-            payload={
-                "preparationMode": "reattest",
-                "installedSelectorPath": "/repo/.beads/embeddeddolt",
-                "executablePath": "/protected/bd",
-                "nextCommandOrdinal": 0,
-            }
+            payload=self.closed_payload(
+                "BeadsPreparationLeaseV1",
+                preparationMode="reattest",
+                installedSelectorPath="/repo/.beads/embeddeddolt",
+                executablePath="/protected/bd",
+                nextCommandOrdinal=0,
+            ),
         )
         exact = ["/protected/bd", "--db", "/repo/.beads/embeddeddolt", "--json", "--sandbox", "config", "list"]
         runtime._expected_preparation_command(lease, "status-config-readback", exact)

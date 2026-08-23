@@ -39,14 +39,16 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def request(self, name: str, **values):
-        return getattr(runtime, name)(
-            payload={
-                "protectedRoot": str(self.root),
-                "hmacKeyPath": str(self.key),
-                "repositoryLocatorSha256": self.repository,
-                **values,
-            }
-        )
+        payload = {
+            "protectedRoot": str(self.root),
+            "hmacKeyPath": str(self.key),
+            "repositoryLocatorSha256": self.repository,
+            **values,
+        }
+        schema = runtime._TYPE_SCHEMAS[name]
+        for field in schema["nullable"]:
+            payload.setdefault(field, None)
+        return getattr(runtime, name)(payload=payload)
 
     def sequence(self) -> dict[str, object]:
         return {
@@ -63,7 +65,101 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         }
 
     def store(self) -> runtime._Store:
-        return runtime._Store(self.request("VerifyBeadsProtectedRuntimeApiManifestRequestV1").payload)
+        return runtime._Store(
+            {
+                "protectedRoot": str(self.root),
+                "hmacKeyPath": str(self.key),
+                "repositoryLocatorSha256": self.repository,
+            }
+        )
+
+    def closed_payload(self, name: str, **values):
+        schema = runtime._TYPE_SCHEMAS[name]
+        payload = {
+            field: (None if field in schema["nullable"] else f"fixture:{field}")
+            for field in schema["fields"]
+        }
+        payload.update(values)
+        return payload
+
+    def seed_current_manifests(self):
+        core_payload = {
+            "bootstrapChangeKind": "create",
+            "adapterChangeKind": "create",
+            "remediationEvidenceSha256": None,
+            "baselineCommit": runtime.BEADS_BASELINE_COMMIT,
+        }
+        bootstrap = runtime.build_beads_bootstrap_runtime_core_v1(
+            runtime.BeadsBootstrapRuntimeCoreInputsV1(payload=core_payload)
+        )
+        adapter = runtime.build_beads_adapter_release_core_v1(
+            runtime.BeadsAdapterReleaseCoreInputsV1(payload=core_payload)
+        )
+        core = runtime.record_beads_change_plan_core_v1(
+            self.request(
+                "RecordBeadsChangePlanCoreRequestV1",
+                bootstrapRuntimeCoreCanonicalJson=bootstrap.decode(),
+                adapterReleaseCoreCanonicalJson=adapter.decode(),
+            )
+        )
+        runtime_capability = runtime.authorize_beads_runtime_api_manifest_record_v1(
+            self.request(
+                "AuthorizeBeadsRuntimeApiManifestRecordRequestV1",
+                mode="revoked-bootstrap",
+                capabilityNonce="hostile-runtime-capability",
+                expiresAtUnix=self.expires,
+                expectedCurrentFullBytesSha256=None,
+                bootstrapRuntimeCoreSha256=core.payload["bootstrapRuntimeCoreSha256"],
+                runtimeTransactionAuthorityBinding={
+                    "kind": "task-3-attempt",
+                    "identitySha256": digest("hostile-task-3"),
+                },
+            )
+        )
+        runtime_manifest = runtime.record_beads_protected_runtime_api_manifest_v1(
+            self.request(
+                "RecordBeadsProtectedRuntimeApiManifestRequestV1",
+                moduleSha256=digest("hostile-module"),
+                schemaFixtureSha256=runtime.sha256(runtime.beads_protected_runtime_schema_v1()),
+                exports=sorted((*runtime._TYPE_NAMES, *runtime._FUNCTION_EXPORTS)),
+                bootstrapRuntimeCoreSha256=core.payload["bootstrapRuntimeCoreSha256"],
+            ),
+            runtime_capability,
+        )
+        release_capability = runtime.authorize_beads_adapter_release_manifest_record_v1(
+            self.request(
+                "AuthorizeBeadsAdapterReleaseManifestRecordRequestV1",
+                capabilityNonce="hostile-release-capability",
+                expiresAtUnix=self.expires,
+                expectedCurrentFullBytesSha256=None,
+                bootstrapRuntimeCoreSha256=core.payload["bootstrapRuntimeCoreSha256"],
+                adapterReleaseCoreSha256=core.payload["adapterReleaseCoreSha256"],
+                runtimeApiManifestRecordSha256=runtime_manifest.record_sha256,
+            )
+        )
+        observation = {
+            "bootstrapRuntimeCoreSha256": core.payload["bootstrapRuntimeCoreSha256"],
+            "adapterReleaseCoreSha256": core.payload["adapterReleaseCoreSha256"],
+            "runtimeApiManifestRecordSha256": runtime_manifest.record_sha256,
+            "adapterPayloadSha256": digest("hostile-adapter-payload"),
+            "remediationEvidenceSha256": None,
+        }
+        release_manifest = runtime.record_beads_adapter_release_manifest_v1(
+            self.request(
+                "RecordBeadsAdapterReleaseManifestRequestV1",
+                bootstrapRuntimeCoreSha256=core.payload["bootstrapRuntimeCoreSha256"],
+                adapterReleaseCoreSha256=core.payload["adapterReleaseCoreSha256"],
+                runtimeApiManifestRecordSha256=runtime_manifest.record_sha256,
+                runtimeManifestObservations=[
+                    {**observation, "phase": phase} for phase in ("A", "B", "C")
+                ],
+                adapterPayloadSha256=observation["adapterPayloadSha256"],
+                releaseIdentitySha256=digest("hostile-release"),
+                remediationEvidenceSha256=None,
+            ),
+            release_capability,
+        )
+        return core, runtime_manifest, release_manifest
 
     def seed_authority(self, state: str, generation: int = 1, predecessor: str | None = None):
         store = self.store()
@@ -80,6 +176,8 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 "preparationPointerRecordSha256": digest(f"pointer:{generation}"),
                 "adapterReleaseManifestRecordSha256": digest(f"release:{generation}"),
                 "runtimeApiManifestRecordSha256": digest(f"runtime:{generation}"),
+                "transitionAuthorizationRecordSha256": digest(f"transition-auth:{generation}"),
+                "transitionIntentSha256": digest(f"transition-intent:{generation}"),
                 **self.sequence(),
             },
             predecessor,
@@ -104,6 +202,7 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 "installObservedRecordSha256": None,
                 "cleanupIntentRecordSha256": None,
                 "cleanupObservedRecordSha256": None,
+                "transactionIntentSha256": digest(f"finish-intent:{suffix}"),
                 **sequence,
             },
             "preparation-results",
@@ -128,6 +227,7 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 "installObservedRecordSha256": None,
                 "cleanupIntentRecordSha256": None,
                 "cleanupObservedRecordSha256": None,
+                "transactionIntentSha256": digest(f"pointer-intent:{suffix}"),
                 **sequence,
             },
             None,
@@ -178,12 +278,16 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         selector = repository_path / ".beads" / "embeddeddolt"
         (selector / "db" / ".dolt").mkdir(parents=True, mode=0o700)
         unsigned = runtime.BeadsAuthorityLocatorV1(
-            payload={
-                "repositoryLocatorSha256": self.repository,
-                "repositoryPath": str(repository_path),
-                "databaseName": "db",
-                "verifiedReceiptRecordSha256": digest("absent-receipt"),
-            }
+            payload=self.closed_payload(
+                "BeadsAuthorityLocatorV1",
+                repositoryLocatorSha256=self.repository,
+                repositoryPath=str(repository_path),
+                databaseName="db",
+                verifiedReceiptRecordSha256=digest("absent-receipt"),
+                authorityStateRecordSha256=digest("absent-authority"),
+                authorityStateFullBytesSha256=digest("absent-authority-full"),
+                predecessorCurrentFullBytesSha256=None,
+            )
         )
         with runtime.use_beads_protected_runtime_v1(str(self.root), str(self.key)):
             with self.assertRaises(runtime.BeadsProtectedRuntimeError):
@@ -224,6 +328,8 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 "preparationPointerRecordSha256": digest("pointer"),
                 "adapterReleaseManifestRecordSha256": digest("release"),
                 "runtimeApiManifestRecordSha256": digest("runtime"),
+                "transitionAuthorizationRecordSha256": digest("transition-auth"),
+                "transitionIntentSha256": digest("transition-intent"),
                 **self.sequence(),
             },
             None,
@@ -308,12 +414,13 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
 
     def test_create_argv_and_wire_shapes_are_closed_before_spawn(self) -> None:
         lease = runtime.BeadsPreparationLeaseV1(
-            payload={
-                "preparationMode": "create",
-                "createStageDatabasePath": str(self.base / "stage"),
-                "executablePath": str(self.base / "bd"),
-                "nextCommandOrdinal": 0,
-            }
+            payload=self.closed_payload(
+                "BeadsPreparationLeaseV1",
+                preparationMode="create",
+                createStageDatabasePath=str(self.base / "stage"),
+                executablePath=str(self.base / "bd"),
+                nextCommandOrdinal=0,
+            )
         )
         with self.assertRaises(runtime.BeadsProtectedRuntimeError):
             runtime._expected_preparation_command(
@@ -362,7 +469,9 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "unique ordered A/B/C"):
             runtime.record_beads_adapter_release_manifest_v1(
                 duplicate,
-                runtime.BeadsAdapterReleaseManifestRecordCapabilityV1(payload={}),
+                runtime.BeadsAdapterReleaseManifestRecordCapabilityV1(
+                    payload=self.closed_payload("BeadsAdapterReleaseManifestRecordCapabilityV1")
+                ),
             )
         malformed = self.request(
             "RecordBeadsAdapterReleaseManifestRequestV1",
@@ -375,7 +484,9 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "observation is malformed"):
             runtime.record_beads_adapter_release_manifest_v1(
                 malformed,
-                runtime.BeadsAdapterReleaseManifestRecordCapabilityV1(payload={}),
+                runtime.BeadsAdapterReleaseManifestRecordCapabilityV1(
+                    payload=self.closed_payload("BeadsAdapterReleaseManifestRecordCapabilityV1")
+                ),
             )
 
     def test_epoch_change_invalidates_claim_chain_before_successor_write(self) -> None:
@@ -453,11 +564,27 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         store = self.store()
         first = runtime._signed_record(
             store, "AtomicClaimReceiptV1", "atomic-claim-receipt",
-            {"repositoryLocatorSha256": self.repository, "revision": "one"}, "claim-receipts",
+            {
+                "repositoryLocatorSha256": self.repository,
+                "leaseRecordSha256": digest("lease-one"),
+                "taskId": "task-one",
+                "revision": "one",
+                "status": "active",
+                "claimIdentitySha256": digest("claim-one"),
+                "activeAuthorityRecordSha256": digest("authority-one"),
+            }, "claim-receipts",
         )
         second = runtime._signed_record(
             store, "AtomicClaimReceiptV1", "atomic-claim-receipt",
-            {"repositoryLocatorSha256": self.repository, "revision": "two"}, "claim-receipts",
+            {
+                "repositoryLocatorSha256": self.repository,
+                "leaseRecordSha256": digest("lease-two"),
+                "taskId": "task-two",
+                "revision": "two",
+                "status": "active",
+                "claimIdentitySha256": digest("claim-two"),
+                "activeAuthorityRecordSha256": digest("authority-two"),
+            }, "claim-receipts",
         )
         first_index = store.read_json(
             store.directory("journals", "by-record")
@@ -533,14 +660,209 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         self.assertTrue((source / "source-marker").exists())
         self.assertTrue((target / "target-marker").exists())
 
+    def test_wrong_preparation_core_has_zero_side_effects(self) -> None:
+        self.seed_authority("revoked")
+        core, runtime_manifest, release_manifest = self.seed_current_manifests()
+        repository = self.base / "wrong-core-repository"
+        install = repository / ".beads" / "embeddeddolt" / "db"
+        install.parent.mkdir(parents=True, mode=0o700)
+        repository.chmod(0o700)
+        (repository / ".beads").chmod(0o700)
+        install.parent.chmod(0o700)
+        cleanup = self.base / "wrong-core-cleanup"
+        cleanup.mkdir(mode=0o700)
+        (cleanup / ".gitignore").write_bytes(b"*\n")
+        (cleanup / ".gitignore").chmod(0o600)
+        stage = cleanup / "db"
+        executable = self.base / "wrong-core-bd"
+        executable_bytes = b"#!/bin/sh\nexit 0\n"
+        executable.write_bytes(executable_bytes)
+        executable.chmod(0o700)
+        sequence = self.sequence()
+        sequence["createStageDatabasePathLocatorSha256"] = runtime.sha256(
+            runtime.canonical_bytes(runtime._observe_path_locator(stage, "wrong-core stage"))
+        )
+        approved = self.store().directory("approved-executables")
+        before = sorted(path.name for path in approved.iterdir())
+        with mock.patch.object(runtime, "_spawn_verified_executable_v1") as spawn:
+            with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "core"):
+                runtime.authorize_beads_preparation_v1(
+                    self.request(
+                        "AuthorizeBeadsPreparationRequestV1",
+                        planSha256=digest("wrong-core-plan"),
+                        executableSha256=runtime.sha256(executable_bytes),
+                        operatorIdentitySha256=digest("wrong-core-operator"),
+                        authorizationNonce="wrong-core-authorization",
+                        expiresAtUnix=self.expires,
+                        runtimeApiManifestRecordSha256=runtime_manifest.record_sha256,
+                        adapterReleaseManifestRecordSha256=release_manifest.record_sha256,
+                        bootstrapRuntimeCoreSha256=digest("wrong-bootstrap-core"),
+                        adapterReleaseCoreSha256=core.payload["adapterReleaseCoreSha256"],
+                        createStageDatabasePath=str(stage),
+                        installedSelectorPath=None,
+                        selectedStorePath=None,
+                        doltRootPath=None,
+                        executablePath=str(executable),
+                        repositoryPath=str(repository),
+                        databaseName="db",
+                        installPath=str(install),
+                        cleanupPath=str(cleanup),
+                        statusConfigValue="open,closed",
+                        sourceAuthorityTransitionReceiptRecordSha256=None,
+                        sourcePreparationPointerRecordSha256=None,
+                        **sequence,
+                    )
+                )
+        self.assertEqual(before, sorted(path.name for path in approved.iterdir()))
+        self.assertFalse(stage.exists())
+        self.assertFalse(install.exists())
+        spawn.assert_not_called()
+
+    def test_regular_hash_binds_lstat_fd_and_final_name(self) -> None:
+        parent_path = self.base / "hash-parent"
+        parent_path.mkdir(mode=0o700)
+        leaf = parent_path / "leaf"
+        leaf.write_bytes(b"approved")
+        leaf.chmod(0o600)
+        replacement = parent_path / "replacement"
+        replacement.write_bytes(b"replacement")
+        replacement.chmod(0o600)
+        metadata = leaf.lstat()
+        parent = os.open(parent_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        real_fstat = runtime.os.fstat
+        calls = 0
+
+        def swap_after_hash(descriptor):
+            nonlocal calls
+            observed = real_fstat(descriptor)
+            calls += 1
+            if calls == 2:
+                saved = parent_path / "saved"
+                leaf.rename(saved)
+                replacement.rename(leaf)
+            return observed
+
+        try:
+            with mock.patch.object(runtime.os, "fstat", side_effect=swap_after_hash):
+                with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "name|identity|changed"):
+                    runtime._hash_regular_at(parent, "leaf", metadata, "swapped file")
+        finally:
+            os.close(parent)
+
+    def test_install_revalidates_authorized_source_identity_inside_rename(self) -> None:
+        source_parent = self.base / "bound-source-parent"
+        target_parent = self.base / "bound-target-parent"
+        source_parent.mkdir(mode=0o700)
+        target_parent.mkdir(mode=0o700)
+        source = source_parent / "database"
+        replacement = source_parent / "replacement"
+        target = target_parent / "database"
+        source.mkdir(mode=0o700)
+        replacement.mkdir(mode=0o700)
+        expected = runtime._directory_identity(source.lstat())
+        source_fd, source_leaf = runtime._open_absolute_parent(source, "source")
+        target_fd, target_leaf = runtime._open_absolute_parent(target, "target")
+        saved = source_parent / "saved"
+        source.rename(saved)
+        replacement.rename(source)
+        try:
+            with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "source.*identity"):
+                runtime._rename_directory_noreplace(
+                    source_fd,
+                    source_leaf,
+                    target_fd,
+                    target_leaf,
+                    expected_source_identity=expected,
+                )
+        finally:
+            os.close(source_fd)
+            os.close(target_fd)
+        self.assertFalse(target.exists())
+        self.assertTrue(source.exists())
+
+        source.rename(replacement)
+        saved.rename(source)
+        raced_replacement = source_parent / "raced-replacement"
+        raced_replacement.mkdir(mode=0o700)
+        raced_saved = source_parent / "raced-saved"
+        expected = runtime._directory_identity(source.lstat())
+        source_fd, source_leaf = runtime._open_absolute_parent(source, "source")
+        target_fd, target_leaf = runtime._open_absolute_parent(target, "target")
+        real_cdll = runtime.ctypes.CDLL
+
+        def swap_while_resolving_rename(*args, **kwargs):
+            source.rename(raced_saved)
+            raced_replacement.rename(source)
+            return real_cdll(*args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                runtime.ctypes,
+                "CDLL",
+                side_effect=swap_while_resolving_rename,
+            ):
+                with self.assertRaisesRegex(
+                    runtime.BeadsProtectedRuntimeError,
+                    "immediately before atomic rename",
+                ):
+                    runtime._rename_directory_noreplace(
+                        source_fd,
+                        source_leaf,
+                        target_fd,
+                        target_leaf,
+                        expected_source_identity=expected,
+                    )
+        finally:
+            os.close(source_fd)
+            os.close(target_fd)
+        self.assertFalse(target.exists())
+        self.assertTrue(source.exists())
+
+    def test_journal_append_recovers_each_unique_crash_boundary(self) -> None:
+        for phase in ("journal-history-written", "journal-index-written", "journal-current-written"):
+            with self.subTest(phase=phase):
+                self.repository = digest(f"journal-crash:{phase}")
+                store = self.store()
+                envelope, _, record_sha, full_sha = store.sign(
+                    "hostile-journal-target",
+                    {"repositoryLocatorSha256": self.repository, "phase": phase},
+                )
+                store.write_immutable(
+                    store.directory("hostile-journal-targets", "history")
+                    / f"{record_sha.removeprefix('sha256:')}.json",
+                    envelope,
+                )
+                with runtime._inject_fault(phase), self.assertRaises(SystemExit):
+                    runtime._journal_record(store, "hostile-journal-target", record_sha, full_sha)
+                runtime._journal_record(store, "hostile-journal-target", record_sha, full_sha)
+                runtime._verify_journal(store, "hostile-journal-target", record_sha, full_sha)
+
     def test_every_registered_type_has_closed_schema_and_cores_roundtrip_exactly(self) -> None:
         schema = json.loads(runtime.beads_protected_runtime_schema_v1())
         self.assertEqual(set(runtime._TYPE_NAMES), set(schema["typeSchemas"]))
         for name in runtime._TYPE_NAMES:
             closure = schema["typeSchemas"][name]
             self.assertEqual({"fields", "nullable", "required"}, set(closure), name)
+            self.assertEqual(set(closure["fields"]), set(closure["required"]), name)
+            self.assertTrue(set(closure["nullable"]) <= set(closure["required"]), name)
             with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "unknown"):
                 getattr(runtime, name)(payload={"unexpectedAuthority": "must-fail"})
+            required = sorted(closure["required"])
+            nullable = set(closure["nullable"])
+            sample = {
+                field: (None if field in nullable else f"fixture:{field}")
+                for field in required
+            }
+            for field in required:
+                missing = dict(sample)
+                missing.pop(field)
+                with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "missing"):
+                    getattr(runtime, name)(payload=missing)
+                if field not in nullable:
+                    invalid_null = dict(sample)
+                    invalid_null[field] = None
+                    with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "non-nullable"):
+                        getattr(runtime, name)(payload=invalid_null)
 
         with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "unknown"):
             runtime.build_beads_bootstrap_runtime_core_v1(
