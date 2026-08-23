@@ -41,7 +41,8 @@ TASK_STRONG_CMD=null             # Optional override for security/schema/concurr
 
 > Mixing LLMs is the design intent — e.g. Claude for team-lead/principal-architect,
 > Codex for the sceptical-architect, Senior Security Engineer, and implementers,
-> Gemini for optional review diversity.
+> Gemini or DeepSeek Harness (`dsh --profile headless "$(cat '{prompt_file}')"`)
+> for optional review diversity.
 > Use a different model family or provider for the two architect roles when
 > possible; role separation without model diversity reduces authority bias but
 > does less to reduce correlated reasoning errors. Same-LLM teams still work.
@@ -167,6 +168,8 @@ is "no new failures", not "all green".
   model CLI requires a home for authentication, configure `AGENT_SANDBOX_HOME`
   as a dedicated external mode-0700 directory containing only its minimum
   reviewed CLI state. Do not point it at the operator's normal home.
+  For DeepSeek Harness, that state is `$DSH_HOME` (`.credentials.yaml`,
+  `settings.yaml`, `profiles/headless/`), which resolves under `HOME` by default.
 - Run `bin/launch-team.sh doctor <preset> <team> <featureId>` after changing a
   role command, CLI login, sandbox runner, allowlist, or dedicated CLI-state
   home. Normal `team` and `gate-team` launches run it automatically after the

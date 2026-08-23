@@ -22,7 +22,7 @@ from .installer import (
 from .readiness import MODES, diagnose, initialize
 
 
-AGENTS = ("codex", "aider", "claude", "claude-code")
+AGENTS = ("codex", "aider", "claude", "claude-code", "deepseek-harness")
 
 
 def _target_arguments(parser: argparse.ArgumentParser) -> None:

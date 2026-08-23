@@ -663,6 +663,7 @@ Choose the project path your agent supports:
 | **Codex** | `.agents/skills/startup-factory` | Native project skill path |
 | **Claude Code** | `.claude/skills/startup-factory` | Native project skill path |
 | **Aider** | `.agents/skills/startup-factory` | Start with `aider --read .agents/skills/startup-factory/SKILL.md` |
+| **DeepSeek Harness** | `.agents/skills/startup-factory` | Reads `AGENTS.md` natively; add a pointer there or paste `SKILL.md` as the task |
 | **Other agents** | Their native project skill directory | Use native discovery or point the agent at `SKILL.md` |
 
 The release package embeds one deterministic bundle built from an exact Git
@@ -807,7 +808,7 @@ installation into a partial one. Its main operator options are:
 
 | Option | Purpose |
 |---|---|
-| `--agent codex\|claude-code\|aider` | Select the native project skill directory. |
+| `--agent codex\|claude-code\|aider\|deepseek-harness` | Select the native project skill directory. |
 | `--project PATH` | Resolve the agent directory relative to another project. |
 | `--install-dir PATH` | Override the mapped installation directory. |
 | `--bundle PATH` | For install/update, use an explicitly supplied local canonical archive. |
@@ -940,6 +941,7 @@ Command templates for common CLIs:
 | Claude Code | `claude -p "$(cat '{prompt_file}')" --permission-mode acceptEdits` |
 | Codex CLI | `codex exec --approve-for-me "$(cat '{prompt_file}')"` |
 | Gemini CLI | `gemini --yolo "$(cat '{prompt_file}')"` |
+| DeepSeek Harness | `dsh --profile headless "$(cat '{prompt_file}')"` |
 | Any file-reading CLI | `yourcli --prompt-file {prompt_file}` |
 
 Direct `claude` commands are detected automatically. If Claude is behind a
@@ -948,6 +950,18 @@ wrapper, mark only that command template so mixed-model teams remain precise:
 ```bash
 FRONTEND_CMD="STARTUP_FACTORY_LLM_RUNTIME=claude /path/to/claude-wrapper {prompt_file}"
 ```
+
+DeepSeek Harness (`dsh`) needs Node.js and a one-time global install —
+`npm install -g @deepseek-ai/dsh` (pin a version; the project is in developer
+preview with breaking changes). Its one-shot mode prints only the final answer
+on stdout and exits non-zero on failure, so `doctor` and task dispatch work
+unchanged. It needs no auto-approve flag: headless sessions run under dsh's own
+`workspace-write` sandbox (writes confined to the working directory). Credentials
+and model defaults live under `$DSH_HOME` (default: under `$HOME`) —
+`.credentials.yaml` / `settings.yaml` — so when `AGENT_SANDBOX_HOME` is
+configured, place the reviewed dsh state inside that sandbox home (or allowlist
+a `DSH_HOME` pointing at reviewed state outside it). dsh is classified as
+runtime family `other`, like Codex and Gemini.
 
 **Mixing LLMs is the design intent** — e.g. Claude to lead and own the primary
 architecture position, Codex to challenge it independently and implement, and
@@ -960,6 +974,22 @@ classification, or a bounded low-risk fast path for documentation, formatting,
 and structurally small test/config tasks. Missing overrides fall back to the
 role command. A requested model profile can increase rigor but cannot downgrade
 the computed security-risk floor.
+
+DeepSeek Harness selects its model from the composed profile config rather than
+a CLI flag. To route task tiers to different models, write one small overlay per
+tier and reference it in the override command. Discover the exact row your dsh
+version composes with `dsh --profile headless --dump-config`, copy the
+`agent-default-model` row into e.g. `~/.dsh-overlays/strong.yml` with your
+`{provider, model}` choice, then:
+
+```
+TASK_STRONG_CMD="dsh --profile headless --patch \"$HOME/.dsh-overlays/strong.yml\" \"$(cat '{prompt_file}')\""
+```
+
+`--patch` is a launcher flag, so it must appear before the positional task text.
+Alternatively, point tiers at distinct `DSH_HOME` directories with different
+`settings.yaml` model defaults (requires allowlisting `DSH_HOME` or a wrapper
+script).
 
 `delivery-profile: auto|micro|standard` is a separate, diagnostic-only signal.
 The current `micro` assessor accepts only a bounded committed diff of ordinary
