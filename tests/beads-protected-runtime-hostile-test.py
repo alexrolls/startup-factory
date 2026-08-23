@@ -860,6 +860,10 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 # read-only verify and skip it, then authorize only this
                 # second exact incomplete publication.
                 ("object-publication-object-written", 2),
+                ("journal-intent-written", 2),
+                ("journal-history-written", 2),
+                ("journal-index-written", 2),
+                ("journal-current-written", 2),
             )
         ]
         controller = runtime._boundary_controller
@@ -977,11 +981,45 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                         if fault_occurrence == 2:
                             self.assertEqual(1, len(before_receipts))
 
-                        with self.assertRaisesRegex(
-                            runtime.BeadsProtectedRuntimeError,
-                            "exact publication suffix recovered; original operation outcome remains uncertain",
+                        incomplete = [
+                            path
+                            for path in publication_root.iterdir()
+                            if not (path / "receipt.json").exists()
+                        ]
+                        self.assertEqual(1, len(incomplete))
+                        incomplete_intent = json.loads(
+                            (incomplete[0] / "intent.json").read_bytes()
+                        )
+                        expected_incomplete_intent = runtime.sha256(
+                            runtime.canonical_bytes(incomplete_intent["payload"])
+                        )
+                        protected_repository = publication_root.parent
+
+                        def protected_snapshot():
+                            return {
+                                str(path.relative_to(protected_repository)): path.read_bytes()
+                                for path in protected_repository.rglob("*")
+                                if path.is_file()
+                            }
+
+                        before_inspection = protected_snapshot()
+                        real_recover = controller.recover_publication_operation
+
+                        def assert_read_only_before_recover(*args, **kwargs):
+                            if kwargs.get("phase") == "authorize-publication":
+                                self.assertEqual(before_inspection, protected_snapshot())
+                            return real_recover(*args, **kwargs)
+
+                        with mock.patch.object(
+                            controller,
+                            "recover_publication_operation",
+                            side_effect=assert_read_only_before_recover,
                         ):
-                            runtime.record_beads_change_plan_core_v1(request)
+                            with self.assertRaisesRegex(
+                                runtime.BeadsProtectedRuntimeError,
+                                "exact publication suffix recovered; original operation outcome remains uncertain",
+                            ):
+                                runtime.record_beads_change_plan_core_v1(request)
 
                         if fault_occurrence == 2:
                             self.assertEqual(
@@ -996,21 +1034,25 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                             for path in state_files
                         ]
                         self.assertTrue(all(state is not None for state in states))
+                        matching_recovery = []
                         for state in states:
                             assert state is not None
                             self.assertEqual("publication-recovered", state[1]["state"])
-                            self.assertIsNotNone(
-                                state[1]["recoveryPublicationIntentSha256"]
-                            )
                             self.assertIsNotNone(state[1]["response"]["resultSha256"])
+                            if (
+                                state[1]["recoveryPublicationIntentSha256"]
+                                == expected_incomplete_intent
+                            ):
+                                matching_recovery.append(state)
+                        self.assertEqual(1, len(matching_recovery))
                 receipts = sorted(
                     (self.root / runtime.REPOSITORY_NAMESPACE).glob(
                         "*/object-publications/*/receipt.json"
                     )
                 )
-                # The later-publication case has two durable publications;
-                # each first-publication fixture has one.
-                self.assertEqual(len(requests) + 1, len(receipts))
+                # Every later-publication case has two durable publications;
+                # the first-publication fixture has one.
+                self.assertEqual(1 + (2 * (len(requests) - 1)), len(receipts))
         finally:
             self.logic_harness = logic_harness(
                 runtime, self.root, self.key, self.repository
@@ -1749,8 +1791,13 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         self.assertEqual(historical.record_sha256, record_sha)
         self.assertEqual(historical.full_bytes_sha256, full_sha)
 
-    def test_journal_append_recovers_each_unique_crash_boundary(self) -> None:
-        for phase in ("journal-history-written", "journal-index-written", "journal-current-written"):
+    def test_journal_inspection_is_read_only_at_each_unique_crash_boundary(self) -> None:
+        for phase in (
+            "journal-intent-written",
+            "journal-history-written",
+            "journal-index-written",
+            "journal-current-written",
+        ):
             with self.subTest(phase=phase):
                 self.repository = digest(f"journal-crash:{phase}")
                 store = self.store()
@@ -1765,8 +1812,21 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 )
                 with runtime._inject_fault(phase), self.assertRaises(SystemExit):
                     runtime._journal_record(store, "hostile-journal-target", record_sha, full_sha)
-                runtime._journal_record(store, "hostile-journal-target", record_sha, full_sha)
-                runtime._verify_journal(store, "hostile-journal-target", record_sha, full_sha)
+                journal_root = store.directory("journals", create=False)
+                before = {
+                    str(path.relative_to(journal_root)): path.read_bytes()
+                    for path in journal_root.rglob("*")
+                    if path.is_file()
+                }
+                inspection = runtime._inspect_journal_chain(store)
+                self.assertEqual(record_sha, inspection.pending_record_sha256)
+                self.assertEqual(phase, inspection.incomplete_category)
+                after = {
+                    str(path.relative_to(journal_root)): path.read_bytes()
+                    for path in journal_root.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(before, after)
 
     def test_every_registered_type_has_closed_schema_and_cores_roundtrip_exactly(self) -> None:
         schema = json.loads(runtime.beads_protected_runtime_schema_v1())

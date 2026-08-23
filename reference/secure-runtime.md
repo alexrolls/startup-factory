@@ -154,7 +154,14 @@ or sentinel digest, example UID/GID, and artifact path with the exact installed
 module/schema/runtime identities and dedicated local account identities. The
 controller no-follow opens root-owned, non-writable configured artifact paths
 and compares their exact digests before it obtains the socket listener or mints
-a receipt. Install the canonical JSON at the fixed config
+a receipt. `modulePath` is the absolute installed
+`startup_factory_cli/beads_boundary_controller.py` selected by the packaged
+`startup-factory-beads-controller` console entry point, not a copied or merely
+digest-equal file. At startup the controller requires its live `__file__`,
+import specification origin, canonical no-symlink path, inode, and bytes to
+match that configured path and digest; replace the Python-version-specific
+example path with the actual installed module path on the host. Install the
+canonical JSON at the fixed config
 path as a root-owned non-writable regular file; install the controller HMAC key
 as a controller-owned mode-0600 single-link regular file; pre-create the fixed
 state directory for the controller and the protected runtime root/key for the

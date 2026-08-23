@@ -438,6 +438,110 @@ def _read_root_owned(path: Path, label: str, *, max_bytes: int = MAX_MESSAGE_BYT
         os.close(parent)
 
 
+def _observe_executing_module_file(
+    path: Path, label: str
+) -> tuple[Path, tuple[int, int, int, int, int, int, int], str]:
+    """No-follow observe one live module path and bind its stable inode/bytes."""
+
+    if not path.is_absolute() or str(path) != os.path.normpath(str(path)):
+        raise ControllerProtocolError(f"{label} is not a normalized absolute path")
+    if Path(os.path.realpath(path)) != path:
+        raise ControllerProtocolError(f"{label} contains a symbolic link")
+    try:
+        before = os.lstat(path)
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise ControllerProtocolError(f"{label} is not a no-follow regular file")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(descriptor)
+            data = bytearray()
+            while len(data) <= MAX_MESSAGE_BYTES:
+                chunk = os.read(
+                    descriptor, min(65536, MAX_MESSAGE_BYTES + 1 - len(data))
+                )
+                if not chunk:
+                    break
+                data.extend(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        rebound = os.lstat(path)
+    except ControllerProtocolError:
+        raise
+    except OSError as exc:
+        raise ControllerProtocolError(f"cannot observe {label}: {exc}") from exc
+    identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mode,
+        before.st_uid,
+        before.st_gid,
+        before.st_nlink,
+    )
+    for observed in (opened, after, rebound):
+        if identity != (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_size,
+            observed.st_mode,
+            observed.st_uid,
+            observed.st_gid,
+            observed.st_nlink,
+        ):
+            raise ControllerProtocolError(f"{label} changed during observation")
+    if len(data) > MAX_MESSAGE_BYTES:
+        raise ControllerProtocolError(f"{label} is oversized")
+    return path, identity, _sha(bytes(data))
+
+
+_EXECUTING_MODULE_PATH, _EXECUTING_MODULE_IDENTITY, _EXECUTING_MODULE_SHA256 = (
+    _observe_executing_module_file(
+        Path(__file__), "executing controller module at import"
+    )
+)
+
+
+def _verify_executing_module_identity(config: ControllerConfig) -> None:
+    """Bind configured bytes to this exact imported module and import origin."""
+
+    module = sys.modules.get(__name__)
+    specification = getattr(module, "__spec__", None)
+    origin = getattr(specification, "origin", None)
+    if not isinstance(origin, str):
+        raise ControllerProtocolError(
+            "executing controller module specification has no file origin"
+        )
+    live_file = Path(__file__)
+    origin_path = Path(origin)
+    if live_file != config.module_path:
+        raise ControllerProtocolError(
+            "configured modulePath is not the executing controller module __file__"
+        )
+    if origin_path != config.module_path:
+        raise ControllerProtocolError(
+            "executing controller module specification origin differs from modulePath"
+        )
+    observed_path, observed_identity, observed_digest = _observe_executing_module_file(
+        config.module_path, "executing controller module"
+    )
+    if observed_path != _EXECUTING_MODULE_PATH:
+        raise ControllerProtocolError(
+            "executing controller module canonical path changed since import"
+        )
+    if observed_identity != _EXECUTING_MODULE_IDENTITY:
+        raise ControllerProtocolError(
+            "executing controller module inode changed since import"
+        )
+    if (
+        observed_digest != _EXECUTING_MODULE_SHA256
+        or observed_digest != config.module_sha256
+    ):
+        raise ControllerProtocolError(
+            "executing controller module digest differs from configured/imported bytes"
+        )
+
+
 def load_controller_config() -> ControllerConfig:
     """Load only the fixed root-owned production configuration."""
 
@@ -498,6 +602,7 @@ def _validate_transport_group(config: ControllerConfig) -> None:
 
 
 def _verify_installed_artifacts(config: ControllerConfig) -> None:
+    _verify_executing_module_identity(config)
     observations = (
         (
             config.runtime_manifest_path,

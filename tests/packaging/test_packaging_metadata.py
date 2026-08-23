@@ -7,6 +7,7 @@ import email.parser
 import gzip
 import hashlib
 import io
+import json
 import os
 import re
 import sys
@@ -171,6 +172,21 @@ class BundledDefaultsTests(unittest.TestCase):
         self.assertTrue(controller.is_file())
         self.assertTrue(fixture.is_file())
         self.assertTrue(config_example.is_file())
+        controller_config = json.loads(config_example.read_bytes())
+        self.assertEqual(
+            "/usr/local/lib/python3.13/site-packages/startup_factory_cli/beads_boundary_controller.py",
+            controller_config["modulePath"],
+        )
+        self.assertEqual(
+            "sha256:" + hashlib.sha256(controller.read_bytes()).hexdigest(),
+            controller_config["moduleSha256"],
+        )
+        self.assertEqual(
+            "startup_factory_cli.beads_boundary_controller:main",
+            tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["scripts"][
+                "startup-factory-beads-controller"
+            ],
+        )
         self.assertTrue(service_example.is_file())
         self.assertTrue(tmpfiles_example.is_file())
         self.assertFalse(

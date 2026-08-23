@@ -217,6 +217,10 @@ class BoundaryControllerTest(unittest.TestCase):
         )
         self.assertEqual(str(controller.ENDPOINT_PATH), example["endpointPath"])
         self.assertEqual(66_004, example["transportGid"])
+        self.assertEqual(
+            "/usr/local/lib/python3.13/site-packages/startup_factory_cli/beads_boundary_controller.py",
+            example["modulePath"],
+        )
         self.assertEqual(str(controller.CONFIG_PATH), "/etc/startup-factory/beads-boundary-controller-v1.json")
 
         service = (
@@ -671,15 +675,18 @@ class BoundaryControllerTest(unittest.TestCase):
         self.assertTrue(good.closed)
 
     def test_serve_preflight_observes_exact_root_owned_artifacts(self) -> None:
+        live_module = Path(controller.__file__)
+        live_module_bytes = live_module.read_bytes()
         values = {
             self.config.runtime_manifest_path: b"runtime-manifest-bytes",
-            self.config.module_path: b"module-bytes",
             self.config.schema_path: b"schema-bytes",
+            live_module: live_module_bytes,
         }
         config = controller.dataclasses.replace(
             self.config,
+            module_path=live_module,
             runtime_manifest_sha256=controller._sha(values[self.config.runtime_manifest_path]),
-            module_sha256=controller._sha(values[self.config.module_path]),
+            module_sha256=controller._sha(live_module_bytes),
             schema_sha256=controller._sha(values[self.config.schema_path]),
         )
         with mock.patch.object(
@@ -697,6 +704,77 @@ class BoundaryControllerTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 controller.ControllerProtocolError, "installed artifact digest"
+            ):
+                controller._verify_installed_artifacts(config)
+
+    def test_serve_preflight_rejects_unrelated_symlinked_or_stale_live_module(self) -> None:
+        live_module = Path(controller.__file__)
+        live_bytes = live_module.read_bytes()
+        config = controller.dataclasses.replace(
+            self.config,
+            module_path=live_module,
+            module_sha256=controller._sha(live_bytes),
+        )
+        values = {
+            config.runtime_manifest_path: b"runtime-manifest-bytes",
+            config.module_path: live_bytes,
+            config.schema_path: b"schema-bytes",
+        }
+        config = controller.dataclasses.replace(
+            config,
+            runtime_manifest_sha256=controller._sha(values[config.runtime_manifest_path]),
+            schema_sha256=controller._sha(values[config.schema_path]),
+        )
+
+        def read_exact(path, _label, **_kwargs):
+            return values[path]
+
+        with mock.patch.object(controller, "_read_root_owned", side_effect=read_exact):
+            controller._verify_installed_artifacts(config)
+
+        unrelated = controller.dataclasses.replace(
+            config, module_path=config.runtime_manifest_path
+        )
+        with mock.patch.object(controller, "_read_root_owned", side_effect=read_exact):
+            with self.assertRaisesRegex(
+                controller.ControllerProtocolError, "executing controller module"
+            ):
+                controller._verify_installed_artifacts(unrelated)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            link = Path(temporary) / "controller.py"
+            link.symlink_to(live_module)
+            symlinked = controller.dataclasses.replace(config, module_path=link)
+            with mock.patch.object(
+                controller,
+                "_read_root_owned",
+                return_value=live_bytes,
+            ):
+                with self.assertRaisesRegex(
+                    controller.ControllerProtocolError,
+                    "executing controller module|symbolic link",
+                ):
+                    controller._verify_installed_artifacts(symlinked)
+
+        stale_identity = tuple(
+            value + 1 if index == 1 else value
+            for index, value in enumerate(controller._EXECUTING_MODULE_IDENTITY)
+        )
+        with mock.patch.object(controller, "_read_root_owned", side_effect=read_exact), mock.patch.object(
+            controller, "_EXECUTING_MODULE_IDENTITY", stale_identity
+        ):
+            with self.assertRaisesRegex(
+                controller.ControllerProtocolError, "changed since import"
+            ):
+                controller._verify_installed_artifacts(config)
+
+        specification = sys.modules[controller.__name__].__spec__
+        assert specification is not None
+        with mock.patch.object(controller, "_read_root_owned", side_effect=read_exact), mock.patch.object(
+            specification, "origin", str(config.runtime_manifest_path)
+        ):
+            with self.assertRaisesRegex(
+                controller.ControllerProtocolError, "module specification origin"
             ):
                 controller._verify_installed_artifacts(config)
 

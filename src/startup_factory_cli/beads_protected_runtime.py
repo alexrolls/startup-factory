@@ -89,6 +89,14 @@ class _PublicationRecoveryCompleted(BeadsProtectedRuntimeError):
     """One exact publication suffix was recovered; the outer outcome stays unknown."""
 
 
+class _IncompleteAuthenticatedPublication(BeadsProtectedRuntimeError):
+    """An exact authenticated publication has a known incomplete suffix."""
+
+    def __init__(self, category: str) -> None:
+        self.category = category
+        super().__init__(f"authenticated publication is incomplete at {category}")
+
+
 @dataclasses.dataclass(slots=True)
 class _ControllerBoundarySessionV1:
     """One request-scoped live controller connection lineage.
@@ -1502,14 +1510,62 @@ _JOURNAL_APPEND_INTENT_FIELDS = {
 }
 
 
+def _open_optional_directory(store: _Store, parts: tuple[str, ...]) -> int | None:
+    """Open a protected directory without ever creating recovery evidence."""
+
+    descriptor = os.dup(store._repository_fd)
+    try:
+        for part in parts:
+            if not _SAFE_ID.fullmatch(part):
+                raise BeadsProtectedRuntimeError("protected path component is invalid")
+            try:
+                child = os.open(
+                    part,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                os.close(descriptor)
+                return None
+            _validate_directory_metadata(
+                os.fstat(child), "protected record directory", private=True
+            )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except (OSError, BeadsProtectedRuntimeError) as exc:
+        os.close(descriptor)
+        if isinstance(exc, BeadsProtectedRuntimeError):
+            raise
+        raise BeadsProtectedRuntimeError(
+            f"protected record ancestry is unsafe or changed: {exc}"
+        ) from exc
+
+
+def _readonly_exists(store: _Store, parts: tuple[str, ...]) -> bool:
+    if not parts or any(not _SAFE_ID.fullmatch(part) for part in parts):
+        raise BeadsProtectedRuntimeError("protected path component is invalid")
+    parent = _open_optional_directory(store, parts[:-1])
+    if parent is None:
+        return False
+    try:
+        try:
+            metadata = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode):
+            raise BeadsProtectedRuntimeError("protected path is a substituted symlink")
+        return True
+    finally:
+        os.close(parent)
+
+
 def _directory_json_names(store: _Store, parts: tuple[str, ...]) -> set[str]:
-    operation = _BOUNDARY_OPERATION_CONTEXT.get()
-    read_only_recovery = (
-        isinstance(operation, Mapping)
-        and operation.get("recoveryMode")
-        and _PUBLICATION_RECOVERY_SCOPE.get() is None
-    )
-    descriptor = store._open_directory(parts, create=not read_only_recovery)
+    descriptor = _open_optional_directory(store, parts)
+    if descriptor is None:
+        return set()
     try:
         names = {entry.name for entry in os.scandir(descriptor)}
     finally:
@@ -1519,20 +1575,38 @@ def _directory_json_names(store: _Store, parts: tuple[str, ...]) -> set[str]:
     return names
 
 
-def _recover_pending_journal_append(store: _Store) -> None:
-    """Complete exactly one authenticated journal append after process death."""
+@dataclasses.dataclass(frozen=True, slots=True)
+class _JournalInspection:
+    chain: dict[str, tuple[str, str, dict[str, Any]]]
+    current_record_sha256: str | None
+    current_full_bytes_sha256: str | None
+    generation: int
+    pending_record_sha256: str | None = None
+    incomplete_category: str | None = None
 
-    pending_path = store.directory("journals") / "pending.json"
-    if not store.exists(pending_path):
-        return
-    pending_envelope = store.read_json(pending_path, "pending protected HMAC journal append")
+
+def _pending_journal_append(
+    store: _Store,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str, str, str | None] | None:
+    """Authenticate a pending append without changing any protected byte."""
+
+    pending_path = _safe_join(store.repository, "journals", "pending.json")
+    if not _readonly_exists(store, ("journals", "pending.json")):
+        return None
+    pending_envelope = store.read_json(
+        pending_path, "pending protected HMAC journal append"
+    )
     pending_body, _, _, _ = store.verify(
         pending_envelope, "beads-protected-journal-append-intent"
     )
     if set(pending_body) != _JOURNAL_APPEND_INTENT_FIELDS:
-        raise BeadsProtectedRuntimeError("protected HMAC journal append intent is malformed")
+        raise BeadsProtectedRuntimeError(
+            "protected HMAC journal append intent is malformed"
+        )
     if pending_body.get("repositoryLocatorSha256") != store.repository_digest:
-        raise BeadsProtectedRuntimeError("protected HMAC journal append repository mismatch")
+        raise BeadsProtectedRuntimeError(
+            "protected HMAC journal append repository mismatch"
+        )
     expected_current = _digest(
         pending_body.get("expectedCurrentFullBytesSha256"),
         "journal append expectedCurrentFullBytesSha256",
@@ -1540,7 +1614,9 @@ def _recover_pending_journal_append(store: _Store) -> None:
     )
     entry = pending_body.get("entry")
     if not isinstance(entry, Mapping):
-        raise BeadsProtectedRuntimeError("protected HMAC journal append has no exact successor entry")
+        raise BeadsProtectedRuntimeError(
+            "protected HMAC journal append has no exact successor entry"
+        )
     entry = _plain(entry)
     entry_body, _, entry_record, entry_full = store.verify(
         entry, "beads-protected-journal-entry"
@@ -1548,13 +1624,46 @@ def _recover_pending_journal_append(store: _Store) -> None:
     if (
         set(entry_body) != _JOURNAL_BODY_FIELDS
         or entry_body.get("repositoryLocatorSha256") != store.repository_digest
-        or entry_body.get("predecessorJournalEntryFullBytesSha256") != expected_current
+        or entry_body.get("predecessorJournalEntryFullBytesSha256")
+        != expected_current
     ):
-        raise BeadsProtectedRuntimeError("protected HMAC journal append successor is malformed")
-    history = store.directory("journals", "history") / (
+        raise BeadsProtectedRuntimeError(
+            "protected HMAC journal append successor is malformed"
+        )
+    return (
+        pending_envelope,
+        pending_body,
+        entry,
+        entry_record,
+        entry_full,
+        expected_current,
+    )
+
+
+def _recover_pending_journal_append(
+    store: _Store, *, expected_record_sha256: str
+) -> None:
+    """Complete exactly one authenticated journal append after process death."""
+
+    if _PUBLICATION_RECOVERY_SCOPE.get() is None:
+        raise _boundary_refusal(
+            "journal recovery lacks an exact controller-selected publication intent"
+        )
+    pending = _pending_journal_append(store)
+    if pending is None:
+        return
+    pending_envelope, _, entry, entry_record, entry_full, expected_current = pending
+    entry_body = _plain(entry["payload"])
+    pending_record = _digest(entry_body.get("recordSha256"), "journal recordSha256")
+    if pending_record != expected_record_sha256:
+        raise _boundary_refusal(
+            "controller-selected publication does not own the pending journal successor"
+        )
+    pending_path = _safe_join(store.repository, "journals", "pending.json")
+    history = _safe_join(store.repository, "journals", "history") / (
         entry_record.removeprefix("sha256:") + ".json"
     )
-    lookup = store.directory("journals", "by-record") / (
+    lookup = _safe_join(store.repository, "journals", "by-record") / (
         str(entry_body.get("recordSha256")).removeprefix("sha256:") + ".json"
     )
     for path, label in ((history, "history"), (lookup, "record index")):
@@ -1565,7 +1674,7 @@ def _recover_pending_journal_append(store: _Store) -> None:
                 )
         else:
             store.write_immutable(path, entry)
-    current_path = store.directory("journals") / "current.json"
+    current_path = _safe_join(store.repository, "journals", "current.json")
     observed_current: str | None = None
     if store.exists(current_path):
         observed_current = sha256(store._read_bytes(current_path, "journal recovery current head"))
@@ -1584,18 +1693,90 @@ def _recover_pending_journal_append(store: _Store) -> None:
     )
 
 
-def _journal_chain(store: _Store) -> tuple[dict[str, tuple[str, str, dict[str, Any]]], str | None, str | None, int]:
-    """Recover one bound append, then verify the complete unique chain."""
+def _inspect_journal_chain(store: _Store) -> _JournalInspection:
+    """Read-only verify the committed chain and one exact incomplete suffix."""
 
-    _recover_pending_journal_append(store)
+    pending = _pending_journal_append(store)
+    pending_record: str | None = None
+    pending_entry_record: str | None = None
+    pending_entry_full: str | None = None
+    pending_expected_current: str | None = None
+    pending_history_name: str | None = None
+    pending_index_name: str | None = None
+    pending_category: str | None = None
+    pending_entry: dict[str, Any] | None = None
+    if pending is not None:
+        _, _, pending_entry, pending_entry_record, pending_entry_full, pending_expected_current = pending
+        pending_body = _plain(pending_entry["payload"])
+        pending_record = _digest(pending_body.get("recordSha256"), "journal recordSha256")
+        assert pending_record is not None
+        pending_history_name = pending_entry_record.removeprefix("sha256:") + ".json"
+        pending_index_name = pending_record.removeprefix("sha256:") + ".json"
 
-    current_path = store.directory("journals") / "current.json"
+    current_path = _safe_join(store.repository, "journals", "current.json")
     history_names = _directory_json_names(store, ("journals", "history"))
     index_names = _directory_json_names(store, ("journals", "by-record"))
-    if not store.exists(current_path):
-        if history_names or index_names:
+    current_exists = _readonly_exists(store, ("journals", "current.json"))
+    current_full_observed: str | None = None
+    if current_exists:
+        current_full_observed = sha256(
+            store._read_bytes(current_path, "current protected HMAC journal entry")
+        )
+
+    pending_history_exists = bool(
+        pending_history_name and pending_history_name in history_names
+    )
+    pending_index_exists = bool(
+        pending_index_name and pending_index_name in index_names
+    )
+    if pending_entry is not None:
+        history_path = _safe_join(
+            store.repository, "journals", "history", str(pending_history_name)
+        )
+        index_path = _safe_join(
+            store.repository, "journals", "by-record", str(pending_index_name)
+        )
+        if pending_history_exists and canonical_bytes(
+            store.read_json(history_path, "pending journal history")
+        ) != canonical_bytes(pending_entry):
+            raise BeadsProtectedRuntimeError(
+                "protected HMAC journal pending history conflicts with append intent"
+            )
+        if pending_index_exists and canonical_bytes(
+            store.read_json(index_path, "pending journal record index")
+        ) != canonical_bytes(pending_entry):
+            raise BeadsProtectedRuntimeError(
+                "protected HMAC journal pending index conflicts with append intent"
+            )
+        if not pending_history_exists:
+            if pending_index_exists or current_full_observed != pending_expected_current:
+                raise BeadsProtectedRuntimeError(
+                    "protected HMAC journal pending intent has an impossible suffix"
+                )
+            pending_category = "journal-intent-written"
+        elif not pending_index_exists:
+            if current_full_observed != pending_expected_current:
+                raise BeadsProtectedRuntimeError(
+                    "protected HMAC journal pending history has an impossible suffix"
+                )
+            pending_category = "journal-history-written"
+        elif current_full_observed == pending_expected_current:
+            pending_category = "journal-index-written"
+        elif current_full_observed == pending_entry_full:
+            pending_category = "journal-current-written"
+        else:
+            raise BeadsProtectedRuntimeError(
+                "protected HMAC journal pending successor changed its predecessor"
+            )
+
+    if not current_exists:
+        allowed_history = {pending_history_name} if pending_history_exists else set()
+        allowed_index = {pending_index_name} if pending_index_exists else set()
+        if history_names != allowed_history or index_names != allowed_index:
             raise BeadsProtectedRuntimeError("protected HMAC journal has evidence without a current head")
-        return {}, None, None, 0
+        return _JournalInspection(
+            {}, None, None, 0, pending_record, pending_category
+        )
     current = store.read_json(current_path, "current protected HMAC journal entry")
     _, _, current_record, current_full = store.verify(current, "beads-protected-journal-entry")
     seen_entries: set[str] = set()
@@ -1650,9 +1831,13 @@ def _journal_chain(store: _Store) -> tuple[dict[str, tuple[str, str, dict[str, A
             raise BeadsProtectedRuntimeError("protected HMAC journal predecessor identity mismatch")
         expected_generation = generation - 1
     expected_history_names = {value[0].removeprefix("sha256:") + ".json" for value in by_protected_record.values()}
+    if pending_history_exists and current_full_observed != pending_entry_full:
+        expected_history_names.add(str(pending_history_name))
     if history_names != expected_history_names:
         raise BeadsProtectedRuntimeError("protected HMAC journal contains an orphan, fork or missing history entry")
     expected_index_names = {record.removeprefix("sha256:") + ".json" for record in by_protected_record}
+    if pending_index_exists and current_full_observed != pending_entry_full:
+        expected_index_names.add(str(pending_index_name))
     if index_names != expected_index_names:
         raise BeadsProtectedRuntimeError("protected HMAC journal record index is incomplete or forked")
     for protected_record, (journal_record, journal_full, _) in by_protected_record.items():
@@ -1663,11 +1848,68 @@ def _journal_chain(store: _Store) -> tuple[dict[str, tuple[str, str, dict[str, A
         _, _, indexed_record, indexed_full = store.verify(index, "beads-protected-journal-entry")
         if indexed_record != journal_record or indexed_full != journal_full:
             raise BeadsProtectedRuntimeError("protected HMAC journal record index selects another successor")
-    return by_protected_record, current_record, current_full, _generation(current["payload"]["generation"])
+    generation = _generation(current["payload"]["generation"])
+    if pending_entry is not None:
+        pending_body = _plain(pending_entry["payload"])
+        pending_generation = _generation(pending_body.get("generation"))
+        if current_full_observed == pending_entry_full:
+            indexed = by_protected_record.get(str(pending_record))
+            if indexed is None or indexed[0] != pending_entry_record:
+                raise BeadsProtectedRuntimeError(
+                    "protected HMAC journal current pending successor is not in its chain"
+                )
+        else:
+            if (
+                pending_generation != generation + 1
+                or pending_body.get("predecessorJournalEntryRecordSha256")
+                != current_record
+                or pending_expected_current != current_full
+                or pending_record in by_protected_record
+            ):
+                raise BeadsProtectedRuntimeError(
+                    "protected HMAC journal pending successor does not extend the current head"
+                )
+    return _JournalInspection(
+        by_protected_record,
+        current_record,
+        current_full,
+        generation,
+        pending_record,
+        pending_category,
+    )
+
+
+def _journal_chain(
+    store: _Store,
+) -> tuple[dict[str, tuple[str, str, dict[str, Any]]], str | None, str | None, int]:
+    inspection = _inspect_journal_chain(store)
+    return (
+        inspection.chain,
+        inspection.current_record_sha256,
+        inspection.current_full_bytes_sha256,
+        inspection.generation,
+    )
 
 
 def _journal_record(store: _Store, kind: str, record_digest: str, full_digest: str) -> None:
-    chain, predecessor, expected_current, generation = _journal_chain(store)
+    inspection = _inspect_journal_chain(store)
+    if inspection.pending_record_sha256 is not None:
+        if inspection.pending_record_sha256 != record_digest:
+            raise BeadsProtectedRuntimeError(
+                "another exact incomplete journal successor precedes this record"
+            )
+        _recover_pending_journal_append(
+            store, expected_record_sha256=record_digest
+        )
+        inspection = _inspect_journal_chain(store)
+        if inspection.pending_record_sha256 is not None:
+            raise BeadsProtectedRuntimeError(
+                "protected HMAC journal recovery did not remove its exact pending intent"
+            )
+    chain = inspection.chain
+    predecessor = inspection.current_record_sha256
+    expected_current = inspection.current_full_bytes_sha256
+    generation = inspection.generation
     existing = chain.get(record_digest)
     if existing is not None:
         _, existing_full, body = existing
@@ -1716,12 +1958,16 @@ def _journal_record(store: _Store, kind: str, record_digest: str, full_digest: s
         canonical_bytes(pending),
         "completed protected HMAC journal append",
     )
-    _journal_chain(store)
+    _inspect_journal_chain(store)
 
 
 def _verify_journal(store: _Store, kind: str, record_digest: str, full_digest: str) -> None:
-    chain, _, _, _ = _journal_chain(store)
-    indexed = chain.get(record_digest)
+    inspection = _inspect_journal_chain(store)
+    if inspection.pending_record_sha256 == record_digest:
+        raise _IncompleteAuthenticatedPublication(
+            str(inspection.incomplete_category)
+        )
+    indexed = inspection.chain.get(record_digest)
     if indexed is None:
         raise BeadsProtectedRuntimeError("protected record has no exact HMAC journal entry in the current chain")
     _, _, body = indexed
@@ -1803,7 +2049,7 @@ def _publish_authenticated_record(
                 store, target, kind, record_digest, full_digest
             )
             publication_complete = True
-        except BeadsProtectedRuntimeError:
+        except _IncompleteAuthenticatedPublication:
             publication_complete = False
 
         selected = session.response.get("recoveryPublicationIntentSha256")
@@ -1969,6 +2215,11 @@ def _verify_authenticated_publication(
             "current publication verification lacks live required controller provenance"
         )
     relative = "/".join(store._relative_parts(target))
+    target_parts = store._relative_parts(target)
+    if not _readonly_exists(store, target_parts):
+        raise _IncompleteAuthenticatedPublication(
+            "object-publication-intent-written"
+        )
     envelope = store.read_json(target, "published protected object")
     _, _, observed_record, observed_full = store.verify(envelope, kind)
     if observed_record != record_digest or observed_full != full_digest:
@@ -1991,8 +2242,45 @@ def _verify_authenticated_publication(
         {"kind": "beads-object-publication-intent", "schemaVersion": 1, **payload}
     ):
         raise BeadsProtectedRuntimeError("object publication intent does not bind the exact object")
-    _verify_journal(store, kind, record_digest, full_digest)
-    provenance = store.read_json(directory / "provenance.json", "object publication live provenance")
+    provenance_path = directory / "provenance.json"
+    receipt_path = directory / "receipt.json"
+    provenance_exists = _readonly_exists(
+        store, store._relative_parts(provenance_path)
+    )
+    receipt_exists = _readonly_exists(store, store._relative_parts(receipt_path))
+    inspection = _inspect_journal_chain(store)
+    if inspection.pending_record_sha256 == record_digest:
+        if provenance_exists or receipt_exists:
+            raise BeadsProtectedRuntimeError(
+                "incomplete journal successor has impossible publication evidence"
+            )
+        raise _IncompleteAuthenticatedPublication(
+            str(inspection.incomplete_category)
+        )
+    indexed = inspection.chain.get(record_digest)
+    if indexed is None:
+        if provenance_exists or receipt_exists:
+            raise BeadsProtectedRuntimeError(
+                "published object journal evidence was removed after publication"
+            )
+        raise _IncompleteAuthenticatedPublication(
+            "object-publication-object-written"
+        )
+    _, _, journal_body = indexed
+    if (
+        journal_body.get("recordKind") != kind
+        or journal_body.get("recordFullBytesSha256") != full_digest
+    ):
+        raise BeadsProtectedRuntimeError("protected HMAC journal entry mismatch")
+    if not provenance_exists:
+        if receipt_exists:
+            raise BeadsProtectedRuntimeError(
+                "object publication receipt exists without live provenance"
+            )
+        raise _IncompleteAuthenticatedPublication(
+            "object-publication-journal-written"
+        )
+    provenance = store.read_json(provenance_path, "object publication live provenance")
     provenance_body, _, provenance_digest, provenance_full = store.verify(
         provenance, "beads-object-publication-live-provenance"
     )
@@ -2006,7 +2294,11 @@ def _verify_authenticated_publication(
         or provenance_body.get("provenanceDomain") != _REQUIRED_PROVENANCE_DOMAIN
     ):
         raise BeadsProtectedRuntimeError("published object lacks exact live production provenance")
-    receipt = store.read_json(directory / "receipt.json", "object publication receipt")
+    if not receipt_exists:
+        raise _IncompleteAuthenticatedPublication(
+            "object-publication-provenance-written"
+        )
+    receipt = store.read_json(receipt_path, "object publication receipt")
     receipt_body, _, _, _ = store.verify(receipt, "beads-object-publication-receipt")
     if (
         receipt_body.get("repositoryLocatorSha256") != store.repository_digest
