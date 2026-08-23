@@ -109,9 +109,39 @@ selected, ordinary claim, mutation, and launch capabilities require one current
 active authority epoch. Preparation is allowed only while that epoch is
 revoked, through one-use HMAC capabilities and immutable intent, consumption,
 history, current-pointer, step, and receipt records under an external mode-0700
-protected root. Requests contain the protected-root and HMAC-key locations;
-key bytes are read only by the broker and are never returned or passed to an
-agent process.
+protected root. Frozen request fields retain the protected-root and record-HMAC
+key locations only as equality bindings. Production authority comes solely from
+the fixed root-owned controller configuration at
+`/etc/startup-factory/beads-boundary-controller-v1.json`; a request,
+environment variable, plugin, or tracker record cannot select another root,
+key, endpoint, controller, or verifier.
+
+The shipped `startup-factory-beads-controller` is a Linux-only
+`AF_UNIX/SOCK_SEQPACKET` service at the fixed endpoint
+`/run/startup-factory/beads-boundary-controller-v1.sock`. The controller,
+broker, and worker UIDs must be distinct. Client and server both check
+`SO_PEERCRED`; the broker process must run as the configured broker UID and the
+service as the configured controller UID. The controller alone holds its HMAC
+key and durably advances each request through `accepted`, `intent-bound`,
+`effect-authorized`, `result-stored`, and `completed`. Each OPEN, STEP, and
+VALIDATE nonce is one-use, one connection carries one request, and a stored
+receipt is never a reusable bearer capability: current use requires a fresh
+controller connection and current-state validation.
+
+`runtime/beads-boundary-controller-v1.example.json` and
+`runtime/startup-factory-beads-controller.service.example` are operator
+templates, not an auto-provisioner or security proof. Replace every zero digest
+and example UID with the exact installed module/schema/runtime identities and
+dedicated local account UIDs. Install the canonical JSON at the fixed config
+path as a root-owned non-writable regular file; install the controller HMAC key
+as a controller-owned mode-0600 single-link regular file; pre-create the fixed
+state directory for the controller and the protected runtime root/key for the
+broker with mode 0700/0600. Pre-create `/run/startup-factory` for the controller
+at boot. `startup-factory-beads-controller validate-config` validates only the
+closed configuration and reports `configured_unproved`; it does not make the
+host ready. Native macOS, a missing service, unsafe ownership/modes, a path or
+UID mismatch, or a stale controller state refuses before the protected
+namespace, key, lock, journal, subprocess, or target filesystem is touched.
 
 The compatibility baseline is `gastownhall/beads` v1.1.2 at full commit
 `20e493e569c922d1253bdeff068c5e56c94957fb`. Re-attestation admits only the
@@ -124,13 +154,18 @@ conformance remains a release gate and a missing or skipped proof is non-green.
 
 Repository-only verification functions require the broker to establish the
 explicit lexical `use_beads_protected_runtime_v1(...)` locator context. They do
-not consult environment variables or discover roots. Historical verification
-is audit-only. A stale current pointer, generation overflow, reused capability,
+not consult environment variables or discover roots, and that context cannot
+override the root-owned controller configuration. Historical verification is
+audit-only. Every current verifier still requires a fresh live controller
+exchange. A stale current pointer, generation overflow, reused capability,
 unknown transition, malformed canonical payload, HMAC mismatch, unsafe mode,
-link, type, owner, or exact-byte CAS mismatch fails closed and preserves the
-append-only records for operator inspection. These Python and same-UID file
-controls are governance evidence inside the external runner boundary; they are
-not themselves an operating-system security boundary.
+link, type, owner, exact-byte CAS mismatch, non-production provenance, or
+non-current controller receipt fails closed and preserves the append-only
+records for operator inspection. The deterministic logic harness exists only
+under `tests/support`; it is absent from the wheel/runtime package, uses a
+separate provenance domain, and production readers reject its records. These
+Python and same-UID file controls are governance evidence inside the external
+Linux boundary; they are not themselves an operating-system security boundary.
 
 Preparation execution and the public preparation-mutation API consume the same
 command intent and lease successor. Expiry, current revoked authority, current
@@ -139,10 +174,17 @@ contiguous command ordinal are rechecked before execution. Create installation
 first moves the candidate to a deterministic transaction quarantine, reopens
 and verifies its signed identity/tree, and only then publishes it with an
 exclusive rename; a mismatched candidate is preserved in quarantine and never
-appears at the authorized target. Cleanup similarly quarantines the signed root
-before unlink/rmdir, so crash recovery or a mismatch preserves evidence. These
-quarantines are recovery mechanisms within the governed broker transaction,
-not a same-UID operating-system boundary. `FinishBeadsPreparationResultV1`
+appears at the authorized target. Tree authorization uses two complete
+descriptor-pinned passes, reopens and rehashes every child, rebinds every final
+name and the root ancestry, and enforces bounded depth, record, byte, and file
+descriptor use. Cleanup never unlinks or removes the signed tree. It moves the
+exact root by a same-filesystem no-clobber rename to a deterministic
+content-addressed retained-evidence name; the retirement receipt is joined into
+the existing cleanup-observed terminal chain, and current verification
+reobserves both active-path absence and the complete retained tree. These
+quarantines and retained trees are recovery/audit mechanisms within the
+governed broker transaction, not a same-UID operating-system boundary.
+`FinishBeadsPreparationResultV1`
 returns only its unchanged HMAC-authenticated result envelope; pointer and
 activation evidence is obtained through the registered current or historical
 verification result types.

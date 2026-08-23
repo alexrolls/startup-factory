@@ -16,8 +16,10 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "tests"))
 
 runtime = importlib.import_module("startup_factory_cli.beads_protected_runtime")
+from support.beads_protected_runtime_harness import TEST_PROVENANCE, logic_harness
 
 
 def digest(label: str) -> str:
@@ -26,8 +28,6 @@ def digest(label: str) -> str:
 
 class ProtectedRuntimeHostileTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.offline_logic = runtime._offline_logic_only_v1()
-        self.offline_logic.__enter__()
         self.temporary = tempfile.TemporaryDirectory()
         self.base = Path(self.temporary.name).resolve()
         self.root = self.base / "protected"
@@ -37,12 +37,16 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         self.key.chmod(0o600)
         self.repository = digest("hostile-repository")
         self.expires = int(time.time()) + 3600
+        self.logic_harness = logic_harness(
+            runtime, self.root, self.key, self.repository
+        )
+        self.logic_harness.__enter__()
 
     def tearDown(self) -> None:
         try:
             self.temporary.cleanup()
         finally:
-            self.offline_logic.__exit__(None, None, None)
+            self.logic_harness.__exit__(None, None, None)
 
     def request(self, name: str, **values):
         payload = {
@@ -71,6 +75,7 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         }
 
     def store(self) -> runtime._Store:
+        self.logic_harness.bind_repository(self.repository)
         return runtime._Store(
             {
                 "protectedRoot": str(self.root),
@@ -92,7 +97,7 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         before_names = sorted(path.name for path in self.root.iterdir())
         before_key = self.key.read_bytes()
         before_mode = self.root.stat().st_mode
-        self.offline_logic.__exit__(None, None, None)
+        self.logic_harness.__exit__(None, None, None)
         try:
             for name in runtime._FUNCTION_EXPORTS:
                 if name in runtime._PURE_OFFLINE_FUNCTIONS:
@@ -111,63 +116,63 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 ]
                 with self.subTest(function=name), self.assertRaisesRegex(
                     runtime.BeadsProtectedRuntimeError,
-                    "external Linux boundary session required",
+                    "fixed root-managed Linux Beads boundary controller required",
                 ):
                     function(*arguments)
         finally:
-            self.offline_logic = runtime._offline_logic_only_v1()
-            self.offline_logic.__enter__()
+            self.logic_harness = logic_harness(
+                runtime, self.root, self.key, self.repository
+            )
+            self.logic_harness.__enter__()
         self.assertEqual(sorted(path.name for path in self.root.iterdir()), before_names)
         self.assertEqual(self.key.read_bytes(), before_key)
         self.assertEqual(self.root.stat().st_mode, before_mode)
         self.assertFalse((self.root / runtime.REPOSITORY_NAMESPACE).exists())
 
-    def test_darwin_and_unproved_boundary_session_providers_are_deterministically_ineligible(self) -> None:
-        now = int(time.time())
-        receipt = {
-            "schemaVersion": 1,
-            "provider": "configured_unproved",
-            "proofState": "configured_unproved",
-            "hostKernel": "darwin",
-            "repositoryLocatorSha256": self.repository,
-            "rootSetSha256": digest("root-set"),
-            "runtimeManifestSha256": digest("runtime-manifest"),
-            "moduleSha256": digest("module"),
-            "verifierIdentitySha256": digest("verifier"),
-            "sessionNonce": "configured-unproved-session",
-            "issuedAtUnix": now,
-            "expiresAtUnix": now + 60,
-            "externalReceiptSha256": digest("external-receipt"),
-        }
-        verifier_called = False
-
-        def verifier(_receipt):
-            nonlocal verifier_called
-            verifier_called = True
-            return {}
-
-        self.offline_logic.__exit__(None, None, None)
+    def test_darwin_missing_service_and_callback_bypass_are_deterministically_ineligible(self) -> None:
+        self.assertFalse(hasattr(runtime, "_accept_verified_external_boundary_session_v1"))
+        self.assertFalse(hasattr(runtime, "_offline_logic_only_v1"))
+        self.logic_harness.__exit__(None, None, None)
         try:
             with mock.patch.object(runtime.sys, "platform", "darwin"):
                 with self.assertRaisesRegex(
                     runtime.BeadsProtectedRuntimeError,
                     "host platform 'darwin' is not Linux",
                 ):
-                    runtime._accept_verified_external_boundary_session_v1(
-                        receipt, verifier
+                    runtime.prepare_atomic_claim_v1(
+                        self.request(
+                            "PrepareAtomicClaimRequestV1",
+                            taskId="task-refused",
+                            expectedRevision="1",
+                            claimNonce="darwin-refusal",
+                            expiresAtUnix=self.expires,
+                        )
                     )
-            with mock.patch.object(runtime.sys, "platform", "linux"):
+            with mock.patch.object(runtime.sys, "platform", "linux"), mock.patch.object(
+                runtime._boundary_controller,
+                "load_controller_config",
+                side_effect=runtime._boundary_controller.ControllerProtocolError(
+                    "fixed controller service is unavailable"
+                ),
+            ):
                 with self.assertRaisesRegex(
                     runtime.BeadsProtectedRuntimeError,
-                    "provider is unproved",
+                    "fixed controller service is unavailable",
                 ):
-                    runtime._accept_verified_external_boundary_session_v1(
-                        receipt, verifier
+                    runtime.prepare_atomic_claim_v1(
+                        self.request(
+                            "PrepareAtomicClaimRequestV1",
+                            taskId="task-refused",
+                            expectedRevision="1",
+                            claimNonce="missing-service-refusal",
+                            expiresAtUnix=self.expires,
+                        )
                     )
         finally:
-            self.offline_logic = runtime._offline_logic_only_v1()
-            self.offline_logic.__enter__()
-        self.assertFalse(verifier_called)
+            self.logic_harness = logic_harness(
+                runtime, self.root, self.key, self.repository
+            )
+            self.logic_harness.__enter__()
         self.assertFalse((self.root / runtime.REPOSITORY_NAMESPACE).exists())
 
     def test_native_mutation_refuses_without_session_before_hook_or_syscall(self) -> None:
@@ -185,12 +190,12 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
             nonlocal hook_called
             hook_called = True
 
-        self.offline_logic.__exit__(None, None, None)
+        self.logic_harness.__exit__(None, None, None)
         try:
             with mock.patch.object(runtime, "_NATIVE_MUTATION_HOOK", hook):
                 with self.assertRaisesRegex(
                     runtime.BeadsProtectedRuntimeError,
-                    "external Linux boundary session required",
+                    "fixed root-managed Linux Beads boundary controller required",
                 ):
                     runtime._native_rename_noreplace(
                         parent,
@@ -201,8 +206,10 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                     )
         finally:
             os.close(parent)
-            self.offline_logic = runtime._offline_logic_only_v1()
-            self.offline_logic.__enter__()
+            self.logic_harness = logic_harness(
+                runtime, self.root, self.key, self.repository
+            )
+            self.logic_harness.__enter__()
         self.assertFalse(hook_called)
         self.assertTrue(source.is_dir())
         self.assertFalse(target.exists())
@@ -762,6 +769,7 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
             "object-publication-intent-written",
             "object-publication-object-written",
             "object-publication-journal-written",
+            "object-publication-provenance-written",
             "object-publication-receipt-written",
         )
         for phase in phases:
@@ -1456,6 +1464,67 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 )
                 os.close(descriptor)
         self.assertTrue(switched)
+
+    def test_two_complete_tree_passes_detect_earlier_child_content_change(self) -> None:
+        tree = self.base / "two-pass-tree"
+        tree.mkdir(mode=0o700)
+        child = tree / "first-child"
+        child.write_bytes(b"first")
+        child.chmod(0o600)
+        hook_calls = 0
+
+        def change_after_first_pass(phase, _descriptor, entries):
+            nonlocal hook_calls
+            self.assertEqual("between-complete-tree-passes", phase)
+            self.assertEqual(1, len(entries))
+            hook_calls += 1
+            child.write_bytes(b"other")
+            child.chmod(0o600)
+
+        with mock.patch.object(runtime, "_TREE_PASS_HOOK", change_after_first_pass):
+            with self.assertRaisesRegex(
+                runtime.BeadsProtectedRuntimeError,
+                "changed between the two complete physical tree passes",
+            ):
+                runtime._observe_directory_tree(tree, "two-pass hostile fixture")
+        self.assertEqual(1, hook_calls)
+
+    def test_production_reader_rejects_noninstalled_harness_provenance(self) -> None:
+        store = self.store()
+        envelope, _, record_sha256, full_sha256 = store.sign(
+            "beads-test-harness-provenance-record",
+            {
+                "repositoryLocatorSha256": self.repository,
+                "remediationEvidenceSha256": digest("test-provenance"),
+            },
+        )
+        runtime._publish_authenticated_record(
+            store,
+            store.directory("test-harness-provenance-records", "history")
+            / f"{record_sha256.removeprefix('sha256:')}.json",
+            envelope,
+            "beads-test-harness-provenance-record",
+            record_sha256,
+            full_sha256,
+        )
+        self.assertEqual(TEST_PROVENANCE, runtime._REQUIRED_PROVENANCE_DOMAIN)
+        runtime._REQUIRED_PROVENANCE_DOMAIN = (
+            runtime._boundary_controller.PRODUCTION_PROVENANCE
+        )
+        try:
+            with self.assertRaisesRegex(
+                runtime.BeadsProtectedRuntimeError,
+                "live required controller provenance|live production provenance",
+            ):
+                runtime._load_record(
+                    store,
+                    "_WireRecord",
+                    "beads-test-harness-provenance-record",
+                    "test-harness-provenance-records",
+                    record_sha256,
+                )
+        finally:
+            runtime._REQUIRED_PROVENANCE_DOMAIN = TEST_PROVENANCE
 
     def test_finish_projection_is_the_unchanged_authenticated_result(self) -> None:
         store, pointer, _ = self.seed_preparation_pointer("authenticated-finish")

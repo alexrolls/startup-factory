@@ -1096,6 +1096,20 @@ runtime_kit.apply_runtime_kit(plan, expected_plan_digest=expected)
         self.assertIn("BROKER_AGENT_OUTBOX_ROOT=", config)
         self.assertIn("AGENT_RUNTIME_MANIFEST=", config)
         self.assertNotIn("new bundled default", config)
+        self.assertEqual(
+            (
+                self.target
+                / "runtime/beads-boundary-controller-v1.example.json"
+            ).read_text(),
+            '{"fixtureVersion":"2"}\n',
+        )
+        self.assertEqual(
+            (
+                self.target
+                / "runtime/startup-factory-beads-controller.service.example"
+            ).read_text(),
+            "# fixture service 2\n",
+        )
 
         digest = self.preview_digest()
         code, output, error = self.apply_on_linux(digest)

@@ -14,8 +14,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "tests"))
 
 runtime = importlib.import_module("startup_factory_cli.beads_protected_runtime")
+from support.beads_protected_runtime_harness import logic_harness
 
 
 def digest(label: str) -> str:
@@ -24,8 +26,6 @@ def digest(label: str) -> str:
 
 class ProtectedRuntimeTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.offline_logic = runtime._offline_logic_only_v1()
-        self.offline_logic.__enter__()
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve() / "protected"
         self.root.mkdir(mode=0o700)
@@ -34,12 +34,16 @@ class ProtectedRuntimeTest(unittest.TestCase):
         self.key.chmod(0o600)
         self.repository = digest("repository")
         self.expires = int(time.time()) + 3600
+        self.logic_harness = logic_harness(
+            runtime, self.root, self.key, self.repository
+        )
+        self.logic_harness.__enter__()
 
     def tearDown(self) -> None:
         try:
             self.temporary.cleanup()
         finally:
-            self.offline_logic.__exit__(None, None, None)
+            self.logic_harness.__exit__(None, None, None)
 
     def request(self, name: str, **values):
         payload = {
@@ -78,6 +82,7 @@ class ProtectedRuntimeTest(unittest.TestCase):
         return payload
 
     def store(self):
+        self.logic_harness.bind_repository(self.repository)
         return runtime._Store(
             {
                 "protectedRoot": str(self.root),

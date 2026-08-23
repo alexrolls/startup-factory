@@ -44,6 +44,7 @@ Source = "https://github.com/alexrolls/startup-factory"
 
 [project.scripts]
 startup-factory = "startup_factory_cli.cli:main"
+startup-factory-beads-controller = "startup_factory_cli.beads_boundary_controller:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

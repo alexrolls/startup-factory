@@ -136,6 +136,10 @@ class ProjectMetadataTests(unittest.TestCase):
             self.config["project"]["scripts"]["startup-factory"],
             "startup_factory_cli.cli:main",
         )
+        self.assertEqual(
+            self.config["project"]["scripts"]["startup-factory-beads-controller"],
+            "startup_factory_cli.beads_boundary_controller:main",
+        )
 
     def test_src_layout_and_generated_resources(self) -> None:
         setuptools = self.config["tool"]["setuptools"]
@@ -156,13 +160,23 @@ class BundledDefaultsTests(unittest.TestCase):
 
     def test_protected_beads_runtime_module_and_fixture_are_shipped(self) -> None:
         module = ROOT / "src" / "startup_factory_cli" / "beads_protected_runtime.py"
+        controller = ROOT / "src" / "startup_factory_cli" / "beads_boundary_controller.py"
         fixture = ROOT / "tests" / "fixtures" / "beads-protected-runtime-v1.json"
+        config_example = ROOT / "runtime" / "beads-boundary-controller-v1.example.json"
+        service_example = ROOT / "runtime" / "startup-factory-beads-controller.service.example"
         spec = (ROOT / "packaging" / "bundle-spec.json").read_text(encoding="utf-8")
         self.assertTrue(module.is_file())
+        self.assertTrue(controller.is_file())
         self.assertTrue(fixture.is_file())
+        self.assertTrue(config_example.is_file())
+        self.assertTrue(service_example.is_file())
         self.assertIn('"tests/beads-protected-runtime-test.py"', spec)
         self.assertIn('"tests/beads-protected-runtime-hostile-test.py"', spec)
+        self.assertIn('"tests/beads-boundary-controller-test.py"', spec)
+        self.assertIn('"tests/support/beads_protected_runtime_harness.py"', spec)
         self.assertIn('"tests/fixtures/beads-protected-runtime-v1.json"', spec)
+        self.assertIn('"runtime/beads-boundary-controller-v1.example.json"', spec)
+        self.assertIn('"runtime/startup-factory-beads-controller.service.example"', spec)
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
@@ -290,6 +304,10 @@ class BuiltDistributionIdentityTests(unittest.TestCase):
         self.assertEqual(metadata.get_all("License-File", []), ["LICENSE"])
         self.assertEqual(metadata.get_all("Requires-Dist", []), [])
         self.assertIn("startup-factory = startup_factory_cli.cli:main", entry_points)
+        self.assertIn(
+            "startup-factory-beads-controller = startup_factory_cli.beads_boundary_controller:main",
+            entry_points,
+        )
         self.assertEqual(license_bytes, (ROOT / "LICENSE").read_bytes())
 
     def test_wheel_embeds_the_exact_canonical_bundle(self) -> None:

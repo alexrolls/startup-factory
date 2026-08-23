@@ -37,6 +37,14 @@ def base_payload(version: str = "1") -> dict[str, tuple[bytes, int]]:
         "README.md": (f"fixture-{version}\n".encode(), 0o644),
         "bin/update-installed-skill.sh": (b"#!/bin/sh\nexit 0\n", 0o755),
         "bin/runtime.sh": (f"#!/bin/sh\necho runtime-{version}\n".encode(), 0o755),
+        "runtime/beads-boundary-controller-v1.example.json": (
+            f"{{\"fixtureVersion\":\"{version}\"}}\n".encode(),
+            0o644,
+        ),
+        "runtime/startup-factory-beads-controller.service.example": (
+            f"# fixture service {version}\n".encode(),
+            0o644,
+        ),
         "adapters/_TEMPLATE.md": (b"adapter-template\n", 0o644),
         "adapters/Retired.md": (b"retired-v1\n", 0o644),
         "extensions/tracker-backends/README.md": (b"backend-contract\n", 0o644),

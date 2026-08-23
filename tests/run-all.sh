@@ -37,6 +37,7 @@ FULL_PYTHON_TESTS=(
   standalone-workspace-test.py
   ticket-content-security-test.py
   execution-graph-test.py
+  beads-boundary-controller-test.py
   beads-protected-runtime-test.py
   beads-protected-runtime-hostile-test.py
   retrospective-test.py
@@ -73,6 +74,7 @@ SMOKE_PYTHON_TESTS=(
   delivery-profile-test.py
   evidence-provider-test.py
   tracker-adapter-pagination-test.py
+  beads-boundary-controller-test.py
   beads-protected-runtime-test.py
   beads-protected-runtime-hostile-test.py
   task-hold-test.py
