@@ -975,6 +975,22 @@ and structurally small test/config tasks. Missing overrides fall back to the
 role command. A requested model profile can increase rigor but cannot downgrade
 the computed security-risk floor.
 
+DeepSeek Harness selects its model from the composed profile config rather than
+a CLI flag. To route task tiers to different models, write one small overlay per
+tier and reference it in the override command. Discover the exact row your dsh
+version composes with `dsh --profile headless --dump-config`, copy the
+`agent-default-model` row into e.g. `~/.dsh-overlays/strong.yml` with your
+`{provider, model}` choice, then:
+
+```
+TASK_STRONG_CMD="dsh --profile headless --patch \"$HOME/.dsh-overlays/strong.yml\" \"$(cat '{prompt_file}')\""
+```
+
+`--patch` is a launcher flag, so it must appear before the positional task text.
+Alternatively, point tiers at distinct `DSH_HOME` directories with different
+`settings.yaml` model defaults (requires allowlisting `DSH_HOME` or a wrapper
+script).
+
 `delivery-profile: auto|micro|standard` is a separate, diagnostic-only signal.
 The current `micro` assessor accepts only a bounded committed diff of ordinary
 documentation and recomputes from Git; code, executable documentation, control
