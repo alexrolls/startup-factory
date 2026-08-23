@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -63,6 +65,26 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
     def store(self) -> runtime._Store:
         return runtime._Store(self.request("VerifyBeadsProtectedRuntimeApiManifestRequestV1").payload)
 
+    def seed_authority(self, state: str, generation: int = 1, predecessor: str | None = None):
+        store = self.store()
+        return runtime._write_current(
+            store,
+            "BeadsAuthorityEpochStateV1",
+            "beads-authority-epoch-state",
+            "authority",
+            {
+                "repositoryLocatorSha256": self.repository,
+                "generation": generation,
+                "authorityState": state,
+                "predecessorCurrentFullBytesSha256": predecessor,
+                "preparationPointerRecordSha256": digest(f"pointer:{generation}"),
+                "adapterReleaseManifestRecordSha256": digest(f"release:{generation}"),
+                "runtimeApiManifestRecordSha256": digest(f"runtime:{generation}"),
+                **self.sequence(),
+            },
+            predecessor,
+        )
+
     def seed_preparation_pointer(self, suffix: str):
         store = self.store()
         sequence = self.sequence()
@@ -78,7 +100,6 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 "statusProfileRecordSha256": digest(f"status:{suffix}"),
                 "preparedPayloadCanonicalSha256": digest(f"payload:{suffix}"),
                 "preparedPayloadCanonicalJson": '{"schemaVersion":1}',
-                "resultStoredJournalHeadSha256": digest(f"head:{suffix}"),
                 "installIntentRecordSha256": None,
                 "installObservedRecordSha256": None,
                 "cleanupIntentRecordSha256": None,
@@ -86,6 +107,9 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 **sequence,
             },
             "preparation-results",
+        )
+        _, result_stored_head = runtime._journal_binding_for_record(
+            store, result.record_sha256, result.full_bytes_sha256, require_current=True
         )
         pointer = runtime._write_current(
             store,
@@ -97,7 +121,7 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 "generation": 1,
                 "predecessorCurrentFullBytesSha256": None,
                 "resultRecordSha256": result.record_sha256,
-                "resultStoredJournalHeadSha256": result.payload["resultStoredJournalHeadSha256"],
+                "resultStoredJournalHeadSha256": result_stored_head,
                 "statusProfileRecordSha256": result.payload["statusProfileRecordSha256"],
                 "leaseRecordSha256": result.payload["leaseRecordSha256"],
                 "installIntentRecordSha256": None,
@@ -117,7 +141,7 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 "pointerRecordSha256": pointer.record_sha256,
                 "pointerFullBytesSha256": pointer.full_bytes_sha256,
                 "resultRecordSha256": result.record_sha256,
-                "resultStoredJournalHeadSha256": result.payload["resultStoredJournalHeadSha256"],
+                "resultStoredJournalHeadSha256": result_stored_head,
                 "statusProfileRecordSha256": result.payload["statusProfileRecordSha256"],
                 "installIntentRecordSha256": None,
                 "installObservedRecordSha256": None,
@@ -352,6 +376,182 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
             runtime.record_beads_adapter_release_manifest_v1(
                 malformed,
                 runtime.BeadsAdapterReleaseManifestRecordCapabilityV1(payload={}),
+            )
+
+    def test_epoch_change_invalidates_claim_chain_before_successor_write(self) -> None:
+        first_authority = self.seed_authority("active")
+        claim = runtime.prepare_atomic_claim_v1(
+            self.request(
+                "PrepareAtomicClaimRequestV1",
+                taskId="task-stale-epoch",
+                expectedRevision="r1",
+                claimNonce="claim-stale-epoch",
+                expiresAtUnix=self.expires,
+            )
+        )
+        self.seed_authority("active", 2, first_authority.full_bytes_sha256)
+        with self.assertRaisesRegex(runtime.BeadsStaleAuthorityError, "current active authority"):
+            runtime.advance_atomic_claim_v1(
+                self.request(
+                    "AdvanceAtomicClaimRequestV1",
+                    leaseRecordSha256=claim.record_sha256,
+                    observedRevision="r2",
+                    observedStatus="active",
+                    claimSucceeded=True,
+                )
+            )
+
+    def test_executable_replacement_cannot_reach_spawn(self) -> None:
+        large_binary = self.base / "large-approved-bd"
+        large_bytes = b"#!/bin/sh\nexit 0\n#" + (b"x" * (runtime.MAX_CANONICAL_BYTES + 1)) + b"\n"
+        large_binary.write_bytes(large_bytes)
+        large_binary.chmod(0o700)
+        large_observation = runtime._observe_executable(
+            large_binary, runtime.sha256(large_bytes)
+        )
+        pinned, pinned_observation = runtime._install_pinned_executable(
+            self.store(), large_binary, large_observation
+        )
+        self.assertEqual(runtime.sha256(large_bytes), pinned_observation["bytesSha256"])
+        self.assertEqual(0o500, pinned.stat().st_mode & 0o777)
+        retry_pinned, retry_observation = runtime._install_pinned_executable(
+            self.store(), large_binary, large_observation
+        )
+        self.assertEqual(pinned, retry_pinned)
+        self.assertEqual(pinned_observation, retry_observation)
+
+        binary = self.base / "approved-bd"
+        approved_marker = self.base / "approved-ran"
+        replacement_marker = self.base / "replacement-ran"
+        approved = f"#!/bin/sh\nprintf approved >'{approved_marker}'\n".encode()
+        replacement = f"#!/bin/sh\nprintf replacement >'{replacement_marker}'\n".encode()
+        binary.write_bytes(approved)
+        binary.chmod(0o700)
+        expected = runtime._observe_executable(binary, runtime.sha256(approved))
+        real_run = runtime.subprocess.run
+
+        def replace_then_run(argv, **kwargs):
+            replacement_path = self.base / "replacement-bd"
+            replacement_path.write_bytes(replacement)
+            replacement_path.chmod(0o700)
+            os.replace(replacement_path, binary)
+            return real_run(argv, **kwargs)
+
+        with mock.patch.object(runtime.subprocess, "run", side_effect=replace_then_run):
+            with self.assertRaises(runtime.BeadsProtectedRuntimeError):
+                runtime._spawn_verified_executable_v1(
+                    binary,
+                    expected,
+                    [str(binary)],
+                    cwd=self.base,
+                    env={"PATH": "/usr/bin:/bin"},
+                )
+        self.assertTrue(approved_marker.exists())
+        self.assertFalse(replacement_marker.exists())
+
+    def test_journal_old_head_and_deleted_terminal_evidence_are_not_recoverable(self) -> None:
+        store = self.store()
+        first = runtime._signed_record(
+            store, "AtomicClaimReceiptV1", "atomic-claim-receipt",
+            {"repositoryLocatorSha256": self.repository, "revision": "one"}, "claim-receipts",
+        )
+        second = runtime._signed_record(
+            store, "AtomicClaimReceiptV1", "atomic-claim-receipt",
+            {"repositoryLocatorSha256": self.repository, "revision": "two"}, "claim-receipts",
+        )
+        first_index = store.read_json(
+            store.directory("journals", "by-record")
+            / f"{first.record_sha256.removeprefix('sha256:')}.json",
+            "first journal index",
+        )
+        (store.directory("journals") / "current.json").write_bytes(runtime.canonical_bytes(first_index))
+        with self.assertRaises(runtime.BeadsProtectedRuntimeError):
+            runtime._verify_journal(store, "atomic-claim-receipt", second.record_sha256, second.full_bytes_sha256)
+
+        self.repository = digest("hostile-deleted-terminal")
+        store, pointer, activation = self.seed_preparation_pointer("deleted-terminal")
+        activation_path = store.directory("preparation-activation-receipts", "history") / (
+            activation.record_sha256.removeprefix("sha256:") + ".json"
+        )
+        index_path = store.directory("journals", "by-record") / (
+            activation.record_sha256.removeprefix("sha256:") + ".json"
+        )
+        index = store.read_json(index_path, "activation journal index")
+        _, _, journal_record, _ = store.verify(index, "beads-protected-journal-entry")
+        activation_path.unlink()
+        index_path.unlink()
+        (store.directory("journals", "history") / (journal_record.removeprefix("sha256:") + ".json")).unlink()
+        with self.assertRaises(runtime.BeadsProtectedRuntimeError):
+            runtime._finish_preparation_projection(store, pointer)
+        self.assertFalse(activation_path.exists())
+
+    def test_tree_identity_race_and_no_clobber_install_fail_closed(self) -> None:
+        tree = self.base / "tree"
+        child = tree / "child"
+        replacement = self.base / "replacement-child"
+        tree.mkdir(mode=0o700)
+        child.mkdir(mode=0o700)
+        replacement.mkdir(mode=0o700)
+        (child / "original").write_bytes(b"original")
+        (child / "original").chmod(0o600)
+        (replacement / "replacement").write_bytes(b"replacement")
+        (replacement / "replacement").chmod(0o600)
+        saved = self.base / "saved-child"
+        real_open = runtime.os.open
+        switched = False
+
+        def swap_before_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal switched
+            if path == "child" and dir_fd is not None and not switched:
+                switched = True
+                child.rename(saved)
+                replacement.rename(child)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(runtime.os, "open", side_effect=swap_before_open):
+            with self.assertRaises(runtime.BeadsProtectedRuntimeError):
+                runtime._observe_directory_tree(tree, "raced tree")
+
+        source_parent = self.base / "source-parent"
+        target_parent = self.base / "target-parent"
+        source_parent.mkdir(mode=0o700)
+        target_parent.mkdir(mode=0o700)
+        source = source_parent / "database"
+        target = target_parent / "database"
+        source.mkdir(mode=0o700)
+        target.mkdir(mode=0o700)
+        (source / "source-marker").write_bytes(b"source")
+        (target / "target-marker").write_bytes(b"target")
+        source_fd, source_leaf = runtime._open_absolute_parent(source, "source")
+        target_fd, target_leaf = runtime._open_absolute_parent(target, "target")
+        try:
+            with self.assertRaises(runtime.BeadsProtectedRuntimeError):
+                runtime._rename_directory_noreplace(source_fd, source_leaf, target_fd, target_leaf)
+        finally:
+            os.close(source_fd)
+            os.close(target_fd)
+        self.assertTrue((source / "source-marker").exists())
+        self.assertTrue((target / "target-marker").exists())
+
+    def test_every_registered_type_has_closed_schema_and_cores_roundtrip_exactly(self) -> None:
+        schema = json.loads(runtime.beads_protected_runtime_schema_v1())
+        self.assertEqual(set(runtime._TYPE_NAMES), set(schema["typeSchemas"]))
+        for name in runtime._TYPE_NAMES:
+            closure = schema["typeSchemas"][name]
+            self.assertEqual({"fields", "nullable", "required"}, set(closure), name)
+            with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "unknown"):
+                getattr(runtime, name)(payload={"unexpectedAuthority": "must-fail"})
+
+        with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "unknown"):
+            runtime.build_beads_bootstrap_runtime_core_v1(
+                runtime.BeadsBootstrapRuntimeCoreInputsV1(
+                    payload={
+                        "bootstrapChangeKind": "create",
+                        "adapterChangeKind": "create",
+                        "remediationEvidenceSha256": None,
+                        "unexpectedAuthority": digest("must-fail"),
+                    }
+                )
             )
 
 

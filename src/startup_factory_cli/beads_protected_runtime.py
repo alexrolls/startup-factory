@@ -12,7 +12,9 @@ broker is expected to invoke these functions outside the agent environment.
 
 from __future__ import annotations
 
+import ctypes
 import dataclasses
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -35,6 +37,7 @@ SCHEMA_VERSION: Final = 1
 BEADS_BASELINE_COMMIT: Final = "20e493e569c922d1253bdeff068c5e56c94957fb"
 MAX_GENERATION: Final = 99_999_999_999_999_999_999
 MAX_CANONICAL_BYTES: Final = 1_048_576
+MAX_EXECUTABLE_BYTES: Final = 67_108_864
 REPOSITORY_NAMESPACE: Final = "beads-authority-v1"
 RE_ATTEST_COMMAND: Final = ("--db", "{selector}", "--json", "--sandbox", "config", "list")
 _DIGEST = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
@@ -170,6 +173,22 @@ class _WireRecord:
 
     def __post_init__(self) -> None:
         validated = _validate_json(_plain(self.payload))
+        schema = globals().get("_TYPE_SCHEMAS", {}).get(type(self).__name__)
+        if schema is not None:
+            unknown = sorted(set(validated) - schema["fields"])
+            if unknown:
+                raise BeadsProtectedRuntimeError(
+                    f"{type(self).__name__} has unknown protected field(s): " + ", ".join(unknown)
+                )
+            forbidden_null = sorted(
+                field for field, value in validated.items()
+                if value is None and field not in schema["nullable"]
+            )
+            if forbidden_null:
+                raise BeadsProtectedRuntimeError(
+                    f"{type(self).__name__} has non-nullable protected field(s): "
+                    + ", ".join(forbidden_null)
+                )
         object.__setattr__(self, "payload", _freeze(validated))
         for label, digest in (("record", self.record_sha256), ("full-bytes", self.full_bytes_sha256)):
             if digest is not None and not _DIGEST.fullmatch(digest):
@@ -263,6 +282,12 @@ _SEQUENCE_FIELDS = {
     "selectorObservationASha256", "selectedStoreObservationASha256",
 }
 _REQUEST_FIELDS: dict[str, set[str]] = {
+    "BeadsBootstrapRuntimeCoreInputsV1": {
+        "bootstrapChangeKind", "adapterChangeKind", "remediationEvidenceSha256", "baselineCommit",
+    },
+    "BeadsAdapterReleaseCoreInputsV1": {
+        "bootstrapChangeKind", "adapterChangeKind", "remediationEvidenceSha256", "baselineCommit",
+    },
     "PrepareAtomicClaimRequestV1": _STORE_FIELDS | {"taskId", "expectedRevision", "claimNonce", "expiresAtUnix"},
     "AdvanceAtomicClaimRequestV1": _STORE_FIELDS | {"leaseRecordSha256", "observedRevision", "observedStatus", "claimSucceeded"},
     "RecordAtomicClaimReceiptRequestV1": _STORE_FIELDS | {"leaseRecordSha256", "readBackRevision", "readBackStatus", "claimIdentitySha256"},
@@ -333,6 +358,173 @@ _REQUEST_FIELDS: dict[str, set[str]] = {
 }
 
 
+_NULLABLE_FIELDS = {
+    "acceptedConfigEnvelopeSha256", "adapterReleaseManifestRecordSha256", "candidate", "cleanupIntentRecordSha256",
+    "cleanupObservedRecordSha256", "configReadbackStepRecordSha256",
+    "createStageDatabasePath", "createStageDatabasePathLocatorSha256",
+    "currentPointerFullBytesSha256", "doltRootPath", "exitCode",
+    "expectedCurrentFullBytesSha256", "expectedCurrentPointerFullBytesSha256",
+    "installIntentRecordSha256",
+    "installedDatabaseSelectorBindingSha256", "installedSelectorPath",
+    "installObservedRecordSha256", "launchAuthorizationRecordSha256",
+    "predecessorCurrentFullBytesSha256", "predecessorJournalEntryFullBytesSha256",
+    "predecessorJournalEntryRecordSha256", "predecessorLeaseRecordSha256",
+    "predecessorObservationRecordSha256", "predecessorTransactionIntentSha256",
+    "preparationCommandIntentRecordSha256", "preparationLeaseRecordSha256",
+    "preparationPointerRecordSha256", "readBackSha256", "remediationEvidenceSha256",
+    "runtimeApiManifestRecordSha256",
+    "selectedStoreObservationASha256", "selectedStorePath",
+    "selectorObservationASha256", "sourceAuthorityTransitionReceiptRecordSha256",
+    "sourcePreparationPointerRecordSha256", "stderrSha256", "stdoutSha256",
+    "successorLeaseRecordSha256",
+}
+
+_SIGNED = {"kind", "schemaVersion"}
+_SEQUENCED = _SIGNED | _SEQUENCE_FIELDS
+_CLAIM_LEASE = _SIGNED | {
+    "repositoryLocatorSha256", "taskId", "expectedRevision", "claimNonce", "expiresAtUnix",
+    "claimState", "activeAuthorityRecordSha256", "transactionIntentSha256",
+    "predecessorLeaseRecordSha256", "observedRevision", "observedStatus",
+}
+_PREPARATION_AUTHORIZATION = _SEQUENCED | {
+    "repositoryLocatorSha256", "planSha256", "executableSha256", "operatorIdentitySha256", "authorizationNonce",
+    "expiresAtUnix", "runtimeApiManifestRecordSha256", "adapterReleaseManifestRecordSha256",
+    "bootstrapRuntimeCoreSha256", "adapterReleaseCoreSha256", "createStageDatabasePath",
+    "repositoryPath", "databaseName", "installPath", "cleanupPath", "statusConfigValue",
+    "installedSelectorPath", "selectedStorePath", "doltRootPath",
+    "executablePath", "executableObservation", "pinnedExecutablePath",
+    "pinnedExecutableObservation", "createStageObservationA", "installObservationA",
+    "cleanupObservationA", "cleanupTreeObservationA", "revokedAuthorityRecordSha256",
+}
+_PREPARATION_LEASE = _PREPARATION_AUTHORIZATION | {
+    "authorizationRecordSha256", "leaseNonce", "transactionIntentSha256", "nextCommandOrdinal",
+    "preparationState", "lastCommandIntentRecordSha256", "predecessorLeaseRecordSha256",
+    "createStageObservationCurrent",
+}
+_PREPARATION_STEP = _SEQUENCED | {
+    "repositoryLocatorSha256", "leaseRecordSha256", "commandIntentRecordSha256", "commandKind",
+    "commandOrdinal", "argv", "argvSha256", "outcome", "exitCode", "stdoutSha256",
+    "stderrSha256", "mutationIntentRecordSha256", "mutationResultRecordSha256",
+    "successorLeaseRecordSha256", "transactionIntentSha256", "postObservationRecordSha256",
+    "stagePathSha256", "installPathSha256", "cleanupPathSha256", "expectedStageTreeSha256",
+    "installIntentRecordSha256", "installedTree", "installedTreeSha256",
+    "installObservedRecordSha256", "cleanupTreeObservationA", "cleanupIntentRecordSha256",
+    "cleanupAbsentObservation",
+}
+_PREPARATION_TERMINAL = _SEQUENCED | {
+    "repositoryLocatorSha256", "leaseRecordSha256", "preObservationRecordSha256",
+    "postObservationRecordSha256", "statusProfileRecordSha256", "preparedPayloadCanonicalSha256",
+    "preparedPayloadCanonicalJson", "transactionIntentSha256", "installIntentRecordSha256",
+    "installObservedRecordSha256", "cleanupIntentRecordSha256", "cleanupObservedRecordSha256",
+}
+_AUTHORITY_STATE = _SEQUENCED | {
+    "repositoryLocatorSha256", "generation", "authorityState", "candidate",
+    "predecessorCurrentFullBytesSha256", "transitionAuthorizationRecordSha256",
+    "transitionIntentSha256", "preparationPointerRecordSha256",
+    "adapterReleaseManifestRecordSha256", "runtimeApiManifestRecordSha256",
+}
+_AUTHORITY_TRANSITION = _SEQUENCED | {
+    "repositoryLocatorSha256", "command", "transactionIntentSha256", "authorizationRecordSha256",
+    "authorityStateRecordSha256", "authorityStateFullBytesSha256",
+    "predecessorCurrentFullBytesSha256", "candidate", "transitionStepRecordSha256",
+}
+_RUNTIME_MANIFEST = _SIGNED | {
+    "repositoryLocatorSha256", "generation", "predecessorCurrentFullBytesSha256",
+    "capabilityRecordSha256", "mode", "moduleSha256", "schemaFixtureSha256", "exports",
+    "bootstrapRuntimeCoreSha256", "runtimeTransactionAuthorityBinding",
+    "runtimeTransactionAuthorityBindingSha256", "changePlanCoreRecordSha256",
+    "transactionIntentSha256", "historicalOnly",
+}
+_ADAPTER_MANIFEST = _SIGNED | {
+    "repositoryLocatorSha256", "generation", "predecessorCurrentFullBytesSha256",
+    "capabilityRecordSha256", "bootstrapRuntimeCoreSha256", "adapterReleaseCoreSha256",
+    "runtimeApiManifestRecordSha256", "changePlanCoreRecordSha256", "runtimeManifestObservations",
+    "adapterPayloadSha256", "releaseIdentitySha256", "remediationEvidenceSha256",
+    "transactionIntentSha256",
+}
+
+# Exact top-level shapes for every registered non-request wire type.  Variants
+# of a state machine share only the explicit union of fields that their own
+# type can carry; fields from another protocol type are never accepted.
+_RESULT_FIELDS: dict[str, set[str]] = {
+    "AtomicClaimLeaseV1": _CLAIM_LEASE,
+    "AtomicClaimReceiptV1": _SIGNED | {"repositoryLocatorSha256", "leaseRecordSha256", "taskId", "revision", "status", "claimIdentitySha256", "activeAuthorityRecordSha256"},
+    "LaunchAuthorizationV1": _SIGNED | {"repositoryLocatorSha256", "claimReceiptRecordSha256", "activeAuthorityRecordSha256", "launchNonce", "expiresAtUnix", "transactionIntentSha256"},
+    "BeadsMutationIntentV1": _SEQUENCED | {"repositoryLocatorSha256", "mutationClass", "mutationNonce", "argv", "argvSha256", "expiresAtUnix", "transactionIntentSha256", "activeAuthorityRecordSha256", "launchAuthorizationRecordSha256", "preparationLeaseRecordSha256", "preparationCommandIntentRecordSha256", "revokedAuthorityRecordSha256"},
+    "BeadsMutationResultV1": _SEQUENCED | {"repositoryLocatorSha256", "mutationClass", "mutationNonce", "argv", "argvSha256", "expiresAtUnix", "transactionIntentSha256", "activeAuthorityRecordSha256", "launchAuthorizationRecordSha256", "preparationLeaseRecordSha256", "preparationCommandIntentRecordSha256", "revokedAuthorityRecordSha256", "mutationIntentRecordSha256", "exitCode", "stdoutSha256", "stderrSha256", "readBackSha256", "observedByBroker"},
+    "BeadsInstalledDatabaseSelectorBindingV1": {"repositoryLocatorSha256", "sourcePreparationPointerRecordSha256", "selectorPath", "selectedStorePath", "doltRootPath", "databaseName", "selectorObservation", "selectedStoreObservation", "doltRootObservation"},
+    "BeadsInstalledSelectorObservationV1": {"pathSha256", "device", "inode", "owner", "linkCount", "fileType", "ancestrySha256"},
+    "BeadsSelectedStoreObservationV1": {"pathSha256", "device", "inode", "owner", "linkCount", "fileType", "ancestrySha256"},
+    "VerifiedBeadsInstalledDatabaseSelectorV1": {"repositoryLocatorSha256", "sourcePreparationPointerRecordSha256", "selectorPath", "selectedStorePath", "doltRootPath", "databaseName", "selectorObservation", "selectedStoreObservation", "doltRootObservation"},
+    "BeadsPreparationRemediationEvidenceV1": {"remediationEvidenceSha256"},
+    "BeadsPreparationSequenceV1": set(_SEQUENCE_FIELDS),
+    "BeadsPreparationAuthorizationV1": _PREPARATION_AUTHORIZATION,
+    "BeadsPreparationLeaseV1": _PREPARATION_LEASE,
+    "BeadsPreparationCommandIntentV1": _SEQUENCED | {"repositoryLocatorSha256", "leaseRecordSha256", "commandOrdinal", "commandKind", "argv", "argvSha256", "transactionIntentSha256"},
+    "BeadsStoreStateProjectionV1": {"primaryStore", "executableObservation", "installObservation", "cleanupObservation", "selectedStoreObservation", "doltRootObservation"},
+    "BeadsStoreObservationV1": _SEQUENCED | {"repositoryLocatorSha256", "leaseRecordSha256", "observationPhase", "stateProjection", "storeStateSha256", "acceptedConfigEnvelopeSha256", "predecessorObservationRecordSha256", "configReadbackStepRecordSha256", "transactionIntentSha256"},
+    "BeadsPreparationStepV1": _PREPARATION_STEP,
+    "BeadsStatusProfileDynamicBindingsV1": {"schemaVersion", "repositoryLocatorSha256", "preparationLeaseRecordSha256", "preObservationRecordSha256", "postObservationRecordSha256", "storeStateSha256", "acceptedConfigEnvelopeCanonicalSha256"} | _SEQUENCE_FIELDS,
+    "VerifiedBeadsStatusProfileDynamicBindingsV1": {"schemaVersion", "repositoryLocatorSha256", "preparationLeaseRecordSha256", "preObservationRecordSha256", "postObservationRecordSha256", "storeStateSha256", "acceptedConfigEnvelopeCanonicalSha256"} | _SEQUENCE_FIELDS,
+    "FinishBeadsPreparationResultV1": _PREPARATION_TERMINAL | {"resultStoredJournalHeadSha256", "pointerRecordSha256", "currentPointerFullBytesSha256", "activationReceiptRecordSha256"},
+    "BeadsStatusProfileV1": _SEQUENCED | {"repositoryLocatorSha256", "leaseRecordSha256", "payloadCanonicalSha256", "payloadCanonicalJson", "dynamicBindingsCanonicalSha256", "transactionIntentSha256"},
+    "BeadsPreparationCurrentV1": _SEQUENCED | {"repositoryLocatorSha256", "generation", "predecessorCurrentFullBytesSha256", "leaseRecordSha256", "resultRecordSha256", "resultStoredJournalHeadSha256", "statusProfileRecordSha256", "transactionIntentSha256", "installIntentRecordSha256", "installObservedRecordSha256", "cleanupIntentRecordSha256", "cleanupObservedRecordSha256"},
+    "BeadsPreparationActivationReceiptV1": _SEQUENCED | {"repositoryLocatorSha256", "pointerRecordSha256", "pointerFullBytesSha256", "resultRecordSha256", "resultStoredJournalHeadSha256", "statusProfileRecordSha256", "installIntentRecordSha256", "installObservedRecordSha256", "cleanupIntentRecordSha256", "cleanupObservedRecordSha256"},
+    "VerifiedCurrentBeadsPreparationV1": _SEQUENCED | {"repositoryLocatorSha256", "pointerRecordSha256", "pointerFullBytesSha256", "resultRecordSha256", "activationReceiptRecordSha256", "historicalOnly"},
+    "VerifiedHistoricalBeadsPreparationV1": _SEQUENCED | {"repositoryLocatorSha256", "pointerRecordSha256", "pointerFullBytesSha256", "resultRecordSha256", "activationReceiptRecordSha256", "historicalOnly"},
+    "BeadsBootstrapRuntimeCoreV1": _SIGNED | {"bootstrapChangeKind", "adapterChangeKind", "remediationEvidenceSha256", "baselineCommit"},
+    "BeadsAdapterReleaseCoreV1": _SIGNED | {"bootstrapChangeKind", "adapterChangeKind", "remediationEvidenceSha256", "baselineCommit"},
+    "BeadsChangePlanCoreReferenceV1": {"changePlanCoreRecordSha256", "bootstrapRuntimeCoreSha256", "adapterReleaseCoreSha256"},
+    "BeadsChangePlanCoreRecordV1": _SIGNED | {"repositoryLocatorSha256", "bootstrapRuntimeCoreSha256", "adapterReleaseCoreSha256", "bootstrapRuntimeCoreCanonicalJson", "adapterReleaseCoreCanonicalJson", "bootstrapChangeKind", "adapterChangeKind", "remediationEvidenceSha256", "transactionIntentSha256"},
+    "BeadsChangePlanCoreTransactionIntentV1": {"repositoryLocatorSha256", "operation", "transactionIntentSha256"},
+    "BeadsChangePlanCoreTransactionReceiptV1": {"repositoryLocatorSha256", "operation", "transactionIntentSha256", "resultRecordSha256", "resultFullBytesSha256"},
+    "VerifiedBeadsChangePlanCoreRecordV1": _SIGNED | {"repositoryLocatorSha256", "bootstrapRuntimeCoreSha256", "adapterReleaseCoreSha256", "bootstrapRuntimeCoreCanonicalJson", "adapterReleaseCoreCanonicalJson", "bootstrapChangeKind", "adapterChangeKind", "remediationEvidenceSha256", "transactionIntentSha256"},
+    "BeadsRepositoryAuthorityLockV1": {"repositoryLocatorSha256", "owner"},
+    "BeadsAuthorityPredecessorV1": {"authorityStateRecordSha256", "authorityStateFullBytesSha256", "predecessorCurrentFullBytesSha256"},
+    "BeadsAuthorityLocatorV1": {"repositoryLocatorSha256", "authorityStateRecordSha256", "authorityStateFullBytesSha256", "predecessorCurrentFullBytesSha256", "verifiedReceiptRecordSha256", "repositoryPath", "databaseName"},
+    "ActiveBeadsAuthorityTupleV1": set(_AUTHORITY_CANDIDATE_FIELDS) if "_AUTHORITY_CANDIDATE_FIELDS" in globals() else {"preparationPointerRecordSha256", "preparationActivationReceiptRecordSha256", "adapterReleaseManifestRecordSha256", "runtimeApiManifestRecordSha256", "repositoryPath", "databaseName"},
+    "BeadsAuthorityCandidateV1": {"preparationPointerRecordSha256", "preparationActivationReceiptRecordSha256", "adapterReleaseManifestRecordSha256", "runtimeApiManifestRecordSha256", "repositoryPath", "databaseName"},
+    "RevokeBeadsAuthorityCommandV1": {"command"}, "StageBeadsAuthorityCommandV1": {"command"}, "ActivateBeadsAuthorityCommandV1": {"command"},
+    "BeadsAuthorityTransitionAuthorizationV1": _SEQUENCED | {"repositoryLocatorSha256", "command", "authorizationNonce", "expiresAtUnix", "expectedCurrentFullBytesSha256", "candidate"},
+    "BeadsAuthorityEpochStateV1": _AUTHORITY_STATE,
+    "BeadsAuthorityTransitionIntentV1": _AUTHORITY_TRANSITION,
+    "BeadsAuthorityTransitionAuthorizationConsumedV1": _AUTHORITY_TRANSITION,
+    "BeadsAuthorityTransitionStepV1": _AUTHORITY_TRANSITION,
+    "BeadsAuthorityTransitionReceiptV1": _AUTHORITY_TRANSITION,
+    "VerifiedBeadsAuthorityTransitionReceiptV1": _AUTHORITY_TRANSITION,
+    "VerifiedRevokedBeadsAuthorityV1": _AUTHORITY_STATE | {"transitionReceiptRecordSha256"},
+    "VerifiedPendingBeadsAuthorityV1": _AUTHORITY_STATE | {"transitionReceiptRecordSha256"},
+    "VerifiedActiveBeadsAuthorityV1": _AUTHORITY_STATE | {"transitionReceiptRecordSha256"},
+    "BeadsRuntimeApiManifestRecordCapabilityV1": _SIGNED | {"repositoryLocatorSha256", "mode", "capabilityNonce", "expiresAtUnix", "expectedCurrentFullBytesSha256", "bootstrapRuntimeCoreSha256", "runtimeTransactionAuthorityBinding", "runtimeTransactionAuthorityBindingSha256", "changePlanCoreRecordSha256", "revokedAuthorityRecordSha256"},
+    "BeadsProtectedRuntimeApiManifestV1": _RUNTIME_MANIFEST,
+    "VerifiedBeadsProtectedRuntimeApiManifestV1": _RUNTIME_MANIFEST,
+    "VerifiedHistoricalBeadsProtectedRuntimeApiManifestV1": _RUNTIME_MANIFEST,
+    "BeadsRuntimeTransactionAuthorityBindingV1": {"kind", "identitySha256"},
+    "BeadsRuntimeApiManifestIntentV1": {"repositoryLocatorSha256", "operation", "transactionIntentSha256"},
+    "BeadsRuntimeApiManifestCapabilityConsumedV1": {"capabilityRecordSha256", "transactionIntentSha256"},
+    "BeadsRuntimeApiManifestTransactionStepV1": _RUNTIME_MANIFEST,
+    "BeadsRuntimeApiManifestReceiptV1": {"resultRecordSha256", "resultFullBytesSha256", "transactionIntentSha256"},
+    "BeadsAdapterReleaseManifestRecordCapabilityV1": _SIGNED | {"repositoryLocatorSha256", "capabilityNonce", "expiresAtUnix", "expectedCurrentFullBytesSha256", "bootstrapRuntimeCoreSha256", "adapterReleaseCoreSha256", "runtimeApiManifestRecordSha256", "changePlanCoreRecordSha256", "revokedAuthorityRecordSha256"},
+    "BeadsAdapterReleaseManifestV1": _ADAPTER_MANIFEST,
+    "VerifiedBeadsAdapterReleaseManifestV1": _ADAPTER_MANIFEST,
+    "BeadsAdapterReleaseManifestIntentV1": {"repositoryLocatorSha256", "operation", "transactionIntentSha256"},
+    "BeadsAdapterReleaseManifestCapabilityConsumedV1": {"capabilityRecordSha256", "transactionIntentSha256"},
+    "BeadsAdapterReleaseManifestTransactionStepV1": _ADAPTER_MANIFEST,
+    "BeadsAdapterReleaseManifestReceiptV1": {"resultRecordSha256", "resultFullBytesSha256", "transactionIntentSha256"},
+    "BeadsRuntimeManifestObservationV1": {"phase", "bootstrapRuntimeCoreSha256", "adapterReleaseCoreSha256", "runtimeApiManifestRecordSha256", "adapterPayloadSha256", "remediationEvidenceSha256"},
+}
+_TYPE_SCHEMAS: dict[str, dict[str, set[str]]] = {}
+for _type_name in _TYPE_NAMES:
+    fields = set(_REQUEST_FIELDS.get(_type_name, _RESULT_FIELDS.get(_type_name, set())))
+    _TYPE_SCHEMAS[_type_name] = {
+        "fields": fields,
+        "nullable": fields & _NULLABLE_FIELDS,
+        "required": set(),
+    }
+for _core_name in ("BeadsBootstrapRuntimeCoreInputsV1", "BeadsAdapterReleaseCoreInputsV1"):
+    _TYPE_SCHEMAS[_core_name]["required"] = set(_REQUEST_FIELDS[_core_name])
+
+
 def _request(value: _WireRecord, expected_name: str) -> dict[str, Any]:
     if type(value).__name__ != expected_name:
         raise BeadsProtectedRuntimeError(f"expected {expected_name}, received {type(value).__name__}")
@@ -398,6 +590,24 @@ def _directory_identity(metadata: os.stat_result) -> dict[str, int]:
     }
 
 
+def _ancestry_identity(metadata: os.stat_result) -> dict[str, int]:
+    """Stable path-substitution identity for an opened ancestor.
+
+    Ancestor link counts can legitimately change when unrelated sibling
+    directories are created.  Device/inode still pins the opened object;
+    owner and mode retain the security-relevant metadata without turning
+    concurrent activity elsewhere in a shared temporary parent into a false
+    substitution signal.
+    """
+
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "owner": metadata.st_uid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+    }
+
+
 def _validate_directory_metadata(metadata: os.stat_result, label: str, *, private: bool) -> None:
     if not stat.S_ISDIR(metadata.st_mode):
         raise BeadsProtectedRuntimeError(f"{label} must be a non-symlink directory")
@@ -421,7 +631,7 @@ def _open_absolute_directory(path: Path, label: str, *, private: bool = False) -
     try:
         root_metadata = os.fstat(descriptor)
         _validate_directory_metadata(root_metadata, f"{label} ancestor", private=False)
-        identities.append(_directory_identity(root_metadata))
+        identities.append(_ancestry_identity(root_metadata))
         for index, part in enumerate(path.parts[1:]):
             if part in {"", ".", ".."}:
                 raise BeadsProtectedRuntimeError(f"{label} contains an unsafe path component")
@@ -432,7 +642,7 @@ def _open_absolute_directory(path: Path, label: str, *, private: bool = False) -
                 label if index == len(path.parts[1:]) - 1 else f"{label} ancestor",
                 private=private and index == len(path.parts[1:]) - 1,
             )
-            identities.append(_directory_identity(metadata))
+            identities.append(_ancestry_identity(metadata))
             os.close(descriptor)
             descriptor = child
         return descriptor, identities
@@ -450,7 +660,13 @@ def _open_absolute_parent(path: Path, label: str) -> tuple[int, str]:
     return descriptor, path.name
 
 
-def _read_regular_descriptor(descriptor: int, label: str, *, executable: bool = False) -> bytes:
+def _read_regular_descriptor(
+    descriptor: int,
+    label: str,
+    *,
+    executable: bool = False,
+    max_bytes: int = MAX_CANONICAL_BYTES,
+) -> bytes:
     before = os.fstat(descriptor)
     if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
         raise BeadsProtectedRuntimeError(f"{label} must be a non-symlink single-link regular file")
@@ -462,13 +678,13 @@ def _read_regular_descriptor(descriptor: int, label: str, *, executable: bool = 
     if executable and stat.S_IMODE(before.st_mode) & 0o111 == 0:
         raise BeadsProtectedRuntimeError(f"{label} is not executable")
     data = bytearray()
-    while len(data) <= MAX_CANONICAL_BYTES:
-        chunk = os.read(descriptor, min(65536, MAX_CANONICAL_BYTES + 1 - len(data)))
+    while len(data) <= max_bytes:
+        chunk = os.read(descriptor, min(65536, max_bytes + 1 - len(data)))
         if not chunk:
             break
         data.extend(chunk)
     after = os.fstat(descriptor)
-    if len(data) > MAX_CANONICAL_BYTES or (
+    if len(data) > max_bytes or (
         before.st_dev,
         before.st_ino,
         before.st_size,
@@ -621,12 +837,18 @@ class _Store:
         parts = self._relative_parts(path)
         return self._open_directory(parts[:-1], create=create), parts[-1]
 
-    def _read_bytes(self, path: Path, label: str) -> bytes:
+    def _read_bytes(
+        self,
+        path: Path,
+        label: str,
+        *,
+        max_bytes: int = MAX_CANONICAL_BYTES,
+    ) -> bytes:
         parent, leaf = self._open_parent(path)
         try:
             descriptor = os.open(leaf, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent)
             try:
-                return _read_regular_descriptor(descriptor, label)
+                return _read_regular_descriptor(descriptor, label, max_bytes=max_bytes)
             finally:
                 os.close(descriptor)
         except OSError as exc:
@@ -713,6 +935,48 @@ class _Store:
         finally:
             os.close(parent)
 
+    def write_immutable_bytes(
+        self,
+        path: Path,
+        encoded: bytes,
+        mode: int,
+        *,
+        max_bytes: int = MAX_CANONICAL_BYTES,
+    ) -> None:
+        if not encoded or len(encoded) > max_bytes:
+            raise BeadsProtectedRuntimeError("immutable protected bytes are empty or oversized")
+        parent, leaf = self._open_parent(path, create=True)
+        try:
+            try:
+                descriptor = os.open(
+                    leaf,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    mode,
+                    dir_fd=parent,
+                )
+            except FileExistsError:
+                if self._read_bytes(
+                    path,
+                    "existing immutable protected bytes",
+                    max_bytes=max_bytes,
+                ) != encoded:
+                    raise BeadsProtectedRuntimeError("immutable protected byte collision")
+                metadata = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+                if stat.S_IMODE(metadata.st_mode) != mode:
+                    raise BeadsProtectedRuntimeError("immutable protected byte mode changed")
+                return
+            try:
+                offset = 0
+                while offset < len(encoded):
+                    offset += os.write(descriptor, encoded[offset:])
+                os.fchmod(descriptor, mode)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+
     def unlink_exact(self, path: Path, expected: bytes, label: str) -> None:
         parent, leaf = self._open_parent(path)
         try:
@@ -785,77 +1049,162 @@ def _record_result(type_name: str, body: Mapping[str, Any], auth: str, record_di
     return globals()[type_name](payload=body, auth=auth, record_sha256=record_digest, full_bytes_sha256=full_digest)
 
 
-def _journal_record(store: _Store, kind: str, record_digest: str, full_digest: str) -> None:
-    lookup = store.directory("journals", "by-record") / f"{record_digest.removeprefix('sha256:')}.json"
-    if store.exists(lookup):
-        envelope = store.read_json(lookup, "protected HMAC journal record index")
-        body, _, journal_digest, journal_full = store.verify(envelope, "beads-protected-journal-entry")
-        expected = {
-            "recordKind": kind,
-            "recordSha256": record_digest,
-            "recordFullBytesSha256": full_digest,
-            "repositoryLocatorSha256": store.repository_digest,
-        }
-        if any(body.get(field) != value for field, value in expected.items()):
-            raise BeadsProtectedRuntimeError("protected HMAC journal record index collision")
-        history = store.directory("journals", "history") / f"{journal_digest.removeprefix('sha256:')}.json"
-        if not store.exists(history) or canonical_bytes(store.read_json(history, "protected HMAC journal history")) != canonical_bytes(envelope):
-            raise BeadsProtectedRuntimeError("protected HMAC journal index lacks exact immutable history")
-        return
+_JOURNAL_BODY_FIELDS = {
+    "kind", "schemaVersion", "generation", "recordKind", "recordSha256",
+    "recordFullBytesSha256", "repositoryLocatorSha256",
+    "predecessorJournalEntryRecordSha256", "predecessorJournalEntryFullBytesSha256",
+}
+
+
+def _directory_json_names(store: _Store, parts: tuple[str, ...]) -> set[str]:
+    descriptor = store._open_directory(parts, create=True)
+    try:
+        names = {entry.name for entry in os.scandir(descriptor)}
+    finally:
+        os.close(descriptor)
+    if any(not re.fullmatch(r"[0-9a-f]{64}\.json", name) for name in names):
+        raise BeadsProtectedRuntimeError("protected HMAC journal contains an unexpected filename")
+    return names
+
+
+def _journal_chain(store: _Store) -> tuple[dict[str, tuple[str, str, dict[str, Any]]], str | None, str | None, int]:
+    """Verify one complete, monotonic and uniquely linked journal chain."""
+
     current_path = store.directory("journals") / "current.json"
-    predecessor: str | None = None
-    expected_current: str | None = None
-    if store.exists(current_path):
-        current = store.read_json(current_path, "current protected HMAC journal entry")
-        _, _, predecessor, expected_current = store.verify(current, "beads-protected-journal-entry")
+    history_names = _directory_json_names(store, ("journals", "history"))
+    index_names = _directory_json_names(store, ("journals", "by-record"))
+    if not store.exists(current_path):
+        if history_names or index_names:
+            raise BeadsProtectedRuntimeError("protected HMAC journal has evidence without a current head")
+        return {}, None, None, 0
+    current = store.read_json(current_path, "current protected HMAC journal entry")
+    _, _, current_record, current_full = store.verify(current, "beads-protected-journal-entry")
+    seen_entries: set[str] = set()
+    by_protected_record: dict[str, tuple[str, str, dict[str, Any]]] = {}
+    envelope = current
+    expected_generation: int | None = None
+    while True:
+        body, _, journal_record, journal_full = store.verify(envelope, "beads-protected-journal-entry")
+        if set(body) != _JOURNAL_BODY_FIELDS:
+            raise BeadsProtectedRuntimeError("protected HMAC journal entry has an unknown or missing field")
+        generation = _generation(body.get("generation"))
+        if expected_generation is None:
+            expected_generation = generation
+        elif generation != expected_generation:
+            raise BeadsProtectedRuntimeError("protected HMAC journal generations are not contiguous")
+        if journal_record in seen_entries:
+            raise BeadsProtectedRuntimeError("protected HMAC journal contains a predecessor cycle")
+        if body.get("repositoryLocatorSha256") != store.repository_digest:
+            raise BeadsProtectedRuntimeError("protected HMAC journal repository binding mismatch")
+        protected_record = _digest(body.get("recordSha256"), "journal recordSha256")
+        protected_full = _digest(body.get("recordFullBytesSha256"), "journal recordFullBytesSha256")
+        assert protected_record is not None and protected_full is not None
+        if protected_record in by_protected_record:
+            raise BeadsProtectedRuntimeError("protected record has multiple journal successors")
+        history_path = store.directory("journals", "history") / f"{journal_record.removeprefix('sha256:')}.json"
+        if not store.exists(history_path) or canonical_bytes(store.read_json(history_path, "journal chain history")) != canonical_bytes(envelope):
+            raise BeadsProtectedRuntimeError("protected HMAC journal head/predecessor lacks exact immutable history")
+        seen_entries.add(journal_record)
+        by_protected_record[protected_record] = (journal_record, journal_full, body)
+        predecessor = _digest(
+            body.get("predecessorJournalEntryRecordSha256"),
+            "predecessorJournalEntryRecordSha256",
+            nullable=True,
+        )
+        predecessor_full = _digest(
+            body.get("predecessorJournalEntryFullBytesSha256"),
+            "predecessorJournalEntryFullBytesSha256",
+            nullable=True,
+        )
+        if predecessor is None:
+            if predecessor_full is not None or generation != 1:
+                raise BeadsProtectedRuntimeError("protected HMAC journal genesis is malformed")
+            break
+        if predecessor_full is None or generation == 1:
+            raise BeadsProtectedRuntimeError("protected HMAC journal predecessor/full-bytes pair is malformed")
+        predecessor_path = store.directory("journals", "history") / f"{predecessor.removeprefix('sha256:')}.json"
+        envelope = store.read_json(predecessor_path, "predecessor protected HMAC journal entry")
+        _, _, observed_predecessor, observed_predecessor_full = store.verify(
+            envelope, "beads-protected-journal-entry"
+        )
+        if observed_predecessor != predecessor or observed_predecessor_full != predecessor_full:
+            raise BeadsProtectedRuntimeError("protected HMAC journal predecessor identity mismatch")
+        expected_generation = generation - 1
+    expected_history_names = {value[0].removeprefix("sha256:") + ".json" for value in by_protected_record.values()}
+    if history_names != expected_history_names:
+        raise BeadsProtectedRuntimeError("protected HMAC journal contains an orphan, fork or missing history entry")
+    expected_index_names = {record.removeprefix("sha256:") + ".json" for record in by_protected_record}
+    if index_names != expected_index_names:
+        raise BeadsProtectedRuntimeError("protected HMAC journal record index is incomplete or forked")
+    for protected_record, (journal_record, journal_full, _) in by_protected_record.items():
+        index = store.read_json(
+            store.directory("journals", "by-record") / (protected_record.removeprefix("sha256:") + ".json"),
+            "protected HMAC journal record index",
+        )
+        _, _, indexed_record, indexed_full = store.verify(index, "beads-protected-journal-entry")
+        if indexed_record != journal_record or indexed_full != journal_full:
+            raise BeadsProtectedRuntimeError("protected HMAC journal record index selects another successor")
+    return by_protected_record, current_record, current_full, _generation(current["payload"]["generation"])
+
+
+def _journal_record(store: _Store, kind: str, record_digest: str, full_digest: str) -> None:
+    chain, predecessor, expected_current, generation = _journal_chain(store)
+    existing = chain.get(record_digest)
+    if existing is not None:
+        _, existing_full, body = existing
+        if (
+            body.get("recordKind") != kind
+            or body.get("recordFullBytesSha256") != full_digest
+            or existing_full is None
+        ):
+            raise BeadsProtectedRuntimeError("protected HMAC journal record index collision")
+        return
+    next_generation = generation + 1
+    _generation(next_generation)
     payload = {
+        "generation": next_generation,
         "recordKind": kind,
         "recordSha256": record_digest,
         "recordFullBytesSha256": full_digest,
         "repositoryLocatorSha256": store.repository_digest,
         "predecessorJournalEntryRecordSha256": predecessor,
+        "predecessorJournalEntryFullBytesSha256": expected_current,
     }
     envelope, _, journal_digest, journal_full = store.sign("beads-protected-journal-entry", payload)
-    path = store.directory("journals", "history") / f"{journal_digest.removeprefix('sha256:')}.json"
-    store.write_immutable(path, envelope)
+    history = store.directory("journals", "history") / f"{journal_digest.removeprefix('sha256:')}.json"
+    lookup = store.directory("journals", "by-record") / f"{record_digest.removeprefix('sha256:')}.json"
+    store.write_immutable(history, envelope)
     store.write_immutable(lookup, envelope)
-    observed = store.replace_current(current_path, envelope, expected_current)
+    observed = store.replace_current(store.directory("journals") / "current.json", envelope, expected_current)
     if observed != journal_full:
         raise BeadsProtectedRuntimeError("protected HMAC journal head exact-byte mismatch")
+    _journal_chain(store)
 
 
 def _verify_journal(store: _Store, kind: str, record_digest: str, full_digest: str) -> None:
-    lookup = store.directory("journals", "by-record") / f"{record_digest.removeprefix('sha256:')}.json"
-    if not store.exists(lookup):
-        raise BeadsProtectedRuntimeError("protected record has no exact HMAC journal index")
-    indexed = store.read_json(lookup, "protected HMAC journal record index")
-    indexed_body, _, journal_digest, journal_full = store.verify(indexed, "beads-protected-journal-entry")
-    path = store.directory("journals", "history") / f"{journal_digest.removeprefix('sha256:')}.json"
-    if not store.exists(path):
-        raise BeadsProtectedRuntimeError("protected record has no exact HMAC journal entry")
-    envelope = store.read_json(path, "protected HMAC journal entry")
-    body, _, observed, observed_full = store.verify(envelope, "beads-protected-journal-entry")
-    payload = {
-        "recordKind": kind,
-        "recordSha256": record_digest,
-        "recordFullBytesSha256": full_digest,
-        "repositoryLocatorSha256": store.repository_digest,
-    }
-    if (
-        observed != journal_digest
-        or observed_full != journal_full
-        or canonical_bytes(envelope) != canonical_bytes(indexed)
-        or any(body.get(key) != value for key, value in payload.items())
-    ):
+    chain, _, _, _ = _journal_chain(store)
+    indexed = chain.get(record_digest)
+    if indexed is None:
+        raise BeadsProtectedRuntimeError("protected record has no exact HMAC journal entry in the current chain")
+    _, _, body = indexed
+    if body.get("recordKind") != kind or body.get("recordFullBytesSha256") != full_digest:
         raise BeadsProtectedRuntimeError("protected HMAC journal entry mismatch")
-    predecessor = indexed_body.get("predecessorJournalEntryRecordSha256")
-    _digest(predecessor, "predecessorJournalEntryRecordSha256", nullable=True)
-    if predecessor is not None:
-        predecessor_path = store.directory("journals", "history") / f"{predecessor.removeprefix('sha256:')}.json"
-        predecessor_envelope = store.read_json(predecessor_path, "predecessor protected HMAC journal entry")
-        _, _, observed_predecessor, _ = store.verify(predecessor_envelope, "beads-protected-journal-entry")
-        if observed_predecessor != predecessor:
-            raise BeadsProtectedRuntimeError("protected HMAC journal predecessor mismatch")
+
+
+def _journal_binding_for_record(
+    store: _Store,
+    record_digest: str,
+    full_digest: str,
+    *,
+    require_current: bool = False,
+) -> tuple[str, str]:
+    chain, current_record, current_full, _ = _journal_chain(store)
+    binding = chain.get(record_digest)
+    if binding is None or binding[2].get("recordFullBytesSha256") != full_digest:
+        raise BeadsProtectedRuntimeError("protected result has no exact result-stored journal head")
+    if require_current and (binding[0] != current_record or binding[1] != current_full):
+        raise BeadsProtectedRuntimeError("protected result is not the actual current result-stored journal head")
+    return binding[0], binding[1]
 
 
 def _signed_record(store: _Store, type_name: str, kind: str, payload: Mapping[str, Any], category: str) -> _WireRecord:
@@ -1130,6 +1479,9 @@ def advance_atomic_claim_v1(request: AdvanceAtomicClaimRequestV1) -> AtomicClaim
         prior = _load_record(store, "AtomicClaimLeaseV1", "atomic-claim-lease", "claims", payload["leaseRecordSha256"])
         _expiry(prior.payload)
         _same_repository(store, prior.payload)
+        _require_current_authority_record(
+            store, prior.payload.get("activeAuthorityRecordSha256"), "active"
+        )
         if prior.payload.get("claimState") != "prepared":
             raise BeadsStaleAuthorityError("atomic claim lease is not in prepared state")
         _consume_capability(store, "atomic-claim-successors", prior, intent_digest)
@@ -1162,6 +1514,9 @@ def record_atomic_claim_receipt_v1(request: RecordAtomicClaimReceiptRequestV1) -
             return resumed
         lease = _load_record(store, "AtomicClaimLeaseV1", "atomic-claim-lease", "claims", payload["leaseRecordSha256"])
         _same_repository(store, lease.payload)
+        _require_current_authority_record(
+            store, lease.payload.get("activeAuthorityRecordSha256"), "active"
+        )
         if lease.payload.get("claimState") != "claimed":
             raise BeadsStaleAuthorityError("claim receipt requires a successful claimed lease")
         if payload["readBackRevision"] != lease.payload.get("observedRevision") or payload["readBackStatus"] != lease.payload.get("observedStatus"):
@@ -1179,6 +1534,7 @@ def record_atomic_claim_receipt_v1(request: RecordAtomicClaimReceiptRequestV1) -
                 "revision": payload["readBackRevision"],
                 "status": payload["readBackStatus"],
                 "claimIdentitySha256": payload["claimIdentitySha256"],
+                "activeAuthorityRecordSha256": lease.payload["activeAuthorityRecordSha256"],
             },
             "claim-receipts",
         )
@@ -1192,6 +1548,20 @@ def _current_authority(store: _Store, *, require_active: bool) -> _WireRecord:
     if require_active and result.payload.get("authorityState") != "active":
         raise BeadsProtectedRuntimeError("ordinary Beads authority is not active")
     return result
+
+
+def _require_current_authority_record(
+    store: _Store,
+    expected_record_sha256: Any,
+    required_state: str,
+) -> _WireRecord:
+    expected = _digest(expected_record_sha256, f"{required_state}AuthorityRecordSha256")
+    current = _current_authority(store, require_active=required_state == "active")
+    if current.payload.get("authorityState") != required_state or current.record_sha256 != expected:
+        raise BeadsStaleAuthorityError(
+            f"protected operation no longer binds the current {required_state} authority"
+        )
+    return current
 
 
 def authorize_claim_launch_v1(request: AuthorizeClaimLaunchRequestV1) -> LaunchAuthorizationV1:
@@ -1209,7 +1579,9 @@ def authorize_claim_launch_v1(request: AuthorizeClaimLaunchRequestV1) -> LaunchA
         if resumed is not None:
             return resumed
         receipt = _load_record(store, "AtomicClaimReceiptV1", "atomic-claim-receipt", "claim-receipts", payload["claimReceiptRecordSha256"])
-        authority = _current_authority(store, require_active=True)
+        authority = _require_current_authority_record(
+            store, receipt.payload.get("activeAuthorityRecordSha256"), "active"
+        )
         _consume_capability(store, "claim-launch-successors", receipt, intent_digest)
         result = _signed_record(
             store,
@@ -1296,9 +1668,9 @@ def begin_beads_mutation_v1(request: BeginBeadsMutationRequestV1) -> BeadsMutati
                 payload["launchAuthorizationRecordSha256"],
             )
             _expiry(launch.payload)
-            authority = _current_authority(store, require_active=True)
-            if launch.payload.get("activeAuthorityRecordSha256") != authority.record_sha256:
-                raise BeadsStaleAuthorityError("claim launch no longer binds the current active authority")
+            authority = _require_current_authority_record(
+                store, launch.payload.get("activeAuthorityRecordSha256"), "active"
+            )
             _consume_capability(store, "claim-launch-authorizations", launch, intent_digest)
             binding = {
                 "activeAuthorityRecordSha256": authority.record_sha256,
@@ -1312,10 +1684,14 @@ def begin_beads_mutation_v1(request: BeginBeadsMutationRequestV1) -> BeadsMutati
                 raise BeadsProtectedRuntimeError("preparation mutation command/lease chain mismatch")
             if tuple(payload["commandArgv"]) != tuple(command.payload.get("argv", ())):
                 raise BeadsProtectedRuntimeError("preparation mutation argv differs from authorized command intent")
+            revoked = _require_current_authority_record(
+                store, lease.payload.get("revokedAuthorityRecordSha256"), "revoked"
+            )
             _consume_capability(store, "preparation-command-intents", command, intent_digest)
             binding = {
                 "preparationLeaseRecordSha256": lease.record_sha256,
                 "preparationCommandIntentRecordSha256": command.record_sha256,
+                "revokedAuthorityRecordSha256": revoked.record_sha256,
                 **_preparation_sequence_fields(lease.payload),
             }
         intent_payload = {
@@ -1349,6 +1725,14 @@ def finish_beads_mutation_v1(request: FinishBeadsMutationRequestV1) -> BeadsMuta
         _expiry(intent.payload)
         if payload["mutationClass"] != intent.payload.get("mutationClass"):
             raise BeadsProtectedRuntimeError("mutation result class differs from the protected intent")
+        if intent.payload.get("mutationClass") == "ordinary":
+            _require_current_authority_record(
+                store, intent.payload.get("activeAuthorityRecordSha256"), "active"
+            )
+        else:
+            _require_current_authority_record(
+                store, intent.payload.get("revokedAuthorityRecordSha256"), "revoked"
+            )
         for field in ("stdoutSha256", "stderrSha256", "readBackSha256"):
             _digest(payload[field], field)
         if not isinstance(payload["exitCode"], int) or isinstance(payload["exitCode"], bool):
@@ -1410,7 +1794,12 @@ def _observe_executable(path: Path, expected_sha256: str) -> dict[str, Any]:
         descriptor = os.open(leaf, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent)
         try:
             metadata = os.fstat(descriptor)
-            data = _read_regular_descriptor(descriptor, "Beads executable", executable=True)
+            data = _read_regular_descriptor(
+                descriptor,
+                "Beads executable",
+                executable=True,
+                max_bytes=MAX_EXECUTABLE_BYTES,
+            )
         finally:
             os.close(descriptor)
     except OSError as exc:
@@ -1425,6 +1814,120 @@ def _observe_executable(path: Path, expected_sha256: str) -> dict[str, Any]:
         "bytesSha256": observed,
         **_directory_identity(metadata),
     }
+
+
+def _open_verified_executable_descriptor(path: Path, expected_observation: Mapping[str, Any]) -> int:
+    parent, leaf = _open_absolute_parent(path, "Beads executable")
+    descriptor = -1
+    try:
+        descriptor = os.open(leaf, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent)
+        metadata = os.fstat(descriptor)
+        data = _read_regular_descriptor(
+            descriptor,
+            "Beads executable",
+            executable=True,
+            max_bytes=MAX_EXECUTABLE_BYTES,
+        )
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        observed = {
+            "pathSha256": sha256(os.fsencode(str(path))),
+            "bytesSha256": sha256(data),
+            **_directory_identity(metadata),
+        }
+        if canonical_bytes(observed) != canonical_bytes(expected_observation):
+            raise BeadsProtectedRuntimeError("protected Beads executable identity changed before spawn")
+        return descriptor
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    finally:
+        os.close(parent)
+
+
+def _install_pinned_executable(
+    store: _Store,
+    source_path: Path,
+    source_observation: Mapping[str, Any],
+) -> tuple[Path, dict[str, Any]]:
+    descriptor = _open_verified_executable_descriptor(source_path, source_observation)
+    try:
+        data = bytearray()
+        while len(data) <= MAX_EXECUTABLE_BYTES:
+            block = os.read(descriptor, min(65536, MAX_EXECUTABLE_BYTES + 1 - len(data)))
+            if not block:
+                break
+            data.extend(block)
+    finally:
+        os.close(descriptor)
+    if len(data) > MAX_EXECUTABLE_BYTES or sha256(bytes(data)) != source_observation.get("bytesSha256"):
+        raise BeadsProtectedRuntimeError("approved executable changed while creating the immutable broker copy")
+    pinned = store.directory("approved-executables") / (
+        str(source_observation["bytesSha256"]).removeprefix("sha256:") + ".bin"
+    )
+    store.write_immutable_bytes(pinned, bytes(data), 0o500, max_bytes=MAX_EXECUTABLE_BYTES)
+    pinned_observation = _observe_executable(pinned, str(source_observation["bytesSha256"]))
+    current_source = _observe_executable(source_path, str(source_observation["bytesSha256"]))
+    if canonical_bytes(current_source) != canonical_bytes(source_observation):
+        raise BeadsProtectedRuntimeError("approved executable path changed while pinning its immutable copy")
+    return pinned, pinned_observation
+
+
+def _spawn_verified_executable_v1(
+    path: Path,
+    expected_observation: Mapping[str, Any],
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    logical_path: Path | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Spawn the already verified inode, never the mutable pathname."""
+
+    expected_argv_path = logical_path if logical_path is not None else path
+    if not argv or argv[0] != str(expected_argv_path):
+        raise BeadsProtectedRuntimeError("spawn argv does not bind the approved executable path")
+    descriptor = _open_verified_executable_descriptor(path, expected_observation)
+    before = os.fstat(descriptor)
+    try:
+        prefix = os.pread(descriptor, 2, 0)
+        if prefix == b"#!":
+            spawn_argv = ["/bin/sh", f"/dev/fd/{descriptor}", *argv[1:]]
+        elif os.uname().sysname == "Linux":
+            spawn_argv = [f"/proc/self/fd/{descriptor}", *argv[1:]]
+        else:
+            raise BeadsProtectedRuntimeError(
+                "descriptor-pinned native executable spawn requires Linux; Darwin offline fixtures must be POSIX shell scripts"
+            )
+        completed = subprocess.run(
+            spawn_argv,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(cwd),
+            env=dict(env),
+            timeout=30,
+            check=False,
+            pass_fds=(descriptor,),
+        )
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev, before.st_ino, before.st_mode, before.st_uid,
+            before.st_nlink, before.st_size,
+        ) != (
+            after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+            after.st_nlink, after.st_size,
+        ):
+            raise BeadsProtectedRuntimeError("approved Beads executable changed during descriptor-pinned spawn")
+        current = _observe_executable(path, str(expected_observation.get("bytesSha256")))
+        if canonical_bytes(current) != canonical_bytes(expected_observation):
+            raise BeadsProtectedRuntimeError(
+                "Beads executable pathname was replaced during spawn; replacement was not executed"
+            )
+        return completed
+    finally:
+        os.close(descriptor)
 
 
 def _hash_regular_at(parent: int, name: str, metadata: os.stat_result, label: str) -> str:
@@ -1485,6 +1988,18 @@ def _observe_directory_tree(path: Path, label: str) -> dict[str, Any]:
                     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
                     dir_fd=descriptor,
                 )
+                opened = os.fstat(child)
+                if (
+                    metadata.st_dev, metadata.st_ino, metadata.st_mode,
+                    metadata.st_uid, metadata.st_nlink,
+                ) != (
+                    opened.st_dev, opened.st_ino, opened.st_mode,
+                    opened.st_uid, opened.st_nlink,
+                ):
+                    os.close(child)
+                    raise BeadsProtectedRuntimeError(
+                        f"{label} child identity changed between no-follow stat and open"
+                    )
                 entries.append({**common, "kind": "directory"})
                 try:
                     walk(child, relative, depth + 1)
@@ -1507,6 +2022,64 @@ def _observe_directory_tree(path: Path, label: str) -> dict[str, Any]:
         "entries": entries,
     }
     return {**projection, "treeSha256": sha256(canonical_bytes(projection))}
+
+
+def _rename_directory_noreplace(
+    source_parent: int,
+    source_leaf: str,
+    target_parent: int,
+    target_leaf: str,
+) -> None:
+    """Atomically move one directory while refusing an existing target.
+
+    Linux uses renameat2(RENAME_NOREPLACE), Darwin uses
+    renameatx_np(RENAME_EXCL).  Other hosts fail closed because the portable
+    POSIX rename primitive is allowed to clobber the destination.
+    """
+
+    try:
+        source_before = os.stat(source_leaf, dir_fd=source_parent, follow_symlinks=False)
+    except OSError as exc:
+        raise BeadsProtectedRuntimeError(f"cannot inspect no-clobber install source: {exc}") from exc
+    if not stat.S_ISDIR(source_before.st_mode):
+        raise BeadsProtectedRuntimeError("no-clobber install source must be a directory")
+    source_name = os.fsencode(source_leaf)
+    target_name = os.fsencode(target_leaf)
+    libc = ctypes.CDLL(None, use_errno=True)
+    result: int
+    if hasattr(libc, "renameat2"):
+        function = libc.renameat2
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        function.restype = ctypes.c_int
+        result = function(source_parent, source_name, target_parent, target_name, 1)
+    elif hasattr(libc, "renameatx_np"):
+        function = libc.renameatx_np
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        function.restype = ctypes.c_int
+        result = function(source_parent, source_name, target_parent, target_name, 0x00000004)
+    else:
+        raise BeadsProtectedRuntimeError(
+            "host lacks an atomic no-clobber directory rename; use Linux renameat2 or Darwin renameatx_np"
+        )
+    if result != 0:
+        error = ctypes.get_errno()
+        if error in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise BeadsProtectedRuntimeError("create install target appeared before atomic no-clobber install")
+        raise BeadsProtectedRuntimeError(f"atomic no-clobber directory install failed: {os.strerror(error)}")
+    try:
+        target_descriptor = os.open(
+            target_leaf,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=target_parent,
+        )
+        try:
+            target_after = os.fstat(target_descriptor)
+        finally:
+            os.close(target_descriptor)
+    except OSError as exc:
+        raise BeadsProtectedRuntimeError(f"cannot reopen installed directory after atomic move: {exc}") from exc
+    if (source_before.st_dev, source_before.st_ino) != (target_after.st_dev, target_after.st_ino):
+        raise BeadsProtectedRuntimeError("atomic no-clobber install changed the source directory identity")
 
 
 def _capture_directory(path: Path, label: str) -> dict[str, Any]:
@@ -1722,6 +2295,15 @@ def authorize_beads_preparation_v1(request: AuthorizeBeadsPreparationRequestV1) 
             "executableObservation": executable_observation,
         }
     with store.locked():
+        pinned_executable_path, pinned_executable_observation = _install_pinned_executable(
+            store, executable_path, executable_observation
+        )
+        path_bindings.update(
+            {
+                "pinnedExecutablePath": str(pinned_executable_path),
+                "pinnedExecutableObservation": pinned_executable_observation,
+            }
+        )
         runtime_manifest = _load_record(
             store,
             "BeadsProtectedRuntimeApiManifestV1",
@@ -1786,6 +2368,9 @@ def begin_beads_preparation_v1(request: BeginBeadsPreparationRequestV1) -> Beads
         )
         _expiry(authorization.payload)
         _same_repository(store, authorization.payload)
+        _require_current_authority_record(
+            store, authorization.payload.get("revokedAuthorityRecordSha256"), "revoked"
+        )
         _revalidate_preparation_physical(authorization)
         _consume_capability(store, "preparation-authorizations", authorization, intent_digest)
         lease_payload = {
@@ -1808,6 +2393,14 @@ def _revalidate_preparation_physical(record: _WireRecord) -> None:
     observation = _observe_executable(executable_path, str(executable_digest))
     if canonical_bytes(observation) != canonical_bytes(record.payload.get("executableObservation")):
         raise BeadsProtectedRuntimeError("protected Beads executable identity changed after authorization")
+    pinned_observation = _observe_executable(
+        Path(str(record.payload.get("pinnedExecutablePath", ""))),
+        str(executable_digest),
+    )
+    if canonical_bytes(pinned_observation) != canonical_bytes(
+        record.payload.get("pinnedExecutableObservation")
+    ):
+        raise BeadsProtectedRuntimeError("immutable broker executable identity changed after authorization")
     if record.payload.get("preparationMode") == "create":
         checks = (
             ("createStageDatabasePath", "createStageObservationA", "create stage database path"),
@@ -1948,6 +2541,9 @@ def advance_beads_preparation_v1(request: AdvanceBeadsPreparationRequestV1) -> B
         lease = _load_record(store, "BeadsPreparationLeaseV1", "beads-preparation-lease", "preparation-leases", payload["leaseRecordSha256"])
         _expiry(lease.payload)
         _same_repository(store, lease.payload)
+        _require_current_authority_record(
+            store, lease.payload.get("revokedAuthorityRecordSha256"), "revoked"
+        )
         if payload["commandOrdinal"] != lease.payload.get("nextCommandOrdinal"):
             raise BeadsStaleAuthorityError("preparation command ordinal is stale or non-contiguous")
         exact_argv = _expected_preparation_command(lease, str(payload["commandKind"]), payload["argv"])
@@ -2005,18 +2601,18 @@ def advance_beads_preparation_v1(request: AdvanceBeadsPreparationRequestV1) -> B
             "mutation-intents",
         )
         _fault("preparation-command-intent-written")
+        _require_current_authority_record(
+            store, lease.payload.get("revokedAuthorityRecordSha256"), "revoked"
+        )
         environment = _frozen_preparation_environment(store, lease, intent_digest)
         try:
-            completed = subprocess.run(
+            completed = _spawn_verified_executable_v1(
+                Path(str(lease.payload["pinnedExecutablePath"])),
+                lease.payload["pinnedExecutableObservation"],
                 list(exact_argv),
-                shell=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=str(lease.payload["repositoryPath"]),
+                cwd=Path(str(lease.payload["repositoryPath"])),
                 env=environment,
-                timeout=30,
-                check=False,
+                logical_path=Path(str(lease.payload["executablePath"])),
             )
             stdout = completed.stdout
             stderr = completed.stderr
@@ -2106,6 +2702,9 @@ def observe_beads_store_v1(request: ObserveBeadsStoreRequestV1) -> BeadsStoreObs
         lease = _load_record(store, "BeadsPreparationLeaseV1", "beads-preparation-lease", "preparation-leases", payload["leaseRecordSha256"])
         _expiry(lease.payload)
         _same_repository(store, lease.payload)
+        _require_current_authority_record(
+            store, lease.payload.get("revokedAuthorityRecordSha256"), "revoked"
+        )
         _revalidate_preparation_physical(lease)
         phase = payload["observationPhase"]
         if lease.payload.get("preparationMode") == "create":
@@ -2289,13 +2888,15 @@ def _install_and_cleanup_create(
         source_parent, source_leaf = _open_absolute_parent(stage, "create stage database")
         target_parent, target_leaf = _open_absolute_parent(install, "create install database")
         try:
-            try:
-                os.stat(target_leaf, dir_fd=target_parent, follow_symlinks=False)
-            except FileNotFoundError:
-                pass
-            else:
-                raise BeadsProtectedRuntimeError("create install target appeared before no-replace install")
-            os.rename(source_leaf, target_leaf, src_dir_fd=source_parent, dst_dir_fd=target_parent)
+            if canonical_bytes(_directory_identity(os.fstat(source_parent))) != canonical_bytes(
+                stage_locator.get("parentIdentity")
+            ):
+                raise BeadsProtectedRuntimeError("create stage parent identity changed before install")
+            if canonical_bytes(_directory_identity(os.fstat(target_parent))) != canonical_bytes(
+                install_locator.get("parentIdentity")
+            ):
+                raise BeadsProtectedRuntimeError("create install parent identity changed before install")
+            _rename_directory_noreplace(source_parent, source_leaf, target_parent, target_leaf)
             os.fsync(source_parent)
             os.fsync(target_parent)
         finally:
@@ -2541,19 +3142,24 @@ def finish_beads_preparation_v1(request: FinishBeadsPreparationRequestV1) -> Fin
                 "statusProfileRecordSha256": status_record.record_sha256,
                 "preparedPayloadCanonicalSha256": sha256(prepared_bytes),
                 "preparedPayloadCanonicalJson": payload["preparedStorePayloadCanonicalJson"],
-                "resultStoredJournalHeadSha256": sha256(canonical_bytes({"lease": lease.record_sha256, "pre": pre.record_sha256, "post": post.record_sha256})),
                 "transactionIntentSha256": intent_digest,
                 **installation_evidence,
                 **_preparation_sequence_fields(lease.payload),
             },
             "preparation-results",
         )
+        _, result_stored_journal_head = _journal_binding_for_record(
+            store,
+            prepared_record.record_sha256,
+            prepared_record.full_bytes_sha256,
+            require_current=True,
+        )
         pointer_payload = {
             "repositoryLocatorSha256": store.repository_digest,
             "generation": generation,
             "predecessorCurrentFullBytesSha256": expected_current,
             "resultRecordSha256": prepared_record.record_sha256,
-            "resultStoredJournalHeadSha256": prepared_record.payload["resultStoredJournalHeadSha256"],
+            "resultStoredJournalHeadSha256": result_stored_journal_head,
             "statusProfileRecordSha256": status_record.record_sha256,
             "leaseRecordSha256": lease.record_sha256,
             "transactionIntentSha256": intent_digest,
@@ -2577,7 +3183,7 @@ def finish_beads_preparation_v1(request: FinishBeadsPreparationRequestV1) -> Fin
                 "pointerRecordSha256": pointer.record_sha256,
                 "pointerFullBytesSha256": pointer.full_bytes_sha256,
                 "resultRecordSha256": prepared_record.record_sha256,
-                "resultStoredJournalHeadSha256": prepared_record.payload["resultStoredJournalHeadSha256"],
+                "resultStoredJournalHeadSha256": result_stored_journal_head,
                 "statusProfileRecordSha256": status_record.record_sha256,
                 **installation_evidence,
                 **_preparation_sequence_fields(lease.payload),
@@ -2587,6 +3193,7 @@ def finish_beads_preparation_v1(request: FinishBeadsPreparationRequestV1) -> Fin
         _transaction_receipt(store, directory, "finish-beads-preparation", pointer)
         result_body = {
             **{key: value for key, value in prepared_record.payload.items() if key not in {"kind", "schemaVersion"}},
+            "resultStoredJournalHeadSha256": result_stored_journal_head,
             "pointerRecordSha256": pointer.record_sha256,
             "currentPointerFullBytesSha256": pointer.full_bytes_sha256,
             "activationReceiptRecordSha256": activation.record_sha256,
@@ -2612,7 +3219,7 @@ def _finish_preparation_projection(store: _Store, pointer: _WireRecord) -> Finis
         "pointerRecordSha256": pointer.record_sha256,
         "pointerFullBytesSha256": pointer.full_bytes_sha256,
         "resultRecordSha256": result.record_sha256,
-        "resultStoredJournalHeadSha256": result.payload.get("resultStoredJournalHeadSha256"),
+        "resultStoredJournalHeadSha256": pointer.payload.get("resultStoredJournalHeadSha256"),
         "statusProfileRecordSha256": result.payload.get("statusProfileRecordSha256"),
         "installIntentRecordSha256": result.payload.get("installIntentRecordSha256"),
         "installObservedRecordSha256": result.payload.get("installObservedRecordSha256"),
@@ -2620,24 +3227,14 @@ def _finish_preparation_projection(store: _Store, pointer: _WireRecord) -> Finis
         "cleanupObservedRecordSha256": result.payload.get("cleanupObservedRecordSha256"),
         **_preparation_sequence_fields(pointer.payload),
     }
-    activation_envelope, _, activation_digest, activation_full = store.sign(
+    _, _, activation_digest, _ = store.sign(
         "beads-preparation-activation-receipt", expected_activation_payload
     )
-    activation_path = store.directory("preparation-activation-receipts", "history") / (
-        activation_digest.removeprefix("sha256:") + ".json"
-    )
-    if not store.exists(activation_path):
-        store.write_immutable(activation_path, activation_envelope)
-        _journal_record(
-            store,
-            "beads-preparation-activation-receipt",
-            activation_digest,
-            activation_full,
-        )
     _verify_preparation_pointer(store, pointer, historical=True)
     return FinishBeadsPreparationResultV1(
         payload={
             **{key: value for key, value in result.payload.items() if key not in {"kind", "schemaVersion"}},
+            "resultStoredJournalHeadSha256": pointer.payload.get("resultStoredJournalHeadSha256"),
             "pointerRecordSha256": pointer.record_sha256,
             "currentPointerFullBytesSha256": pointer.full_bytes_sha256,
             "activationReceiptRecordSha256": activation_digest,
@@ -2656,7 +3253,7 @@ def _verify_preparation_pointer(store: _Store, pointer: _WireRecord, *, historic
         "pointerRecordSha256": pointer.record_sha256,
         "pointerFullBytesSha256": pointer.full_bytes_sha256,
         "resultRecordSha256": result.record_sha256,
-        "resultStoredJournalHeadSha256": result.payload.get("resultStoredJournalHeadSha256"),
+        "resultStoredJournalHeadSha256": pointer.payload.get("resultStoredJournalHeadSha256"),
         "statusProfileRecordSha256": result.payload.get("statusProfileRecordSha256"),
         "installIntentRecordSha256": result.payload.get("installIntentRecordSha256"),
         "installObservedRecordSha256": result.payload.get("installObservedRecordSha256"),
@@ -2678,7 +3275,7 @@ def _verify_preparation_pointer(store: _Store, pointer: _WireRecord, *, historic
     exact_pointer_joins = {
         "repositoryLocatorSha256": store.repository_digest,
         "resultRecordSha256": result.record_sha256,
-        "resultStoredJournalHeadSha256": result.payload.get("resultStoredJournalHeadSha256"),
+        "resultStoredJournalHeadSha256": pointer.payload.get("resultStoredJournalHeadSha256"),
         "statusProfileRecordSha256": result.payload.get("statusProfileRecordSha256"),
         "leaseRecordSha256": result.payload.get("leaseRecordSha256"),
         "installIntentRecordSha256": result.payload.get("installIntentRecordSha256"),
@@ -2688,6 +3285,11 @@ def _verify_preparation_pointer(store: _Store, pointer: _WireRecord, *, historic
     }
     if any(pointer.payload.get(key) != value for key, value in exact_pointer_joins.items()):
         raise BeadsProtectedRuntimeError("preparation pointer terminal suffix join mismatch")
+    _, actual_result_stored_head = _journal_binding_for_record(
+        store, result.record_sha256, result.full_bytes_sha256
+    )
+    if actual_result_stored_head != pointer.payload.get("resultStoredJournalHeadSha256"):
+        raise BeadsProtectedRuntimeError("preparation pointer does not bind the actual result-stored journal head")
     if canonical_bytes(_plain(activation.payload)) != canonical_bytes(
         {"kind": "beads-preparation-activation-receipt", "schemaVersion": 1, **expected_activation_payload}
     ):
@@ -2749,7 +3351,9 @@ _CORE_CELLS = {
 
 def _build_core(inputs: _WireRecord, expected_type: str, kind: str) -> bytes:
     payload = _request(inputs, expected_type)
-    _required(payload, "bootstrapChangeKind", "adapterChangeKind", "remediationEvidenceSha256")
+    _required(payload, "bootstrapChangeKind", "adapterChangeKind", "remediationEvidenceSha256", "baselineCommit")
+    if payload["baselineCommit"] != BEADS_BASELINE_COMMIT:
+        raise BeadsProtectedRuntimeError("change-plan core baselineCommit is not the supported Beads baseline")
     cell = (payload["bootstrapChangeKind"], payload["adapterChangeKind"])
     if cell not in _CORE_CELLS:
         raise BeadsProtectedRuntimeError("change-plan core is outside the six registered cells")
@@ -2778,6 +3382,24 @@ def record_beads_change_plan_core_v1(request: RecordBeadsChangePlanCoreRequestV1
     adapter = _canonical_json_text(payload["adapterReleaseCoreCanonicalJson"], "adapter release core")
     bootstrap_value = json.loads(bootstrap)
     adapter_value = json.loads(adapter)
+    expected_core_fields = {
+        "kind", "schemaVersion", "bootstrapChangeKind", "adapterChangeKind",
+        "remediationEvidenceSha256", "baselineCommit",
+    }
+    if set(bootstrap_value) != expected_core_fields or set(adapter_value) != expected_core_fields:
+        raise BeadsProtectedRuntimeError("change-plan core canonical bytes have unknown or missing fields")
+    rebuilt_bootstrap = build_beads_bootstrap_runtime_core_v1(
+        BeadsBootstrapRuntimeCoreInputsV1(
+            payload={key: value for key, value in bootstrap_value.items() if key not in {"kind", "schemaVersion"}}
+        )
+    )
+    rebuilt_adapter = build_beads_adapter_release_core_v1(
+        BeadsAdapterReleaseCoreInputsV1(
+            payload={key: value for key, value in adapter_value.items() if key not in {"kind", "schemaVersion"}}
+        )
+    )
+    if rebuilt_bootstrap != bootstrap or rebuilt_adapter != adapter:
+        raise BeadsProtectedRuntimeError("change-plan core cannot be rebuilt byte-for-byte from its exact input schema")
     bootstrap_cell = (bootstrap_value.get("bootstrapChangeKind"), bootstrap_value.get("adapterChangeKind"))
     adapter_cell = (adapter_value.get("bootstrapChangeKind"), adapter_value.get("adapterChangeKind"))
     if bootstrap_cell != adapter_cell or bootstrap_cell not in _CORE_CELLS:
@@ -2917,10 +3539,16 @@ def _verify_completed_preparation_physical(
     result: _WireRecord,
     lease: _WireRecord,
 ) -> None:
-    _observe_executable(
+    executable_observation = _observe_executable(
         Path(str(lease.payload.get("executablePath", ""))),
         str(lease.payload.get("executableSha256", "")),
     )
+    if canonical_bytes(executable_observation) != canonical_bytes(
+        lease.payload.get("executableObservation")
+    ):
+        raise BeadsProtectedRuntimeError(
+            "terminal preparation executable inode differs from the authorized lease"
+        )
     evidence_fields = (
         "installIntentRecordSha256", "installObservedRecordSha256",
         "cleanupIntentRecordSha256", "cleanupObservedRecordSha256",
@@ -3432,6 +4060,14 @@ def beads_protected_runtime_schema_v1() -> bytes:
             "baselineCommit": BEADS_BASELINE_COMMIT,
             "module": "startup_factory_cli.beads_protected_runtime",
             "types": sorted(_TYPE_NAMES),
+            "typeSchemas": {
+                name: {
+                    "fields": sorted(_TYPE_SCHEMAS[name]["fields"]),
+                    "nullable": sorted(_TYPE_SCHEMAS[name]["nullable"]),
+                    "required": sorted(_TYPE_SCHEMAS[name]["required"]),
+                }
+                for name in sorted(_TYPE_NAMES)
+            },
             "functions": sorted(_FUNCTION_EXPORTS),
             "generationRange": [1, MAX_GENERATION],
             "reattestArgv": ["B", "--db", "S", "--json", "--sandbox", "config", "list"],
