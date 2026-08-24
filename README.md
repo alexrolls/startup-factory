@@ -68,7 +68,7 @@ account, API key, application server, or coordinator database.
    ```
 
    For Claude Code, use `--agent claude-code`. Pin a release in controlled
-   environments, for example `startup-factory@0.1.12`. For a Git checkout or an
+   environments, for example `startup-factory@0.1.13`. For a Git checkout or an
    offline installation, use the
    [auditable shell compatibility path](#shell-compatibility-path).
 
