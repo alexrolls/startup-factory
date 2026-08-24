@@ -25,7 +25,6 @@ import os
 import re
 import secrets
 import stat
-import subprocess
 import sys
 import time
 from contextlib import contextmanager
@@ -2903,25 +2902,59 @@ def finish_beads_mutation_v1(request: FinishBeadsMutationRequestV1) -> BeadsMuta
         if payload["mutationClass"] != intent.payload.get("mutationClass"):
             raise BeadsProtectedRuntimeError("mutation result class differs from the protected intent")
         if intent.payload.get("mutationClass") == "ordinary":
-            _require_current_authority_record(
+            authority = _require_current_authority_record(
                 store, intent.payload.get("activeAuthorityRecordSha256"), "active"
+            )
+            candidate = authority.payload.get("candidate")
+            if (
+                not isinstance(candidate, Mapping)
+                or set(candidate) != _AUTHORITY_CANDIDATE_FIELDS
+            ):
+                raise BeadsProtectedRuntimeError(
+                    "active authority has no exact protected repository candidate"
+                )
+            repository_path = Path(str(candidate["repositoryPath"]))
+            _capture_directory(
+                repository_path, "active authority candidate repository"
             )
         else:
             _require_current_authority_record(
                 store, intent.payload.get("revokedAuthorityRecordSha256"), "revoked"
             )
-        for field in ("stdoutSha256", "stderrSha256", "readBackSha256"):
-            _digest(payload[field], field)
-        if not isinstance(payload["exitCode"], int) or isinstance(payload["exitCode"], bool):
-            raise BeadsProtectedRuntimeError("exitCode must be an integer")
+            lease = _load_record(
+                store,
+                "BeadsPreparationLeaseV1",
+                "beads-preparation-lease",
+                "preparation-leases",
+                intent.payload.get("preparationLeaseRecordSha256"),
+            )
+            repository_path = (
+                Path(str(lease.payload["createStageDatabasePath"])).parent
+                if lease.payload.get("preparationMode") == "create"
+                else Path(str(lease.payload["repositoryPath"]))
+            )
+            _revalidate_preparation_physical(lease)
         _consume_capability(store, "beads-mutation-intent-successors", intent, intent_digest)
+        native_result = _execute_supervised_beads_effect_v27(
+            operation_class=(
+                "ordinary"
+                if intent.payload.get("mutationClass") == "ordinary"
+                else (
+                    "create-preparation"
+                    if lease.payload.get("preparationMode") == "create"
+                    else "reattest-preparation"
+                )
+            ),
+            argv=list(intent.payload["argv"]),
+            repository_path=repository_path,
+        )
         result_payload = {
             **{key: value for key, value in intent.payload.items() if key not in {"kind", "schemaVersion"}},
             "mutationIntentRecordSha256": intent.record_sha256,
-            "exitCode": payload["exitCode"],
-            "stdoutSha256": payload["stdoutSha256"],
-            "stderrSha256": payload["stderrSha256"],
-            "readBackSha256": payload["readBackSha256"],
+            "exitCode": native_result["exitCode"],
+            "stdoutSha256": native_result["stdoutSha256"],
+            "stderrSha256": native_result["stderrSha256"],
+            "readBackSha256": native_result["readBackSha256"],
             "observedByBroker": True,
         }
         result = _signed_record(store, "BeadsMutationResultV1", "beads-mutation-result", result_payload, "mutation-results")
@@ -3051,62 +3084,84 @@ def _install_pinned_executable(
     return pinned, pinned_observation
 
 
-def _spawn_verified_executable_v1(
-    path: Path,
-    expected_observation: Mapping[str, Any],
-    argv: Sequence[str],
+def _execute_supervised_beads_effect_v27(
     *,
-    cwd: Path,
-    env: Mapping[str, str],
-    logical_path: Path | None = None,
-) -> subprocess.CompletedProcess[bytes]:
-    _require_boundary_operation(mutation=True)
-    """Spawn the already verified inode, never the mutable pathname."""
+    operation_class: str,
+    argv: Sequence[str],
+    repository_path: Path,
+) -> Mapping[str, Any]:
+    """Execute only through the controller's durable worker/native boundary."""
 
-    expected_argv_path = logical_path if logical_path is not None else path
-    if not argv or argv[0] != str(expected_argv_path):
-        raise BeadsProtectedRuntimeError("spawn argv does not bind the approved executable path")
-    descriptor = _open_verified_executable_descriptor(path, expected_observation)
-    before = os.fstat(descriptor)
+    _require_boundary_operation(mutation=True)
+    session = _validate_live_boundary_session()
     try:
-        prefix = os.pread(descriptor, 2, 0)
-        if prefix == b"#!":
-            spawn_argv = ["/bin/sh", f"/dev/fd/{descriptor}", *argv[1:]]
-        elif os.uname().sysname == "Linux":
-            spawn_argv = [f"/proc/self/fd/{descriptor}", *argv[1:]]
-        else:
-            raise BeadsProtectedRuntimeError(
-                "descriptor-pinned native executable spawn requires Linux; Darwin offline fixtures must be POSIX shell scripts"
-            )
-        completed = subprocess.run(
-            spawn_argv,
-            shell=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=str(cwd),
-            env=dict(env),
-            timeout=30,
-            check=False,
-            pass_fds=(descriptor,),
+        raw = _boundary_controller._read_root_owned(
+            session.config.native_boundary_manifest_path,
+            "installed native boundary V27 manifest for execution plan",
         )
-        after = os.fstat(descriptor)
-        if (
-            before.st_dev, before.st_ino, before.st_mode, before.st_uid,
-            before.st_nlink, before.st_size,
-        ) != (
-            after.st_dev, after.st_ino, after.st_mode, after.st_uid,
-            after.st_nlink, after.st_size,
-        ):
-            raise BeadsProtectedRuntimeError("approved Beads executable changed during descriptor-pinned spawn")
-        current = _observe_executable(path, str(expected_observation.get("bytesSha256")))
-        if canonical_bytes(current) != canonical_bytes(expected_observation):
-            raise BeadsProtectedRuntimeError(
-                "Beads executable pathname was replaced during spawn; replacement was not executed"
+        if _boundary_controller._sha(raw) != session.config.native_boundary_manifest_sha256:
+            raise _boundary_controller.ControllerProtocolError(
+                "native boundary manifest changed before execution-plan construction"
             )
-        return completed
-    finally:
-        os.close(descriptor)
+        parsed = json.loads(raw)
+        native = _boundary_controller.native_boundary_v27
+        if native.canonical_bytes(parsed) + b"\n" != raw:
+            raise native.NativeBoundaryV27Error(
+                "native boundary manifest is not canonical JSON plus LF"
+            )
+        manifest = native.parse_native_boundary_manifest_v27(parsed)
+        if not argv:
+            raise BeadsProtectedRuntimeError("protected Beads effect argv is empty")
+        container_argv = ["/usr/local/bin/bd"]
+        for item in argv[1:]:
+            text = str(item)
+            candidate = Path(text)
+            if candidate.is_absolute() and (
+                candidate == repository_path or repository_path in candidate.parents
+            ):
+                relative = candidate.relative_to(repository_path)
+                text = str(Path("/workspace") / relative)
+            container_argv.append(text)
+        plan = native.reference_supervised_effect_plan_v27(
+            manifest,
+            operation_id=str(session.response["operationId"]),
+            operation_class=operation_class,
+            argv=container_argv,
+            repository_path=str(repository_path),
+        )
+        result = _boundary_controller.execute_native_effect_v27(
+            session.config, session.response, plan
+        )
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        _boundary_controller.ControllerProtocolError,
+        _boundary_controller.native_boundary_v27.NativeBoundaryV27Error,
+    ) as exc:
+        raise _boundary_refusal(
+            f"durable V27 native supervisor execution failed: {exc}"
+        ) from exc
+    required = {
+        "exitCode",
+        "stdoutSha256",
+        "stderrSha256",
+        "readBackSha256",
+        "lifecycle",
+        "observedByNativeSupervisor",
+    }
+    if (
+        set(result) != required
+        or result.get("observedByNativeSupervisor") is not True
+        or list(result.get("lifecycle", ()))
+        != ["create", "init", "start-attach", "terminal", "cleanup", "rm"]
+    ):
+        raise _boundary_refusal("native supervisor result is not the closed V27 observation")
+    for field in ("stdoutSha256", "stderrSha256", "readBackSha256"):
+        _digest(result[field], field)
+    if type(result["exitCode"]) is not int:
+        raise _boundary_refusal("native supervisor exit code is invalid")
+    return MappingProxyType(dict(result))
 
 
 def _hash_regular_at(parent: int, name: str, metadata: os.stat_result, label: str) -> str:
@@ -4269,31 +4324,27 @@ def advance_beads_preparation_v1(request: AdvanceBeadsPreparationRequestV1) -> B
         )
         _verify_current_preparation_core_bindings(store, lease.payload)
         _revalidate_preparation_physical(lease)
-        environment = _frozen_preparation_environment(store, lease, intent_digest)
-        try:
-            completed = _spawn_verified_executable_v1(
-                Path(str(lease.payload["pinnedExecutablePath"])),
-                lease.payload["pinnedExecutableObservation"],
-                list(exact_argv),
-                cwd=Path(str(lease.payload["repositoryPath"])),
-                env=environment,
-                logical_path=Path(str(lease.payload["executablePath"])),
-            )
-            stdout = completed.stdout
-            stderr = completed.stderr
-            if len(stdout) > MAX_CANONICAL_BYTES or len(stderr) > MAX_CANONICAL_BYTES:
-                raise BeadsProtectedRuntimeError("preparation command output exceeds 1048576 bytes")
-            exit_code: int | None = completed.returncode
-            outcome = "succeeded" if completed.returncode == 0 else "failed"
-            stdout_digest = sha256(stdout)
-            stderr_digest = sha256(stderr)
-        except subprocess.TimeoutExpired as exc:
-            stdout = bytes(exc.stdout or b"")[:MAX_CANONICAL_BYTES]
-            stderr = bytes(exc.stderr or b"")[:MAX_CANONICAL_BYTES]
-            exit_code = None
-            outcome = "outcome-uncertain"
-            stdout_digest = sha256(stdout)
-            stderr_digest = sha256(stderr)
+        # Revalidate the frozen environment binding even though no broker-local
+        # child receives it; the native controller builds the only execution
+        # environment from its closed profile.
+        _frozen_preparation_environment(store, lease, intent_digest)
+        native_result = _execute_supervised_beads_effect_v27(
+            operation_class=(
+                "create-preparation"
+                if lease.payload.get("preparationMode") == "create"
+                else "reattest-preparation"
+            ),
+            argv=list(exact_argv),
+            repository_path=(
+                Path(str(lease.payload["createStageDatabasePath"])).parent
+                if lease.payload.get("preparationMode") == "create"
+                else Path(str(lease.payload["repositoryPath"]))
+            ),
+        )
+        exit_code = int(native_result["exitCode"])
+        outcome = "succeeded" if exit_code == 0 else "failed"
+        stdout_digest = str(native_result["stdoutSha256"])
+        stderr_digest = str(native_result["stderrSha256"])
         mutation_result = _signed_record(
             store,
             "BeadsMutationResultV1",
@@ -4304,7 +4355,11 @@ def advance_beads_preparation_v1(request: AdvanceBeadsPreparationRequestV1) -> B
                 "exitCode": exit_code,
                 "stdoutSha256": stdout_digest,
                 "stderrSha256": stderr_digest,
-                "readBackSha256": stdout_digest if payload["commandKind"] == "status-config-readback" else None,
+                "readBackSha256": (
+                    str(native_result["readBackSha256"])
+                    if payload["commandKind"] == "status-config-readback"
+                    else None
+                ),
                 "observedByBroker": True,
             },
             "mutation-results",

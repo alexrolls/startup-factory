@@ -565,6 +565,10 @@ exit 64
             )
         )
         self.assertEqual("ordinary", result.payload["mutationClass"])
+        self.assertNotEqual(digest("stdout"), result.payload["stdoutSha256"])
+        self.assertNotEqual(digest("empty"), result.payload["stderrSha256"])
+        self.assertNotEqual(digest("read-back"), result.payload["readBackSha256"])
+        self.assertTrue(result.payload["observedByBroker"])
         executable_path.write_bytes(executable_bytes + b"# changed after activation\n")
         executable_path.chmod(0o700)
         with runtime.use_beads_protected_runtime_v1(str(self.root), str(self.key)):

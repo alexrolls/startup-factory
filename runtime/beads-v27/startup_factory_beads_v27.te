@@ -1,0 +1,32 @@
+policy_module(startup_factory_beads_v27, 1.0)
+
+type beads_controller_t;
+type beads_controller_exec_t;
+type beads_supervisor_exec_t;
+type beads_native_supervisor_t;
+type beads_worker_t;
+
+init_daemon_domain(beads_controller_t, beads_controller_exec_t)
+domain_type(beads_native_supervisor_t)
+domain_type(beads_worker_t)
+files_type(beads_supervisor_exec_t)
+
+domain_entry_file(beads_native_supervisor_t, beads_supervisor_exec_t)
+domtrans_pattern(beads_controller_t, beads_supervisor_exec_t, beads_native_supervisor_t)
+allow beads_native_supervisor_t self:process { fork sigchld sigkill };
+allow beads_native_supervisor_t self:unix_stream_socket create_socket_perms;
+
+corecmd_exec_bin(beads_controller_t)
+corecmd_exec_bin(beads_native_supervisor_t)
+files_read_etc_files(beads_controller_t)
+files_read_usr_files(beads_controller_t)
+files_read_usr_files(beads_native_supervisor_t)
+kernel_read_system_state(beads_controller_t)
+kernel_read_system_state(beads_native_supervisor_t)
+logging_send_syslog_msg(beads_controller_t)
+miscfiles_read_localization(beads_controller_t)
+miscfiles_read_localization(beads_native_supervisor_t)
+
+# Podman/conmon policy is deliberately expected from the pinned host policy.
+# No Docker/Podman API socket, tracker credential, cloud credential, broker
+# lifecycle, release authority or controller HMAC-key access is granted here.

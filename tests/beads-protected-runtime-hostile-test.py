@@ -296,6 +296,8 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
 
     def seed_authority(self, state: str, generation: int = 1, predecessor: str | None = None):
         store = self.store()
+        repository_path = self.base / f"authority-repository-{generation}"
+        repository_path.mkdir(mode=0o700, exist_ok=True)
         return runtime._write_current(
             store,
             "BeadsAuthorityEpochStateV1",
@@ -305,6 +307,20 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 "repositoryLocatorSha256": self.repository,
                 "generation": generation,
                 "authorityState": state,
+                "candidate": {
+                    "preparationPointerRecordSha256": digest(f"pointer:{generation}"),
+                    "preparationActivationReceiptRecordSha256": digest(
+                        f"activation:{generation}"
+                    ),
+                    "adapterReleaseManifestRecordSha256": digest(
+                        f"release:{generation}"
+                    ),
+                    "runtimeApiManifestRecordSha256": digest(
+                        f"runtime:{generation}"
+                    ),
+                    "repositoryPath": str(repository_path),
+                    "databaseName": "db",
+                },
                 "predecessorCurrentFullBytesSha256": predecessor,
                 "preparationPointerRecordSha256": digest(f"pointer:{generation}"),
                 "adapterReleaseManifestRecordSha256": digest(f"release:{generation}"),
@@ -535,6 +551,16 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 "repositoryLocatorSha256": self.repository,
                 "generation": 1,
                 "authorityState": "active",
+                "candidate": {
+                    "preparationPointerRecordSha256": digest("pointer"),
+                    "preparationActivationReceiptRecordSha256": digest(
+                        "activation"
+                    ),
+                    "adapterReleaseManifestRecordSha256": digest("release"),
+                    "runtimeApiManifestRecordSha256": digest("runtime"),
+                    "repositoryPath": str(self.base),
+                    "databaseName": "db",
+                },
                 "predecessorCurrentFullBytesSha256": None,
                 "preparationPointerRecordSha256": digest("pointer"),
                 "adapterReleaseManifestRecordSha256": digest("release"),
@@ -890,6 +916,8 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 "/usr/lib/startup-factory/native-boundary-v27.json"
             ),
             native_boundary_manifest_sha256=digest("integrated-native-boundary-v27"),
+            native_module_path=Path(controller.native_boundary_v27.__file__),
+            native_module_sha256=digest("integrated-native-module-v27"),
         )
 
         class PacketCarrier:
@@ -939,8 +967,10 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 controller.socket, "socket", PacketCarrier
             ), mock.patch.object(
                 runtime,
-                "_spawn_verified_executable_v1",
-                side_effect=AssertionError("publication recovery must never spawn bd"),
+                "_execute_supervised_beads_effect_v27",
+                side_effect=AssertionError(
+                    "publication recovery must never execute a Beads effect"
+                ),
             ):
                 for ordinal, (fault_phase, fault_occurrence, request) in enumerate(requests, 1):
                     with self.subTest(
@@ -1203,7 +1233,7 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 )
             )
 
-    def test_executable_replacement_cannot_reach_spawn(self) -> None:
+    def test_executable_replacement_cannot_reintroduce_broker_spawn(self) -> None:
         large_binary = self.base / "large-approved-bd"
         large_bytes = b"#!/bin/sh\nexit 0\n#" + (b"x" * (runtime.MAX_CANONICAL_BYTES + 1)) + b"\n"
         large_binary.write_bytes(large_bytes)
@@ -1222,34 +1252,9 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         self.assertEqual(pinned, retry_pinned)
         self.assertEqual(pinned_observation, retry_observation)
 
-        binary = self.base / "approved-bd"
-        approved_marker = self.base / "approved-ran"
-        replacement_marker = self.base / "replacement-ran"
-        approved = f"#!/bin/sh\nprintf approved >'{approved_marker}'\n".encode()
-        replacement = f"#!/bin/sh\nprintf replacement >'{replacement_marker}'\n".encode()
-        binary.write_bytes(approved)
-        binary.chmod(0o700)
-        expected = runtime._observe_executable(binary, runtime.sha256(approved))
-        real_run = runtime.subprocess.run
-
-        def replace_then_run(argv, **kwargs):
-            replacement_path = self.base / "replacement-bd"
-            replacement_path.write_bytes(replacement)
-            replacement_path.chmod(0o700)
-            os.replace(replacement_path, binary)
-            return real_run(argv, **kwargs)
-
-        with mock.patch.object(runtime.subprocess, "run", side_effect=replace_then_run):
-            with self.assertRaises(runtime.BeadsProtectedRuntimeError):
-                runtime._spawn_verified_executable_v1(
-                    binary,
-                    expected,
-                    [str(binary)],
-                    cwd=self.base,
-                    env={"PATH": "/usr/bin:/bin"},
-                )
-        self.assertTrue(approved_marker.exists())
-        self.assertFalse(replacement_marker.exists())
+        source = inspect.getsource(runtime)
+        self.assertNotIn("def _spawn_verified_executable_v1", source)
+        self.assertNotIn("subprocess.run(", source)
 
     def test_journal_old_head_and_deleted_terminal_evidence_are_not_recoverable(self) -> None:
         store = self.store()
@@ -1375,7 +1380,9 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         )
         approved = self.store().directory("approved-executables")
         before = sorted(path.name for path in approved.iterdir())
-        with mock.patch.object(runtime, "_spawn_verified_executable_v1") as spawn:
+        with mock.patch.object(
+            runtime, "_execute_supervised_beads_effect_v27"
+        ) as spawn:
             with self.assertRaisesRegex(runtime.BeadsProtectedRuntimeError, "core"):
                 runtime.authorize_beads_preparation_v1(
                     self.request(

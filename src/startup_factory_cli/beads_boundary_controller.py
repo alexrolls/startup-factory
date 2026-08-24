@@ -10,6 +10,7 @@ connection before using current authority.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import dataclasses
 import grp
 import hashlib
@@ -19,6 +20,8 @@ import os
 import pwd
 import re
 import secrets
+import select
+import signal
 import socket
 import stat
 import struct
@@ -34,6 +37,8 @@ CONFIG_PATH: Final = Path("/etc/startup-factory/beads-boundary-controller-v1.jso
 ENDPOINT_PATH: Final = Path("/run/startup-factory/beads-boundary-controller-v1.sock")
 STATE_ROOT: Final = Path("/var/lib/startup-factory/beads-boundary-controller/v1")
 CONTROLLER_KEY_PATH: Final = Path("/etc/startup-factory/beads-boundary-controller-v1.key")
+OPERATOR_KEY_PATH: Final = Path("/etc/startup-factory/beads-local-operator-v1.key")
+OPERATOR_STATE_PATH: Final = Path("/etc/startup-factory/beads-local-operator-v1.state.json")
 PROTOCOL: Final = "startup-factory/beads-boundary-controller/v1"
 PRODUCTION_PROVENANCE: Final = "startup-factory/beads-boundary-controller/production/v1"
 MAX_MESSAGE_BYTES: Final = 1_048_576
@@ -46,6 +51,9 @@ _NONCE = re.compile(r"\A[a-zA-Z0-9][a-zA-Z0-9._:-]{15,255}\Z")
 _OPERATION_ID = re.compile(r"\A[0-9a-f]{64}\Z")
 _HMAC = re.compile(r"\Ahmac-sha256:[0-9a-f]{64}\Z")
 _EMPTY_SHA256 = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+_OPERATOR_HMAC_DOMAIN: Final = b"startup-factory/beads/local-operator-state/v1\0"
+_WORKER_PROTOCOL: Final = "startup-factory/beads-native-worker/v27"
+_WORKER_WAIT_SECONDS: Final = 150.0
 
 ALLOWED_OPERATIONS: Final = (
     "prepare_atomic_claim_v1",
@@ -101,6 +109,8 @@ _CONFIG_FIELDS = {
     "schemaSha256",
     "nativeBoundaryManifestPath",
     "nativeBoundaryManifestSha256",
+    "nativeModulePath",
+    "nativeModuleSha256",
     "configEpoch",
     "keyEpoch",
     "allowedOperations",
@@ -157,6 +167,13 @@ _RECOVER_FIELDS = {
     "publicationIntentSha256",
     "recoveryResultSha256",
 }
+_EXECUTE_FIELDS = {
+    "operationId",
+    "sessionNonce",
+    "executionNonce",
+    "predecessorReceiptSha256",
+    "plan",
+}
 _RESPONSE_FIELDS = {
     "schemaVersion",
     "protocol",
@@ -176,6 +193,7 @@ _RECOVERY_RESPONSE_EXTRA_FIELDS = {
     "operationExpiresAtUnix",
     "recoveryPublicationIntentSha256",
 }
+_EXECUTE_RESPONSE_EXTRA_FIELDS = {"nativeResult"}
 _NORMAL_STATES = (
     "accepted",
     "intent-bound",
@@ -285,6 +303,8 @@ class ControllerConfig:
     key_epoch: int
     native_boundary_manifest_path: Path
     native_boundary_manifest_sha256: str
+    native_module_path: Path
+    native_module_sha256: str
 
     @property
     def root_set_sha256(self) -> str:
@@ -294,7 +314,330 @@ class ControllerConfig:
             "recordHmacKeyPath": str(self.record_hmac_key_path),
             "nativeBoundaryManifestPath": str(self.native_boundary_manifest_path),
             "nativeBoundaryManifestSha256": self.native_boundary_manifest_sha256,
+            "nativeModulePath": str(self.native_module_path),
+            "nativeModuleSha256": self.native_module_sha256,
         }))
+
+
+def _operator_state_auth(payload: Mapping[str, Any], operator_key: bytes) -> str:
+    if not isinstance(operator_key, bytes) or not 32 <= len(operator_key) <= 4096:
+        raise ControllerProtocolError(
+            "local operator key must contain 32..4096 bytes"
+        )
+    return "hmac-sha256:" + hmac.new(
+        operator_key,
+        _OPERATOR_HMAC_DOMAIN + _canonical(dict(payload)),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _read_operator_key(path: Path = OPERATOR_KEY_PATH) -> bytes:
+    try:
+        metadata = os.lstat(path)
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ControllerProtocolError(
+                "local operator key must be a root-owned mode-0600 single-link file"
+            )
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_mode,
+                opened.st_uid,
+                opened.st_nlink,
+                opened.st_size,
+            ) != (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_uid,
+                metadata.st_nlink,
+                metadata.st_size,
+            ):
+                raise ControllerProtocolError("local operator key changed before open")
+            key = os.read(descriptor, 4097)
+        finally:
+            os.close(descriptor)
+    except ControllerProtocolError:
+        raise
+    except OSError as exc:
+        raise ControllerProtocolError(f"cannot read local operator key: {exc}") from exc
+    if not 32 <= len(key) <= 4096:
+        raise ControllerProtocolError("local operator key must contain 32..4096 bytes")
+    return key
+
+
+def _read_operator_state_v1(
+    config: ControllerConfig,
+    operator_key: bytes,
+    *,
+    state_path: Path = OPERATOR_STATE_PATH,
+    missing_ok: bool = False,
+) -> tuple[dict[str, Any], bytes] | None:
+    try:
+        descriptor = os.open(
+            state_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise ControllerProtocolError(
+            "local operator Apply has not produced authenticated activation state"
+        )
+    except OSError as exc:
+        raise ControllerProtocolError(f"cannot open local operator state: {exc}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        expected_owner = 0 if state_path == OPERATOR_STATE_PATH else os.getuid()
+        expected_group = (
+            config.transport_gid if state_path == OPERATOR_STATE_PATH else metadata.st_gid
+        )
+        expected_mode = 0o640 if state_path == OPERATOR_STATE_PATH else 0o600
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != expected_owner
+            or metadata.st_gid != expected_group
+            or stat.S_IMODE(metadata.st_mode) != expected_mode
+            or metadata.st_size <= 0
+            or metadata.st_size > MAX_MESSAGE_BYTES
+        ):
+            raise ControllerProtocolError("local operator state metadata is unsafe")
+        raw = os.read(descriptor, metadata.st_size + 1)
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ControllerProtocolError("local operator state is malformed") from exc
+    if raw != _canonical(value) or not isinstance(value, dict) or set(value) != {
+        "schemaVersion",
+        "payload",
+        "auth",
+    }:
+        raise ControllerProtocolError("local operator state is not canonical schema v1")
+    payload = value["payload"]
+    if not isinstance(payload, dict) or set(payload) != {
+        "configEpoch",
+        "generation",
+        "operatorState",
+        "predecessorStateSha256",
+        "rootSetSha256",
+        "transition",
+    }:
+        raise ControllerProtocolError("local operator state payload is not closed")
+    if (
+        value["schemaVersion"] != 1
+        or value["auth"] != _operator_state_auth(payload, operator_key)
+    ):
+        raise ControllerProtocolError("local operator state authentication failed")
+    if (
+        payload["rootSetSha256"] != config.root_set_sha256
+        or payload["configEpoch"] != config.config_epoch
+        or type(payload["generation"]) is not int
+        or payload["generation"] < 1
+        or payload["operatorState"] not in {"active", "disabled"}
+    ):
+        raise ControllerProtocolError("local operator state configuration binding changed")
+    return dict(value), raw
+
+
+def verify_operator_lifecycle_v1(
+    config: ControllerConfig,
+    operator_key: bytes,
+    *,
+    state_path: Path = OPERATOR_STATE_PATH,
+    require_active: bool = False,
+) -> dict[str, Any]:
+    observed = _read_operator_state_v1(
+        config, operator_key, state_path=state_path
+    )
+    assert observed is not None
+    state = observed[0]
+    if require_active and state["payload"]["operatorState"] != "active":
+        raise ControllerProtocolError("local operator state is not active")
+    if require_active and not config.beads_enabled:
+        raise ControllerProtocolError("Beads configuration remains disabled")
+    return dict(state["payload"])
+
+
+def preview_operator_lifecycle_v1(
+    config: ControllerConfig,
+    action: str,
+    *,
+    state_path: Path = OPERATOR_STATE_PATH,
+    operator_key: bytes | None = None,
+) -> dict[str, Any]:
+    if action not in {"apply", "disable", "reactivate"}:
+        raise ControllerProtocolError("local operator action is invalid")
+    if operator_key is None:
+        operator_key = _read_operator_key()
+    current = _read_operator_state_v1(
+        config, operator_key, state_path=state_path, missing_ok=True
+    )
+    if current is None:
+        current_state = None
+        generation = 1
+        predecessor = None
+    else:
+        current_state = current[0]["payload"]["operatorState"]
+        generation = int(current[0]["payload"]["generation"]) + 1
+        predecessor = _sha(current[1])
+    target = "active" if action in {"apply", "reactivate"} else "disabled"
+    if (
+        (action == "apply" and current_state is not None)
+        or (action == "disable" and current_state != "active")
+        or (action == "reactivate" and current_state != "disabled")
+    ):
+        raise ControllerProtocolError(
+            "local operator transition is not the unique lifecycle successor"
+        )
+    plan = {
+        "schemaVersion": 1,
+        "action": action,
+        "configEnabled": config.beads_enabled,
+        "configEpoch": config.config_epoch,
+        "rootSetSha256": config.root_set_sha256,
+        "generation": generation,
+        "predecessorStateSha256": predecessor,
+        "targetState": target,
+    }
+    return {**plan, "planDigest": _sha(_canonical(plan))}
+
+
+def apply_operator_lifecycle_v1(
+    config: ControllerConfig,
+    action: str,
+    plan_digest: str,
+    *,
+    operator_key: bytes | None = None,
+    state_path: Path = OPERATOR_STATE_PATH,
+) -> dict[str, Any]:
+    if os.geteuid() != 0:
+        raise ControllerProtocolError(
+            "local operator lifecycle changes require the authenticated root operator"
+        )
+    if operator_key is None:
+        operator_key = _read_operator_key()
+    preview = preview_operator_lifecycle_v1(
+        config, action, state_path=state_path, operator_key=operator_key
+    )
+    if plan_digest != preview["planDigest"]:
+        raise ControllerProtocolError("local operator plan digest changed before Apply")
+    if action in {"apply", "reactivate"} and not config.beads_enabled:
+        raise ControllerProtocolError("Beads configuration remains disabled")
+    payload = {
+        "configEpoch": config.config_epoch,
+        "generation": preview["generation"],
+        "operatorState": preview["targetState"],
+        "predecessorStateSha256": preview["predecessorStateSha256"],
+        "rootSetSha256": config.root_set_sha256,
+        "transition": action,
+    }
+    envelope = {
+        "schemaVersion": 1,
+        "payload": payload,
+        "auth": _operator_state_auth(payload, operator_key),
+    }
+    raw = _canonical(envelope)
+    if not state_path.is_absolute() or str(state_path) != os.path.normpath(
+        str(state_path)
+    ):
+        raise ControllerProtocolError("local operator state path is not absolute")
+    parent = os.open(
+        state_path.parent,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    temporary_leaf: str | None = None
+    installed = False
+    try:
+        parent_info = os.fstat(parent)
+        expected_parent_uid = 0 if state_path == OPERATOR_STATE_PATH else os.getuid()
+        if (
+            not stat.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_uid != expected_parent_uid
+            or stat.S_IMODE(parent_info.st_mode) & 0o022
+        ):
+            raise ControllerProtocolError(
+                "local operator state parent is not an exact private trusted directory"
+            )
+        current = _read_operator_state_v1(
+            config,
+            operator_key,
+            state_path=state_path,
+            missing_ok=True,
+        )
+        current_raw = None if current is None else current[1]
+        expected_predecessor = preview["predecessorStateSha256"]
+        if (
+            (current_raw is None and expected_predecessor is not None)
+            or (
+                current_raw is not None
+                and _sha(current_raw) != expected_predecessor
+            )
+        ):
+            raise ControllerProtocolError(
+                "local operator state predecessor changed before Apply"
+            )
+        temporary_leaf = (
+            f".{state_path.name}.tmp.{os.getpid()}.{secrets.token_hex(8)}"
+        )
+        descriptor = os.open(
+            temporary_leaf,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent,
+        )
+        try:
+            if state_path == OPERATOR_STATE_PATH:
+                os.fchown(descriptor, 0, config.transport_gid)
+                os.fchmod(descriptor, 0o640)
+            os.write(descriptor, raw)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        rebound = _read_operator_state_v1(
+            config,
+            operator_key,
+            state_path=state_path,
+            missing_ok=True,
+        )
+        rebound_raw = None if rebound is None else rebound[1]
+        if rebound_raw != current_raw:
+            raise ControllerProtocolError(
+                "local operator state changed concurrently before Apply"
+            )
+        os.replace(
+            temporary_leaf,
+            state_path.name,
+            src_dir_fd=parent,
+            dst_dir_fd=parent,
+        )
+        installed = True
+        os.fsync(parent)
+    finally:
+        if temporary_leaf is not None and not installed:
+            try:
+                os.unlink(temporary_leaf, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+        os.close(parent)
+    return verify_operator_lifecycle_v1(
+        config, operator_key, state_path=state_path
+    )
 
 
 def _parse_config(value: Any) -> ControllerConfig:
@@ -330,8 +673,9 @@ def _parse_config(value: Any) -> ControllerConfig:
         _absolute_path(
             data["nativeBoundaryManifestPath"], "nativeBoundaryManifestPath"
         ),
+        _absolute_path(data["nativeModulePath"], "nativeModulePath"),
     )
-    if len(set(artifacts)) != 4 or any(
+    if len(set(artifacts)) != 5 or any(
         path in {CONFIG_PATH, CONTROLLER_KEY_PATH, record_key}
         or path == protected
         or protected in path.parents
@@ -360,6 +704,10 @@ def _parse_config(value: Any) -> ControllerConfig:
         native_boundary_manifest_sha256=_installed_digest(
             data["nativeBoundaryManifestSha256"],
             "nativeBoundaryManifestSha256",
+        ),
+        native_module_path=artifacts[4],
+        native_module_sha256=_installed_digest(
+            data["nativeModuleSha256"], "nativeModuleSha256"
         ),
     )
 
@@ -522,6 +870,12 @@ _EXECUTING_MODULE_PATH, _EXECUTING_MODULE_IDENTITY, _EXECUTING_MODULE_SHA256 = (
         Path(__file__), "executing controller module at import"
     )
 )
+_NATIVE_MODULE_PATH, _NATIVE_MODULE_IDENTITY, _NATIVE_MODULE_SHA256 = (
+    _observe_executing_module_file(
+        Path(str(native_boundary_v27.__file__)),
+        "executing native V27 module at import",
+    )
+)
 
 
 def _verify_executing_module_identity(config: ControllerConfig) -> None:
@@ -561,6 +915,29 @@ def _verify_executing_module_identity(config: ControllerConfig) -> None:
     ):
         raise ControllerProtocolError(
             "executing controller module digest differs from configured/imported bytes"
+        )
+
+    native_specification = getattr(native_boundary_v27, "__spec__", None)
+    native_origin = getattr(native_specification, "origin", None)
+    if (
+        not isinstance(native_origin, str)
+        or Path(str(native_boundary_v27.__file__)) != config.native_module_path
+        or Path(native_origin) != config.native_module_path
+    ):
+        raise ControllerProtocolError(
+            "configured nativeModulePath is not the live imported V27 module"
+        )
+    native_path, native_identity, native_digest = _observe_executing_module_file(
+        config.native_module_path, "executing native V27 module"
+    )
+    if (
+        native_path != _NATIVE_MODULE_PATH
+        or native_identity != _NATIVE_MODULE_IDENTITY
+        or native_digest != _NATIVE_MODULE_SHA256
+        or native_digest != config.native_module_sha256
+    ):
+        raise ControllerProtocolError(
+            "executing native V27 module differs from configured/imported bytes"
         )
 
 
@@ -642,6 +1019,11 @@ def _verify_installed_artifacts(
             "installed native boundary V27 manifest",
             config.native_boundary_manifest_sha256,
         ),
+        (
+            config.native_module_path,
+            "installed native V27 module",
+            config.native_module_sha256,
+        ),
     )
     native_manifest_bytes: bytes | None = None
     for path, label, expected in observations:
@@ -674,6 +1056,9 @@ def _verify_installed_artifacts(
 
 def _verify_native_platform_gate(
     manifest: native_boundary_v27.NativeBoundaryManifestV27,
+    *,
+    expected_worker_uid: int | None = None,
+    run_probe: bool = True,
 ) -> None:
     observations = (
         (
@@ -690,12 +1075,322 @@ def _verify_native_platform_gate(
             raise ControllerProtocolError(
                 f"{label} digest does not match the native V27 manifest"
             )
+    if run_probe:
+        try:
+            native_boundary_v27.verify_local_platform_gate_v27(
+                manifest, expected_worker_uid=expected_worker_uid
+            )
+        except native_boundary_v27.NativeBoundaryV27Error as exc:
+            raise ControllerProtocolError(
+                f"native V27 Linux/SELinux/systemd/Podman/supervisor gate failed: {exc}"
+            ) from exc
+
+
+def _worker_packet_v27(value: Any, label: str) -> dict[str, Any]:
     try:
-        native_boundary_v27.verify_local_platform_gate_v27(manifest)
+        parsed = json.loads(value)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ControllerProtocolError(f"{label} is malformed") from exc
+    if (
+        not isinstance(parsed, dict)
+        or _canonical(parsed) != value
+        or len(value) > MAX_MESSAGE_BYTES
+    ):
+        raise ControllerProtocolError(f"{label} is not bounded canonical JSON")
+    return parsed
+
+
+def _worker_result_packet_v27(
+    plan_sha256: str, result: Mapping[str, Any]
+) -> bytes:
+    try:
+        observation = native_boundary_v27._decode_supervisor_result(result)
     except native_boundary_v27.NativeBoundaryV27Error as exc:
         raise ControllerProtocolError(
-            f"native V27 Linux/SELinux/systemd/Podman/supervisor gate failed: {exc}"
+            f"native worker result is invalid: {exc}"
         ) from exc
+    return _canonical(
+        {
+            "schemaVersion": 27,
+            "protocol": _WORKER_PROTOCOL,
+            "status": "completed",
+            "planSha256": plan_sha256,
+            "nativeObservation": observation,
+        }
+    )
+
+
+def _assert_worker_dac_isolation_v27(config: ControllerConfig) -> None:
+    protected = (
+        config.protected_root,
+        config.record_hmac_key_path,
+        CONTROLLER_KEY_PATH,
+        OPERATOR_KEY_PATH,
+        OPERATOR_STATE_PATH,
+        STATE_ROOT,
+    )
+    for path in protected:
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | (getattr(os, "O_DIRECTORY", 0) if path in {config.protected_root, STATE_ROOT} else 0),
+            )
+        except PermissionError:
+            continue
+        except OSError as exc:
+            raise ControllerProtocolError(
+                f"worker could not prove protected asset denial for {path}: {exc}"
+            ) from exc
+        else:
+            os.close(descriptor)
+            raise ControllerProtocolError(
+                f"configured worker UID can read protected controller asset {path}"
+            )
+
+
+def _drop_to_worker_identity_v27(config: ControllerConfig) -> None:
+    try:
+        account = pwd.getpwuid(config.worker_uid)
+    except KeyError as exc:
+        raise ControllerProtocolError("configured worker UID has no local account") from exc
+    os.environ.clear()
+    os.environ.update(
+        {
+            "HOME": account.pw_dir,
+            "LANG": "C",
+            "LC_ALL": "C",
+            "LOGNAME": account.pw_name,
+            "PATH": "/usr/bin:/bin",
+            "USER": account.pw_name,
+            "XDG_RUNTIME_DIR": f"/run/user/{config.worker_uid}",
+        }
+    )
+    os.setgroups([])
+    os.setgid(account.pw_gid)
+    os.setuid(config.worker_uid)
+    if (
+        os.geteuid() != config.worker_uid
+        or os.getegid() != account.pw_gid
+        or os.getgroups()
+    ):
+        raise ControllerProtocolError(
+            "native worker did not enter the exact configured unprivileged identity"
+        )
+    _assert_worker_dac_isolation_v27(config)
+
+
+def _set_worker_parent_death_v27(parent_pid: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+        raise ControllerProtocolError("native worker could not bind parent-death signal")
+    if os.getppid() != parent_pid:
+        raise ControllerProtocolError("controller died during native worker bootstrap")
+
+
+def _close_worker_inherited_descriptors_v27(retained: int) -> None:
+    try:
+        descriptors = tuple(int(name) for name in os.listdir("/proc/self/fd"))
+    except (OSError, ValueError) as exc:
+        raise ControllerProtocolError(
+            f"native worker cannot enumerate inherited descriptors: {exc}"
+        ) from exc
+    for descriptor in descriptors:
+        if descriptor > 2 and descriptor != retained:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _worker_main_v27(
+    channel: socket.socket,
+    config: ControllerConfig,
+    manifest: native_boundary_v27.NativeBoundaryManifestV27,
+    parent_pid: int,
+) -> None:
+    os.setsid()
+    _set_worker_parent_death_v27(parent_pid)
+    _close_worker_inherited_descriptors_v27(channel.fileno())
+    _drop_to_worker_identity_v27(config)
+    _verify_native_platform_gate(
+        manifest, expected_worker_uid=config.worker_uid
+    )
+    channel.sendall(
+        _canonical(
+            {
+                "schemaVersion": 27,
+                "protocol": _WORKER_PROTOCOL,
+                "status": "ready",
+                "workerPid": os.getpid(),
+                "workerUid": os.geteuid(),
+            }
+        )
+    )
+    while True:
+        packet = channel.recv(MAX_MESSAGE_BYTES + 1)
+        if not packet or len(packet) > MAX_MESSAGE_BYTES:
+            raise ControllerProtocolError("native worker request is empty or oversized")
+        request = _worker_packet_v27(packet, "native worker request")
+        if set(request) != {"schemaVersion", "protocol", "action", "plan"} or (
+            request["schemaVersion"], request["protocol"]
+        ) != (27, _WORKER_PROTOCOL):
+            raise ControllerProtocolError("native worker request shape is invalid")
+        if request["action"] == "STOP" and request["plan"] is None:
+            return
+        if request["action"] != "EXECUTE":
+            raise ControllerProtocolError("native worker action is invalid")
+        _assert_worker_dac_isolation_v27(config)
+        _verify_native_platform_gate(
+            manifest, expected_worker_uid=config.worker_uid
+        )
+        plan = native_boundary_v27.validate_supervised_effect_plan_v27(
+            request["plan"], manifest
+        )
+        result = native_boundary_v27.run_native_supervisor_v27(manifest, plan)
+        channel.sendall(_worker_result_packet_v27(plan["planSha256"], result))
+
+
+@dataclasses.dataclass(slots=True)
+class _WorkerChannelV27:
+    channel: socket.socket
+    pid: int
+    worker_uid: int
+
+    def _assert_peer(self) -> None:
+        _pid, uid, _gid = _peer_credentials(self.channel)
+        if uid != self.worker_uid:
+            raise ControllerProtocolError("native worker peer UID changed")
+
+    def await_ready(self) -> None:
+        self.channel.settimeout(CONNECTION_DEADLINE_SECONDS * 6)
+        self._assert_peer()
+        packet = self.channel.recv(MAX_MESSAGE_BYTES + 1)
+        value = _worker_packet_v27(packet, "native worker readiness")
+        if set(value) != {
+            "schemaVersion",
+            "protocol",
+            "status",
+            "workerPid",
+            "workerUid",
+        } or (
+            value["schemaVersion"],
+            value["protocol"],
+            value["status"],
+            value["workerPid"],
+            value["workerUid"],
+        ) != (27, _WORKER_PROTOCOL, "ready", self.pid, self.worker_uid):
+            raise ControllerProtocolError("native worker readiness identity is invalid")
+        self.channel.settimeout(None)
+
+    def execute(
+        self,
+        manifest: native_boundary_v27.NativeBoundaryManifestV27,
+        value: Any,
+        *,
+        lifecycle_check: Any,
+    ) -> dict[str, Any]:
+        plan = native_boundary_v27.validate_supervised_effect_plan_v27(
+            value, manifest
+        )
+        self._assert_peer()
+        self.channel.sendall(
+            _canonical(
+                {
+                    "schemaVersion": 27,
+                    "protocol": _WORKER_PROTOCOL,
+                    "action": "EXECUTE",
+                    "plan": plan,
+                }
+            )
+        )
+        deadline = time.monotonic() + _WORKER_WAIT_SECONDS
+        while True:
+            lifecycle_check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.terminate()
+                raise ControllerProtocolError(
+                    "native worker timed out and its delegated process group was drained"
+                )
+            readable, _, _ = select.select(
+                [self.channel], [], [], min(0.25, remaining)
+            )
+            if readable:
+                break
+        packet = self.channel.recv(MAX_MESSAGE_BYTES + 1)
+        response = _worker_packet_v27(packet, "native worker result")
+        expected_fields = {
+            "schemaVersion",
+            "protocol",
+            "status",
+            "planSha256",
+            "nativeObservation",
+        }
+        if set(response) != expected_fields or (
+            response["schemaVersion"],
+            response["protocol"],
+            response["status"],
+            response["planSha256"],
+        ) != (27, _WORKER_PROTOCOL, "completed", plan["planSha256"]):
+            raise ControllerProtocolError("native worker result identity is invalid")
+        result = {"nativeObservation": response["nativeObservation"]}
+        native_boundary_v27._decode_supervisor_result(result)
+        return result
+
+    def terminate(self) -> None:
+        try:
+            os.killpg(self.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            os.waitpid(self.pid, 0)
+        except ChildProcessError:
+            pass
+
+    def close(self) -> None:
+        try:
+            self.channel.sendall(
+                _canonical(
+                    {
+                        "schemaVersion": 27,
+                        "protocol": _WORKER_PROTOCOL,
+                        "action": "STOP",
+                        "plan": None,
+                    }
+                )
+            )
+        except OSError:
+            pass
+        self.channel.close()
+        try:
+            waited, _status = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if waited == 0:
+            self.terminate()
+
+
+def _spawn_worker_channel_v27(
+    config: ControllerConfig,
+    manifest: native_boundary_v27.NativeBoundaryManifestV27,
+) -> _WorkerChannelV27:
+    parent, child = socket.socketpair(
+        socket.AF_UNIX,
+        socket.SOCK_SEQPACKET | getattr(socket, "SOCK_CLOEXEC", 0),
+    )
+    parent_pid = os.getpid()
+    pid = os.fork()
+    if pid == 0:
+        parent.close()
+        try:
+            _worker_main_v27(child, config, manifest, parent_pid)
+        except BaseException:
+            os._exit(125)
+        os._exit(0)
+    child.close()
+    return _WorkerChannelV27(parent, pid, config.worker_uid)
 
 
 def _validate_endpoint_parent(config: ControllerConfig) -> None:
@@ -769,7 +1464,7 @@ def _validate_controller_directory(path: Path, config: ControllerConfig, label: 
 def _request(action: str, request: Mapping[str, Any], config: ControllerConfig) -> dict[str, Any]:
     if not config.beads_enabled:
         raise ControllerProtocolError("protected Beads boundary is disabled")
-    if action not in {"OPEN", "STEP", "VALIDATE", "RECOVER"}:
+    if action not in {"OPEN", "STEP", "VALIDATE", "RECOVER", "EXECUTE"}:
         raise ControllerProtocolError("client requested an unknown controller action")
     if not sys.platform.startswith("linux"):
         raise ControllerProtocolError("fixed Beads boundary controller requires Linux")
@@ -806,16 +1501,16 @@ def _request(action: str, request: Mapping[str, Any], config: ControllerConfig) 
         value = json.loads(response)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ControllerProtocolError("controller returned malformed JSON") from exc
-    expected_response_fields = (
-        _RESPONSE_FIELDS | _RECOVERY_RESPONSE_EXTRA_FIELDS
-        if action == "RECOVER"
-        else _RESPONSE_FIELDS
-    )
+    expected_response_fields = set(_RESPONSE_FIELDS)
+    if action == "RECOVER":
+        expected_response_fields |= _RECOVERY_RESPONSE_EXTRA_FIELDS
+    elif action == "EXECUTE":
+        expected_response_fields |= _EXECUTE_RESPONSE_EXTRA_FIELDS
     if not isinstance(value, dict) or set(value) != expected_response_fields or _canonical(value) != response:
         raise ControllerProtocolError("controller response is not a canonical closed object")
     if value.get("schemaVersion") != 1 or value.get("protocol") != PROTOCOL or value.get("action") != action or value.get("requestSha256") != _sha(encoded):
         raise ControllerProtocolError("controller response does not bind the exact request")
-    if value.get("provenanceDomain") != PRODUCTION_PROVENANCE or value.get("status") not in {"accepted", "completed", "validated", "recovered"}:
+    if value.get("provenanceDomain") != PRODUCTION_PROVENANCE or value.get("status") not in {"accepted", "completed", "validated", "recovered", "executed"}:
         raise ControllerProtocolError("controller response is not live production provenance")
     _digest(value.get("receiptSha256"), "receiptSha256")
     if not isinstance(value.get("controllerHmac"), str) or not _HMAC.fullmatch(value["controllerHmac"]):
@@ -840,6 +1535,15 @@ def _request(action: str, request: Mapping[str, Any], config: ControllerConfig) 
             "recoveryPublicationIntentSha256",
             nullable=True,
         )
+    elif action == "EXECUTE":
+        native_result = value.get("nativeResult")
+        if (
+            not isinstance(native_result, dict)
+            or _sha(_canonical(native_result)) != value.get("resultSha256")
+        ):
+            raise ControllerProtocolError(
+                "EXECUTE response native result digest is invalid"
+            )
     return value
 
 
@@ -898,6 +1602,32 @@ def step_operation(config: ControllerConfig, session: Mapping[str, Any], target_
     ):
         raise ControllerProtocolError("STEP response changed the exact requested successor")
     return response
+
+
+def execute_native_effect_v27(
+    config: ControllerConfig,
+    session: Mapping[str, Any],
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    request = {
+        "operationId": session["operationId"],
+        "sessionNonce": session["sessionNonce"],
+        "executionNonce": secrets.token_hex(32),
+        "predecessorReceiptSha256": session["receiptSha256"],
+        "plan": dict(plan),
+    }
+    response = _request("EXECUTE", request, config)
+    if (
+        response.get("operationId") != session.get("operationId")
+        or response.get("sessionNonce") != session.get("sessionNonce")
+        or response.get("state") != "effect-authorized"
+        or response.get("status") != "executed"
+        or not isinstance(response.get("nativeResult"), dict)
+    ):
+        raise ControllerProtocolError(
+            "EXECUTE response changed the exact native effect lineage"
+        )
+    return dict(response["nativeResult"])
 
 
 def validate_stored_receipt(config: ControllerConfig, *, operation_id: str, stored_receipt_sha256: str, expected_state: str, expected_result_sha256: str | None) -> dict[str, Any]:
@@ -1093,6 +1823,9 @@ def _load_state(
         "publication-recovered",
     }:
         fields.add("effectAuthorizationReceiptSha256")
+        fields.update(
+            {"nativeEffectPlanSha256", "nativeEffectResultSha256"}
+        )
     if state in _RECOVERY_STATES:
         fields.add("recoveryPublicationIntentSha256")
     data = _closed_mapping(value, fields, "controller durable state")
@@ -1107,6 +1840,22 @@ def _load_state(
             data["effectAuthorizationReceiptSha256"],
             "state effectAuthorizationReceiptSha256",
         )
+        _digest(
+            data["nativeEffectPlanSha256"],
+            "state nativeEffectPlanSha256",
+            nullable=True,
+        )
+        _digest(
+            data["nativeEffectResultSha256"],
+            "state nativeEffectResultSha256",
+            nullable=True,
+        )
+        if (data["nativeEffectPlanSha256"] is None) != (
+            data["nativeEffectResultSha256"] is None
+        ):
+            raise ControllerProtocolError(
+                "controller native effect plan/result binding is incomplete"
+            )
     if state in _RECOVERY_STATES:
         _digest(
             data["recoveryPublicationIntentSha256"],
@@ -1215,9 +1964,25 @@ def _write_state(path: Path, value: Mapping[str, Any], expected: bytes | None) -
         os.close(directory)
 
 
-def _serve_packet(packet: bytes, peer_uid: int, config: ControllerConfig, key: bytes) -> bytes:
+def _serve_packet(
+    packet: bytes,
+    peer_uid: int,
+    config: ControllerConfig,
+    key: bytes,
+    *,
+    operator_key: bytes | None = None,
+    operator_state_path: Path = OPERATOR_STATE_PATH,
+    supervisor_runner: Any = None,
+) -> bytes:
     if not config.beads_enabled:
         raise ControllerProtocolError("protected Beads boundary is disabled")
+    if operator_key is not None:
+        verify_operator_lifecycle_v1(
+            config,
+            operator_key,
+            state_path=operator_state_path,
+            require_active=True,
+        )
     try:
         value = json.loads(packet)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1234,7 +1999,7 @@ def _serve_packet(packet: bytes, peer_uid: int, config: ControllerConfig, key: b
     if peer_uid != config.broker_uid or peer_uid in {config.controller_uid, config.worker_uid}:
         raise ControllerProtocolError("request peer is not the distinct configured broker UID")
     action = _string(data["action"], "controller action")
-    if action not in {"OPEN", "STEP", "VALIDATE", "RECOVER"}:
+    if action not in {"OPEN", "STEP", "VALIDATE", "RECOVER", "EXECUTE"}:
         raise ControllerProtocolError("unknown controller action")
     request = data["request"]
     request_sha = _sha(packet)
@@ -1386,6 +2151,8 @@ def _serve_packet(packet: bytes, peer_uid: int, config: ControllerConfig, key: b
             successor["effectAuthorizationReceiptSha256"] = response[
                 "receiptSha256"
             ]
+            successor["nativeEffectPlanSha256"] = None
+            successor["nativeEffectResultSha256"] = None
         _write_state(path, successor, prior_bytes)
         return _canonical(response)
     if action == "VALIDATE":
@@ -1415,6 +2182,91 @@ def _serve_packet(packet: bytes, peer_uid: int, config: ControllerConfig, key: b
             "resultSha256": prior["response"].get("resultSha256"),
         })
         _write_state(path, {**prior, "usedNonces": [*prior["usedNonces"], validation["validationNonce"]]}, prior_bytes)
+        return _canonical(response)
+    if action == "EXECUTE":
+        execution = _closed_mapping(request, _EXECUTE_FIELDS, "EXECUTE request")
+        operation_id = _operation_id(execution["operationId"])
+        _nonce(execution["sessionNonce"], "EXECUTE session nonce")
+        _nonce(execution["executionNonce"], "EXECUTE nonce")
+        _digest(
+            execution["predecessorReceiptSha256"],
+            "EXECUTE predecessorReceiptSha256",
+        )
+        path = _state_file(operation_id)
+        loaded = _load_state(path, key)
+        assert loaded is not None
+        prior_bytes, prior = loaded
+        if (
+            prior.get("state") != "effect-authorized"
+            or execution["sessionNonce"] != prior["response"]["sessionNonce"]
+            or execution["predecessorReceiptSha256"]
+            != prior["response"]["receiptSha256"]
+            or int(prior.get("expiresAtUnix", 0)) <= int(time.time())
+        ):
+            raise ControllerProtocolError(
+                "EXECUTE does not bind the live effect-authorized predecessor"
+            )
+        if execution["executionNonce"] in prior.get("usedNonces", []):
+            raise ControllerProtocolError("EXECUTE nonce was already consumed")
+        manifest = _verify_installed_artifacts(config)
+        _verify_native_platform_gate(manifest, run_probe=False)
+        plan = native_boundary_v27.validate_supervised_effect_plan_v27(
+            execution["plan"], manifest
+        )
+        if plan["operationId"] != operation_id:
+            raise ControllerProtocolError(
+                "EXECUTE plan operationId differs from the controller lineage"
+            )
+        stored_plan = prior.get("nativeEffectPlanSha256")
+        if stored_plan is not None and stored_plan != plan["planSha256"]:
+            raise ControllerProtocolError(
+                "EXECUTE attempted to rebind a consumed native effect plan"
+            )
+        try:
+            native_result = native_boundary_v27.execute_supervised_effect_v27(
+                STATE_ROOT,
+                key,
+                manifest,
+                plan,
+                runner=(
+                    native_boundary_v27.run_native_supervisor_v27
+                    if supervisor_runner is None
+                    else supervisor_runner
+                ),
+            )
+        except native_boundary_v27.NativeBoundaryV27Error as exc:
+            raise ControllerProtocolError(
+                f"EXECUTE native supervisor boundary failed: {exc}"
+            ) from exc
+        result_digest = _sha(_canonical(native_result))
+        stored_result = prior.get("nativeEffectResultSha256")
+        if stored_result is not None and stored_result != result_digest:
+            raise ControllerProtocolError(
+                "EXECUTE native result changed after durable completion"
+            )
+        response = _sign_response(
+            key,
+            action,
+            {
+                "status": "executed",
+                "state": "effect-authorized",
+                "requestSha256": request_sha,
+                "operationId": operation_id,
+                "sessionNonce": execution["sessionNonce"],
+                "resultSha256": result_digest,
+                "nativeResult": native_result,
+            },
+        )
+        _write_state(
+            path,
+            {
+                **prior,
+                "usedNonces": [*prior["usedNonces"], execution["executionNonce"]],
+                "nativeEffectPlanSha256": plan["planSha256"],
+                "nativeEffectResultSha256": result_digest,
+            },
+            prior_bytes,
+        )
         return _canonical(response)
     recovery = _closed_mapping(request, _RECOVER_FIELDS, "RECOVER request")
     _operation_id(recovery["operationId"])
@@ -1590,6 +2442,8 @@ def _serve_connection(
     connection: socket.socket,
     config: ControllerConfig,
     key: bytes,
+    operator_key: bytes | None = None,
+    supervisor_runner: Any = None,
 ) -> None:
     """Contain every untrusted connection failure and emit no error oracle."""
 
@@ -1618,7 +2472,14 @@ def _serve_connection(
                 raise ControllerProtocolError(
                     "controller connection supplied more than one request packet"
                 )
-            response = _serve_packet(packet, peer_uid, config, key)
+            response = _serve_packet(
+                packet,
+                peer_uid,
+                config,
+                key,
+                operator_key=operator_key,
+                supervisor_runner=supervisor_runner,
+            )
             connection.sendall(response)
         except Exception:
             # Protocol, type, parser, filesystem and unexpected per-client
@@ -1719,9 +2580,18 @@ def serve_forever() -> None:
     _validate_transport_group(config)
     _validate_endpoint_parent(config)
     native_manifest = _verify_installed_artifacts(config)
-    _verify_native_platform_gate(native_manifest)
-    listener = _create_listener(config)
+    _verify_native_platform_gate(native_manifest, run_probe=False)
+    worker = _spawn_worker_channel_v27(config, native_manifest)
+    listener: socket.socket | None = None
     try:
+        # Spawn before either operator or controller HMAC material is read, so
+        # the forked worker cannot inherit either secret.  The worker drops to
+        # workerUid, closes every inherited descriptor, proves DAC denial, and
+        # performs all Podman/supervisor probes under that identity.
+        operator_key = _read_operator_key()
+        verify_operator_lifecycle_v1(config, operator_key, require_active=True)
+        listener = _create_listener(config)
+        worker.await_ready()
         try:
             key_info = os.lstat(CONTROLLER_KEY_PATH)
             if (
@@ -1755,17 +2625,56 @@ def serve_forever() -> None:
             raise ControllerProtocolError("controller HMAC key must contain 32..4096 bytes")
         _validate_controller_directory(STATE_ROOT, config, "controller state root")
         listener.listen(LISTEN_BACKLOG)
+        listener.settimeout(1.0)
         while True:
-            connection, _ = listener.accept()
-            _serve_connection(connection, config, key)
+            # A root operator disable replaces authenticated state in /etc.
+            # Re-read it before every accept and request.  A disabled state
+            # fences new work and closes the listener so systemd can drain the
+            # complete delegated service cgroup.
+            verify_operator_lifecycle_v1(
+                config, operator_key, require_active=True
+            )
+            try:
+                connection, _ = listener.accept()
+            except socket.timeout:
+                continue
+            _serve_connection(
+                connection,
+                config,
+                key,
+                operator_key,
+                supervisor_runner=lambda manifest, plan: worker.execute(
+                    manifest,
+                    plan,
+                    lifecycle_check=lambda: verify_operator_lifecycle_v1(
+                        config, operator_key, require_active=True
+                    ),
+                ),
+            )
     finally:
-        listener.close()
+        if listener is not None:
+            listener.close()
+        worker.close()
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="startup-factory-beads-controller")
     parser.add_argument(
-        "command", choices=("validate-config", "require-enabled", "serve")
+        "command",
+        choices=(
+            "validate-config",
+            "require-enabled",
+            "serve",
+            "operator-preview",
+            "operator-apply",
+            "operator-disable",
+            "operator-reactivate",
+            "operator-status",
+        ),
+    )
+    parser.add_argument("--plan-digest")
+    parser.add_argument(
+        "--transition", choices=("apply", "disable", "reactivate"), default="apply"
     )
     args = parser.parse_args(argv)
     try:
@@ -1773,10 +2682,51 @@ def main(argv: list[str] | None = None) -> int:
             serve_forever()
         else:
             config = load_controller_config()
-            if args.command == "require-enabled" and not config.beads_enabled:
-                raise ControllerProtocolError(
-                    "protected Beads boundary is disabled; set beadsEnabled=true only after the external V27 proof gate passes"
+            if args.command == "require-enabled":
+                if not config.beads_enabled:
+                    raise ControllerProtocolError(
+                        "protected Beads boundary is disabled; set beadsEnabled=true only after the external V27 proof gate passes"
+                    )
+                verify_operator_lifecycle_v1(
+                    config, _read_operator_key(), require_active=True
                 )
+                return 0
+            if args.command.startswith("operator-"):
+                operator_key = _read_operator_key()
+                action = args.command.removeprefix("operator-")
+                if action == "status":
+                    print(
+                        _canonical(
+                            verify_operator_lifecycle_v1(config, operator_key)
+                        ).decode("utf-8")
+                    )
+                    return 0
+                if action == "preview":
+                    action = args.transition
+                    print(
+                        _canonical(
+                            preview_operator_lifecycle_v1(
+                                config, action, operator_key=operator_key
+                            )
+                        ).decode("utf-8")
+                    )
+                    return 0
+                if args.plan_digest is None:
+                    raise ControllerProtocolError(
+                        "operator lifecycle Apply requires --plan-digest from preview"
+                    )
+                transition = "apply" if action == "apply" else action
+                print(
+                    _canonical(
+                        apply_operator_lifecycle_v1(
+                            config,
+                            transition,
+                            args.plan_digest,
+                            operator_key=operator_key,
+                        )
+                    ).decode("utf-8")
+                )
+                return 0
             print(_canonical({
                 "schemaVersion": 1,
                 "protocol": PROTOCOL,

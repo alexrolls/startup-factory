@@ -36,7 +36,7 @@ from startup_factory_cli import beads_boundary_controller as controller  # noqa:
 from startup_factory_cli import beads_native_boundary_v27 as boundary  # noqa: E402
 
 
-def strict_json(raw: bytes, label: str) -> dict:
+def strict_json(raw: bytes, label: str) -> object:
     if not raw or len(raw) > boundary.MAX_CANONICAL_BYTES:
         raise SystemExit(f"{label} returned empty or oversized JSON")
 
@@ -52,8 +52,8 @@ def strict_json(raw: bytes, label: str) -> dict:
         value = json.loads(raw, object_pairs_hook=pairs)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise SystemExit(f"{label} returned malformed/duplicate JSON: {exc}") from exc
-    if not isinstance(value, dict):
-        raise SystemExit(f"{label} did not return one JSON object")
+    if not isinstance(value, (dict, list)):
+        raise SystemExit(f"{label} did not return one JSON object or array")
     return value
 
 
@@ -96,23 +96,13 @@ def fixed_run(argv: list[str], *, as_uid: int | None = None) -> bytes:
 config = controller.load_controller_config()
 if not config.beads_enabled:
     raise SystemExit("beadsEnabled is false; the operator has not enabled this gate")
+operator_key = controller._read_operator_key()
+controller.verify_operator_lifecycle_v1(config, operator_key, require_active=True)
 controller._verify_installed_artifacts(config)
 manifest_raw = controller._read_root_owned(
     config.native_boundary_manifest_path, "installed V27 manifest"
 )
 manifest = boundary.parse_native_boundary_manifest_v27(json.loads(manifest_raw))
-
-systemd = fixed_run(["/usr/bin/systemd", "--version"]).splitlines()[0]
-if systemd != b"systemd 254 (254)" and not systemd.startswith(b"systemd 254 "):
-    raise SystemExit(f"systemd version differs from exact 254 fixture: {systemd!r}")
-podman_version = fixed_run([str(manifest.podman_path), "--version"]).strip()
-if podman_version != b"podman version 5.4.1":
-    raise SystemExit(f"Podman version differs from exact 5.4.1 fixture: {podman_version!r}")
-conmon_version = fixed_run([str(manifest.conmon_path), "--version"]).splitlines()[0]
-if b"2.1.12" not in conmon_version:
-    raise SystemExit(f"conmon version differs from exact 2.1.12 fixture: {conmon_version!r}")
-if fixed_run(["/usr/sbin/getenforce"]).strip() != b"Enforcing":
-    raise SystemExit("SELinux is not enforcing")
 
 for path, expected, label in (
     (manifest.supervisor_path, manifest.supervisor_sha256, "native supervisor"),
@@ -122,24 +112,82 @@ for path, expected, label in (
     if controller._sha(controller._read_root_owned(path, label, executable=True)) != expected:
         raise SystemExit(f"{label} digest differs from the V27 manifest")
 policy_path = Path("/sys/fs/selinux/policy")
-if controller._sha(controller._read_root_owned(policy_path, "SELinux policy")) != manifest.selinux_policy_sha256:
+if controller._sha(
+    controller._read_root_owned(
+        policy_path, "SELinux policy", max_bytes=64 * 1024 * 1024
+    )
+) != manifest.selinux_policy_sha256:
     raise SystemExit("loaded SELinux policy digest differs from the V27 manifest")
 
-podman_info = strict_json(
-    fixed_run([str(manifest.podman_path), "info", "--format", "json"], as_uid=config.worker_uid),
-    "rootless Podman info",
-)
-try:
-    if podman_info["host"]["security"]["rootless"] is not True:
-        raise KeyError("rootless")
-except (KeyError, TypeError) as exc:
-    raise SystemExit("Podman info does not prove exact rootless execution") from exc
+# A non-broker/non-controller/non-worker account must not even connect to the
+# protected endpoint or read any protected authority/key root.
+agent = pwd.getpwnam("nobody")
+if agent.pw_uid in {0, config.controller_uid, config.broker_uid, config.worker_uid}:
+    raise SystemExit("nobody is not a distinct agent denial identity")
+agent_pid = os.fork()
+if agent_pid == 0:
+    try:
+        os.setgroups([])
+        os.setgid(agent.pw_gid)
+        os.setuid(agent.pw_uid)
+        for forbidden in (
+            config.protected_root,
+            config.record_hmac_key_path,
+            controller.CONTROLLER_KEY_PATH,
+            controller.OPERATOR_KEY_PATH,
+        ):
+            try:
+                descriptor = os.open(forbidden, os.O_RDONLY | os.O_NOFOLLOW)
+            except PermissionError:
+                continue
+            else:
+                os.close(descriptor)
+                os._exit(91)
+        denied = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            denied.connect(str(controller.ENDPOINT_PATH))
+        except PermissionError:
+            os._exit(0)
+        os._exit(92)
+    except BaseException:
+        os._exit(93)
+_, agent_status = os.waitpid(agent_pid, 0)
+if not os.WIFEXITED(agent_status) or os.WEXITSTATUS(agent_status) != 0:
+    raise SystemExit("unprivileged agent denial fixture failed")
 
-supervisor_observation = strict_json(
-    fixed_run([str(manifest.supervisor_path), "--startup-factory-probe-v27"]),
-    "native supervisor",
+fixture_root = Path(tempfile.mkdtemp(prefix="startup-factory-beads-v27-"))
+workspace = fixture_root / "workspace"
+state_root = fixture_root / "state"
+workspace.mkdir(mode=0o700)
+state_root.mkdir(mode=0o700)
+account = pwd.getpwuid(config.worker_uid)
+for path in (fixture_root, workspace, state_root):
+    os.chown(path, account.pw_uid, account.pw_gid)
+    os.chmod(path, 0o700)
+
+# Permanently enter the production worker identity. All probes and every real
+# Podman/bd lifecycle below run after this point and cannot regain root.
+os.environ.clear()
+os.environ.update(
+    {
+        "HOME": account.pw_dir,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "LOGNAME": account.pw_name,
+        "PATH": "/usr/bin:/bin",
+        "USER": account.pw_name,
+        "XDG_RUNTIME_DIR": f"/run/user/{config.worker_uid}",
+    }
 )
-boundary.validate_platform_observation_v27(supervisor_observation, manifest)
+os.setgroups([])
+os.setgid(account.pw_gid)
+os.setuid(account.pw_uid)
+controller._assert_worker_dac_isolation_v27(config)
+
+supervisor_observation = boundary.verify_local_platform_gate_v27(
+    manifest, expected_worker_uid=config.worker_uid
+)
+boundary.validate_native_supervisor_probe_v27(supervisor_observation, manifest)
 
 left, right = socket.socketpair(
     socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC, 0
@@ -190,7 +238,99 @@ with tempfile.NamedTemporaryFile() as operation_lock:
     if (result, captured_errno) != ("acquired", 0):
         raise SystemExit("the genuine OFD operation-lock fixture did not acquire exactly once")
 
+# Run four genuine bd invocations. Each one traverses sealed-plan FD3 and the
+# exact Podman create -> init -> start/attach -> terminal -> cleanup -> rm path.
+commands = (
+    ["/usr/local/bin/bd", "version", "--json"],
+    [
+        "/usr/local/bin/bd",
+        "--db",
+        "/workspace/db",
+        "--json",
+        "--sandbox",
+        "init",
+    ],
+    [
+        "/usr/local/bin/bd",
+        "--db",
+        "/workspace/db",
+        "--json",
+        "--sandbox",
+        "config",
+        "set",
+        "status.custom",
+        "open,closed",
+    ],
+    [
+        "/usr/local/bin/bd",
+        "--db",
+        "/workspace/db",
+        "--json",
+        "--sandbox",
+        "config",
+        "list",
+    ],
+)
+fixture_key = os.urandom(32)
+for ordinal, argv in enumerate(commands, 1):
+    operation_id = f"{ordinal:064x}"
+    plan = boundary.reference_supervised_effect_plan_v27(
+        manifest,
+        operation_id=operation_id,
+        operation_class="create-preparation",
+        argv=argv,
+        repository_path=str(workspace),
+    )
+    captured = []
+
+    def genuine_runner(observed_manifest, observed_plan):
+        raw = boundary.run_native_supervisor_v27(observed_manifest, observed_plan)
+        captured.append(raw)
+        return raw
+
+    result = boundary.execute_supervised_effect_v27(
+        state_root, fixture_key, manifest, plan, runner=genuine_runner
+    )
+    if result["exitCode"] != 0 or len(captured) != 1:
+        raise SystemExit(f"genuine bd lifecycle {ordinal} did not complete exactly once")
+    strict_json(captured[0]["stdout"], f"genuine bd lifecycle {ordinal}")
+
+# A real child death after the authenticated result object is fsynced must
+# recover only the durable suffix and must never relaunch Podman.
+crash_plan = boundary.reference_supervised_effect_plan_v27(
+    manifest,
+    operation_id="f" * 64,
+    operation_class="ordinary",
+    argv=["/usr/local/bin/bd", "version", "--json"],
+    repository_path=str(workspace),
+)
+crash_pid = os.fork()
+if crash_pid == 0:
+    try:
+        with boundary.inject_native_effect_fault_v27("result-object-written"):
+            boundary.execute_supervised_effect_v27(
+                state_root, fixture_key, manifest, crash_plan
+            )
+    except SystemExit:
+        os._exit(91)
+    except BaseException:
+        os._exit(93)
+    os._exit(92)
+_, crash_status = os.waitpid(crash_pid, 0)
+if not os.WIFEXITED(crash_status) or os.WEXITSTATUS(crash_status) != 91:
+    raise SystemExit("real V27 process-death fixture did not stop at the bound phase")
+
+def forbidden_replay(_manifest, _plan):
+    raise SystemExit("stored-result recovery attempted to replay Podman")
+
+recovered = boundary.execute_supervised_effect_v27(
+    state_root, fixture_key, manifest, crash_plan, runner=forbidden_replay
+)
+if recovered["exitCode"] != 0:
+    raise SystemExit("stored-result suffix recovery did not preserve the terminal result")
+
 print(
-    "external protected Beads V27 Linux fixture: PASS "
-    "(evidence only; readiness is not promoted and release remains operator-gated)"
+    "external protected Beads V27 Linux full lifecycle: PASS "
+    "(worker UID, agent denial, four real bd/Podman lifecycles, process death and "
+    "no-replay recovery; evidence only, readiness is not promoted)"
 )

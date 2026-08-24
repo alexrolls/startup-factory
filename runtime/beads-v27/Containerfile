@@ -1,0 +1,2 @@
+FROM scratch
+COPY --chmod=0555 bd /usr/local/bin/bd

@@ -14,6 +14,7 @@ import struct
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -65,6 +66,10 @@ class BoundaryControllerTest(unittest.TestCase):
                 "/usr/lib/startup-factory/beads-native-boundary-v27.json"
             ),
             native_boundary_manifest_sha256=digest("native-boundary-v27"),
+            native_module_path=Path(controller.native_boundary_v27.__file__),
+            native_module_sha256=controller._sha(
+                Path(controller.native_boundary_v27.__file__).read_bytes()
+            ),
         )
         self.state_patch = mock.patch.object(
             controller, "STATE_ROOT", self.state_root
@@ -202,6 +207,8 @@ class BoundaryControllerTest(unittest.TestCase):
                 self.config.native_boundary_manifest_path
             ),
             "nativeBoundaryManifestSha256": self.config.native_boundary_manifest_sha256,
+            "nativeModulePath": str(self.config.native_module_path),
+            "nativeModuleSha256": self.config.native_module_sha256,
             "allowedOperations": list(controller.ALLOWED_OPERATIONS),
         }
         self.assertEqual(self.config, controller._parse_config(value))
@@ -290,6 +297,80 @@ class BoundaryControllerTest(unittest.TestCase):
             controller, "load_controller_config", return_value=disabled
         ), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(1, controller.main(["require-enabled"]))
+
+    def test_local_operator_apply_disable_and_reactivation_are_authenticated_and_independent(self) -> None:
+        operator_state = Path(self.temporary.name) / "operator-state.json"
+        operator_key = b"independent-local-operator-key-material-v1"
+        disabled = controller.dataclasses.replace(self.config, beads_enabled=False)
+
+        disabled_preview = controller.preview_operator_lifecycle_v1(
+            disabled, "apply", state_path=operator_state, operator_key=operator_key
+        )
+        self.assertFalse(disabled_preview["configEnabled"])
+        self.assertFalse(operator_state.exists(), "fresh disabled preview is zero-artifact")
+        with mock.patch.object(controller.os, "geteuid", return_value=0):
+            with self.assertRaisesRegex(controller.ControllerProtocolError, "configuration remains disabled"):
+                controller.apply_operator_lifecycle_v1(
+                    disabled,
+                    "apply",
+                    disabled_preview["planDigest"],
+                    operator_key=operator_key,
+                    state_path=operator_state,
+                )
+        self.assertFalse(operator_state.exists(), "config true alone is not bypassed")
+
+        with mock.patch.object(controller.os, "geteuid", return_value=0):
+            preview = controller.preview_operator_lifecycle_v1(
+                self.config, "apply", state_path=operator_state, operator_key=operator_key
+            )
+            active = controller.apply_operator_lifecycle_v1(
+                self.config,
+                "apply",
+                preview["planDigest"],
+                operator_key=operator_key,
+                state_path=operator_state,
+            )
+            self.assertEqual("active", active["operatorState"])
+            controller.verify_operator_lifecycle_v1(
+                self.config, operator_key, state_path=operator_state, require_active=True
+            )
+
+            disable_preview = controller.preview_operator_lifecycle_v1(
+                self.config, "disable", state_path=operator_state, operator_key=operator_key
+            )
+            disabled_state = controller.apply_operator_lifecycle_v1(
+                self.config,
+                "disable",
+                disable_preview["planDigest"],
+                operator_key=operator_key,
+                state_path=operator_state,
+            )
+            self.assertEqual("disabled", disabled_state["operatorState"])
+            with self.assertRaisesRegex(controller.ControllerProtocolError, "not active"):
+                controller.verify_operator_lifecycle_v1(
+                    self.config, operator_key, state_path=operator_state, require_active=True
+                )
+
+            reactivate_preview = controller.preview_operator_lifecycle_v1(
+                self.config, "reactivate", state_path=operator_state, operator_key=operator_key
+            )
+            reactivated = controller.apply_operator_lifecycle_v1(
+                self.config,
+                "reactivate",
+                reactivate_preview["planDigest"],
+                operator_key=operator_key,
+                state_path=operator_state,
+            )
+            self.assertEqual("active", reactivated["operatorState"])
+            self.assertGreater(reactivated["generation"], active["generation"])
+
+        tampered = json.loads(operator_state.read_bytes())
+        tampered["payload"]["operatorState"] = "disabled"
+        operator_state.write_bytes(controller._canonical(tampered))
+        with self.assertRaisesRegex(controller.ControllerProtocolError, "authentication"):
+            controller.verify_operator_lifecycle_v1(
+                self.config, operator_key, state_path=operator_state
+            )
 
     def test_linux_probe_pins_registered_operation_set_and_active_verifier(self) -> None:
         probe_path = ROOT / "tests/beads-boundary-controller-linux-opt-in.py"
@@ -729,6 +810,7 @@ class BoundaryControllerTest(unittest.TestCase):
                 ROOT / "runtime/beads-native-boundary-v27.example.json"
             ).read_bytes(),
             live_module: live_module_bytes,
+            self.config.native_module_path: self.config.native_module_path.read_bytes(),
         }
         config = controller.dataclasses.replace(
             self.config,
@@ -739,6 +821,9 @@ class BoundaryControllerTest(unittest.TestCase):
             native_boundary_manifest_sha256=controller._sha(
                 values[self.config.native_boundary_manifest_path]
             ),
+            native_module_sha256=controller._sha(
+                values[self.config.native_module_path]
+            ),
         )
         with mock.patch.object(
             controller,
@@ -746,7 +831,7 @@ class BoundaryControllerTest(unittest.TestCase):
             side_effect=lambda path, _label, **_kwargs: values[path],
         ) as observed:
             controller._verify_installed_artifacts(config)
-        self.assertEqual(4, observed.call_count)
+        self.assertEqual(5, observed.call_count)
 
         with mock.patch.object(
             controller,
@@ -779,7 +864,7 @@ class BoundaryControllerTest(unittest.TestCase):
         ) as platform_gate:
             controller._verify_native_platform_gate(manifest)
         self.assertEqual(3, observed.call_count)
-        platform_gate.assert_called_once_with(manifest)
+        platform_gate.assert_called_once_with(manifest, expected_worker_uid=None)
 
         assets[manifest.podman_path] = b"tampered"
         with mock.patch.object(
@@ -794,6 +879,136 @@ class BoundaryControllerTest(unittest.TestCase):
             ):
                 controller._verify_native_platform_gate(manifest)
         platform_gate.assert_not_called()
+
+    def test_execute_uses_only_worker_runner_and_durable_done_result(self) -> None:
+        opened = self.exchange("OPEN", self.open_request())
+        intent = self.exchange("STEP", self.step_request(opened, "intent-bound", 1))
+        effect = self.exchange(
+            "STEP", self.step_request(intent, "effect-authorized", 2)
+        )
+        manifest = controller.native_boundary_v27.parse_native_boundary_manifest_v27(
+            json.loads(
+                (ROOT / "runtime/beads-native-boundary-v27.example.json").read_bytes()
+            )
+        )
+        plan = controller.native_boundary_v27.reference_supervised_effect_plan_v27(
+            manifest,
+            operation_id=effect["operationId"],
+            operation_class="ordinary",
+            argv=["/usr/local/bin/bd", "update", "task-1", "--json"],
+            repository_path="/srv/startup-factory/repositories/repository-1",
+        )
+        calls = []
+
+        def worker_runner(_manifest, observed):
+            calls.append(observed["planSha256"])
+            return {
+                "exitCode": 0,
+                "stdout": b'{"id":"task-1"}\n',
+                "stderr": b"",
+                "readBack": b'{"id":"task-1"}\n',
+                "lifecycle": [
+                    "create",
+                    "init",
+                    "start-attach",
+                    "terminal",
+                    "cleanup",
+                    "rm",
+                ],
+            }
+
+        request = {
+            "operationId": effect["operationId"],
+            "sessionNonce": effect["sessionNonce"],
+            "executionNonce": "execute-native-worker-nonce-0001",
+            "predecessorReceiptSha256": effect["receiptSha256"],
+            "plan": plan,
+        }
+        with mock.patch.object(
+            controller, "_verify_installed_artifacts", return_value=manifest
+        ), mock.patch.object(
+            controller, "_verify_native_platform_gate"
+        ) as platform, mock.patch.object(
+            controller.native_boundary_v27,
+            "run_native_supervisor_v27",
+            side_effect=AssertionError("controller must not run supervisor directly"),
+        ):
+            result = json.loads(
+                controller._serve_packet(
+                    self.packet("EXECUTE", request),
+                    self.config.broker_uid,
+                    self.config,
+                    self.key,
+                    supervisor_runner=worker_runner,
+                )
+            )
+            repeated = json.loads(
+                controller._serve_packet(
+                    self.packet(
+                        "EXECUTE",
+                        {
+                            **request,
+                            "executionNonce": "execute-native-worker-nonce-0002",
+                        },
+                    ),
+                    self.config.broker_uid,
+                    self.config,
+                    self.key,
+                    supervisor_runner=worker_runner,
+                )
+            )
+        self.assertEqual(result["nativeResult"], repeated["nativeResult"])
+        self.assertEqual([plan["planSha256"]], calls)
+        self.assertEqual(2, platform.call_count)
+        for call in platform.call_args_list:
+            self.assertEqual(mock.call(manifest, run_probe=False), call)
+
+    def test_worker_drop_sanitizes_environment_and_proves_dac_denial(self) -> None:
+        account = types.SimpleNamespace(
+            pw_uid=self.config.worker_uid,
+            pw_gid=82_003,
+            pw_dir="/var/lib/startup-factory/beads-worker",
+            pw_name="startup-factory-beads-worker",
+        )
+        with mock.patch.dict(
+            controller.os.environ,
+            {"AWS_SECRET_ACCESS_KEY": "must-disappear"},
+            clear=True,
+        ), mock.patch.object(
+            controller.pwd, "getpwuid", return_value=account
+        ), mock.patch.object(
+            controller.os, "setgroups"
+        ) as setgroups, mock.patch.object(
+            controller.os, "setgid"
+        ) as setgid, mock.patch.object(
+            controller.os, "setuid"
+        ) as setuid, mock.patch.object(
+            controller.os, "geteuid", return_value=self.config.worker_uid
+        ), mock.patch.object(
+            controller.os, "getegid", return_value=account.pw_gid
+        ), mock.patch.object(
+            controller.os, "getgroups", return_value=[]
+        ), mock.patch.object(
+            controller.os, "open", side_effect=PermissionError("denied")
+        ) as opened:
+            controller._drop_to_worker_identity_v27(self.config)
+            self.assertNotIn("AWS_SECRET_ACCESS_KEY", controller.os.environ)
+            self.assertEqual(
+                {
+                    "HOME",
+                    "LANG",
+                    "LC_ALL",
+                    "LOGNAME",
+                    "PATH",
+                    "USER",
+                    "XDG_RUNTIME_DIR",
+                },
+                set(controller.os.environ),
+            )
+        setgroups.assert_called_once_with([])
+        setgid.assert_called_once_with(account.pw_gid)
+        setuid.assert_called_once_with(self.config.worker_uid)
+        self.assertEqual(6, opened.call_count)
 
     def test_serve_preflight_rejects_unrelated_symlinked_or_stale_live_module(self) -> None:
         live_module = Path(controller.__file__)
@@ -810,6 +1025,7 @@ class BoundaryControllerTest(unittest.TestCase):
             config.native_boundary_manifest_path: (
                 ROOT / "runtime/beads-native-boundary-v27.example.json"
             ).read_bytes(),
+            config.native_module_path: config.native_module_path.read_bytes(),
         }
         config = controller.dataclasses.replace(
             config,
@@ -818,6 +1034,7 @@ class BoundaryControllerTest(unittest.TestCase):
             native_boundary_manifest_sha256=controller._sha(
                 values[config.native_boundary_manifest_path]
             ),
+            native_module_sha256=controller._sha(values[config.native_module_path]),
         )
 
         def read_exact(path, _label, **_kwargs):

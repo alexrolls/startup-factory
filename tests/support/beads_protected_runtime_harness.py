@@ -62,6 +62,8 @@ class LogicHarness:
                 "/usr/lib/startup-factory/test-native-boundary-v27.json"
             ),
             native_boundary_manifest_sha256=digest(b"test-native-boundary-v27"),
+            native_module_path=Path(controller.native_boundary_v27.__file__),
+            native_module_sha256=digest(b"test-native-module-v27"),
         )
 
     def _session_and_operation(
@@ -124,6 +126,7 @@ class LogicHarness:
             "_controller_operation",
             "_validate_live_boundary_session",
             "_complete_controller_operation",
+            "_execute_supervised_beads_effect_v27",
             "_REQUIRED_PROVENANCE_DOMAIN",
         ):
             self._saved[name] = getattr(runtime, name)
@@ -168,9 +171,59 @@ class LogicHarness:
         def complete(session: Any, result: Any) -> None:
             session.completed = True
 
+        def execute_supervised_effect(
+            *, operation_class: str, argv: Any, repository_path: Path
+        ) -> MappingProxyType:
+            if operation_class not in {
+                "ordinary",
+                "create-preparation",
+                "reattest-preparation",
+            }:
+                raise runtime.BeadsProtectedRuntimeError(
+                    "test harness received an unknown native effect class"
+                )
+            if (
+                not isinstance(argv, list)
+                or not argv
+                or not isinstance(repository_path, Path)
+                or not repository_path.is_absolute()
+            ):
+                raise runtime.BeadsProtectedRuntimeError(
+                    "test harness received an invalid native effect plan"
+                )
+            if "init" in argv and "--db" in argv:
+                database_path = Path(argv[argv.index("--db") + 1])
+                database_path.mkdir(mode=0o700, parents=False, exist_ok=False)
+                (database_path / ".dolt").mkdir(mode=0o700)
+            observation = runtime.canonical_bytes(
+                {
+                    "argv": argv,
+                    "operationClass": operation_class,
+                    "repositoryPath": str(repository_path),
+                }
+            )
+            return MappingProxyType(
+                {
+                    "exitCode": 0,
+                    "stdoutSha256": runtime.sha256(observation),
+                    "stderrSha256": runtime.sha256(b""),
+                    "readBackSha256": runtime.sha256(observation),
+                    "lifecycle": [
+                        "create",
+                        "init",
+                        "start-attach",
+                        "terminal",
+                        "cleanup",
+                        "rm",
+                    ],
+                    "observedByNativeSupervisor": True,
+                }
+            )
+
         runtime._controller_operation = controller_operation
         runtime._validate_live_boundary_session = validate
         runtime._complete_controller_operation = complete
+        runtime._execute_supervised_beads_effect_v27 = execute_supervised_effect
         runtime._REQUIRED_PROVENANCE_DOMAIN = TEST_PROVENANCE
         session, operation = self._session_and_operation(
             "test-harness-lexical-context",

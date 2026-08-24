@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +42,9 @@ class NativeBoundaryV27Test(unittest.TestCase):
             "conmonPath": "/usr/bin/conmon",
             "conmonSha256": digest("conmon"),
             "selinuxPolicySha256": digest("policy"),
+            "imageDigest": digest("beads-v27-image"),
+            "imageReference": "localhost/startup-factory/beads-v27@"
+            + digest("beads-v27-image"),
             "selinuxContexts": {
                 "proc-current-preexec": self.context("system_u:system_r:beads_controller_t:s0", "none"),
                 "proc-exec-preexec": self.context("", "empty"),
@@ -391,6 +395,40 @@ class NativeBoundaryV27Test(unittest.TestCase):
                 return b"systemd 254 (254.26-1)\n"
             if argv == [str(manifest.podman_path), "--version"]:
                 return b"podman version 5.4.1\n"
+            if argv == [str(manifest.podman_path), "info", "--format", "json"]:
+                return boundary.canonical_bytes(
+                    {
+                        "host": {
+                            "cgroupManager": "systemd",
+                            "cgroupVersion": "v2",
+                            "idMappings": {
+                                "gidmap": [
+                                    {"container_id": 0, "host_id": 81003, "size": 1}
+                                ],
+                                "uidmap": [
+                                    {"container_id": 0, "host_id": 81003, "size": 1}
+                                ],
+                            },
+                            "security": {"rootless": True},
+                        }
+                    }
+                ) + b"\n"
+            if argv == [
+                str(manifest.podman_path),
+                "image",
+                "inspect",
+                "--format",
+                "json",
+                manifest.image_reference,
+            ]:
+                return boundary.canonical_bytes(
+                    [
+                        {
+                            "Id": manifest.image_digest,
+                            "RepoDigests": [manifest.image_reference],
+                        }
+                    ]
+                ) + b"\n"
             if argv == [str(manifest.conmon_path), "--version"]:
                 return b"conmon version 2.1.12\n"
             if argv == [str(manifest.supervisor_path), "--startup-factory-probe-v27"]:
@@ -408,6 +446,15 @@ class NativeBoundaryV27Test(unittest.TestCase):
             [
                 ("/usr/bin/systemd", "--version"),
                 (str(manifest.podman_path), "--version"),
+                (str(manifest.podman_path), "info", "--format", "json"),
+                (
+                    str(manifest.podman_path),
+                    "image",
+                    "inspect",
+                    "--format",
+                    "json",
+                    manifest.image_reference,
+                ),
                 (str(manifest.conmon_path), "--version"),
                 (str(manifest.supervisor_path), "--startup-factory-probe-v27"),
             ],
@@ -418,6 +465,248 @@ class NativeBoundaryV27Test(unittest.TestCase):
                 manifest, runner=runner, selinux_enforce_reader=lambda: b"0\n"
                 , platform_name="linux"
             )
+
+        def hostile_systemd(argv):
+            if argv == ["/usr/bin/systemd", "--version"]:
+                return b"systemd 254 attacker-controlled-suffix\n"
+            return runner(argv)
+
+        with self.assertRaises(boundary.NativeBoundaryV27Error):
+            boundary.verify_local_platform_gate_v27(
+                manifest,
+                runner=hostile_systemd,
+                selinux_enforce_reader=lambda: b"1\n",
+                platform_name="linux",
+            )
+
+        for hostile in (
+            b'{"host":{"cgroupManager":"systemd","cgroupVersion":"v2","idMappings":{"gidmap":[],"uidmap":[]},"security":{"rootless":true}}}\n',
+            b'{"host":{"cgroupManager":"systemd","cgroupVersion":"v2","idMappings":{"gidmap":[{"container_id":0,"host_id":81003,"size":1}],"uidmap":[{"container_id":0,"host_id":81003,"size":1}]},"security":{"rootless":true,"rootless":true}}}\n',
+        ):
+            with self.subTest(hostile_podman_info=hostile), self.assertRaises(
+                boundary.NativeBoundaryV27Error
+            ):
+                boundary.verify_local_platform_gate_v27(
+                    manifest,
+                    runner=lambda argv, hostile=hostile: (
+                        hostile
+                        if argv
+                        == [str(manifest.podman_path), "info", "--format", "json"]
+                        else runner(argv)
+                    ),
+                    selinux_enforce_reader=lambda: b"1\n",
+                    platform_name="linux",
+                )
+
+        with self.assertRaises(boundary.NativeBoundaryV27Error):
+            boundary.verify_local_platform_gate_v27(
+                manifest,
+                runner=lambda argv: (
+                    boundary.canonical_bytes(
+                        [
+                            {
+                                "Id": manifest.image_digest,
+                                "RepoDigests": [manifest.image_reference],
+                            },
+                            {
+                                "Id": manifest.image_digest,
+                                "RepoDigests": [manifest.image_reference],
+                            },
+                        ]
+                    )
+                    + b"\n"
+                    if argv[:3]
+                    == [str(manifest.podman_path), "image", "inspect"]
+                    else runner(argv)
+                ),
+                selinux_enforce_reader=lambda: b"1\n",
+                platform_name="linux",
+            )
+
+        def hostile_conmon(argv):
+            if argv == [str(manifest.conmon_path), "--version"]:
+                return b"not-conmon 2.1.12-malicious\n"
+            return runner(argv)
+
+        with self.assertRaises(boundary.NativeBoundaryV27Error):
+            boundary.verify_local_platform_gate_v27(
+                manifest,
+                runner=hostile_conmon,
+                selinux_enforce_reader=lambda: b"1\n",
+                platform_name="linux",
+            )
+
+    def test_production_effect_is_durable_hmac_cas_and_never_replays_consumed_launch(self) -> None:
+        manifest = boundary.parse_native_boundary_manifest_v27(self.manifest())
+        plan = boundary.reference_supervised_effect_plan_v27(
+            manifest,
+            operation_id="a" * 64,
+            operation_class="ordinary",
+            argv=["/usr/local/bin/bd", "update", "task-1", "--status", "active", "--json"],
+            repository_path="/srv/startup-factory/repositories/repository-1",
+        )
+        calls = []
+
+        def runner(_manifest, observed_plan):
+            calls.append(observed_plan)
+            return {
+                "exitCode": 0,
+                "stdout": b'{"id":"task-1","status":"active"}\n',
+                "stderr": b"",
+                "readBack": b'{"id":"task-1","status":"active"}\n',
+                "lifecycle": ["create", "init", "start-attach", "terminal", "cleanup", "rm"],
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = boundary.execute_supervised_effect_v27(
+                root,
+                b"v27-test-stage-hmac-key-material-32-bytes",
+                manifest,
+                plan,
+                runner=runner,
+            )
+            self.assertEqual(0, result["exitCode"])
+            self.assertEqual(1, len(calls))
+            current = boundary.inspect_supervised_effect_v27(
+                root,
+                b"v27-test-stage-hmac-key-material-32-bytes",
+                plan["operationId"],
+            )
+            self.assertEqual(boundary.DONE_LOCATIONS_V27["ordinary"], current["payload"]["location"])
+            self.assertEqual("completion", current["payload"]["state"])
+            self.assertTrue(current["auth"].startswith("hmac-sha256:"))
+
+            repeated = boundary.execute_supervised_effect_v27(
+                root,
+                b"v27-test-stage-hmac-key-material-32-bytes",
+                manifest,
+                plan,
+                runner=runner,
+            )
+            self.assertEqual(result, repeated)
+            self.assertEqual(1, len(calls), "a Done current must return without replay")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaises(SystemExit):
+                with boundary.inject_native_effect_fault_v27("launch-consumed-current"):
+                    boundary.execute_supervised_effect_v27(
+                        root,
+                        b"v27-test-stage-hmac-key-material-32-bytes",
+                        manifest,
+                        plan,
+                        runner=runner,
+                    )
+            with self.assertRaisesRegex(
+                boundary.NativeBoundaryV27Error, "possible effect"
+            ):
+                boundary.execute_supervised_effect_v27(
+                    root,
+                    b"v27-test-stage-hmac-key-material-32-bytes",
+                    manifest,
+                    plan,
+                    runner=runner,
+                )
+            self.assertEqual(1, len(calls), "a consumed launch is never replayed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            before = len(calls)
+            with self.assertRaises(SystemExit):
+                with boundary.inject_native_effect_fault_v27("result-object-written"):
+                    boundary.execute_supervised_effect_v27(
+                        root,
+                        b"v27-test-stage-hmac-key-material-32-bytes",
+                        manifest,
+                        plan,
+                        runner=runner,
+                    )
+            recovered = boundary.execute_supervised_effect_v27(
+                root,
+                b"v27-test-stage-hmac-key-material-32-bytes",
+                manifest,
+                plan,
+                runner=runner,
+            )
+            self.assertEqual(0, recovered["exitCode"])
+            self.assertEqual(before + 1, len(calls), "stored result recovery never replays")
+
+    def test_native_runner_uses_pinned_supervisor_and_closed_podman_lifecycle(self) -> None:
+        manifest = boundary.parse_native_boundary_manifest_v27(self.manifest())
+        plan = boundary.reference_supervised_effect_plan_v27(
+            manifest,
+            operation_id="b" * 64,
+            operation_class="create-preparation",
+            argv=["/usr/local/bin/bd", "init", "--json"],
+            repository_path="/srv/startup-factory/repositories/repository-2",
+        )
+        captured = {}
+
+        def process_runner(argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            return boundary.subprocess.CompletedProcess(
+                argv,
+                0,
+                boundary.canonical_bytes(
+                    {
+                        "exitCode": 0,
+                        "lifecycle": ["create", "init", "start-attach", "terminal", "cleanup", "rm"],
+                        "readBackBase64": "e30K",
+                        "stderrBase64": "",
+                        "stdoutBase64": "e30K",
+                    }
+                )
+                + b"\n",
+                b"",
+            )
+
+        result = boundary.run_native_supervisor_v27(
+            manifest, plan, process_runner=process_runner
+        )
+        self.assertEqual(0, result["exitCode"])
+        self.assertEqual(
+            [str(manifest.supervisor_path), "--startup-factory-execute-v27"],
+            captured["argv"],
+        )
+        self.assertEqual(
+            boundary._fixed_worker_environment_v27(),
+            captured["kwargs"]["env"],
+        )
+        self.assertFalse(captured["kwargs"]["shell"])
+        self.assertEqual("/", captured["kwargs"]["cwd"])
+
+    def test_shipped_native_assets_bind_reproducible_closed_profile(self) -> None:
+        source = (ROOT / "runtime/beads-v27/startup-factory-beads-supervisor-v27.c").read_text()
+        containerfile = (ROOT / "runtime/beads-v27/Containerfile").read_text()
+        policy = (ROOT / "runtime/beads-v27/startup_factory_beads_v27.te").read_text()
+        build = (ROOT / "runtime/beads-v27/build.sh").read_text()
+        service = (ROOT / "runtime/startup-factory-beads-controller.service.example").read_text()
+        protected_runtime_source = (ROOT / "src/startup_factory_cli/beads_protected_runtime.py").read_text()
+
+        self.assertIn("--startup-factory-execute-v27", source)
+        for stage in ("create", "init", "start", "wait", "cleanup", "rm"):
+            self.assertIn(f'\"{stage}\"', source)
+        self.assertIn("--pull", source)
+        self.assertIn("never", source)
+        self.assertIn("--network", source)
+        self.assertIn("none", source)
+        self.assertIn("--cgroups", source)
+        self.assertIn("verify_selinux_transition", source)
+        self.assertIn("security.selinux", source)
+        self.assertIn("FROM scratch", containerfile)
+        self.assertIn("beads_native_supervisor_t", policy)
+        self.assertIn("-Werror", build)
+        self.assertIn("Delegate=yes", service)
+        self.assertIn("DelegateSubgroup=supervisor", service)
+        self.assertIn("ProtectControlGroups=false", service)
+        self.assertIn("KillMode=control-group", service)
+        self.assertIn(
+            "SELinuxContext=system_u:system_r:beads_controller_t:s0", service
+        )
+        self.assertNotIn("def _spawn_verified_executable_v1", protected_runtime_source)
+        self.assertNotIn("subprocess.run(", protected_runtime_source)
 
 
 if __name__ == "__main__":

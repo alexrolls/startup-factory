@@ -170,6 +170,13 @@ class BundledDefaultsTests(unittest.TestCase):
         tmpfiles_example = ROOT / "runtime" / "startup-factory-beads-controller.tmpfiles.example"
         linux_probe = ROOT / "tests" / "beads-boundary-controller-linux-opt-in.py"
         native_linux_probe = ROOT / "tests" / "beads-native-boundary-linux-opt-in.py"
+        native_assets = (
+            ROOT / "runtime" / "beads-v27" / "startup-factory-beads-supervisor-v27.c",
+            ROOT / "runtime" / "beads-v27" / "build.sh",
+            ROOT / "runtime" / "beads-v27" / "Containerfile",
+            ROOT / "runtime" / "beads-v27" / "startup_factory_beads_v27.te",
+            ROOT / "runtime" / "beads-v27" / "startup_factory_beads_v27.fc",
+        )
         spec = (ROOT / "packaging" / "bundle-spec.json").read_text(encoding="utf-8")
         self.assertTrue(module.is_file())
         self.assertTrue(controller.is_file())
@@ -192,6 +199,14 @@ class BundledDefaultsTests(unittest.TestCase):
             controller_config["moduleSha256"],
         )
         self.assertEqual(
+            "sha256:" + hashlib.sha256(native_boundary.read_bytes()).hexdigest(),
+            controller_config["nativeModuleSha256"],
+        )
+        self.assertEqual(
+            "/usr/local/lib/python3.13/site-packages/startup_factory_cli/beads_native_boundary_v27.py",
+            controller_config["nativeModulePath"],
+        )
+        self.assertEqual(
             "startup_factory_cli.beads_boundary_controller:main",
             tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["scripts"][
                 "startup-factory-beads-controller"
@@ -204,6 +219,7 @@ class BundledDefaultsTests(unittest.TestCase):
         )
         self.assertTrue(linux_probe.is_file())
         self.assertTrue(native_linux_probe.is_file())
+        self.assertTrue(all(path.is_file() for path in native_assets))
         self.assertIn('"tests/beads-protected-runtime-test.py"', spec)
         self.assertIn('"tests/beads-protected-runtime-hostile-test.py"', spec)
         self.assertIn('"tests/beads-boundary-controller-test.py"', spec)
@@ -212,6 +228,10 @@ class BundledDefaultsTests(unittest.TestCase):
         self.assertIn('"tests/fixtures/beads-protected-runtime-v1.json"', spec)
         self.assertIn('"runtime/beads-boundary-controller-v1.example.json"', spec)
         self.assertIn('"runtime/beads-native-boundary-v27.example.json"', spec)
+        for path in native_assets:
+            self.assertIn(
+                f'"{path.relative_to(ROOT).as_posix()}"', spec
+            )
         self.assertIn('"runtime/startup-factory-beads-controller.service.example"', spec)
         self.assertIn('"runtime/startup-factory-beads-controller.tmpfiles.example"', spec)
         self.assertNotIn('"runtime/startup-factory-beads-controller.socket.example"', spec)
