@@ -41,6 +41,7 @@
     "bin/dispatch.sh",
     "bin/delivery_profile.py",
     "bin/evidence_provider.py",
+    "bin/heartbeat-status.py",
     "bin/launch-team.sh",
     "bin/superpowers-planning.py",
     "bin/ticket_content_security.py",
@@ -76,6 +77,7 @@
     "tests/retrospective-test.py",
     "tests/delivery-profile-test.py",
     "tests/evidence-provider-test.py",
+    "tests/heartbeat-status-test.py",
     "tests/run-all.sh"
   ],
   "preservationPolicy": {

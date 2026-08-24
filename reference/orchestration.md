@@ -102,9 +102,12 @@ a run: signatures are grep keys.
   turn's work is done, deliver your artifact and exit — you will not be alive later,
   so never plan to "check back". The dispatcher owns time (`reference/dispatch.md`);
   `POLL_INTERVAL_SECONDS` is *its* cadence, not yours.
-- **Heartbeat:** between work steps, rewrite your heartbeat file with
-  `<ISO-8601 UTC> | <current taskId or -> | <one-line state>` (e.g.
-  `2026-07-06T14:02:11Z | ENG-142 | implementing, subtask 3/5`).
+- **Heartbeat:** between work steps, atomically rewrite your heartbeat file with
+  `<ISO-8601 UTC> | <current taskId or -> | <one-line state> | <next-action-by ISO-8601 UTC>`
+  (e.g. `2026-07-06T14:02:11Z | ENG-142 | implementing, subtask 3/5 | 2026-07-06T14:12:11Z`).
+  The declared deadline may shorten but never extend `STUCK_AFTER_MINUTES`; the
+  status classifier caps it at that TTL. Three-field legacy heartbeats remain
+  readable and receive a derived deadline.
 - **Degradation:** if the workspace directory is unreachable (different machine),
   skip mailboxes and heartbeats entirely and poll the tracker for comments addressed
   to your role. State this degradation once in a comment on your current [task].
@@ -698,6 +701,12 @@ loop decides when that is — read all heartbeats, your mailbox, and the tracker
 act on **every** pending event in one pass, then exit.
 
 Detect:
+- **Lifecycle verdict** — `launch-team.sh status <team>` combines the protected
+  process identity with the bounded heartbeat deadline and reports `active`,
+  `starting`, `exited`, `identity-mismatch`, or a typed `stalled:*` reason.
+  `stalled:idle-no-assignment`, `stalled:waiting-on-gate`,
+  `stalled:no-heartbeat`, and `stalled:no-progress` are different recovery
+  inputs; do not collapse them into a generic hang.
 - **Stuck** — heartbeat older than `STUCK_AFTER_MINUTES`; an `[Active]` [task] with
   no new comment past the threshold; a `[design-note]`, question, or
   `[review-request]` that nobody answered (both architects are on the hot path —

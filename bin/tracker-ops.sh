@@ -18,6 +18,7 @@
 #   tracker-ops.sh record-denial  <taskId> --actor <agent> --reason <text> [--denial-id <id>] [bodyfile]
 #                                                                            # idempotent [DENIED ACTION] audit comment
 #   tracker-ops.sh integrate      <taskId> <hash> [bodyfile]                # terminal move + completion comment citing <hash>
+#   tracker-ops.sh probe          <featureId>                               # minimal read proving access + feature scope
 #   tracker-ops.sh export         <featureId> <outfile>                     # read-side: dump the [feature]'s [tasks] as JSON
 #   tracker-ops.sh scan           <outfile> --status <Status>...            # board-wide normalized discovery
 #   tracker-ops.sh feature-state  <featureId> <Status>                      # set [feature] status (generic name)
@@ -393,6 +394,48 @@ def task_has_ignored_label(task, ignored_labels):
     return bool(ignored_labels.intersection(label.casefold() for label in task.get('labels') or []))
 
 # ---- adapter backends --------------------------------------------------------
+def http_error_kind(status):
+    if status == 429:
+        return 'RATELIMITED'
+    if status in (401, 403):
+        return 'AUTH'
+    if status == 404:
+        return 'NOT_FOUND'
+    if 500 <= status <= 599:
+        return 'SERVER'
+    return 'CLIENT'
+
+def bounded_api_message(raw):
+    """Extract one useful provider message without dumping an HTML/error body."""
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    candidates = []
+    if isinstance(value, dict):
+        candidates.extend(value.get(name) for name in (
+            'userPresentableMessage', 'message', 'error_description', 'error'))
+        errors = value.get('errors')
+        if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+            candidates.extend(errors[0].get(name) for name in (
+                'userPresentableMessage', 'message'))
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return sanitize_untrusted(candidate, 500).replace('\n', ' ')
+    return None
+
+def retry_hint(headers):
+    if headers is None:
+        return None
+    values = {str(key).casefold(): str(value).strip() for key, value in headers.items()}
+    reset = values.get('x-ratelimit-requests-reset') or values.get('x-ratelimit-reset')
+    retry_after = values.get('retry-after')
+    if reset:
+        return 'retry after rate-limit reset %s' % reset
+    if retry_after:
+        return 'retry after %s' % retry_after
+    return None
+
 def http_json(url, payload=None, headers=None, method=None):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method or ('POST' if data else 'GET'))
@@ -401,14 +444,30 @@ def http_json(url, payload=None, headers=None, method=None):
         req.add_header(k, v)
     try:
         with urllib.request.urlopen(req, timeout=OPERATION_TIMEOUT) as resp:
-            raw = resp.read().decode()
-            return json.loads(raw) if raw.strip() else {}
+            try:
+                raw = resp.read().decode()
+            except UnicodeDecodeError:
+                die("MALFORMED_RESPONSE: tracker returned non-UTF-8 content from %s — andon" % url)
+            if not raw.strip():
+                return {}
+            try:
+                return json.loads(raw)
+            except ValueError:
+                die("MALFORMED_RESPONSE: tracker returned non-JSON content from %s — andon" % url)
     except urllib.error.HTTPError as e:
-        die("HTTP %s from %s: %s" % (e.code, url, e.read().decode()[:500]))
+        raw = e.read().decode(errors='replace')
+        parts = ["%s: HTTP %s from %s" % (http_error_kind(e.code), e.code, url)]
+        message = bounded_api_message(raw)
+        hint = retry_hint(e.headers)
+        if message:
+            parts.append(message)
+        if hint:
+            parts.append(hint)
+        die(" — ".join(parts))
     except urllib.error.URLError as e:
-        die("request to %s failed: %s" % (url, e.reason))
+        die("NETWORK: request to %s failed: %s" % (url, e.reason))
     except TimeoutError:
-        die("request to %s exceeded the %ss tracker operation deadline" % (url, OPERATION_TIMEOUT))
+        die("TIMEOUT: request to %s exceeded the %ss tracker operation deadline" % (url, OPERATION_TIMEOUT))
 
 class Linear:
     def __init__(self):
@@ -418,9 +477,34 @@ class Linear:
         out = http_json('https://api.linear.app/graphql',
                         {'query': query, 'variables': variables or {}},
                         {'Authorization': self.key})
+        if not isinstance(out, dict):
+            die("MALFORMED_RESPONSE: Linear returned a non-object GraphQL envelope — andon")
+        if 'errors' in out and not isinstance(out.get('errors'), list):
+            die("MALFORMED_RESPONSE: Linear returned malformed GraphQL errors — andon")
         if out.get('errors'):
-            die("Linear API error: %s" % out['errors'][0].get('message'))
+            error = out['errors'][0] if isinstance(out['errors'][0], dict) else {}
+            extensions = error.get('extensions') if isinstance(error.get('extensions'), dict) else {}
+            code = str(extensions.get('code') or 'SERVER').upper().replace('_', '')
+            kind = {
+                'RATELIMITED': 'RATELIMITED',
+                'UNAUTHENTICATED': 'AUTH', 'FORBIDDEN': 'AUTH',
+                'NOTFOUND': 'NOT_FOUND',
+            }.get(code, 'SERVER')
+            message = (extensions.get('userPresentableMessage')
+                       or error.get('userPresentableMessage') or error.get('message')
+                       or 'provider returned an unspecified GraphQL error')
+            die("%s: Linear API error: %s" %
+                (kind, sanitize_untrusted(str(message), 500).replace('\n', ' ')))
+        if not isinstance(out.get('data'), dict):
+            die("MALFORMED_RESPONSE: Linear GraphQL response omitted object data — andon")
         return out['data']
+
+    def probe(self, feature_id):
+        project_id = self.project_id(feature_id)
+        data = self.gql('query($id: String!) { project(id: $id) { id } }', {'id': project_id})
+        observed = (data.get('project') or {}).get('id')
+        if observed != project_id:
+            die("no Linear project '%s' — andon" % feature_id)
 
     @staticmethod
     def mutation_payload(data, key, action):
@@ -809,6 +893,17 @@ class Jira:
             die("Jira project lookup resolved key '%s', expected exact key '%s' — andon"
                 % (observed, project_key))
         return project_key, task_issue_type
+
+    def probe(self, feature_id):
+        project_key, _task_issue_type = self.resolve_scope()
+        issue = self.api('/rest/api/3/issue/%s?fields=project' %
+                         urllib.parse.quote(str(feature_id), safe=''))
+        if not isinstance(issue, dict) or str(issue.get('key') or '') != str(feature_id):
+            die("Jira feature lookup did not resolve '%s' exactly — andon" % feature_id)
+        observed_project = ((issue.get('fields') or {}).get('project') or {}).get('key')
+        if observed_project != project_key:
+            die("Jira feature '%s' belongs to project '%s', expected '%s' — andon" %
+                (feature_id, observed_project, project_key))
 
     @staticmethod
     def scoped_issue_fields(issue, project_key, task_issue_type, context):
@@ -1400,6 +1495,9 @@ class GitHubIssues:
             die("no GitHub milestone '%s' — andon" % feature_id)
         return repo, current
 
+    def probe(self, feature_id):
+        self.milestone(feature_id)
+
     def current_feature_status(self, feature_id):
         _repo, milestone = self.milestone(feature_id)
         if milestone.get('state') == 'closed':
@@ -1576,6 +1674,11 @@ class Markdown:
                 os.close(file_fd)
             if directory_fd is not None:
                 os.close(directory_fd)
+
+    def probe(self, feature_id):
+        text = self.load(feature_id)
+        if not re.search(r'^# .*?\[[^\]]+\][ \t]*$', text, re.M):
+            die("Markdown feature has no bracketed status: %s" % feature_id)
 
     def save(self, feature_id, text):
         directory_fd = temp_fd = None
@@ -1972,6 +2075,21 @@ def fresh_task_status(task_id, expected=None):
     return current
 
 # ---- operations ----------------------------------------------------------------
+def op_probe(args):
+    if len(args) != 1:
+        die("usage: probe <featureId>")
+    feature_id = args[0]
+    probe = getattr(backend, 'probe', None)
+    if callable(probe):
+        probe(feature_id)
+    else:
+        # Preserve compatibility for project-owned adapters. Shipped adapters
+        # all implement a field-scoped probe that avoids task/comment exports.
+        tasks = backend.export(feature_id)
+        if not isinstance(tasks, list):
+            die("adapter returned a malformed feature probe — andon")
+    print("probe OK: %s" % feature_id)
+
 def op_state(args):
     if len(args) != 2:
         die("usage: state <taskId> <Status>")
@@ -2367,13 +2485,13 @@ def op_scan(args):
         os.replace(temp, outfile)
         print("scanned %d [tasks] (%d orphaned) to %s" % (len(normalized), len(orphans), outfile))
 
-OPS = {'state': op_state, 'comment': op_comment, 'comment-once': op_comment_once, 'update-comment': op_update_comment,
+OPS = {'probe': op_probe, 'state': op_state, 'comment': op_comment, 'comment-once': op_comment_once, 'update-comment': op_update_comment,
        'upsert-progress': op_upsert_progress, 'upsert-digest': op_upsert_digest,
        'upsert-deployment': op_upsert_deployment, 'feature-state': op_feature_state,
        'feature-reopen': op_feature_reopen, 'task-reopen': op_task_reopen,
        'claim': op_claim, 'record-denial': op_record_denial, 'integrate': op_integrate,
        'export': op_export, 'scan': op_scan}
 if not ARGS or ARGS[0] not in OPS:
-    die("usage: tracker-ops.sh {state|feature-state|feature-reopen|task-reopen|comment|comment-once|update-comment|upsert-progress|upsert-digest|upsert-deployment|claim|record-denial|integrate|export|scan} ...")
+    die("usage: tracker-ops.sh {probe|state|feature-state|feature-reopen|task-reopen|comment|comment-once|update-comment|upsert-progress|upsert-digest|upsert-deployment|claim|record-denial|integrate|export|scan} ...")
 OPS[ARGS[0]](ARGS[1:])
 PYEOF

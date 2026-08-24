@@ -10,6 +10,15 @@ time. **Dispatch is a stateless read-and-act pass** executed by machinery:
 | CLI (tmux / background processes) | `bin/dispatch.sh <team> <featureId> --once` (or `--watch`) | fresh tracker export → establish/act on task holds → finalize integrations/process artifact outbox → refresh export/projection → claim/launch task instances and gate roles |
 | Harness (in-session subagents) | the team-lead orchestrator itself — its native event loop | same table, executed directly: subagent spawn = role launch, idle notifications = heartbeats; use `compose-task` for one implementation [task] and `compose-review` for one exact-package verdict |
 
+An unscoped pass is deliberately feature-wide. Inspect
+`dispatch.sh <team> <featureId> --once --dry-run` before the first mutating pass
+for a new run. When the operator named one [task], use
+`--once --dry-run --task <taskId>`: the planner retains the complete feature
+dependency/concurrency evidence but emits actions only for that [task]. Targeted
+dispatch is read-only; execute the approved task with `launch-team.sh
+start-task` (or `compose-task` in a harness). This makes scope widening visible
+before any status write, outbox processing, integration, or launch.
+
 `--watch` needs a persistent shell (tmux window or `nohup`) — **the human
 owns that process**, explicitly. Hiding this ownership is how a pipeline
 silently stalls for hours.
@@ -63,6 +72,10 @@ heartbeat files, then acts top to bottom:
 - **End of turn = exit.** Role briefs contain no self-scheduling. An agent
   that finished its queue delivers its artifacts and exits; the next pass
   owns what happens next.
+- **Launch only consumers with work.** `gate-team` is the normal feature-level
+  bootstrap; dispatch starts task workers and wakes gate consumers only for a
+  concrete queue. The eager `team` command is an explicit operator choice, not
+  the default response to a one-task request.
 - **Blocked is a task-scoped human lock:** observation stops only the protected
   task workers and revokes only their broker capabilities. It does not stop the
   team, PM loop, gate roles, sibling [tasks], or other [features]. No dispatch

@@ -1377,12 +1377,48 @@ your agent in the generic vocabulary:
 > Keep `SF_HOME` set in every shell that runs a launcher or dispatcher. For a
 > protected external automation installation, set it to that absolute path.
 
+### Preview or run exactly one task
+
+When an operator or harness requests one task, keep the execution boundary at
+that task. First prove the tracker scope, then preview the decision using the
+complete feature dependency/concurrency evidence, and finally launch only the
+named worker:
+
+```bash
+"$SF_HOME/bin/launch-team.sh" preflight payments-revamp ENG-100
+"$SF_HOME/bin/dispatch.sh" payments-revamp ENG-100 \
+  --once --dry-run --task ENG-142
+"$SF_HOME/bin/launch-team.sh" start-task \
+  payments-revamp ENG-100 senior-backend-engineer ENG-142 1 deep-backend
+```
+
+The targeted dispatcher form is deliberately read-only: it can explain the
+task's eligibility without claiming work, launching siblings, or emitting
+feature-wide closeout actions. Use `start-task` for the explicit mutation. The
+feature branch (the team name) must already exist; if it does not, the launcher
+stops before creating a task worktree and prints an exact branch-creation
+command.
+
+`preflight` uses a minimal feature-scoped tracker probe before any launch. It
+reports typed transport failures such as `AUTH`, `RATELIMITED`, `NOT_FOUND`,
+`NETWORK`, `TIMEOUT`, and `MALFORMED_RESPONSE`, preserving safe provider retry
+guidance when available. This makes credential/scope failures distinguishable
+from temporary service failures. Shipped adapters avoid broadly exporting task
+comments merely to test connectivity; custom backends retain their compatible
+export fallback.
+
+After launch, `launch-team.sh status <team>` combines authenticated process
+identity with the worker heartbeat. `active` and `starting` are live states;
+`stalled:*` names the missing progress condition, while `identity-mismatch`
+fails closed because the recorded process can no longer be authenticated. A
+worker-reported next-action deadline never extends the configured liveness TTL.
+
 **`bin/launch-team.sh` subcommands:**
 
 | Command | Purpose |
 |---|---|
-| `team <preset> <team> <featureId>` | Launch a whole preset roster |
-| `gate-team <preset> <team> <featureId>` | Launch only persistent supervision/review/integration gates; automation uses this and starts implementers per task |
+| `team <preset> <team> <featureId>` | Eagerly launch a whole preset roster; use only when every role should start immediately |
+| `gate-team <preset> <team> <featureId>` | Normal feature bootstrap: launch supervision/review/integration gates; dispatch starts implementers per task |
 | `planning-handoff <team> <spec-path> <plan-path>` | Bind committed Claude/Superpowers specification and plan inputs to this Startup Factory team |
 | `preflight <team> <featureId>` | Verify adapter access, workspace writability, and UTC pin — run once before any CLI team launch |
 | `start <team> <featureId> <role>…` | Launch specific roles (custom teams) |
@@ -1394,7 +1430,7 @@ your agent in the generic vocabulary:
 | `worktree <team> <role> <taskId> [attempt]` | Create an implementer's isolated task worktree |
 | `worktree-remove <team> <role> <taskId> [attempt]` | Remove a worktree only after protected lifecycle state proves its worker is stopped; unmanaged mode refuses |
 | `validate-board [config-path]` | Validate status structure, initial/terminal rules, transitions, reachability, owners, and marker-role references |
-| `status <team>` | Show authenticated process state plus last heartbeat when protected lifecycle authority is enabled; otherwise report that markers are non-authoritative |
+| `status <team>` | Show authenticated process state, typed heartbeat verdict, and bounded next-action deadline when protected lifecycle authority is enabled; otherwise report that markers are non-authoritative |
 | `stop <team>` | Stop the managed team through authenticated lifecycle identities; unmanaged mode refuses to signal |
 | `stop-task <team> <taskId>` | Send bounded TERM→KILL to the authenticated launcher-managed process group/session for one [task], then revoke that [task]'s active publication capabilities; sibling workers and gate roles continue |
 
@@ -1409,7 +1445,8 @@ reject output from an escaped stale process.
 
 | Command | Purpose |
 |---|---|
-| `dispatch.sh <team> <featureId> --once [--dry-run]` | One deterministic read-and-act pass |
+| `dispatch.sh <team> <featureId> --once [--dry-run]` | One deterministic feature-wide read-and-act pass; inspect the first pass with `--dry-run` |
+| `dispatch.sh <team> <featureId> --once --dry-run --task <taskId>` | Read-only single-task scope preview that retains full dependency/concurrency evidence without emitting sibling actions |
 | `dispatch.sh <team> <featureId> --watch` | Wake on runtime events with `POLL_INTERVAL_SECONDS` as a fallback — run in a persistent shell (tmux/nohup); **you own this process** |
 
 > **CLI dispatch requires scriptable tracker access.** Linear and Jira default to MCP; set `LINEAR_ACCESS=rest` or `JIRA_ACCESS=rest` in `config/project-management.config.md` before running `dispatch.sh --watch`. Harness mode (`launch-team.sh compose`) supports MCP natively.
@@ -1418,6 +1455,7 @@ reject output from an escaped stale process.
 
 | Command | Purpose |
 |---|---|
+| `probe <featureId>` | Prove adapter access and exact feature scope with a minimal read; shipped remote adapters do not export task comments for this check. |
 | `state <taskId> <Status>` | Make and verify a legal generic `[task]` status write. Startup Factory rejects every outbound `[Blocked]` transition; a human must perform that move in the project-management tool. |
 | `feature-state <featureId> <Status>` | Make and verify a legal generic `[feature]` status write. |
 | `feature-reopen <featureId> <Status>` | PM-supervisor-only terminal-to-queued reopen for a new delivery generation. |
@@ -1926,11 +1964,13 @@ exact protocol markers — never invent new ones.
 | Symptom | Fix |
 |---|---|
 | Agent says the tracker is unavailable | Re-check the adapter's *Access mechanisms* (MCP block or exported API-key env vars); the agent stops rather than fabricating — that's by design |
+| Preflight reports a typed tracker failure | Treat `AUTH`/`NOT_FOUND` as credential or exact-scope configuration problems. Respect the provider reset hint for `RATELIMITED`; retry `NETWORK`, `TIMEOUT`, or `SERVER` only after checking service health. `MALFORMED_RESPONSE` is an andon: inspect the adapter/provider contract instead of retrying blindly. |
+| `start-task` reports that the feature branch is missing | Run the exact `git branch '<branch>' <base-commit>` command printed by the launcher, inspect the branch, then retry. No task worktree was created. |
 | `launch-team.sh` can't find a role | The role needs a brief in `roles/` or `teams/roles/`, and its `<ROLE>_CMD` (or `TEAM_DEFAULT_CMD`) must be set |
 | A role won't launch in a preset | An optional role may have `<ROLE>_CMD=null`; remove the line to fall back to `TEAM_DEFAULT_CMD`. Team Lead, Principal Architect, and Sceptical Principal Architect are mandatory, distinct rostered reviewers. Security must have a distinct launchable mapping but stays out of ordinary startup rosters; Deep Infra and Deep Security require it in the roster. Invalid mappings or missing commands reject launch. |
 | No `tmux` | Agents run as background processes automatically. With protected lifecycle state use `status`/`stop`; otherwise supervise them externally. Logs remain under `.teamwork/<team>/pids/` |
 | `status` says lifecycle supervision is disabled | Provision `BROKER_LIFECYCLE_ROOT` as documented in `config/team.config.md`; unmanaged manual mode deliberately refuses `stop` rather than trusting workspace PID text |
-| Team seems stuck | With protected lifecycle state configured, `bin/launch-team.sh status <team>` shows authoritative process state plus heartbeats; the lead applies the recovery ladder, and anything needing you is in `.teamwork/<team>/ESCALATIONS.md`. A `[Blocked]` task is intentionally human-held and never changed outbound by automation. |
+| Team seems stuck | With protected lifecycle state configured, `bin/launch-team.sh status <team>` shows authoritative process state plus a typed heartbeat verdict and bounded next-action deadline. Investigate the named `stalled:*` condition; treat `identity-mismatch` as a failed authentication, not a stale heartbeat. The lead applies the recovery ladder, and anything needing you is in `.teamwork/<team>/ESCALATIONS.md`. A `[Blocked]` task is intentionally human-held and never changed outbound by automation. |
 | An eligible queued task never launches | Confirm automation is enabled and scheduled, the scriptable adapter has an exact scope, the task does not carry an `ignoredTaskLabels` value such as `human-work`, and `team-preset` is absent or exactly one allowed preset. If `requireMetadataOptIn` is true, also confirm the latest metadata says `automation: enabled`; conflicting or unordered metadata deliberately pauses. |
 | A human moved `[Blocked]` to queued but no fresh attempt starts | Inspect the generated resume-review request. A broker-authenticated `[resume-review]` must bind its exact hold and communication digest; changed requirements also need a later `[resume-plan]` and both architect design approvals, and the prior worktree must be clean. |
 | `--print-cron` rejects the scan interval | Conventional cron output supports minute divisors of 60 and whole-hour divisors of 24. Use a service timer or hosted scheduler for cadences such as seven minutes |
