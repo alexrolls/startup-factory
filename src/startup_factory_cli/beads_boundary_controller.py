@@ -27,6 +27,8 @@ import time
 from pathlib import Path
 from typing import Any, Final, Mapping
 
+from . import beads_native_boundary_v27 as native_boundary_v27
+
 
 CONFIG_PATH: Final = Path("/etc/startup-factory/beads-boundary-controller-v1.json")
 ENDPOINT_PATH: Final = Path("/run/startup-factory/beads-boundary-controller-v1.sock")
@@ -79,6 +81,7 @@ ALLOWED_OPERATIONS: Final = (
 )
 
 _CONFIG_FIELDS = {
+    "beadsEnabled",
     "schemaVersion",
     "protocol",
     "endpointPath",
@@ -96,6 +99,8 @@ _CONFIG_FIELDS = {
     "runtimeManifestSha256",
     "moduleSha256",
     "schemaSha256",
+    "nativeBoundaryManifestPath",
+    "nativeBoundaryManifestSha256",
     "configEpoch",
     "keyEpoch",
     "allowedOperations",
@@ -263,6 +268,7 @@ def _positive_int(value: Any, label: str) -> int:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class ControllerConfig:
+    beads_enabled: bool
     protected_root: Path
     record_hmac_key_path: Path
     controller_uid: int
@@ -277,17 +283,24 @@ class ControllerConfig:
     schema_sha256: str
     config_epoch: int
     key_epoch: int
+    native_boundary_manifest_path: Path
+    native_boundary_manifest_sha256: str
 
     @property
     def root_set_sha256(self) -> str:
         return _sha(_canonical({
+            "beadsEnabled": self.beads_enabled,
             "protectedRoot": str(self.protected_root),
             "recordHmacKeyPath": str(self.record_hmac_key_path),
+            "nativeBoundaryManifestPath": str(self.native_boundary_manifest_path),
+            "nativeBoundaryManifestSha256": self.native_boundary_manifest_sha256,
         }))
 
 
 def _parse_config(value: Any) -> ControllerConfig:
     data = _closed_mapping(value, _CONFIG_FIELDS, "controller configuration")
+    if type(data["beadsEnabled"]) is not bool:
+        raise ControllerProtocolError("beadsEnabled must be a literal boolean")
     if (
         type(data["schemaVersion"]) is not int
         or data["schemaVersion"] != 1
@@ -314,8 +327,11 @@ def _parse_config(value: Any) -> ControllerConfig:
         _absolute_path(data["runtimeManifestPath"], "runtimeManifestPath"),
         _absolute_path(data["modulePath"], "modulePath"),
         _absolute_path(data["schemaPath"], "schemaPath"),
+        _absolute_path(
+            data["nativeBoundaryManifestPath"], "nativeBoundaryManifestPath"
+        ),
     )
-    if len(set(artifacts)) != 3 or any(
+    if len(set(artifacts)) != 4 or any(
         path in {CONFIG_PATH, CONTROLLER_KEY_PATH, record_key}
         or path == protected
         or protected in path.parents
@@ -325,6 +341,7 @@ def _parse_config(value: Any) -> ControllerConfig:
             "installed artifact paths must be distinct root-owned files outside protected state"
         )
     return ControllerConfig(
+        beads_enabled=data["beadsEnabled"],
         protected_root=protected,
         record_hmac_key_path=record_key,
         controller_uid=identities[0],
@@ -339,6 +356,11 @@ def _parse_config(value: Any) -> ControllerConfig:
         schema_sha256=_installed_digest(data["schemaSha256"], "schemaSha256"),
         config_epoch=_positive_int(data["configEpoch"], "configEpoch"),
         key_epoch=_positive_int(data["keyEpoch"], "keyEpoch"),
+        native_boundary_manifest_path=artifacts[3],
+        native_boundary_manifest_sha256=_installed_digest(
+            data["nativeBoundaryManifestSha256"],
+            "nativeBoundaryManifestSha256",
+        ),
     )
 
 
@@ -601,7 +623,11 @@ def _validate_transport_group(config: ControllerConfig) -> None:
         )
 
 
-def _verify_installed_artifacts(config: ControllerConfig) -> None:
+def _verify_installed_artifacts(
+    config: ControllerConfig,
+) -> native_boundary_v27.NativeBoundaryManifestV27:
+    if not config.beads_enabled:
+        raise ControllerProtocolError("protected Beads boundary is disabled")
     _verify_executing_module_identity(config)
     observations = (
         (
@@ -611,13 +637,65 @@ def _verify_installed_artifacts(config: ControllerConfig) -> None:
         ),
         (config.module_path, "installed boundary controller module", config.module_sha256),
         (config.schema_path, "installed protected runtime schema", config.schema_sha256),
+        (
+            config.native_boundary_manifest_path,
+            "installed native boundary V27 manifest",
+            config.native_boundary_manifest_sha256,
+        ),
     )
+    native_manifest_bytes: bytes | None = None
     for path, label, expected in observations:
-        observed = _sha(_read_root_owned(path, label))
+        installed_bytes = _read_root_owned(path, label)
+        observed = _sha(installed_bytes)
         if observed != expected:
             raise ControllerProtocolError(
                 f"{label} installed artifact digest does not match closed configuration"
             )
+        if path == config.native_boundary_manifest_path:
+            native_manifest_bytes = installed_bytes
+    assert native_manifest_bytes is not None
+    try:
+        parsed = json.loads(native_manifest_bytes)
+        if native_boundary_v27.canonical_bytes(parsed) + b"\n" != native_manifest_bytes:
+            raise native_boundary_v27.NativeBoundaryV27Error(
+                "native boundary manifest must be canonical JSON plus one LF"
+            )
+        manifest = native_boundary_v27.parse_native_boundary_manifest_v27(parsed)
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        native_boundary_v27.NativeBoundaryV27Error,
+    ) as exc:
+        raise ControllerProtocolError(
+            f"installed native boundary V27 manifest is invalid: {exc}"
+        ) from exc
+    return manifest
+
+
+def _verify_native_platform_gate(
+    manifest: native_boundary_v27.NativeBoundaryManifestV27,
+) -> None:
+    observations = (
+        (
+            manifest.supervisor_path,
+            "installed native supervisor",
+            manifest.supervisor_sha256,
+        ),
+        (manifest.podman_path, "installed native Podman", manifest.podman_sha256),
+        (manifest.conmon_path, "installed native conmon", manifest.conmon_sha256),
+    )
+    for path, label, expected in observations:
+        observed = _sha(_read_root_owned(path, label, executable=True))
+        if observed != expected:
+            raise ControllerProtocolError(
+                f"{label} digest does not match the native V27 manifest"
+            )
+    try:
+        native_boundary_v27.verify_local_platform_gate_v27(manifest)
+    except native_boundary_v27.NativeBoundaryV27Error as exc:
+        raise ControllerProtocolError(
+            f"native V27 Linux/SELinux/systemd/Podman/supervisor gate failed: {exc}"
+        ) from exc
 
 
 def _validate_endpoint_parent(config: ControllerConfig) -> None:
@@ -689,6 +767,8 @@ def _validate_controller_directory(path: Path, config: ControllerConfig, label: 
 
 
 def _request(action: str, request: Mapping[str, Any], config: ControllerConfig) -> dict[str, Any]:
+    if not config.beads_enabled:
+        raise ControllerProtocolError("protected Beads boundary is disabled")
     if action not in {"OPEN", "STEP", "VALIDATE", "RECOVER"}:
         raise ControllerProtocolError("client requested an unknown controller action")
     if not sys.platform.startswith("linux"):
@@ -1136,6 +1216,8 @@ def _write_state(path: Path, value: Mapping[str, Any], expected: bytes | None) -
 
 
 def _serve_packet(packet: bytes, peer_uid: int, config: ControllerConfig, key: bytes) -> bytes:
+    if not config.beads_enabled:
+        raise ControllerProtocolError("protected Beads boundary is disabled")
     try:
         value = json.loads(packet)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1625,16 +1707,19 @@ def _create_listener(config: ControllerConfig) -> socket.socket:
 
 
 def serve_forever() -> None:
+    config = load_controller_config()
+    if not config.beads_enabled:
+        raise ControllerProtocolError("protected Beads boundary is disabled")
     if not sys.platform.startswith("linux"):
         raise ControllerProtocolError("controller service requires Linux")
-    config = load_controller_config()
     if os.geteuid() != 0:
         raise ControllerProtocolError(
             "controller service must start as root and drop to the configured controller UID"
         )
     _validate_transport_group(config)
     _validate_endpoint_parent(config)
-    _verify_installed_artifacts(config)
+    native_manifest = _verify_installed_artifacts(config)
+    _verify_native_platform_gate(native_manifest)
     listener = _create_listener(config)
     try:
         try:
@@ -1679,20 +1764,28 @@ def serve_forever() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="startup-factory-beads-controller")
-    parser.add_argument("command", choices=("validate-config", "serve"))
+    parser.add_argument(
+        "command", choices=("validate-config", "require-enabled", "serve")
+    )
     args = parser.parse_args(argv)
     try:
         if args.command == "serve":
             serve_forever()
         else:
             config = load_controller_config()
+            if args.command == "require-enabled" and not config.beads_enabled:
+                raise ControllerProtocolError(
+                    "protected Beads boundary is disabled; set beadsEnabled=true only after the external V27 proof gate passes"
+                )
             print(_canonical({
                 "schemaVersion": 1,
                 "protocol": PROTOCOL,
-                "configured": True,
+                "configured": config.beads_enabled,
                 "endpointPath": str(ENDPOINT_PATH),
                 "rootSetSha256": config.root_set_sha256,
-                "proofState": "configured_unproved",
+                "proofState": (
+                    "configured_unproved" if config.beads_enabled else "disabled"
+                ),
             }).decode())
         return 0
     except ControllerProtocolError as exc:

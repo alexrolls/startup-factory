@@ -162,17 +162,27 @@ class BundledDefaultsTests(unittest.TestCase):
     def test_protected_beads_runtime_module_and_fixture_are_shipped(self) -> None:
         module = ROOT / "src" / "startup_factory_cli" / "beads_protected_runtime.py"
         controller = ROOT / "src" / "startup_factory_cli" / "beads_boundary_controller.py"
+        native_boundary = ROOT / "src" / "startup_factory_cli" / "beads_native_boundary_v27.py"
         fixture = ROOT / "tests" / "fixtures" / "beads-protected-runtime-v1.json"
         config_example = ROOT / "runtime" / "beads-boundary-controller-v1.example.json"
+        native_manifest = ROOT / "runtime" / "beads-native-boundary-v27.example.json"
         service_example = ROOT / "runtime" / "startup-factory-beads-controller.service.example"
         tmpfiles_example = ROOT / "runtime" / "startup-factory-beads-controller.tmpfiles.example"
         linux_probe = ROOT / "tests" / "beads-boundary-controller-linux-opt-in.py"
+        native_linux_probe = ROOT / "tests" / "beads-native-boundary-linux-opt-in.py"
         spec = (ROOT / "packaging" / "bundle-spec.json").read_text(encoding="utf-8")
         self.assertTrue(module.is_file())
         self.assertTrue(controller.is_file())
+        self.assertTrue(native_boundary.is_file())
         self.assertTrue(fixture.is_file())
         self.assertTrue(config_example.is_file())
+        self.assertTrue(native_manifest.is_file())
         controller_config = json.loads(config_example.read_bytes())
+        self.assertIs(controller_config["beadsEnabled"], False)
+        self.assertEqual(
+            "sha256:" + hashlib.sha256(native_manifest.read_bytes()).hexdigest(),
+            controller_config["nativeBoundaryManifestSha256"],
+        )
         self.assertEqual(
             "/usr/local/lib/python3.13/site-packages/startup_factory_cli/beads_boundary_controller.py",
             controller_config["modulePath"],
@@ -193,16 +203,20 @@ class BundledDefaultsTests(unittest.TestCase):
             (ROOT / "runtime" / "startup-factory-beads-controller.socket.example").exists()
         )
         self.assertTrue(linux_probe.is_file())
+        self.assertTrue(native_linux_probe.is_file())
         self.assertIn('"tests/beads-protected-runtime-test.py"', spec)
         self.assertIn('"tests/beads-protected-runtime-hostile-test.py"', spec)
         self.assertIn('"tests/beads-boundary-controller-test.py"', spec)
+        self.assertIn('"tests/beads-native-boundary-v27-test.py"', spec)
         self.assertIn('"tests/support/beads_protected_runtime_harness.py"', spec)
         self.assertIn('"tests/fixtures/beads-protected-runtime-v1.json"', spec)
         self.assertIn('"runtime/beads-boundary-controller-v1.example.json"', spec)
+        self.assertIn('"runtime/beads-native-boundary-v27.example.json"', spec)
         self.assertIn('"runtime/startup-factory-beads-controller.service.example"', spec)
         self.assertIn('"runtime/startup-factory-beads-controller.tmpfiles.example"', spec)
         self.assertNotIn('"runtime/startup-factory-beads-controller.socket.example"', spec)
         self.assertIn('"tests/beads-boundary-controller-linux-opt-in.py"', spec)
+        self.assertIn('"tests/beads-native-boundary-linux-opt-in.py"', spec)
 
 
 class ReleaseWorkflowTests(unittest.TestCase):

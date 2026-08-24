@@ -1106,6 +1106,13 @@ runtime_kit.apply_runtime_kit(plan, expected_plan_digest=expected)
         self.assertEqual(
             (
                 self.target
+                / "runtime/beads-native-boundary-v27.example.json"
+            ).read_text(),
+            '{"fixtureVersion":"2"}\n',
+        )
+        self.assertEqual(
+            (
+                self.target
                 / "runtime/startup-factory-beads-controller.service.example"
             ).read_text(),
             "# fixture service 2\n",

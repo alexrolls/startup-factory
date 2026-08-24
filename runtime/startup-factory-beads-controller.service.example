@@ -8,23 +8,30 @@ Type=simple
 # The process starts as root only to create/chown/chmod the socket inside the
 # root:transport 0750 tmpfiles directory, then irreversibly drops itself to the
 # closed controller UID and transport GID before listen().
+ExecCondition=/usr/local/bin/startup-factory-beads-controller require-enabled
 ExecStart=/usr/local/bin/startup-factory-beads-controller serve
 Restart=on-failure
 RestartSec=2s
 CapabilityBoundingSet=CAP_CHOWN CAP_SETGID CAP_SETUID
 NoNewPrivileges=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
 PrivateDevices=true
+PrivateNetwork=true
 PrivateTmp=true
+ProtectClock=true
 ProtectControlGroups=true
 ProtectHome=true
 ProtectKernelLogs=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectSystem=strict
+RemoveIPC=true
 ReadWritePaths=/run/startup-factory /var/lib/startup-factory/beads-boundary-controller/v1
 RestrictAddressFamilies=AF_UNIX
 RestrictSUIDSGID=true
 SystemCallArchitectures=native
+UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AZURE_CLIENT_SECRET GOOGLE_APPLICATION_CREDENTIALS DOCKER_HOST CONTAINER_HOST SSH_AUTH_SOCK
 UMask=0007
 
 [Install]

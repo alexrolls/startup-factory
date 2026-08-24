@@ -38,7 +38,9 @@ FULL_PYTHON_TESTS=(
   ticket-content-security-test.py
   execution-graph-test.py
   beads-boundary-controller-test.py
+  beads-native-boundary-v27-test.py
   beads-boundary-controller-linux-opt-in.py
+  beads-native-boundary-linux-opt-in.py
   beads-protected-runtime-test.py
   beads-protected-runtime-hostile-test.py
   retrospective-test.py
@@ -76,6 +78,7 @@ SMOKE_PYTHON_TESTS=(
   evidence-provider-test.py
   tracker-adapter-pagination-test.py
   beads-boundary-controller-test.py
+  beads-native-boundary-v27-test.py
   beads-protected-runtime-test.py
   beads-protected-runtime-hostile-test.py
   task-hold-test.py

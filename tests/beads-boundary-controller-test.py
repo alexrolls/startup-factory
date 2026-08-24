@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
+import io
 import importlib
 import json
 import os
@@ -36,6 +38,7 @@ class BoundaryControllerTest(unittest.TestCase):
         self.state_root.mkdir(mode=0o700)
         self.key = b"controller-test-domain-key-material-32-bytes"
         self.config = controller.ControllerConfig(
+            beads_enabled=True,
             protected_root=Path("/var/lib/startup-factory/beads-protected-runtime"),
             record_hmac_key_path=Path(
                 "/var/lib/startup-factory/beads-protected-runtime/records.hmac"
@@ -58,6 +61,10 @@ class BoundaryControllerTest(unittest.TestCase):
             schema_sha256=digest("schema"),
             config_epoch=4,
             key_epoch=7,
+            native_boundary_manifest_path=Path(
+                "/usr/lib/startup-factory/beads-native-boundary-v27.json"
+            ),
+            native_boundary_manifest_sha256=digest("native-boundary-v27"),
         )
         self.state_patch = mock.patch.object(
             controller, "STATE_ROOT", self.state_root
@@ -171,6 +178,7 @@ class BoundaryControllerTest(unittest.TestCase):
 
     def test_closed_config_pins_paths_roles_operations_and_identity(self) -> None:
         value = {
+            "beadsEnabled": True,
             "schemaVersion": 1,
             "protocol": controller.PROTOCOL,
             "endpointPath": str(controller.ENDPOINT_PATH),
@@ -190,17 +198,24 @@ class BoundaryControllerTest(unittest.TestCase):
             "schemaSha256": self.config.schema_sha256,
             "configEpoch": self.config.config_epoch,
             "keyEpoch": self.config.key_epoch,
+            "nativeBoundaryManifestPath": str(
+                self.config.native_boundary_manifest_path
+            ),
+            "nativeBoundaryManifestSha256": self.config.native_boundary_manifest_sha256,
             "allowedOperations": list(controller.ALLOWED_OPERATIONS),
         }
         self.assertEqual(self.config, controller._parse_config(value))
         for mutation in (
             {"schemaVersion": True},
+            {"beadsEnabled": "false"},
             {"endpointPath": "/tmp/caller.sock"},
             {"workerUid": self.config.broker_uid},
             {"transportGid": True},
             {"allowedOperations": list(controller.ALLOWED_OPERATIONS[:-1])},
             {"unexpectedOverride": "/tmp/escape"},
             {"moduleSha256": "sha256:" + "0" * 64},
+            {"nativeBoundaryManifestSha256": "sha256:" + "0" * 64},
+            {"nativeBoundaryManifestPath": str(self.config.module_path)},
         ):
             invalid = {**value, **mutation}
             with self.subTest(mutation=mutation), self.assertRaises(
@@ -223,6 +238,22 @@ class BoundaryControllerTest(unittest.TestCase):
         )
         self.assertEqual(str(controller.CONFIG_PATH), "/etc/startup-factory/beads-boundary-controller-v1.json")
 
+    def test_shipped_config_is_literal_disabled_and_serve_creates_nothing(self) -> None:
+        example = json.loads(
+            (ROOT / "runtime/beads-boundary-controller-v1.example.json").read_bytes()
+        )
+        self.assertIs(example["beadsEnabled"], False)
+        disabled = controller.dataclasses.replace(self.config, beads_enabled=False)
+        with mock.patch.object(
+            controller, "load_controller_config", return_value=disabled
+        ), mock.patch.object(controller, "_create_listener") as create_listener, mock.patch.object(
+            controller, "_verify_installed_artifacts"
+        ) as verify_artifacts:
+            with self.assertRaisesRegex(controller.ControllerProtocolError, "disabled"):
+                controller.serve_forever()
+        create_listener.assert_not_called()
+        verify_artifacts.assert_not_called()
+
         service = (
             ROOT / "runtime/startup-factory-beads-controller.service.example"
         ).read_text()
@@ -232,6 +263,10 @@ class BoundaryControllerTest(unittest.TestCase):
         self.assertIn("Restart=on-failure", service)
         self.assertIn("UMask=0007", service)
         self.assertIn("Requires=systemd-tmpfiles-setup.service", service)
+        self.assertIn(
+            "ExecCondition=/usr/local/bin/startup-factory-beads-controller require-enabled",
+            service,
+        )
         self.assertIn(
             "ReadWritePaths=/run/startup-factory /var/lib/startup-factory/beads-boundary-controller/v1",
             service,
@@ -245,6 +280,16 @@ class BoundaryControllerTest(unittest.TestCase):
         self.assertFalse(
             (ROOT / "runtime/startup-factory-beads-controller.socket.example").exists()
         )
+        output = io.StringIO()
+        with mock.patch.object(
+            controller, "load_controller_config", return_value=disabled
+        ), contextlib.redirect_stdout(output):
+            self.assertEqual(0, controller.main(["validate-config"]))
+        self.assertEqual("disabled", json.loads(output.getvalue())["proofState"])
+        with mock.patch.object(
+            controller, "load_controller_config", return_value=disabled
+        ), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(1, controller.main(["require-enabled"]))
 
     def test_linux_probe_pins_registered_operation_set_and_active_verifier(self) -> None:
         probe_path = ROOT / "tests/beads-boundary-controller-linux-opt-in.py"
@@ -680,6 +725,9 @@ class BoundaryControllerTest(unittest.TestCase):
         values = {
             self.config.runtime_manifest_path: b"runtime-manifest-bytes",
             self.config.schema_path: b"schema-bytes",
+            self.config.native_boundary_manifest_path: (
+                ROOT / "runtime/beads-native-boundary-v27.example.json"
+            ).read_bytes(),
             live_module: live_module_bytes,
         }
         config = controller.dataclasses.replace(
@@ -688,6 +736,9 @@ class BoundaryControllerTest(unittest.TestCase):
             runtime_manifest_sha256=controller._sha(values[self.config.runtime_manifest_path]),
             module_sha256=controller._sha(live_module_bytes),
             schema_sha256=controller._sha(values[self.config.schema_path]),
+            native_boundary_manifest_sha256=controller._sha(
+                values[self.config.native_boundary_manifest_path]
+            ),
         )
         with mock.patch.object(
             controller,
@@ -695,7 +746,7 @@ class BoundaryControllerTest(unittest.TestCase):
             side_effect=lambda path, _label, **_kwargs: values[path],
         ) as observed:
             controller._verify_installed_artifacts(config)
-        self.assertEqual(3, observed.call_count)
+        self.assertEqual(4, observed.call_count)
 
         with mock.patch.object(
             controller,
@@ -706,6 +757,43 @@ class BoundaryControllerTest(unittest.TestCase):
                 controller.ControllerProtocolError, "installed artifact digest"
             ):
                 controller._verify_installed_artifacts(config)
+
+    def test_enabled_preflight_binds_native_assets_and_fixed_platform_gate(self) -> None:
+        manifest_value = json.loads(
+            (ROOT / "runtime/beads-native-boundary-v27.example.json").read_bytes()
+        )
+        manifest = controller.native_boundary_v27.parse_native_boundary_manifest_v27(
+            manifest_value
+        )
+        assets = {
+            manifest.supervisor_path: b"supervisor",
+            manifest.podman_path: b"podman",
+            manifest.conmon_path: b"conmon",
+        }
+        with mock.patch.object(
+            controller,
+            "_read_root_owned",
+            side_effect=lambda path, _label, **_kwargs: assets[path],
+        ) as observed, mock.patch.object(
+            controller.native_boundary_v27, "verify_local_platform_gate_v27"
+        ) as platform_gate:
+            controller._verify_native_platform_gate(manifest)
+        self.assertEqual(3, observed.call_count)
+        platform_gate.assert_called_once_with(manifest)
+
+        assets[manifest.podman_path] = b"tampered"
+        with mock.patch.object(
+            controller,
+            "_read_root_owned",
+            side_effect=lambda path, _label, **_kwargs: assets[path],
+        ), mock.patch.object(
+            controller.native_boundary_v27, "verify_local_platform_gate_v27"
+        ) as platform_gate:
+            with self.assertRaisesRegex(
+                controller.ControllerProtocolError, "native Podman"
+            ):
+                controller._verify_native_platform_gate(manifest)
+        platform_gate.assert_not_called()
 
     def test_serve_preflight_rejects_unrelated_symlinked_or_stale_live_module(self) -> None:
         live_module = Path(controller.__file__)
@@ -719,11 +807,17 @@ class BoundaryControllerTest(unittest.TestCase):
             config.runtime_manifest_path: b"runtime-manifest-bytes",
             config.module_path: live_bytes,
             config.schema_path: b"schema-bytes",
+            config.native_boundary_manifest_path: (
+                ROOT / "runtime/beads-native-boundary-v27.example.json"
+            ).read_bytes(),
         }
         config = controller.dataclasses.replace(
             config,
             runtime_manifest_sha256=controller._sha(values[config.runtime_manifest_path]),
             schema_sha256=controller._sha(values[config.schema_path]),
+            native_boundary_manifest_sha256=controller._sha(
+                values[config.native_boundary_manifest_path]
+            ),
         )
 
         def read_exact(path, _label, **_kwargs):

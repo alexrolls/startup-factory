@@ -37,6 +37,7 @@ class LogicHarness:
         digest = self.runtime.sha256
         controller = self.runtime._boundary_controller
         return controller.ControllerConfig(
+            beads_enabled=True,
             protected_root=self.protected_root,
             record_hmac_key_path=self.hmac_key_path,
             controller_uid=91_001,
@@ -57,6 +58,10 @@ class LogicHarness:
             schema_sha256=digest(b"test-schema"),
             config_epoch=1,
             key_epoch=1,
+            native_boundary_manifest_path=Path(
+                "/usr/lib/startup-factory/test-native-boundary-v27.json"
+            ),
+            native_boundary_manifest_sha256=digest(b"test-native-boundary-v27"),
         )
 
     def _session_and_operation(

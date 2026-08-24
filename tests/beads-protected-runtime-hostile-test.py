@@ -871,6 +871,7 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
         state_root.mkdir(mode=0o700)
         controller_key = b"integrated-controller-domain-key-32bytes"
         config = controller.ControllerConfig(
+            beads_enabled=True,
             protected_root=self.root,
             record_hmac_key_path=self.key,
             controller_uid=91_001,
@@ -885,6 +886,10 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
             schema_sha256=digest("integrated-schema"),
             config_epoch=11,
             key_epoch=13,
+            native_boundary_manifest_path=Path(
+                "/usr/lib/startup-factory/native-boundary-v27.json"
+            ),
+            native_boundary_manifest_sha256=digest("integrated-native-boundary-v27"),
         )
 
         class PacketCarrier:

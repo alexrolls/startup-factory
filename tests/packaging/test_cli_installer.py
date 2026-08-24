@@ -41,6 +41,10 @@ def base_payload(version: str = "1") -> dict[str, tuple[bytes, int]]:
             f"{{\"fixtureVersion\":\"{version}\"}}\n".encode(),
             0o644,
         ),
+        "runtime/beads-native-boundary-v27.example.json": (
+            f"{{\"fixtureVersion\":\"{version}\"}}\n".encode(),
+            0o644,
+        ),
         "runtime/startup-factory-beads-controller.service.example": (
             f"# fixture service {version}\n".encode(),
             0o644,
