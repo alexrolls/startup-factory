@@ -367,8 +367,8 @@ sed_i 's|^SENIOR_SECURITY_ENGINEER_CMD=.*|SENIOR_SECURITY_ENGINEER_CMD="cat '\''
 sed_i 's|^SENIOR_QA_ENGINEER_CMD=.*|SENIOR_QA_ENGINEER_CMD="cat '\''{prompt_file}'\''"|' .claude/skills/pm/config/team.config.md
 sed_i 's|^TEAM_DEFAULT_CMD=.*|TEAM_DEFAULT_CMD="cat '\''{prompt_file}'\''"|' .claude/skills/pm/config/team.config.md
 doctor_out="$("$LAUNCH" doctor full-stack doctor-team FEAT-DOCTOR)"
-printf '%s' "$doctor_out" | grep -q "every distinct configured command completed" \
-  && echo "ok: doctor completes prompt/auth round trips under the real agent environment" \
+printf '%s' "$doctor_out" | grep -Eq "distinct command\(s\) verified, covering [0-9]+ enabled roster role\(s\)" \
+  && echo "ok: doctor reports verified commands and covered roles accurately" \
   || { echo "FAIL: doctor did not complete: $doctor_out"; FAILURES=$((FAILURES+1)); }
 sed_i 's|^SENIOR_QA_ENGINEER_CMD=.*|SENIOR_QA_ENGINEER_CMD="false"|' .claude/skills/pm/config/team.config.md
 if doctor_out="$("$LAUNCH" doctor full-stack doctor-fail FEAT-DOCTOR 2>&1)"; then
@@ -513,6 +513,15 @@ else
 fi
 
 # -- worktree subcommand -------------------------------------------------------
+if missing_branch_out="$("$LAUNCH" worktree missing-feature backend T-MISSING 2>&1)"; then
+  echo "FAIL: missing feature branch was accepted"; FAILURES=$((FAILURES+1))
+elif printf '%s' "$missing_branch_out" | grep -q "feature branch 'missing-feature' does not exist.*git branch 'missing-feature' <base-commit>"; then
+  echo "ok: missing feature branch reports an actionable creation command"
+else
+  echo "FAIL: missing feature branch produced the wrong error: $missing_branch_out"; FAILURES=$((FAILURES+1))
+fi
+check "missing feature branch creates no task worktree" test ! -e .teamwork/missing-feature/worktrees
+
 T42_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key T-42)"
 T42_WT=".teamwork/test-feature/worktrees/backend#1-$T42_KEY"
 "$LAUNCH" worktree test-feature backend T-42

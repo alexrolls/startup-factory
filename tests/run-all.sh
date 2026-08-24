@@ -42,6 +42,7 @@ FULL_PYTHON_TESTS=(
   evidence-provider-test.py
   release-lifecycle-test.py
   tracker-adapter-pagination-test.py
+  heartbeat-status-test.py
   task-hold-test.py
   custom-tracker-release-snapshot-test.py
 )
@@ -66,6 +67,7 @@ SMOKE_PYTHON_TESTS=(
   delivery-profile-test.py
   evidence-provider-test.py
   tracker-adapter-pagination-test.py
+  heartbeat-status-test.py
   task-hold-test.py
 )
 SMOKE_SHELL_TESTS=(

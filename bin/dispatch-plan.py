@@ -268,6 +268,7 @@ def main() -> None:
     parser.add_argument("--execution", choices=["sequential", "parallel"], required=True)
     parser.add_argument("--max-active", type=int)
     parser.add_argument("--ignored-labels-json", default="[]")
+    parser.add_argument("--task", action="append", dest="task_scope", default=[])
     args = parser.parse_args()
 
     skill = Path(args.skill)
@@ -320,19 +321,40 @@ def main() -> None:
         entry = hold_entry(task_id)
         return bool(entry and entry.get("state") in HOLD_STATES)
     tasks = payload.get("tasks") or []
+    if not isinstance(tasks, list):
+        raise RuntimeError("tracker snapshot tasks must be a list")
     excluded = ignored_labels(args.ignored_labels_json)
+    evidence_tasks = []
     filtered_tasks = []
     for task in tasks:
         labels = task.get("labels")
         if not isinstance(labels, list) or any(not isinstance(label, str) for label in labels):
             raise RuntimeError("tracker snapshot task labels must be a list of label names")
+        evidence_tasks.append(task)
         if excluded.intersection(label.casefold() for label in labels):
             continue
         filtered_tasks.append(task)
-    tasks = filtered_tasks
+    all_tasks = filtered_tasks
+    task_scope = set(args.task_scope)
+    if len(task_scope) != len(args.task_scope):
+        raise RuntimeError("targeted dispatch contains a duplicate --task identity")
+    all_ids = {str(task.get("taskId")) for task in all_tasks}
+    missing_scope = sorted(task_scope - all_ids)
+    if missing_scope:
+        raise RuntimeError(
+            "targeted dispatch task is absent from the feature snapshot: %s"
+            % ", ".join(missing_scope)
+        )
+    tasks = [
+        task for task in all_tasks
+        if not task_scope or str(task.get("taskId")) in task_scope
+    ]
     if str(payload.get("featureId") or "") != args.feature:
         raise RuntimeError("tracker snapshot featureId does not match the dispatcher invocation")
-    by_id = {str(task["taskId"]): task for task in tasks}
+    # Scope selects actions, not evidence. Dependency and concurrency checks
+    # retain the complete feature snapshot so a narrow plan cannot ignore a
+    # blocker or active sibling.
+    by_id = {str(task["taskId"]): task for task in evidence_tasks}
     terminal = {status["name"] for status in board["tasks"]["statuses"] if status.get("terminal")}
     by_kind = {
         status.get("kind"): status["name"]
@@ -623,8 +645,10 @@ def main() -> None:
     product_closeout_role = None
     product_closeout_detail = None
     product_request = workdir / "product-acceptance-request.json"
-    all_terminal = bool(tasks) and all(task.get("status") in terminal for task in tasks)
-    if all_terminal:
+    all_terminal = bool(evidence_tasks) and all(
+        task.get("status") in terminal for task in evidence_tasks
+    )
+    if all_terminal and not task_scope:
         try:
             request_text = read_regular_at(
                 workdir_fd, "product-acceptance-request.json", "product-acceptance request", 1024 * 1024
@@ -768,13 +792,13 @@ def main() -> None:
 
     active_count = sum(
         1
-        for task in tasks
+        for task in evidence_tasks
         if task.get("status") == working_status
         and not task_is_held(str(task["taskId"]))
     )
     unintegrated = [
         task
-        for task in tasks
+        for task in evidence_tasks
         if task.get("status") in {working_status, review_status}
         and not task_is_held(str(task["taskId"]))
     ]
@@ -882,28 +906,31 @@ def main() -> None:
         slots -= 1
 
     stale = []
-    try:
-        heartbeat_fd = open_child_directory(workdir_fd, "heartbeats", "heartbeat directory")
-    except FileNotFoundError:
-        heartbeat_fd = None
-    if heartbeat_fd is not None:
-        now = time.time()
-        for name in os.listdir(heartbeat_fd):
-            info = os.stat(name, dir_fd=heartbeat_fd, follow_symlinks=False)
-            if not stat.S_ISREG(info.st_mode):
-                stale.append(name + " (unsafe non-file heartbeat)")
-            elif now - info.st_mtime > args.stuck_minutes * 60:
-                stale.append(name)
+    if not task_scope:
+        try:
+            heartbeat_fd = open_child_directory(workdir_fd, "heartbeats", "heartbeat directory")
+        except FileNotFoundError:
+            heartbeat_fd = None
+        if heartbeat_fd is not None:
+            now = time.time()
+            for name in os.listdir(heartbeat_fd):
+                info = os.stat(name, dir_fd=heartbeat_fd, follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode):
+                    stale.append(name + " (unsafe non-file heartbeat)")
+                elif now - info.st_mtime > args.stuck_minutes * 60:
+                    stale.append(name)
 
     resume_pending = [
         entry["taskId"]
         for entry in hold_entries.values()
         if entry.get("state") == "resume-review-pending"
+        and (not task_scope or entry["taskId"] in task_scope)
     ]
     manual_takeovers = [
         entry["taskId"]
         for entry in hold_entries.values()
         if entry.get("state") == "manual-takeover"
+        and (not task_scope or entry["taskId"] in task_scope)
     ]
     if (
         missing_gate

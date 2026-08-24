@@ -1381,8 +1381,8 @@ your agent in the generic vocabulary:
 
 | Command | Purpose |
 |---|---|
-| `team <preset> <team> <featureId>` | Launch a whole preset roster |
-| `gate-team <preset> <team> <featureId>` | Launch only persistent supervision/review/integration gates; automation uses this and starts implementers per task |
+| `team <preset> <team> <featureId>` | Eagerly launch a whole preset roster; use only when every role should start immediately |
+| `gate-team <preset> <team> <featureId>` | Normal feature bootstrap: launch supervision/review/integration gates; dispatch starts implementers per task |
 | `planning-handoff <team> <spec-path> <plan-path>` | Bind committed Claude/Superpowers specification and plan inputs to this Startup Factory team |
 | `preflight <team> <featureId>` | Verify adapter access, workspace writability, and UTC pin — run once before any CLI team launch |
 | `start <team> <featureId> <role>…` | Launch specific roles (custom teams) |
@@ -1394,7 +1394,7 @@ your agent in the generic vocabulary:
 | `worktree <team> <role> <taskId> [attempt]` | Create an implementer's isolated task worktree |
 | `worktree-remove <team> <role> <taskId> [attempt]` | Remove a worktree only after protected lifecycle state proves its worker is stopped; unmanaged mode refuses |
 | `validate-board [config-path]` | Validate status structure, initial/terminal rules, transitions, reachability, owners, and marker-role references |
-| `status <team>` | Show authenticated process state plus last heartbeat when protected lifecycle authority is enabled; otherwise report that markers are non-authoritative |
+| `status <team>` | Show authenticated process state, typed heartbeat verdict, and bounded next-action deadline when protected lifecycle authority is enabled; otherwise report that markers are non-authoritative |
 | `stop <team>` | Stop the managed team through authenticated lifecycle identities; unmanaged mode refuses to signal |
 | `stop-task <team> <taskId>` | Send bounded TERM→KILL to the authenticated launcher-managed process group/session for one [task], then revoke that [task]'s active publication capabilities; sibling workers and gate roles continue |
 
@@ -1409,7 +1409,8 @@ reject output from an escaped stale process.
 
 | Command | Purpose |
 |---|---|
-| `dispatch.sh <team> <featureId> --once [--dry-run]` | One deterministic read-and-act pass |
+| `dispatch.sh <team> <featureId> --once [--dry-run]` | One deterministic feature-wide read-and-act pass; inspect the first pass with `--dry-run` |
+| `dispatch.sh <team> <featureId> --once --dry-run --task <taskId>` | Read-only single-task scope preview that retains full dependency/concurrency evidence without emitting sibling actions |
 | `dispatch.sh <team> <featureId> --watch` | Wake on runtime events with `POLL_INTERVAL_SECONDS` as a fallback — run in a persistent shell (tmux/nohup); **you own this process** |
 
 > **CLI dispatch requires scriptable tracker access.** Linear and Jira default to MCP; set `LINEAR_ACCESS=rest` or `JIRA_ACCESS=rest` in `config/project-management.config.md` before running `dispatch.sh --watch`. Harness mode (`launch-team.sh compose`) supports MCP natively.
@@ -1418,6 +1419,7 @@ reject output from an escaped stale process.
 
 | Command | Purpose |
 |---|---|
+| `probe <featureId>` | Prove adapter access and exact feature scope with a minimal read; shipped remote adapters do not export task comments for this check. |
 | `state <taskId> <Status>` | Make and verify a legal generic `[task]` status write. Startup Factory rejects every outbound `[Blocked]` transition; a human must perform that move in the project-management tool. |
 | `feature-state <featureId> <Status>` | Make and verify a legal generic `[feature]` status write. |
 | `feature-reopen <featureId> <Status>` | PM-supervisor-only terminal-to-queued reopen for a new delivery generation. |

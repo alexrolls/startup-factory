@@ -132,6 +132,31 @@ echo "$plan" | grep -q "launch integrator" && echo "ok: plans integrator merge q
 check "dry-run does not move status" grep -q '^## 2 Blocked thing \[Blocked\]$' "$FID"
 check "dry-run launches nothing"     test ! -d .teamwork/feat-team/pids
 
+# -- targeted dry-run retains full evidence but emits only the requested scope -
+target_plan="$(TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once --dry-run --task "$FID#3")"
+echo "$target_plan" | grep -q "launch senior-security-engineer.*$FID#3" \
+  && echo "ok: targeted plan includes the requested task" \
+  || { echo "FAIL: targeted task was absent: $target_plan"; FAILURES=$((FAILURES+1)); }
+if echo "$target_plan" | grep -Eq "$FID#(2|4|5|6)"; then
+  echo "FAIL: targeted plan widened to sibling tasks: $target_plan"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: targeted plan does not widen to sibling tasks"
+fi
+if target_apply_out="$(TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once --task "$FID#3" 2>&1)"; then
+  echo "FAIL: targeted dispatch mutated without an explicit task launch"; FAILURES=$((FAILURES+1))
+elif printf '%s' "$target_apply_out" | grep -q "read-only scope preview and requires --dry-run"; then
+  echo "ok: targeted dispatch is a read-only scope preview"
+else
+  echo "FAIL: targeted live dispatch produced wrong error: $target_apply_out"; FAILURES=$((FAILURES+1))
+fi
+if missing_target_out="$(TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once --dry-run --task "$FID#99" 2>&1)"; then
+  echo "FAIL: targeted plan accepted an absent task"; FAILURES=$((FAILURES+1))
+elif printf '%s' "$missing_target_out" | grep -q "targeted dispatch task is absent.*$FID#99"; then
+  echo "ok: targeted plan identifies an absent task exactly"
+else
+  echo "FAIL: absent targeted task produced wrong error: $missing_target_out"; FAILURES=$((FAILURES+1))
+fi
+
 mkdir -p .teamwork/feat-missing-sceptical
 cat > .teamwork/feat-missing-sceptical/preset.env <<'EOF'
 PRESET=full-stack
@@ -201,6 +226,24 @@ files: src/automatic.py
 >
 > [sceptical-design-approved] round 1
 > - sceptical-architect
+
+## 3 Automatic but human-dependent [Planned]
+
+**Assignee:** —
+**BlockedBy:** 1
+
+track: backend
+parallel-safe: true
+files: src/dependent.py
+
+> [design-note] round 1
+> - backend
+>
+> [design-approved] round 1
+> - principal-architect
+>
+> [sceptical-design-approved] round 1
+> - sceptical-architect
 EOF
 HUMAN_FID="feat/human-work.md"
 human_plan="$(STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='["human-work"]' TEAM_RUNNER=background "$DISPATCH" feat-human-team "$HUMAN_FID" --once --dry-run)"
@@ -212,6 +255,12 @@ fi
 echo "$human_plan" | grep -q "claim $HUMAN_FID#2.*backend" \
   && echo "ok: non-human sibling remains automatically claimable" \
   || { echo "FAIL: automatic sibling was not claimed: $human_plan"; FAILURES=$((FAILURES+1)); }
+human_dependency_plan="$(STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='["human-work"]' TEAM_RUNNER=background "$DISPATCH" feat-human-team "$HUMAN_FID" --once --dry-run --task "$HUMAN_FID#3")"
+if echo "$human_dependency_plan" | grep -q "claim $HUMAN_FID#3"; then
+  echo "FAIL: targeted scope ignored its human-owned dependency"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: targeted scope retains excluded sibling dependency evidence"
+fi
 
 # -- real pass: blocked task stays held while unrelated gate queues still run --
 TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once

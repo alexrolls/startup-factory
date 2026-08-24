@@ -3,7 +3,7 @@
 # Zero LLM per cycle. Logic spec: reference/dispatch.md.
 #
 # Usage:
-#   dispatch.sh <team> <featureId> --once [--dry-run]
+#   dispatch.sh <team> <featureId> --once [--dry-run] [--task <taskId>]
 #   dispatch.sh <team> <featureId> --watch
 set -euo pipefail
 
@@ -197,8 +197,8 @@ print("dispatch-" + hashlib.sha256("\0".join(
 PY
 }
 
-dispatch_once() { # dispatch_once <team> <featureId> <dry:yes|no>
-  local team="$1" fid="$2" dry="$3"
+dispatch_once() { # dispatch_once <team> <featureId> <dry:yes|no> [target-task]
+  local team="$1" fid="$2" dry="$3" target_task="${4:-}"
   local dir lock tasks_file; dir="$(teamroot "$team")"
   lock="$(team_path "$dir" dispatch.lock)"
   tasks_file="$(team_path "$dir" tasks.json)"
@@ -340,6 +340,7 @@ EOF
   max_active="$(read_key MAX_ACTIVE_IMPLEMENTERS)"
   local planner_args=(--skill "$SKILL_DIR" --workdir "$dir" --team "$team" --feature "$fid" --stuck-minutes "$stuck" --execution "$execution")
   [ -z "$max_active" ] || planner_args+=(--max-active "$max_active")
+  [ -z "$target_task" ] || planner_args+=(--task "$target_task")
   planner_args+=(--ignored-labels-json "${STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON:-[]}")
   plan="$(python3 "$SKILL_DIR/bin/dispatch-plan.py" "${planner_args[@]}")"
   if [ -z "$plan" ]; then echo "dispatch: nothing actionable"; return 0; fi
@@ -456,22 +457,36 @@ $plan
 EOF
 }
 
-[ $# -ge 3 ] || die "usage: dispatch.sh <team> <featureId> --once|--watch [--dry-run]"
+[ $# -ge 3 ] || die "usage: dispatch.sh <team> <featureId> --once|--watch [--dry-run] [--task <taskId>]"
 TEAM="$1"; FID="$2"; MODE="$3"; shift 3
 DRY=no
-for opt in "$@"; do
-  case "$opt" in
+TARGET_TASK=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     --dry-run) DRY=yes ;;
+    --task)
+      [ $# -ge 2 ] || die "--task requires one taskId"
+      [ -z "$TARGET_TASK" ] || die "--task may be specified only once"
+      TARGET_TASK="$2"
+      shift ;;
+    --task=*)
+      [ -z "$TARGET_TASK" ] || die "--task may be specified only once"
+      TARGET_TASK="${1#--task=}"
+      [ -n "$TARGET_TASK" ] || die "--task requires one taskId" ;;
     --unblock=auto|--unblock=suggest|--unblock=off)
-      echo "dispatch: warning — $opt is deprecated and ignored; [Blocked] exits are human-only" >&2 ;;
-    --unblock=*) die "unknown legacy unblock option $opt" ;;
-    *) die "unknown option $opt" ;;
+      echo "dispatch: warning — $1 is deprecated and ignored; [Blocked] exits are human-only" >&2 ;;
+    --unblock=*) die "unknown legacy unblock option $1" ;;
+    *) die "unknown option $1" ;;
   esac
+  shift
 done
+[ -z "$TARGET_TASK" ] || [ "$DRY" = yes ] \
+  || die "--task is a read-only scope preview and requires --dry-run; execute one task with launch-team.sh start-task"
 case "$MODE" in
-  --once) dispatch_once "$TEAM" "$FID" "$DRY" ;;
+  --once) dispatch_once "$TEAM" "$FID" "$DRY" "$TARGET_TASK" ;;
   --watch)
     [ "$DRY" = "no" ] || die "--watch does not combine with --dry-run"
+    [ -z "$TARGET_TASK" ] || die "--watch does not combine with --task"
     INTERVAL="$(read_key POLL_INTERVAL_SECONDS)"; INTERVAL="${INTERVAL:-120}"
     echo "dispatch: watching (every ${INTERVAL}s) — this shell is the loop owner; keep it alive (tmux/nohup)"
     while true; do
