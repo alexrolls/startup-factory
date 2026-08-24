@@ -1377,6 +1377,42 @@ your agent in the generic vocabulary:
 > Keep `SF_HOME` set in every shell that runs a launcher or dispatcher. For a
 > protected external automation installation, set it to that absolute path.
 
+### Preview or run exactly one task
+
+When an operator or harness requests one task, keep the execution boundary at
+that task. First prove the tracker scope, then preview the decision using the
+complete feature dependency/concurrency evidence, and finally launch only the
+named worker:
+
+```bash
+"$SF_HOME/bin/launch-team.sh" preflight payments-revamp ENG-100
+"$SF_HOME/bin/dispatch.sh" payments-revamp ENG-100 \
+  --once --dry-run --task ENG-142
+"$SF_HOME/bin/launch-team.sh" start-task \
+  payments-revamp ENG-100 senior-backend-engineer ENG-142 1 deep-backend
+```
+
+The targeted dispatcher form is deliberately read-only: it can explain the
+task's eligibility without claiming work, launching siblings, or emitting
+feature-wide closeout actions. Use `start-task` for the explicit mutation. The
+feature branch (the team name) must already exist; if it does not, the launcher
+stops before creating a task worktree and prints an exact branch-creation
+command.
+
+`preflight` uses a minimal feature-scoped tracker probe before any launch. It
+reports typed transport failures such as `AUTH`, `RATELIMITED`, `NOT_FOUND`,
+`NETWORK`, `TIMEOUT`, and `MALFORMED_RESPONSE`, preserving safe provider retry
+guidance when available. This makes credential/scope failures distinguishable
+from temporary service failures. Shipped adapters avoid broadly exporting task
+comments merely to test connectivity; custom backends retain their compatible
+export fallback.
+
+After launch, `launch-team.sh status <team>` combines authenticated process
+identity with the worker heartbeat. `active` and `starting` are live states;
+`stalled:*` names the missing progress condition, while `identity-mismatch`
+fails closed because the recorded process can no longer be authenticated. A
+worker-reported next-action deadline never extends the configured liveness TTL.
+
 **`bin/launch-team.sh` subcommands:**
 
 | Command | Purpose |
@@ -1928,11 +1964,13 @@ exact protocol markers — never invent new ones.
 | Symptom | Fix |
 |---|---|
 | Agent says the tracker is unavailable | Re-check the adapter's *Access mechanisms* (MCP block or exported API-key env vars); the agent stops rather than fabricating — that's by design |
+| Preflight reports a typed tracker failure | Treat `AUTH`/`NOT_FOUND` as credential or exact-scope configuration problems. Respect the provider reset hint for `RATELIMITED`; retry `NETWORK`, `TIMEOUT`, or `SERVER` only after checking service health. `MALFORMED_RESPONSE` is an andon: inspect the adapter/provider contract instead of retrying blindly. |
+| `start-task` reports that the feature branch is missing | Run the exact `git branch '<branch>' <base-commit>` command printed by the launcher, inspect the branch, then retry. No task worktree was created. |
 | `launch-team.sh` can't find a role | The role needs a brief in `roles/` or `teams/roles/`, and its `<ROLE>_CMD` (or `TEAM_DEFAULT_CMD`) must be set |
 | A role won't launch in a preset | An optional role may have `<ROLE>_CMD=null`; remove the line to fall back to `TEAM_DEFAULT_CMD`. Team Lead, Principal Architect, and Sceptical Principal Architect are mandatory, distinct rostered reviewers. Security must have a distinct launchable mapping but stays out of ordinary startup rosters; Deep Infra and Deep Security require it in the roster. Invalid mappings or missing commands reject launch. |
 | No `tmux` | Agents run as background processes automatically. With protected lifecycle state use `status`/`stop`; otherwise supervise them externally. Logs remain under `.teamwork/<team>/pids/` |
 | `status` says lifecycle supervision is disabled | Provision `BROKER_LIFECYCLE_ROOT` as documented in `config/team.config.md`; unmanaged manual mode deliberately refuses `stop` rather than trusting workspace PID text |
-| Team seems stuck | With protected lifecycle state configured, `bin/launch-team.sh status <team>` shows authoritative process state plus heartbeats; the lead applies the recovery ladder, and anything needing you is in `.teamwork/<team>/ESCALATIONS.md`. A `[Blocked]` task is intentionally human-held and never changed outbound by automation. |
+| Team seems stuck | With protected lifecycle state configured, `bin/launch-team.sh status <team>` shows authoritative process state plus a typed heartbeat verdict and bounded next-action deadline. Investigate the named `stalled:*` condition; treat `identity-mismatch` as a failed authentication, not a stale heartbeat. The lead applies the recovery ladder, and anything needing you is in `.teamwork/<team>/ESCALATIONS.md`. A `[Blocked]` task is intentionally human-held and never changed outbound by automation. |
 | An eligible queued task never launches | Confirm automation is enabled and scheduled, the scriptable adapter has an exact scope, the task does not carry an `ignoredTaskLabels` value such as `human-work`, and `team-preset` is absent or exactly one allowed preset. If `requireMetadataOptIn` is true, also confirm the latest metadata says `automation: enabled`; conflicting or unordered metadata deliberately pauses. |
 | A human moved `[Blocked]` to queued but no fresh attempt starts | Inspect the generated resume-review request. A broker-authenticated `[resume-review]` must bind its exact hold and communication digest; changed requirements also need a later `[resume-plan]` and both architect design approvals, and the prior worktree must be clean. |
 | `--print-cron` rejects the scan interval | Conventional cron output supports minute divisors of 60 and whole-hour divisors of 24. Use a service timer or hosted scheduler for cadences such as seven minutes |
