@@ -29,7 +29,7 @@ python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$wor
 python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative pm >/dev/null
 python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative pm-projection.json >/dev/null
 python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative executions >/dev/null
-args=(sync --workspace "$workspace" --team "$team" --feature "$feature" --tasks "$tasks"
+args=(sync --repo "$repo" --workspace "$workspace" --team "$team" --feature "$feature" --tasks "$tasks"
       --tracker-ops "$SKILL_DIR/bin/tracker-ops.sh"
       --ignored-labels-json "${STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON:-[]}")
 while IFS= read -r status; do

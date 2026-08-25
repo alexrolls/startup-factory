@@ -30,7 +30,7 @@ Three principles rule everything:
 ├── prompts/tasks/<instance>.md  # lean prompt for one task attempt
 ├── planning/superpowers-handoff.json # optional digest-bound Claude planning intake
 ├── mailbox/<role>/NNN-<from>.md # incoming messages for <role>, numbered, append-only
-├── heartbeats/<role>            # one line: <ISO-8601 UTC> | <taskId or -> | <state>
+├── heartbeats/<instance>        # semantic heartbeat; authenticated lifecycle supplies identity
 ├── pids/<role>.pid              # non-authoritative `managed`/`unmanaged` UI marker + log location
 ├── pids/tasks/<instance>.pid    # non-authoritative task marker; never PID/signal authority
 ├── worktrees/<role>#<attempt>-<safe-task-key>/ # isolated task working copies
@@ -43,6 +43,8 @@ Three principles rule everything:
 ├── events.ndjson                # append-only wake/event journal; never authoritative
 ├── pm-projection.json           # disposable progress/digest projection
 ├── outbox/{pending,done}/       # structured artifacts awaiting tracker publication
+├── control-outbox/{pending,done,failed}/ # Team Lead lifecycle requests and broker projections
+├── quarantine/<safe-task-key>/ # non-authoritative manifests for protected dirty-attempt quarantine
 ├── CONTRACTS.md                 # append-only registry of names plans export/consume (see "Contract registry")
 ├── BASELINE.md                  # known state of the branch at creation: test counts, known failures, validation commands (see "Baseline manifest")
 ├── review-ledger.md             # reviewers' one-line-per-ruling ledger of still-live conditions
@@ -102,10 +104,11 @@ a run: signatures are grep keys.
   turn's work is done, deliver your artifact and exit — you will not be alive later,
   so never plan to "check back". The dispatcher owns time (`reference/dispatch.md`);
   `POLL_INTERVAL_SECONDS` is *its* cadence, not yours.
-- **Heartbeat:** between work steps, atomically rewrite your heartbeat file with
-  `<ISO-8601 UTC> | <current taskId or -> | <one-line state> | <next-action-by ISO-8601 UTC>`
-  (e.g. `2026-07-06T14:02:11Z | ENG-142 | implementing, subtask 3/5 | 2026-07-06T14:12:11Z`).
-  The declared deadline may shorten but never extend `STUCK_AFTER_MINUTES`; the
+- **Heartbeat:** between work steps, atomically rewrite your assigned instance heartbeat
+  with `<ISO-8601 UTC> | <current taskId or -> | <one-line state> |
+  <optional next-action-by ISO-8601 UTC>` (e.g. `2026-07-06T14:02:11Z |
+  ENG-142 | implementing, subtask 3/5 | 2026-07-06T14:07:11Z`). A requested
+  next-action time may shorten but never extend `STUCK_AFTER_MINUTES`; the
   status classifier caps it at that TTL. Three-field legacy heartbeats remain
   readable and receive a derived deadline.
 - **Degradation:** if the workspace directory is unreachable (different machine),
@@ -700,14 +703,15 @@ the release transaction described by `reference/deployment.md`.
 loop decides when that is — read all heartbeats, your mailbox, and the tracker,
 act on **every** pending event in one pass, then exit.
 
-Detect:
-- **Lifecycle verdict** — `launch-team.sh status <team>` combines the protected
-  process identity with the bounded heartbeat deadline and reports `active`,
-  `starting`, `exited`, `identity-mismatch`, or a typed `stalled:*` reason.
-  `stalled:idle-no-assignment`, `stalled:waiting-on-gate`,
-  `stalled:no-heartbeat`, and `stalled:no-progress` are different recovery
-  inputs; do not collapse them into a generic hang.
-- **Stuck** — heartbeat older than `STUCK_AFTER_MINUTES`; an `[Active]` [task] with
+Detect from `bin/launch-team.sh status <team> --json`, which joins an
+authenticated external lifecycle record to the bounded semantic heartbeat and
+returns typed verdicts (`starting`, `active`, `exited`, `identity-mismatch`, or
+`stalled:<reason>`). Workspace PID/heartbeat mtimes alone are never authority.
+`stalled:idle-no-assignment`, `stalled:waiting-on-gate`,
+`stalled:no-heartbeat`, and `stalled:no-progress` are different recovery inputs;
+do not collapse them into a generic hang.
+
+- **Stuck** — an authenticated `stalled:<reason>` verdict; an `[Active]` [task] with
   no new comment past the threshold; a `[design-note]`, question, or
   `[review-request]` that nobody answered (both architects are on the hot path —
   monitor them like anyone else). **A teammate that goes idle while you are
@@ -733,7 +737,10 @@ Autonomous mode therefore requires its sandbox/cgroup/container/service job to
 contain every descendant; broker fences still reject stale escaped output.
 
 Recovery ladder for non-Blocked work — in order, one rung at a time:
-1. **Message** the agent (mailbox + tracker comment) with a concrete instruction.
+1. **Nudge** the exact task with an authenticated Team Lead `nudge-task`
+   request naming the missing artifact. Refresh after
+   `STALE_NUDGE_GRACE_SECONDS`; do not keep extending the same attempt with
+   generic “still working?” messages.
 2. **Decide** — make a binding process decision. Architecture disputes go to both
    architects; an independent team-lead may adjudicate a recorded trade-off. If
    the lead is mapped to either architect, or a Critical risk would be accepted,
@@ -741,10 +748,15 @@ Recovery ladder for non-Blocked work — in order, one rung at a time:
 3. **Reassign** — `[handoff]` comment summarizing state; when the current
    transition is legal and the [task] is not human-held, move it back to
    `[Planned]`, clear the assignee, and relaunch a fresh agent.
-4. **Kill & relaunch** — quarantine the dead instance's working copy first (see
-   *Recovery* → *Relaunch hygiene*), then
-   `bin/launch-team.sh relaunch <team> <featureId> <role>` (or respawn in the
-   harness). The replacement resumes from tracker state alone.
+4. **Stop & replace** — submit an authenticated `restart-task` control bound to
+   the exact attempt, the completed nudge receipt, and protected lifecycle
+   `createdAt`. The broker rechecks fresh tracker revision/status, claim and
+   execution digests, holds, and nudge grace; issues a protected operation-bound
+   grant; stops only that generation; revokes its publication
+   capability, quarantines dirty work, and starts N+1. Role controls use
+   `retire-role`/`restart-role`; generic control never targets the integrator.
+   `MAX_AUTOMATIC_RESTARTS`, `MAX_AUTHORIZED_RESTARTS`, and
+   `RESTART_BACKOFF_SECONDS` are hard circuit breakers.
 5. **Escalate** — `[escalation]` comment + append to `ESCALATIONS.md`. Reserved for
    scope/business-rule questions, destructive actions, or after
    `ESCALATE_AFTER_ATTEMPTS` failed rungs.
@@ -782,11 +794,15 @@ missing state.
 
 ### Relaunch hygiene
 
-A killed or unresponsive task instance may leave uncommitted writes in its
-attempt worktree. Quarantine or remove that worktree, then create attempt N+1 on
-the same task branch. Reviewed checkpoint commits survive; uncommitted residue
-does not cross attempts unless the successor explicitly salvages and justifies
-it against the approved design. Gate-role recovery remains tracker-driven.
+A stopped or unresponsive task instance may leave uncommitted writes in its
+attempt worktree. The broker removes a clean worktree. A dirty worktree is moved
+intact beneath the broker-owned lifecycle root at
+`quarantine-worktrees/<repo>/<team>/<safe-task-key>/attempt-<N>-<control>/` on a
+quarantine branch before attempt N+1 starts; `.teamwork/.../quarantine/` holds
+only its operator-facing manifest. Quarantined residue never crosses attempts
+and is never salvaged or merged automatically; a later human decision may
+inspect it. Reviewed checkpoint commits on the task branch survive. Gate-role
+recovery remains tracker-driven.
 
 ## Andon cord
 

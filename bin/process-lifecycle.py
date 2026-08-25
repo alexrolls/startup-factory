@@ -569,6 +569,19 @@ def base_context(args: argparse.Namespace) -> tuple[Path, Path, bytes]:
     return initialize(args.root, args.repo)
 
 
+def enforce_expected_generation(record: dict[str, Any], args: argparse.Namespace) -> None:
+    expected_created = getattr(args, "expected_created_at", None)
+    if expected_created is not None and record.get("createdAt") != expected_created:
+        fail("protected lifecycle generation changed before the requested action")
+    if not getattr(args, "expect_token_stdin", False):
+        return
+    expected_token = sys.stdin.readline().strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_token):
+        fail("expected lifecycle token on stdin is malformed")
+    if not hmac.compare_digest(str(record.get("launchToken") or ""), expected_token):
+        fail("protected lifecycle generation changed before the requested action")
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     root, _, _ = base_context(args)
     print(root)
@@ -652,6 +665,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
     if found is None:
         return NOT_LIVE
     _, record = found
+    enforce_expected_generation(record, args)
     if record_state(record) != "live":
         return NOT_LIVE
     print(json.dumps(record, sort_keys=True, separators=(",", ":")))
@@ -690,6 +704,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     if found is None:
         return NOT_LIVE
     _, record = found
+    enforce_expected_generation(record, args)
     state = record_state(record)
     if state == "dead":
         return NOT_LIVE
@@ -707,6 +722,7 @@ def cmd_signal(args: argparse.Namespace) -> int:
     if found is None:
         return NOT_LIVE
     _, record = found
+    enforce_expected_generation(record, args)
     signal_number = {
         "TERM": signal.SIGTERM,
         "KILL": signal.SIGKILL,
@@ -723,6 +739,7 @@ def cmd_forget(args: argparse.Namespace) -> int:
     if found is None:
         return 0
     path, record = found
+    enforce_expected_generation(record, args)
     state = record_state(record)
     if state == "live":
         fail(f"refusing to forget a live lifecycle record for {args.team}/{args.instance}")
@@ -763,6 +780,7 @@ def parser() -> argparse.ArgumentParser:
         child.add_argument("--team", required=True)
         child.add_argument("--category", required=True, choices=("gate", "task", "release"))
         child.add_argument("--instance", required=True)
+        child.add_argument("--expect-token-stdin", action="store_true")
         child.set_defaults(handler=handler)
 
     listing = common("list")
@@ -779,6 +797,7 @@ def parser() -> argparse.ArgumentParser:
     signalling.add_argument("--team", required=True)
     signalling.add_argument("--category", required=True, choices=("gate", "task", "release"))
     signalling.add_argument("--instance", required=True)
+    signalling.add_argument("--expect-token-stdin", action="store_true")
     signalling.add_argument(
         "--signal", dest="signal_name", choices=("TERM", "KILL"), default="TERM"
     )
@@ -788,6 +807,8 @@ def parser() -> argparse.ArgumentParser:
     forget.add_argument("--team", required=True)
     forget.add_argument("--category", required=True, choices=("gate", "task", "release"))
     forget.add_argument("--instance", required=True)
+    forget.add_argument("--expect-token-stdin", action="store_true")
+    forget.add_argument("--expected-created-at")
     forget.add_argument("--allow-identity-mismatch", action="store_true")
     forget.set_defaults(handler=cmd_forget)
     return result

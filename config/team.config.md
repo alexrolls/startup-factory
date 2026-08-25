@@ -82,6 +82,13 @@ DOCTOR_TIMEOUT_SECONDS=60        # Per distinct configured command. team/gate-te
 POLL_INTERVAL_SECONDS=120        # Fallback only; local runtime events wake dispatch within ~1s
 STUCK_AFTER_MINUTES=15           # Lead treats silence longer than this as "stuck"
 ESCALATE_AFTER_ATTEMPTS=2        # Failed unblock attempts before the Lead escalates to the human
+TURBO_MODE=off                   # off|safe. Safe is a fail-closed readiness profile; it never
+                                 # weakens gates or silently overrides conflicting settings.
+START_GRACE_SECONDS=60           # Missing semantic heartbeat is tolerated only during startup.
+STALE_NUDGE_GRACE_SECONDS=120    # Grace after one named-artifact nudge before Lead-authorized restart.
+MAX_AUTOMATIC_RESTARTS=1         # Per-target dead worker/Team Lead recovery before escalation.
+MAX_AUTHORIZED_RESTARTS=2        # Team Lead restart circuit breaker per task or gate role.
+RESTART_BACKOFF_SECONDS=30       # Minimum delay before a replacement attempt is eligible.
 TRACKER_WRITERS=broker           # broker = single-writer mode: only deterministic dispatcher/
                                  # supervisor processes hold credentials and post on agents' behalf
                                  # (reference/orchestration.md → "Tracker write modes")
@@ -112,9 +119,10 @@ AGENT_SANDBOX_ENFORCED=false     # true routes every LLM command and WORKTREE_SE
 BROKER_LIFECYCLE_ROOT=null       # Absolute pre-created mode-0700 directory, external and disjoint
                                  # from the repository. Required when AGENT_SANDBOX_ENFORCED=true
                                  # (or supply STARTUP_FACTORY_LIFECYCLE_STATE_ROOT to the broker).
-                                 # Authenticated PID/start-time/tmux records live here; .teamwork
-                                 # contains non-authoritative markers only. Agent sandboxes must not
-                                 # be able to read or write this directory.
+                                 # Authenticated PID/start-time/tmux records, control receipts, and
+                                 # preserved dirty-attempt worktrees live here; size it accordingly.
+                                 # .teamwork contains non-authoritative markers/manifests only.
+                                 # Agent sandboxes must not be able to read or write this directory.
 ```
 
 Review depth (`REVIEW_MODE=sequential|parallel|tiered`) is a **per-team** choice

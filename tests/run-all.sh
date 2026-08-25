@@ -34,6 +34,13 @@ esac
 
 FULL_PYTHON_TESTS=(
   ticket-content-security-test.py
+  heartbeat-status-test.py
+  worker-control-test.py
+  protected-control-policy-test.py
+  team-context-test.py
+  team-policy-test.py
+  process-lifecycle-generation-test.py
+  safe-turbo-readiness-test.py
   retrospective-test.py
   product-acceptance-test.py
   superpowers-planning-test.py
@@ -60,6 +67,13 @@ FULL_SHELL_TESTS=(
 )
 SMOKE_PYTHON_TESTS=(
   ticket-content-security-test.py
+  heartbeat-status-test.py
+  worker-control-test.py
+  protected-control-policy-test.py
+  team-context-test.py
+  team-policy-test.py
+  process-lifecycle-generation-test.py
+  safe-turbo-readiness-test.py
   retrospective-test.py
   product-acceptance-test.py
   superpowers-planning-test.py
