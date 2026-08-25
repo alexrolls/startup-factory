@@ -4,6 +4,7 @@ set -euo pipefail
 umask 077
 
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+POLICY_SOURCE_ROOT="${STARTUP_FACTORY_TEAM_POLICY_SOURCE_ROOT:-$SKILL_DIR}"
 CONFIG="$SKILL_DIR/config/team.config.md"
 
 die() { echo "finalize-integrations: $*" >&2; exit 1; }
@@ -64,7 +65,7 @@ PY
     if ! python3 "$SKILL_DIR/bin/team_policy.py" \
       --repo "$(git_unprivileged rev-parse --show-toplevel)" \
       --workspace "$policy_workspace" --team "$policy_team" --feature "$policy_feature" \
-      --skill "$SKILL_DIR" > "$policy_tmp"; then
+      --skill "$SKILL_DIR" --source-skill "$POLICY_SOURCE_ROOT" > "$policy_tmp"; then
       rm -f -- "$policy_tmp"
       return 1
     fi
@@ -281,12 +282,13 @@ PY
   [ ! -L "$snapshot" ] || die "authorization snapshot path is a symlink"
   "$SKILL_DIR/bin/tracker-ops.sh" export "$feature" "$snapshot" >/dev/null
   python3 - "$entry" "$snapshot" "$repo" "$workspace" "$team" "$feature" \
-    "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/bin/review_evidence.py" "$SKILL_DIR" <<'PY'
+    "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/bin/review_evidence.py" \
+    "$SKILL_DIR" "$POLICY_SOURCE_ROOT" <<'PY'
 import hashlib, json, os, re, stat, subprocess, sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-entry_raw,snapshot_raw,repo_raw,workspace_raw,team,feature,board_raw,review_module_raw,skill_raw=sys.argv[1:]
+entry_raw,snapshot_raw,repo_raw,workspace_raw,team,feature,board_raw,review_module_raw,skill_raw,policy_source_raw=sys.argv[1:]
 entry,snapshot,repo,workspace=Path(entry_raw),Path(snapshot_raw),Path(repo_raw).resolve(),Path(workspace_raw).resolve()
 sys.dont_write_bytecode=True; sys.path.insert(0,str(Path(review_module_raw).resolve().parent))
 from review_evidence import EvidenceError, SUPPORTING_GATE_MARKERS, request_binding, validate as validate_review_evidence
@@ -339,7 +341,7 @@ def assert_unheld(task):
     if record is not None and record.get("state") in {"blocked","resume-review-pending","manual-takeover"}:
         fail("task %s is held (%s)"%(task,record.get("state")))
 regular(entry,"prepared transaction",1024*1024); regular(snapshot,"fresh tracker snapshot",8*1024*1024)
-try: preset_text=load_team_policy(repo,workspace,team,feature,Path(skill_raw).resolve()).text
+try: preset_text=load_team_policy(repo,workspace,team,feature,Path(skill_raw).resolve(),Path(policy_source_raw).resolve()).text
 except (OSError,TeamPolicyError) as exc: fail("cannot authenticate team policy: %s"%exc)
 try: preset_gates=required_review_gates(preset_text)
 except ValueError as exc: fail("invalid team preset review gates: %s"%exc)
@@ -631,11 +633,13 @@ fi
 # evidence bindings. Output is a stable line protocol consumed below.
 validate_entry() {
   local entry="$1" snapshot="${2:-}"
-  python3 - "$entry" "$repo" "$workspace" "$team" "$feature" "$snapshot" "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/bin/review_evidence.py" "$SKILL_DIR" <<'PY'
+  python3 - "$entry" "$repo" "$workspace" "$team" "$feature" "$snapshot" \
+    "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/bin/review_evidence.py" \
+    "$SKILL_DIR" "$POLICY_SOURCE_ROOT" <<'PY'
 import hashlib, json, os, re, stat, subprocess, sys
 from pathlib import Path
 
-entry_raw, repo_raw, workspace_raw, team, feature, snapshot_raw, board_raw, review_module_raw, skill_raw = sys.argv[1:]
+entry_raw, repo_raw, workspace_raw, team, feature, snapshot_raw, board_raw, review_module_raw, skill_raw, policy_source_raw = sys.argv[1:]
 repo, workspace = Path(repo_raw).resolve(), Path(workspace_raw).resolve()
 entry = Path(entry_raw)
 sys.dont_write_bytecode = True
@@ -920,7 +924,12 @@ expected_signers = {
 }
 try:
     preset_text = load_team_policy(
-        repo, workspace, team, feature, Path(skill_raw).resolve()
+        repo,
+        workspace,
+        team,
+        feature,
+        Path(skill_raw).resolve(),
+        Path(policy_source_raw).resolve(),
     ).text
 except (OSError, TeamPolicyError) as exc:
     fail("cannot authenticate team policy: %s" % exc)

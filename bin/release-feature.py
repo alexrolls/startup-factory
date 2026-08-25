@@ -760,6 +760,8 @@ def trusted_file_specs() -> dict[str, tuple[Path, Path]]:
         "policy-check.py": ((SKILL_DIR / "bin" / "policy-check.py").resolve(), Path("bin/policy-check.py")),
         "tracker-ops.sh": ((SKILL_DIR / "bin" / "tracker-ops.sh").resolve(), Path("bin/tracker-ops.sh")),
         "finalize-integrations.sh": ((SKILL_DIR / "bin" / "finalize-integrations.sh").resolve(), Path("bin/finalize-integrations.sh")),
+        "team-context.py": ((SKILL_DIR / "bin" / "team-context.py").resolve(), Path("bin/team-context.py")),
+        "team_policy.py": ((SKILL_DIR / "bin" / "team_policy.py").resolve(), Path("bin/team_policy.py")),
         "task-hold.py": ((SKILL_DIR / "bin" / "task-hold.py").resolve(), Path("bin/task-hold.py")),
         "outbox_capability.py": ((SKILL_DIR / "bin" / "outbox_capability.py").resolve(), Path("bin/outbox_capability.py")),
         "broker_evidence.py": ((SKILL_DIR / "bin" / "broker_evidence.py").resolve(), Path("bin/broker_evidence.py")),
@@ -2858,6 +2860,9 @@ def execute(args: argparse.Namespace) -> int:
         raise ReleaseError("feature branch did not resolve to a full commit hash")
 
     tracker_env = read_environment(config, "trackerEnvironmentAllowlist", repository)
+    tracker_env["STARTUP_FACTORY_TEAM_POLICY_SOURCE_ROOT"] = os.environ.get(
+        "STARTUP_FACTORY_TEAM_POLICY_SOURCE_ROOT", str(SKILL_DIR)
+    )
     lifecycle_authority = os.environ.get("STARTUP_FACTORY_LIFECYCLE_STATE_ROOT")
     if lifecycle_authority:
         # Internal broker authority is deliberately not a deployment-provider

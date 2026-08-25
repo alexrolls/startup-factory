@@ -95,10 +95,15 @@ def load_team_policy(
     team: str,
     feature: str,
     skill: Path,
+    source_skill: Path | None = None,
 ) -> TeamPolicy:
     repository = canonical_directory(repository, "repository")
     workspace = canonical_directory(workspace, "team workspace")
     skill = canonical_directory(skill, "Startup Factory root")
+    source_skill = canonical_directory(
+        source_skill if source_skill is not None else skill,
+        "Startup Factory policy source root",
+    )
     projection = workspace / "preset.env"
     verifier = skill / "bin" / "team-context.py"
     if verifier.is_symlink() or not verifier.is_file():
@@ -140,7 +145,7 @@ def load_team_policy(
             "verify",
             *identity_arguments,
             "--skill",
-            str(skill),
+            str(source_skill),
         ],
         text=True,
         stdout=subprocess.PIPE,
@@ -167,7 +172,7 @@ def load_team_policy(
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,62}", preset):
             raise TeamPolicyError("protected team-context preset identity is invalid")
         raw = bounded_regular_bytes(
-            skill / "teams" / f"{preset}.md", "protected team preset"
+            source_skill / "teams" / f"{preset}.md", "protected team preset"
         )
         if digest(raw) != receipt.get("sourceSha256"):
             raise TeamPolicyError("protected team preset changed after verification")
@@ -186,9 +191,15 @@ def main() -> int:
     parser.add_argument("--team", required=True)
     parser.add_argument("--feature", required=True)
     parser.add_argument("--skill", required=True, type=Path)
+    parser.add_argument("--source-skill", type=Path)
     args = parser.parse_args()
     policy = load_team_policy(
-        args.repo, args.workspace, args.team, args.feature, args.skill
+        args.repo,
+        args.workspace,
+        args.team,
+        args.feature,
+        args.skill,
+        args.source_skill,
     )
     sys.stdout.write(policy.text)
     return 0

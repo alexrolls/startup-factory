@@ -42,6 +42,8 @@ RELEASE_SNAPSHOT_FILES = {
     "policy-check.py": Path("bin/policy-check.py"),
     "tracker-ops.sh": Path("bin/tracker-ops.sh"),
     "finalize-integrations.sh": Path("bin/finalize-integrations.sh"),
+    "team-context.py": Path("bin/team-context.py"),
+    "team_policy.py": Path("bin/team_policy.py"),
     "task-hold.py": Path("bin/task-hold.py"),
     "outbox_capability.py": Path("bin/outbox_capability.py"),
     "broker_evidence.py": Path("bin/broker_evidence.py"),
@@ -1053,6 +1055,7 @@ def validate_release_handoff(
             "STARTUP_FACTORY_RELEASE_FEATURE must name bin/release-feature.py in the external skill install"
         )
     release_env = minimal_release_environment(config)
+    release_env["STARTUP_FACTORY_TEAM_POLICY_SOURCE_ROOT"] = str(source_root)
     snapshot_files = dict(RELEASE_SNAPSHOT_FILES)
     pm_values = read_key_values(source_root / "config" / "project-management.config.md")
     tracker_adapter = release_env.get("TRACKER_ADAPTER") or pm_values.get(
