@@ -68,7 +68,7 @@ account, API key, application server, or coordinator database.
    ```
 
    For Claude Code, use `--agent claude-code`. Pin a release in controlled
-   environments, for example `startup-factory@0.1.14`. For a Git checkout or an
+   environments, for example `startup-factory@0.1.15`. For a Git checkout or an
    offline installation, use the
    [auditable shell compatibility path](#shell-compatibility-path).
 
@@ -874,7 +874,8 @@ requires byte-identical output, embeds those exact bytes in the wheel and source
 distribution, exercises the built wheel, generates GitHub provenance
 attestations, and publishes through PyPI Trusted Publishing. The GitHub Release
 is created from the same already-tested artifacts; nothing is rebuilt during
-publication.
+publication. A post-publish job resolves the exact public package with `uvx`
+and verifies its reported version before the GitHub Release is finalized.
 
 Before the first release, a maintainer must register the `startup-factory` PyPI
 Trusted Publisher for `.github/workflows/release.yml` on the `pypi` GitHub
@@ -883,9 +884,22 @@ required reviewers for unattended publication, protect `main` with Package CI
 as a required check, and enable immutable GitHub Releases. Every successful
 push produced by a merge to `main` runs the release workflow. The merge must
 advance the version in `pyproject.toml` because PyPI package versions are
-immutable. After the exact merged commit is tested, attested, and published to
-PyPI, the workflow creates the matching `vX.Y.Z` tag and GitHub Release from the
-same artifacts.
+immutable; Package CI rejects a pull request that still names an existing
+`vX.Y.Z` tag so this is caught before merge. After the exact merged commit is
+tested, attested, and published to PyPI, CI waits for the public
+`uvx startup-factory@X.Y.Z` and `uvx startup-factory@latest` paths to resolve
+that version and then creates the matching tag and GitHub Release from the same
+artifacts. Release runs are serialized so closely spaced merges cannot publish
+out of order. There is no separate `uvx` registry: `uvx` installs the
+distribution published on PyPI.
+
+The unattended merge-to-release path is therefore:
+
+```text
+PR Package CI -> merge to main -> full release validation -> reproducible build
+-> attest -> PyPI Trusted Publishing -> public uvx verification
+-> immutable vX.Y.Z GitHub Release
+```
 
 Multi-agent teams require the **target project** to be a git repository because
 every implementation attempt receives a task branch and git worktree. The skill
@@ -920,6 +934,51 @@ VALIDATE_TEST="<your deterministic test command>"
 TRACKER_WRITERS=broker
 AGENT_SANDBOX_ENFORCED=true
 BROKER_LIFECYCLE_ROOT=/absolute/operator-owned/mode-0700/path
+```
+
+These are runtime settings, not prompt flags. A prompt that says "Turbo" does
+not enable the mode, create the protected lifecycle directory, or weaken a
+failed readiness check. Configure `config/team.config.md` in the installed
+Startup Factory bundle first. Use real project commands rather than no-op
+placeholders; for example, `WORKTREE_SETUP="uv sync --frozen"` with
+`VALIDATE_TEST="uv run pytest -q"`, or `WORKTREE_SETUP="npm ci"` with
+`VALIDATE_TEST="npm test"`.
+
+Once the operator-owned prerequisites exist, this prompt is the recommended
+entry point:
+
+```text
+Use the installed Startup Factory skill to deliver [FEATURE] with the
+full-stack team in Safe Turbo mode.
+
+Before launching agents, verify TURBO_MODE=safe, EXECUTION=parallel,
+MAX_ACTIVE_IMPLEMENTERS=2, TRACKER_WRITERS=broker, enforced agent sandboxing,
+a meaningful WORKTREE_SETUP and validation command, an external protected
+BROKER_LIFECYCLE_ROOT, and REVIEW_MODE=parallel. Run preflight and fail closed
+with a precise remediation message if any prerequisite is missing; do not
+bypass or weaken a gate.
+
+Plan dependency- and resource-safe tasks, dispatch at most two implementers in
+parallel, keep each attempt in its own worktree, and keep integration serialized.
+Run Principal Architect, Sceptical Principal Architect, QA, and risk-triggered
+Security review independently against the same immutable package, with Team
+Lead making the final decision.
+
+Monitor authenticated heartbeat and lifecycle status. For a stalled task, have
+Team Lead nudge the exact attempt, wait the configured grace period, and request
+an authenticated restart only if that same attempt is still stalled. Retire an
+idle gate role when its queue is empty. Report active workers, queued tasks,
+validation failures, restarts, review findings, and final integration status.
+```
+
+After the project has a proven stable Turbo configuration, the short form is:
+
+```text
+Deliver [FEATURE] with the installed Startup Factory skill, the full-stack
+preset, and Safe Turbo mode. Start with two parallel implementers, preserve all
+architecture, QA, security, and integration gates, monitor authenticated
+heartbeats, and use Team Lead nudge/restart/retire controls for stalled or idle
+agents. Fail closed if Turbo preflight is not green.
 ```
 
 The selected team must also declare `REVIEW_MODE=parallel`; the full-stack
