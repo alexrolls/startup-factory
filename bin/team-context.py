@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from outbox_capability import CapabilityError, git_common_dir
 

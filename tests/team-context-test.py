@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -79,7 +80,15 @@ class TeamContextTests(unittest.TestCase):
             arguments.extend(("--preset", preset or self.preset))
         elif preset is not None:
             arguments.extend(("--expected-preset", preset))
-        return subprocess.run(arguments, text=True, capture_output=True, check=False)
+        environment = dict(os.environ)
+        environment["PYTHONSAFEPATH"] = "1"
+        return subprocess.run(
+            arguments,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
 
     def issue(self, *, preset: str | None = None) -> dict[str, object]:
         result = self.command("issue", preset=preset)
