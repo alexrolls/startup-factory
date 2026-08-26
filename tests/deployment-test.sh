@@ -196,6 +196,8 @@ trusted={name:digest(pathlib.Path(root)/rel) for name,rel in {
   "policy-check.py":"bin/policy-check.py",
   "tracker-ops.sh":"bin/tracker-ops.sh",
   "finalize-integrations.sh":"bin/finalize-integrations.sh",
+  "team-context.py":"bin/team-context.py",
+  "team_policy.py":"bin/team_policy.py",
   "task-hold.py":"bin/task-hold.py",
   "outbox_capability.py":"bin/outbox_capability.py",
   "broker_evidence.py":"bin/broker_evidence.py",

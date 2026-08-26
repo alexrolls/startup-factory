@@ -61,7 +61,7 @@ executor refuses unless all of these hold:
   immutable commit; archive inspection separately rejects every gitlink;
 - the external config and private state root pass path/type/owner/permission
   checks; the config digest is transaction-bound; and configured hook
-  executables plus all sixteen trusted Startup Factory files match their protected pins;
+  executables plus all twenty trusted Startup Factory files match their protected pins;
 - the exact commit is exported with credential-free Git into the protected release
   directory, gitlinks/submodules, unsafe archive members, and Git LFS pointers are
   rejected, and `plan` runs only inside that read-only materialization. Untracked
@@ -201,11 +201,14 @@ setting `enabled`):
     "policy-check.py": "sha256:<64 lowercase hex>",
     "tracker-ops.sh": "sha256:<64 lowercase hex>",
     "finalize-integrations.sh": "sha256:<64 lowercase hex>",
+    "team-context.py": "sha256:<64 lowercase hex>",
+    "team_policy.py": "sha256:<64 lowercase hex>",
     "task-hold.py": "sha256:<64 lowercase hex>",
     "outbox_capability.py": "sha256:<64 lowercase hex>",
     "broker_evidence.py": "sha256:<64 lowercase hex>",
     "retrospective.py": "sha256:<64 lowercase hex>",
     "runtime-state.py": "sha256:<64 lowercase hex>",
+    "ticket_content_security.py": "sha256:<64 lowercase hex>",
     "task_metadata.py": "sha256:<64 lowercase hex>",
     "product_acceptance.py": "sha256:<64 lowercase hex>",
     "teamwork-path.py": "sha256:<64 lowercase hex>",
@@ -255,7 +258,7 @@ executor interprets normalized tracker records, not provider-specific objects.
 
 Only configured hooks need a `trustedHookDigests` entry; `plan`, `apply`,
 `status`, `verify`, and `verifyCi` are required. `verifyApproval` is required in
-`approval-required`; `verifyDelivery` is required in `automatic`. The sixteen
+`approval-required`; `verifyDelivery` is required in `automatic`. The twenty
 `trustedCodeDigests` keys above are exact and all are required whenever delivery
 is enabled with a shipped adapter. A custom adapter adds exactly one required
 entry, `"tracker-backend.<AdapterName>.py": "sha256:<64 lowercase hex>"`, for
@@ -597,7 +600,7 @@ break-glass mutation outside Startup Factory: require two-person review, record
 the observed target/artifact/release ID, archive `active.json`, remove it, and
 only then re-enable one scheduler.
 
-The supervisor first captures the sixteen pinned helper/config files into
+The supervisor first captures the twenty pinned helper/config files into
 `stateRoot/supervisor-entrypoints/<config-digest>` and starts only that protected
 entrypoint/config snapshot. The release executor then independently reads and
 hashes those snapshot files through open descriptors and copies them beneath

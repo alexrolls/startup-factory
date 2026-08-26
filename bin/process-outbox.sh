@@ -42,6 +42,38 @@ preset_file="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --
 python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative events.ndjson >/dev/null
 mkdir -p "$pending" "$bodies" "$staged" "$authority" "$done" "$failed" "$locks"
 
+trusted_policy_file=""
+trusted_policy_digest=""
+team_context_required=no
+if [ -e "$preset_file" ] || [ -L "$preset_file" ]; then
+  team_context_required=yes
+else
+  team_context_probe_rc=0
+  python3 "$SKILL_DIR/bin/team-context.py" probe \
+    --repo "$repo" --workspace "$workspace" --team "$team" --feature "$feature" >/dev/null \
+    || team_context_probe_rc=$?
+  case "$team_context_probe_rc" in
+    0) team_context_required=yes ;;
+    3) ;;
+    *) echo "process-outbox: could not inspect protected team preset authority" >&2; exit 1 ;;
+  esac
+fi
+if [ "$team_context_required" = yes ]; then
+  team_context="$(python3 "$SKILL_DIR/bin/team-context.py" verify \
+    --repo "$repo" --workspace "$workspace" --team "$team" --feature "$feature" \
+    --skill "$SKILL_DIR")" \
+    || { echo "process-outbox: protected team preset authority is unavailable" >&2; exit 1; }
+  trusted_preset="$(printf '%s' "$team_context" | python3 -c 'import json,sys; print(json.load(sys.stdin)["preset"])')" \
+    || { echo "process-outbox: protected team preset authority is malformed" >&2; exit 1; }
+  if [ "$trusted_preset" = - ]; then
+    trusted_policy_file="$preset_file"
+    trusted_policy_digest="$(printf '%s' "$team_context" | python3 -c 'import json,sys; print(json.load(sys.stdin)["projectionSha256"])')"
+  else
+    trusted_policy_file="$SKILL_DIR/teams/$trusted_preset.md"
+    trusted_policy_digest="$(printf '%s' "$team_context" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sourceSha256"])')"
+  fi
+fi
+
 current_snapshot=""
 cleanup_snapshot() {
   if [ -n "$current_snapshot" ] && [ -f "$current_snapshot" ] && [ ! -L "$current_snapshot" ]; then
@@ -94,12 +126,12 @@ PY
   fi
   if ! validation_output="$(python3 - "$entry" "$workspace" "$team" "$feature" \
       "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/config/project-management.config.md" \
-      "$preset_file" "$pending" "$bodies" "$staged" "$current_snapshot" "$repo" "$SKILL_DIR" <<'PY'
+      "$trusted_policy_file" "$trusted_policy_digest" "$pending" "$bodies" "$staged" "$current_snapshot" "$repo" "$SKILL_DIR" <<'PY'
 import hashlib, json, os, re, stat, sys
 from pathlib import Path
 
 (entry, workspace, expected_team, expected_feature, board_path, pm_path,
- preset, pending, bodies, staged, snapshot_path, repository, skill_dir) = sys.argv[1:]
+ policy_file, policy_digest, pending, bodies, staged, snapshot_path, repository, skill_dir) = sys.argv[1:]
 
 def fail(message):
     print("process-outbox: " + message, file=sys.stderr)
@@ -336,10 +368,14 @@ if ignored.intersection(label.strip().casefold() for label in labels):
     fail("task is labeled for human work; every agent publication is stopped")
 
 protocol = {}
-if os.path.lexists(preset):
-    if os.path.islink(preset) or not os.path.isfile(preset) or os.path.getsize(preset) > 1024 * 1024:
-        fail("team preset must be a bounded non-symlink regular file")
-    for line in open(preset):
+if policy_file:
+    if os.path.islink(policy_file) or not os.path.isfile(policy_file) or os.path.getsize(policy_file) > 1024 * 1024:
+        fail("trusted team policy must be a bounded non-symlink regular file")
+    policy_bytes = open(policy_file, "rb").read()
+    observed_policy_digest = "sha256:" + hashlib.sha256(policy_bytes).hexdigest()
+    if observed_policy_digest != policy_digest:
+        fail("trusted team policy changed after broker verification")
+    for line in policy_bytes.decode("utf-8").splitlines():
         match = re.match(r"PROTOCOL_([A-Z_]+)=(.+)$", line.strip())
         if match:
             name, concrete = match.groups()
@@ -684,8 +720,8 @@ PY
       read -r base head package_digest <<EOF
 $binding
 EOF
-      review_gates="$(python3 - "$current_snapshot" "$task" "$SKILL_DIR/bin" "$preset_file" <<'PY'
-import json, os, sys
+      review_gates="$(python3 - "$current_snapshot" "$task" "$SKILL_DIR/bin" "$trusted_policy_file" "$trusted_policy_digest" <<'PY'
+import hashlib, json, os, sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, sys.argv[3])
 from task_metadata import effective_review_gates, parse_task_metadata
@@ -694,11 +730,17 @@ task = next((item for item in snapshot.get("tasks") or [] if str(item.get("taskI
 if task is None:
     raise SystemExit("process-outbox: review task disappeared from the authoritative snapshot")
 preset = sys.argv[4]
+expected_digest = sys.argv[5]
 preset_text = ""
-if os.path.lexists(preset):
+if preset:
+    if not os.path.lexists(preset):
+        raise SystemExit("process-outbox: trusted team policy disappeared")
     if os.path.islink(preset) or not os.path.isfile(preset) or os.path.getsize(preset) > 1024 * 1024:
-        raise SystemExit("process-outbox: team preset must be a bounded non-symlink regular file")
-    preset_text = open(preset).read()
+        raise SystemExit("process-outbox: trusted team policy must be a bounded non-symlink regular file")
+    policy_bytes = open(preset, "rb").read()
+    if "sha256:" + hashlib.sha256(policy_bytes).hexdigest() != expected_digest:
+        raise SystemExit("process-outbox: trusted team policy changed after broker verification")
+    preset_text = policy_bytes.decode("utf-8")
 print(",".join(effective_review_gates(
     parse_task_metadata(task.get("description"), task.get("title")),
     preset_text,
