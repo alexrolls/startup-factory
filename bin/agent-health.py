@@ -125,26 +125,83 @@ def repository_identity(repository_raw: str | Path) -> str:
     return hashlib.sha256(material).hexdigest()
 
 
-def read_bounded_json(path: Path) -> dict[str, Any] | None:
+def directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def open_directory_at(
+    parent_descriptor: int, name: str, label: str
+) -> int | None:
     try:
-        named = path.lstat()
-    except (FileNotFoundError, OSError):
+        descriptor = os.open(name, directory_flags(), dir_fd=parent_descriptor)
+    except FileNotFoundError:
         return None
-    if stat.S_ISLNK(named.st_mode) or not stat.S_ISREG(named.st_mode):
-        return None
-    if named.st_size > MAX_EXECUTION_BYTES:
-        return None
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    except OSError as exc:
+        raise AgentHealthError(f"cannot open {label} safely: {exc}") from exc
     try:
-        descriptor = os.open(path, flags)
-    except OSError:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise AgentHealthError(f"{label} is not a directory")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def open_workspace_descriptor(workspace_host: Path, workspace: Path) -> int | None:
+    """Open a managed workspace without following any relative path component."""
+
+    try:
+        relative = workspace.relative_to(workspace_host)
+    except ValueError as exc:
+        raise AgentHealthError("managed workspace is outside its teamwork host") from exc
+    if not relative.parts:
+        raise AgentHealthError("managed workspace must be below its teamwork host")
+    try:
+        named_host = workspace_host.stat(follow_symlinks=False)
+        descriptor = os.open(workspace_host, directory_flags())
+    except OSError as exc:
+        raise AgentHealthError(f"cannot open teamwork host safely: {exc}") from exc
+    try:
+        opened_host = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened_host.st_mode) or (
+            opened_host.st_dev,
+            opened_host.st_ino,
+        ) != (named_host.st_dev, named_host.st_ino):
+            raise AgentHealthError("teamwork host changed identity while being opened")
+        for part in relative.parts:
+            child = open_directory_at(descriptor, part, "managed workspace")
+            if child is None:
+                os.close(descriptor)
+                return None
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def read_bounded_json_at(parent_descriptor: int, name: str) -> dict[str, Any] | None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise AgentHealthError(f"cannot open execution record safely: {exc}") from exc
     try:
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
-            named.st_dev,
-            named.st_ino,
-        ):
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size > MAX_EXECUTION_BYTES:
             return None
         chunks: list[bytes] = []
         remaining = MAX_EXECUTION_BYTES + 1
@@ -155,13 +212,14 @@ def read_bounded_json(path: Path) -> dict[str, Any] | None:
             chunks.append(chunk)
             remaining -= len(chunk)
         raw = b"".join(chunks)
-        if len(raw) > MAX_EXECUTION_BYTES:
+        if len(raw) > MAX_EXECUTION_BYTES or len(raw) != opened.st_size:
             return None
         after = os.fstat(descriptor)
-        if (opened.st_dev, opened.st_ino, opened.st_size) != (
+        if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
             after.st_dev,
             after.st_ino,
             after.st_size,
+            after.st_mtime_ns,
         ):
             return None
     finally:
@@ -173,53 +231,84 @@ def read_bounded_json(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def execution_binding(workspace: Path, instance: str) -> dict[str, Any] | None:
-    directory = workspace / "executions"
+def execution_binding(
+    workspace_host: Path,
+    workspace: Path,
+    workspace_descriptor: int | None,
+    instance: str,
+) -> dict[str, Any] | None:
+    match = heartbeat_status.TASK_INSTANCE_RE.fullmatch(instance)
+    if match is None:
+        return None
+    role = match.group("role")
+    task_key = match.group("task_key")
+    attempt = int(match.group("attempt"))
+    if not re.fullmatch(r"[a-z0-9-]{1,63}", role) or not IDENTIFIER.fullmatch(task_key):
+        return None
     try:
-        info = directory.lstat()
-    except (FileNotFoundError, OSError):
+        teamwork_path.child(
+            str(workspace_host), workspace, f"executions/{task_key}.json"
+        )
+    except (OSError, RuntimeError, SystemExit) as exc:
+        raise AgentHealthError("cannot resolve managed execution record path") from exc
+    if workspace_descriptor is None:
         return None
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+    executions_descriptor = open_directory_at(
+        workspace_descriptor, "executions", "managed executions directory"
+    )
+    if executions_descriptor is None:
         return None
-    matches: list[dict[str, Any]] = []
     try:
-        paths = list(directory.iterdir())
-    except OSError:
+        record = read_bounded_json_at(executions_descriptor, f"{task_key}.json")
+    finally:
+        os.close(executions_descriptor)
+    if record is None:
         return None
-    for path in paths:
-        if not path.name.endswith(".json"):
-            continue
-        record = read_bounded_json(path)
-        if record is None:
-            continue
-        task_id = record.get("taskId")
-        task_key = record.get("taskKey")
-        role = record.get("role")
-        attempt = record.get("attempt")
-        if (
-            not isinstance(task_id, str)
-            or not task_id
-            or len(task_id) > 1024
-            or any(ord(character) < 32 or character == "|" for character in task_id)
-            or not isinstance(task_key, str)
-            or not IDENTIFIER.fullmatch(task_key)
-            or not isinstance(role, str)
-            or not re.fullmatch(r"[a-z0-9-]{1,63}", role)
-            or type(attempt) is not int
-            or attempt < 1
-        ):
-            continue
-        expected_key = re.sub(
-            r"[^a-zA-Z0-9]+", "-", task_id
-        ).strip("-").lower()[:32] or "task"
-        expected_key += "-" + hashlib.sha256(task_id.encode()).hexdigest()[:10]
-        if task_key != expected_key or path.name != f"{task_key}.json":
-            continue
-        if f"{role}--{task_key}--a{attempt}" == instance:
-            matches.append(
-                {"taskId": task_id, "taskKey": task_key, "role": role, "attempt": attempt}
-            )
-    return matches[0] if len(matches) == 1 else None
+    task_id = record.get("taskId")
+    if (
+        not isinstance(task_id, str)
+        or not task_id
+        or len(task_id) > 1024
+        or any(ord(character) < 32 or character == "|" for character in task_id)
+        or record.get("taskKey") != task_key
+        or record.get("role") != role
+        or type(record.get("attempt")) is not int
+        or record.get("attempt") != attempt
+    ):
+        return None
+    expected_key = (
+        re.sub(r"[^a-zA-Z0-9]+", "-", task_id).strip("-").lower()[:32]
+        or "task"
+    )
+    expected_key += "-" + hashlib.sha256(task_id.encode()).hexdigest()[:10]
+    if task_key != expected_key:
+        return None
+    return {"taskId": task_id, "taskKey": task_key, "role": role, "attempt": attempt}
+
+
+def heartbeat_value(
+    workspace_host: Path,
+    workspace: Path,
+    workspace_descriptor: int | None,
+    instance: str,
+    *,
+    read: bool = True,
+) -> str | None:
+    try:
+        teamwork_path.child(str(workspace_host), workspace, f"heartbeats/{instance}")
+    except (OSError, RuntimeError, SystemExit) as exc:
+        raise AgentHealthError("cannot resolve managed heartbeat path") from exc
+    if not read or workspace_descriptor is None:
+        return None
+    heartbeats_descriptor = open_directory_at(
+        workspace_descriptor, "heartbeats", "managed heartbeats directory"
+    )
+    if heartbeats_descriptor is None:
+        return None
+    try:
+        return heartbeat_status.read_heartbeat_at(heartbeats_descriptor, instance)
+    finally:
+        os.close(heartbeats_descriptor)
 
 
 def validate_envelope(envelope: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[str]]:
@@ -242,20 +331,14 @@ def validate_envelope(envelope: dict[str, Any]) -> tuple[str, list[dict[str, Any
 
 def assessment_for(
     record: dict[str, Any],
-    heartbeat: Path,
+    heartbeat: str | None,
     binding: dict[str, Any] | None,
     now: datetime,
     stuck_minutes: int,
     start_grace_seconds: int,
 ) -> dict[str, Any]:
     state = record.get("state")
-    if state in {"dead", "identity-mismatch"}:
-        value = None
-    else:
-        try:
-            value = heartbeat_status.read_heartbeat(heartbeat)
-        except heartbeat_status.HeartbeatError as exc:
-            return heartbeat_status.stalled("stalled:invalid-heartbeat", None, str(exc))
+    value = None if state in {"dead", "identity-mismatch"} else heartbeat
     arguments: dict[str, Any] = {
         "expected_instance": record["instance"],
         "start_grace": heartbeat_status.timedelta(seconds=start_grace_seconds),
@@ -322,27 +405,43 @@ def build_snapshot(
             workspace = teamwork_path.workspace(str(workspace_host), teamwork_root, team)
         except (OSError, RuntimeError, SystemExit) as exc:
             raise AgentHealthError(f"cannot resolve managed team workspace for {team}") from exc
-        binding = execution_binding(workspace, instance) if category == "task" else None
-        if category == "task" and binding is None:
-            warnings.append(
-                f"Managed task agent {team}/{instance} has no unique current execution binding; assignment and percentage were omitted."
-            )
+        workspace_descriptor = open_workspace_descriptor(workspace_host, workspace)
         try:
-            heartbeat = teamwork_path.child(
-                str(workspace_host), workspace, f"heartbeats/{instance}"
+            binding = (
+                execution_binding(
+                    workspace_host, workspace, workspace_descriptor, instance
+                )
+                if category == "task"
+                else None
             )
-        except (OSError, RuntimeError, SystemExit) as exc:
-            raise AgentHealthError(
-                f"cannot resolve managed heartbeat path for {team}/{instance}"
-            ) from exc
-        assessment = assessment_for(
-            record,
-            heartbeat,
-            binding,
-            now,
-            stuck_minutes,
-            start_grace_seconds,
-        )
+            if category == "task" and binding is None:
+                warnings.append(
+                    f"Managed task agent {team}/{instance} has no unique current execution binding; assignment and percentage were omitted."
+                )
+            try:
+                heartbeat = heartbeat_value(
+                    workspace_host,
+                    workspace,
+                    workspace_descriptor,
+                    instance,
+                    read=record.get("state") not in {"dead", "identity-mismatch"},
+                )
+            except heartbeat_status.HeartbeatError as exc:
+                assessment = heartbeat_status.stalled(
+                    "stalled:invalid-heartbeat", None, str(exc)
+                )
+            else:
+                assessment = assessment_for(
+                    record,
+                    heartbeat,
+                    binding,
+                    now,
+                    stuck_minutes,
+                    start_grace_seconds,
+                )
+        finally:
+            if workspace_descriptor is not None:
+                os.close(workspace_descriptor)
         try:
             created = heartbeat_status.parse_time(record.get("createdAt"), "lifecycle createdAt")
         except heartbeat_status.HeartbeatError as exc:

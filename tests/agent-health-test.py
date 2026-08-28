@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,10 +63,10 @@ class AgentHealthTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.repo = Path(self.temp.name)
-        workspace = self.repo / ".teamwork" / "feature-a"
-        (workspace / "executions").mkdir(parents=True)
-        (workspace / "heartbeats").mkdir()
-        (workspace / "executions" / f"{TASK_KEY}.json").write_text(
+        self.workspace = self.repo / ".teamwork" / "feature-a"
+        (self.workspace / "executions").mkdir(parents=True)
+        (self.workspace / "heartbeats").mkdir()
+        (self.workspace / "executions" / f"{TASK_KEY}.json").write_text(
             json.dumps(
                 {
                     "taskId": TASK_ID,
@@ -76,7 +77,7 @@ class AgentHealthTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        self.heartbeat = workspace / "heartbeats" / f"backend--{TASK_KEY}--a2"
+        self.heartbeat = self.workspace / "heartbeats" / f"backend--{TASK_KEY}--a2"
 
     def tearDown(self):
         self.temp.cleanup()
@@ -194,6 +195,75 @@ class AgentHealthTest(unittest.TestCase):
         self.heartbeat.parent.symlink_to(outside, target_is_directory=True)
         with self.assertRaises(agent_health.AgentHealthError):
             self.snapshot()
+
+    def test_execution_lookup_never_scans_large_fanout(self):
+        for index in range(1000):
+            (self.workspace / "executions" / f"decoy-{index}.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+        self.heartbeat.write_text(
+            "2026-08-24T18:10:00Z | TASK-1 | implementing; attempt=2; progress=42\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            Path, "iterdir", side_effect=AssertionError("execution lookup must not scan")
+        ):
+            row = self.snapshot()["agents"][0]
+        self.assertEqual(TASK_ID, row["taskId"])
+        self.assertEqual(42, row["progressPercent"])
+
+    def test_execution_ancestor_swap_after_policy_validation_fails_closed(self):
+        outside = self.repo / "outside-executions"
+        outside.mkdir()
+        (outside / f"{TASK_KEY}.json").write_text(
+            json.dumps(
+                {
+                    "taskId": TASK_ID,
+                    "taskKey": TASK_KEY,
+                    "role": "backend",
+                    "attempt": 2,
+                }
+            ),
+            encoding="utf-8",
+        )
+        original_child = agent_health.teamwork_path.child
+
+        def swap_after_validation(repo, workspace, relative):
+            resolved = original_child(repo, workspace, relative)
+            if relative == f"executions/{TASK_KEY}.json":
+                executions = self.workspace / "executions"
+                executions.rename(self.workspace / "executions-before-swap")
+                executions.symlink_to(outside, target_is_directory=True)
+            return resolved
+
+        with mock.patch.object(
+            agent_health.teamwork_path, "child", side_effect=swap_after_validation
+        ):
+            with self.assertRaises(agent_health.AgentHealthError):
+                self.snapshot()
+
+    def test_heartbeat_ancestor_swap_after_policy_validation_fails_closed(self):
+        outside = self.repo / "outside-heartbeats-after-validation"
+        outside.mkdir()
+        (outside / self.heartbeat.name).write_text(
+            "2026-08-24T18:10:00Z | TASK-1 | implementing; attempt=2; progress=90\n",
+            encoding="utf-8",
+        )
+        original_child = agent_health.teamwork_path.child
+
+        def swap_after_validation(repo, workspace, relative):
+            resolved = original_child(repo, workspace, relative)
+            if relative == f"heartbeats/{self.heartbeat.name}":
+                heartbeats = self.workspace / "heartbeats"
+                heartbeats.rename(self.workspace / "heartbeats-before-swap")
+                heartbeats.symlink_to(outside, target_is_directory=True)
+            return resolved
+
+        with mock.patch.object(
+            agent_health.teamwork_path, "child", side_effect=swap_after_validation
+        ):
+            with self.assertRaises(agent_health.AgentHealthError):
+                self.snapshot()
 
     def test_release_lifecycle_process_is_omitted_as_a_non_agent(self):
         snapshot = self.snapshot(

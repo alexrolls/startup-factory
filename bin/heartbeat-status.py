@@ -47,6 +47,75 @@ def iso(value: datetime) -> str:
     )
 
 
+def _read_open_heartbeat(
+    descriptor: int, expected_identity: tuple[int, int] | None = None
+) -> str:
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode):
+        raise HeartbeatError("heartbeat must be a non-symlink regular file")
+    if expected_identity is not None and (opened.st_dev, opened.st_ino) != expected_identity:
+        raise HeartbeatError("heartbeat changed identity while being read")
+    if opened.st_size > MAX_HEARTBEAT_BYTES:
+        raise HeartbeatError("heartbeat exceeds the 4096-byte limit")
+    chunks: list[bytes] = []
+    remaining = MAX_HEARTBEAT_BYTES + 1
+    while remaining:
+        chunk = os.read(descriptor, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    raw = b"".join(chunks)
+    if len(raw) > MAX_HEARTBEAT_BYTES:
+        raise HeartbeatError("heartbeat exceeds the 4096-byte limit")
+    if len(raw) != opened.st_size:
+        raise HeartbeatError("heartbeat changed size while being read")
+    after = os.fstat(descriptor)
+    if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise HeartbeatError("heartbeat changed identity or contents while being read")
+    try:
+        text = raw.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise HeartbeatError("heartbeat is not UTF-8") from exc
+    if any(ord(char) < 32 for char in text):
+        raise HeartbeatError("heartbeat must be exactly one printable line")
+    return text
+
+
+def read_heartbeat_at(parent_descriptor: int, name: str) -> str | None:
+    """Read a heartbeat leaf relative to an already-verified directory."""
+
+    if (
+        not isinstance(name, str)
+        or name in {"", ".", ".."}
+        or os.path.basename(name) != name
+        or "/" in name
+        or "\\" in name
+    ):
+        raise HeartbeatError("heartbeat name must be one safe path component")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise HeartbeatError(f"cannot open heartbeat safely: {exc}") from exc
+    try:
+        return _read_open_heartbeat(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def read_heartbeat(path: Path) -> str | None:
     try:
         info = path.lstat()
@@ -64,30 +133,7 @@ def read_heartbeat(path: Path) -> str | None:
     except OSError as exc:
         raise HeartbeatError(f"cannot open heartbeat safely: {exc}") from exc
     try:
-        current = os.fstat(descriptor)
-        if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
-            info.st_dev,
-            info.st_ino,
-        ):
-            raise HeartbeatError("heartbeat changed identity while being read")
-        chunks: list[bytes] = []
-        remaining = MAX_HEARTBEAT_BYTES + 1
-        while remaining:
-            chunk = os.read(descriptor, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        raw = b"".join(chunks)
-        if len(raw) > MAX_HEARTBEAT_BYTES:
-            raise HeartbeatError("heartbeat exceeds the 4096-byte limit")
-        try:
-            text = raw.decode("utf-8").strip()
-        except UnicodeDecodeError as exc:
-            raise HeartbeatError("heartbeat is not UTF-8") from exc
-        if any(ord(char) < 32 for char in text):
-            raise HeartbeatError("heartbeat must be exactly one printable line")
-        return text
+        return _read_open_heartbeat(descriptor, (info.st_dev, info.st_ino))
     finally:
         os.close(descriptor)
 
