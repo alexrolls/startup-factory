@@ -35,6 +35,7 @@ esac
 FULL_PYTHON_TESTS=(
   ticket-content-security-test.py
   agent-health-test.py
+  pm-agent-health-test.py
   heartbeat-status-test.py
   worker-control-test.py
   protected-control-policy-test.py
@@ -69,6 +70,7 @@ FULL_SHELL_TESTS=(
 SMOKE_PYTHON_TESTS=(
   ticket-content-security-test.py
   agent-health-test.py
+  pm-agent-health-test.py
   heartbeat-status-test.py
   worker-control-test.py
   protected-control-policy-test.py

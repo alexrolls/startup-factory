@@ -682,7 +682,10 @@ for required_file in \
   adapters/Linear.md \
   adapters/Markdown.md \
   bin/dispatch.sh \
+  bin/agent-health.py \
+  bin/heartbeat-status.py \
   bin/launch-team.sh \
+  bin/process-lifecycle.py \
   bin/superpowers-planning.py \
   bin/pm-agent.py \
   bin/policy-check.py \
@@ -690,6 +693,7 @@ for required_file in \
   bin/retrospective.py \
   bin/runtime-state.py \
   bin/ticket_content_security.py \
+  bin/teamwork-path.py \
   bin/tracker-ops.sh \
   bin/update-installed-skill.sh \
   config/project-management.config.md \

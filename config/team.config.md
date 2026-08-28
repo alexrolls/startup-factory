@@ -134,6 +134,13 @@ protected lifecycle elapsed time for live agents. Unmanaged agents are never inf
 from workspace PID markers. Deterministic release lifecycle processes are not agents;
 the health envelope omits them and reports only a non-identifying omission count.
 
+The external `bin/pm-agent.py --healthcheck` command publishes the same JSON
+semantics atomically at the canonical primary worktree's
+`.teamwork/pm-agent/agent-health.json`. Its default five-minute watch deadline is
+independent of the board scan clock. This cache is presentation-only and must
+never be read as lifecycle, scheduling, recovery, review, integration, or
+release authority; a failed refresh preserves its previous generation.
+
 Review depth (`REVIEW_MODE=sequential|parallel|tiered`) is a **per-team** choice
 and lives in the team file (`teams/<preset>.md`, next to `ROSTER=`), not here —
 see `teams/_PLAYBOOK.md` → *Review modes*.

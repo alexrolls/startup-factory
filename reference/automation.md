@@ -101,6 +101,29 @@ configuration checks ToDo/queued and Blocked work every three minutes. Existing
 external configs that specify only `pollSeconds` remain supported for migration;
 setting both fields is rejected as ambiguous.
 
+`healthcheckIntervalMinutes` independently controls current-project health
+publication, is also a strict integer from 1 through 1440, and defaults to `5`.
+`pm-agent.py --healthcheck` performs one health-only pass even when portfolio
+automation is disabled: it does not initialize a tracker adapter, scan or mutate
+the board, invoke workflow/release code, or signal an agent. `--watch` publishes
+health immediately, then advances separate monotonic scan and health deadlines;
+an overrun skips missed slots rather than producing a catch-up burst, and a
+failure on either clock does not suppress the other.
+
+Successful collection atomically replaces
+`.teamwork/pm-agent/agent-health.json` in the canonical primary worktree. The
+snapshot is `agent-health-snapshot-v1`, is project-bound, records `generatedAt`,
+and remains presentation-only. It is never consumed as lifecycle or workflow
+authority. Failure preserves the prior complete bytes and generation time.
+Percentages remain optional, self-reported, exact-attempt-bound, and fresh only
+for the snapshot interval; otherwise a live managed row exposes elapsed time.
+Other projects and legacy unbound records are omitted. An external runtime with
+insufficient protected attribution degrades to an explicit warning and no
+fabricated rows. The cadence is an observer guarantee and never wakes an LLM.
+For unattended use a scheduler can run `--healthcheck` every five minutes, with
+overlap prevention owned by that scheduler; `--watch` is the interactive/service
+alternative with an internal health-only publication lock.
+
 `observeStatusKinds`, `launchStatusKinds`, and `blockedTaskPolicy` intentionally
 have no permissive variants. Autonomous delivery requires observation of exactly
 `queued` plus `blocked`, launches exactly `queued`, and enforces a task-scoped,

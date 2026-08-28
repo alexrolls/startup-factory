@@ -48,8 +48,11 @@ for adapter in GitHubIssues Jira Linear Markdown; do
 done
 for required_file in \
   adapters/_TEMPLATE.md \
+  bin/agent-health.py \
   bin/dispatch.sh \
+  bin/heartbeat-status.py \
   bin/launch-team.sh \
+  bin/process-lifecycle.py \
   bin/superpowers-planning.py \
   bin/pm-agent.py \
   bin/policy-check.py \
@@ -57,6 +60,7 @@ for required_file in \
   bin/retrospective.py \
   bin/runtime-state.py \
   bin/ticket_content_security.py \
+  bin/teamwork-path.py \
   bin/tracker-ops.sh \
   extensions/tracker-backends/README.md \
   reference/automation.md \

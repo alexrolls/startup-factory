@@ -370,11 +370,14 @@ def build_snapshot(
     now: datetime,
     stuck_minutes: int,
     start_grace_seconds: int,
+    interval_seconds: int = INTERVAL_SECONDS,
 ) -> dict[str, Any]:
     if not 1 <= stuck_minutes <= 24 * 60:
         raise AgentHealthError("stuck minutes must be from 1 to 1440")
     if not 1 <= start_grace_seconds <= 86400:
         raise AgentHealthError("start grace must be from 1 to 86400 seconds")
+    if not 1 <= interval_seconds <= 86400:
+        raise AgentHealthError("observer interval must be from 1 to 86400 seconds")
     repository = Path(repo).resolve(strict=True)
     workspace_host = Path(teamwork_host or repository).resolve(strict=True)
     repository_id, records, warnings = validate_envelope(envelope)
@@ -507,7 +510,7 @@ def build_snapshot(
         "schemaVersion": SCHEMA,
         "generatedAt": iso(now),
         "repositoryId": repository_id,
-        "intervalSeconds": INTERVAL_SECONDS,
+        "intervalSeconds": interval_seconds,
         "presentationOnly": True,
         "nonAgentProcessesOmitted": non_agent_processes_omitted,
         "agents": rows,
@@ -515,12 +518,16 @@ def build_snapshot(
     }
 
 
-def unmanaged_snapshot(repository_id: str, now: datetime) -> dict[str, Any]:
+def unmanaged_snapshot(
+    repository_id: str, now: datetime, interval_seconds: int = INTERVAL_SECONDS
+) -> dict[str, Any]:
+    if not 1 <= interval_seconds <= 86400:
+        raise AgentHealthError("observer interval must be from 1 to 86400 seconds")
     return {
         "schemaVersion": SCHEMA,
         "generatedAt": iso(now),
         "repositoryId": repository_id,
-        "intervalSeconds": INTERVAL_SECONDS,
+        "intervalSeconds": interval_seconds,
         "presentationOnly": True,
         "nonAgentProcessesOmitted": 0,
         "agents": [],
@@ -645,6 +652,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--lifecycle-root")
     result.add_argument("--stuck-minutes", required=True, type=int)
     result.add_argument("--start-grace-seconds", required=True, type=int)
+    result.add_argument("--interval-seconds", type=int, default=INTERVAL_SECONDS)
     result.add_argument("--json", action="store_true")
     result.add_argument("--watch", action="store_true")
     result.add_argument("--now", help="fixed ISO-8601 time for a one-shot deterministic probe")
@@ -670,16 +678,19 @@ def main() -> int:
                 now=now,
                 stuck_minutes=args.stuck_minutes,
                 start_grace_seconds=args.start_grace_seconds,
+                interval_seconds=args.interval_seconds,
             )
         else:
-            snapshot = unmanaged_snapshot(repository_identity(repository), now)
+            snapshot = unmanaged_snapshot(
+                repository_identity(repository), now, args.interval_seconds
+            )
         if args.json:
             print(json.dumps(snapshot, sort_keys=True, separators=(",", ":")), flush=True)
         else:
             print(render_table(snapshot), flush=True)
 
     if args.watch:
-        watch(emit)
+        watch(emit, interval_seconds=args.interval_seconds)
     else:
         emit()
     return 0
