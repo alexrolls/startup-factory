@@ -29,6 +29,7 @@ from ticket_content_security import (
     protect_ticket_content,
     security_report,
 )
+from team_policy import TeamPolicyError, load_team_policy
 
 
 MARKER_RE = re.compile(r"^\s*\[([\w-]+)\]")
@@ -278,12 +279,29 @@ def cmd_wait(args) -> None:
 
 def cmd_sync(args) -> None:
     workspace = Path(args.workspace)
-    preset_path = workspace / "preset.env"
-    preset_text = ""
-    if os.path.lexists(preset_path):
-        if preset_path.is_symlink() or not preset_path.is_file():
-            raise SystemExit("runtime-state: team preset must be a non-symlink regular file")
-        preset_text = preset_path.read_text()
+    if args.repo:
+        repository = Path(args.repo).resolve(strict=True)
+    else:
+        completed = subprocess.run(
+            ["git", "-C", str(workspace), "rev-parse", "--show-toplevel"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise SystemExit("runtime-state: cannot resolve repository for team policy")
+        repository = Path(completed.stdout.strip()).resolve(strict=True)
+    try:
+        preset_text = load_team_policy(
+            repository,
+            workspace.resolve(strict=True),
+            args.team,
+            args.feature,
+            Path(__file__).resolve().parent.parent,
+        ).text
+    except (OSError, TeamPolicyError) as exc:
+        raise SystemExit(f"runtime-state: {exc}") from exc
     payload = read_json(Path(args.tasks), {})
     tasks = payload.get("tasks") or []
     try:
@@ -867,6 +885,7 @@ def build_parser() -> argparse.ArgumentParser:
     wait.set_defaults(func=cmd_wait)
 
     sync = sub.add_parser("sync")
+    sync.add_argument("--repo")
     sync.add_argument("--workspace", required=True)
     sync.add_argument("--team", required=True)
     sync.add_argument("--feature", required=True)

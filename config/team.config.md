@@ -25,11 +25,11 @@ exceptions: they require and roster Security for every task.
 ```
 TEAM_LEAD_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
 PRINCIPAL_ARCHITECT_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
-SCEPTICAL_ARCHITECT_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
-SENIOR_SECURITY_ENGINEER_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
+SCEPTICAL_ARCHITECT_CMD="codex exec --approve-for-me \"$(cat '{prompt_file}')\""
+SENIOR_SECURITY_ENGINEER_CMD="codex exec --approve-for-me \"$(cat '{prompt_file}')\""
 INTEGRATOR_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
-BACKEND_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
-FRONTEND_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
+BACKEND_CMD="codex exec --approve-for-me \"$(cat '{prompt_file}')\""
+FRONTEND_CMD="codex exec --approve-for-me \"$(cat '{prompt_file}')\""
 QA_CMD=null
 REVIEWER_CMD="gemini --yolo \"$(cat '{prompt_file}')\""
 TEAM_DEFAULT_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
@@ -41,7 +41,8 @@ TASK_STRONG_CMD=null             # Optional override for security/schema/concurr
 
 > Mixing LLMs is the design intent — e.g. Claude for team-lead/principal-architect,
 > Codex for the sceptical-architect, Senior Security Engineer, and implementers,
-> Gemini for optional review diversity.
+> Gemini or DeepSeek Harness (`dsh --profile headless "$(cat '{prompt_file}')"`)
+> for optional review diversity.
 > Use a different model family or provider for the two architect roles when
 > possible; role separation without model diversity reduces authority bias but
 > does less to reduce correlated reasoning errors. Same-LLM teams still work.
@@ -81,6 +82,13 @@ DOCTOR_TIMEOUT_SECONDS=60        # Per distinct configured command. team/gate-te
 POLL_INTERVAL_SECONDS=120        # Fallback only; local runtime events wake dispatch within ~1s
 STUCK_AFTER_MINUTES=15           # Lead treats silence longer than this as "stuck"
 ESCALATE_AFTER_ATTEMPTS=2        # Failed unblock attempts before the Lead escalates to the human
+TURBO_MODE=off                   # off|safe. Safe is a fail-closed readiness profile; it never
+                                 # weakens gates or silently overrides conflicting settings.
+START_GRACE_SECONDS=60           # Missing semantic heartbeat is tolerated only during startup.
+STALE_NUDGE_GRACE_SECONDS=120    # Grace after one named-artifact nudge before Lead-authorized restart.
+MAX_AUTOMATIC_RESTARTS=1         # Per-target dead worker/Team Lead recovery before escalation.
+MAX_AUTHORIZED_RESTARTS=2        # Team Lead restart circuit breaker per task or gate role.
+RESTART_BACKOFF_SECONDS=30       # Minimum delay before a replacement attempt is eligible.
 TRACKER_WRITERS=broker           # broker = single-writer mode: only deterministic dispatcher/
                                  # supervisor processes hold credentials and post on agents' behalf
                                  # (reference/orchestration.md → "Tracker write modes")
@@ -117,9 +125,10 @@ AGENT_SANDBOX_ENFORCED=false     # true routes every LLM command and WORKTREE_SE
 BROKER_LIFECYCLE_ROOT=null       # Absolute pre-created mode-0700 directory, external and disjoint
                                  # from the repository. Required when AGENT_SANDBOX_ENFORCED=true
                                  # (or supply STARTUP_FACTORY_LIFECYCLE_STATE_ROOT to the broker).
-                                 # Authenticated PID/start-time/tmux records live here; .teamwork
-                                 # contains non-authoritative markers only. Agent sandboxes must not
-                                 # be able to read or write this directory.
+                                 # Authenticated PID/start-time/tmux records, control receipts, and
+                                 # preserved dirty-attempt worktrees live here; size it accordingly.
+                                 # .teamwork contains non-authoritative markers/manifests only.
+                                 # Agent sandboxes must not be able to read or write this directory.
 AGENT_RUNTIME_MANIFEST=null      # External digest-bound rootless Podman/runtime policy manifest.
                                   # Configuration is not boundary proof; offline doctor stays yellow.
 ```
@@ -178,6 +187,8 @@ is "no new failures", not "all green".
   model CLI requires a home for authentication, configure `AGENT_SANDBOX_HOME`
   as a dedicated external mode-0700 directory containing only its minimum
   reviewed CLI state. Do not point it at the operator's normal home.
+  For DeepSeek Harness, that state is `$DSH_HOME` (`.credentials.yaml`,
+  `settings.yaml`, `profiles/headless/`), which resolves under `HOME` by default.
 - Run `bin/launch-team.sh doctor <preset> <team> <featureId>` after changing a
   role command, CLI login, sandbox runner, allowlist, or dedicated CLI-state
   home. Normal `team` and `gate-team` launches run it automatically after the

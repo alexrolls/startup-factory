@@ -58,8 +58,8 @@ licensed**
 Start with one agent and the local Markdown tracker. You do not need a tracker
 account, API key, application server, or coordinator database.
 
-1. **Install Startup Factory from your project root.** Codex and Aider use the
-   shared Agent Skills project directory:
+1. **Install Startup Factory from your project root.** Codex, Aider, and
+   DeepSeek Harness use the shared Agent Skills project directory:
 
    ```bash
    uvx startup-factory@latest install --agent codex
@@ -68,7 +68,7 @@ account, API key, application server, or coordinator database.
    ```
 
    For Claude Code, use `--agent claude-code`. Pin a release in controlled
-   environments, for example `startup-factory@0.1.9`. For a Git checkout or an
+   environments, for example `startup-factory@0.1.15`. For a Git checkout or an
    offline installation, use the
    [auditable shell compatibility path](#shell-compatibility-path).
 
@@ -711,6 +711,7 @@ Choose the project path your agent supports:
 | **Codex** | `.agents/skills/startup-factory` | Native project skill path |
 | **Claude Code** | `.claude/skills/startup-factory` | Native project skill path |
 | **Aider** | `.agents/skills/startup-factory` | Start with `aider --read .agents/skills/startup-factory/SKILL.md` |
+| **DeepSeek Harness** | `.agents/skills/startup-factory` | Reads `AGENTS.md` natively; add a pointer there or paste `SKILL.md` as the task |
 | **Other agents** | Their native project skill directory | Use native discovery or point the agent at `SKILL.md` |
 
 The release package embeds one deterministic bundle built from an exact Git
@@ -724,6 +725,9 @@ uvx startup-factory@latest install --agent codex
 
 # Claude Code
 uvx startup-factory@latest install --agent claude-code
+
+# DeepSeek Harness
+uvx startup-factory@latest install --agent deepseek-harness
 
 # Alternative isolated runner
 pipx run startup-factory install --agent codex
@@ -855,7 +859,7 @@ installation into a partial one. Its main operator options are:
 
 | Option | Purpose |
 |---|---|
-| `--agent codex\|claude-code\|aider` | Select the native project skill directory. |
+| `--agent codex\|claude-code\|aider\|deepseek-harness` | Select the native project skill directory. |
 | `--project PATH` | Resolve the agent directory relative to another project. |
 | `--install-dir PATH` | Override the mapped installation directory. |
 | `--bundle PATH` | For install/update, use an explicitly supplied local canonical archive. |
@@ -918,7 +922,8 @@ requires byte-identical output, embeds those exact bytes in the wheel and source
 distribution, exercises the built wheel, generates GitHub provenance
 attestations, and publishes through PyPI Trusted Publishing. The GitHub Release
 is created from the same already-tested artifacts; nothing is rebuilt during
-publication.
+publication. A post-publish job resolves the exact public package with `uvx`
+and verifies its reported version before the GitHub Release is finalized.
 
 Before the first release, a maintainer must register the `startup-factory` PyPI
 Trusted Publisher for `.github/workflows/release.yml` on the `pypi` GitHub
@@ -927,9 +932,22 @@ required reviewers for unattended publication, protect `main` with Package CI
 as a required check, and enable immutable GitHub Releases. Every successful
 push produced by a merge to `main` runs the release workflow. The merge must
 advance the version in `pyproject.toml` because PyPI package versions are
-immutable. After the exact merged commit is tested, attested, and published to
-PyPI, the workflow creates the matching `vX.Y.Z` tag and GitHub Release from the
-same artifacts.
+immutable; Package CI rejects a pull request that still names an existing
+`vX.Y.Z` tag so this is caught before merge. After the exact merged commit is
+tested, attested, and published to PyPI, CI waits for the public
+`uvx startup-factory@X.Y.Z` and `uvx startup-factory@latest` paths to resolve
+that version and then creates the matching tag and GitHub Release from the same
+artifacts. Release runs are serialized so closely spaced merges cannot publish
+out of order. There is no separate `uvx` registry: `uvx` installs the
+distribution published on PyPI.
+
+The unattended merge-to-release path is therefore:
+
+```text
+PR Package CI -> merge to main -> full release validation -> reproducible build
+-> attest -> PyPI Trusted Publishing -> public uvx verification
+-> immutable vX.Y.Z GitHub Release
+```
 
 Multi-agent teams require the **target project** to be a git repository because
 every implementation attempt receives a task branch and git worktree. The skill
@@ -948,6 +966,102 @@ task-branch/worktree isolation: **`sequential`** runs one task worker at a time;
 **`parallel`** dispatches dependency/resource-safe waves, bounded by
 `MAX_ACTIVE_IMPLEMENTERS` (default 2 when unset). Gate roles and integration
 remain serialized where required.
+
+### Safe Turbo mode
+
+`TURBO_MODE=safe` is the supported fast profile. It is a fail-closed readiness
+check, not a switch that weakens review or silently rewrites other settings.
+Configure the prerequisites explicitly:
+
+```text
+TURBO_MODE=safe
+EXECUTION=parallel
+MAX_ACTIVE_IMPLEMENTERS=2
+WORKTREE_SETUP="<your reproducible dependency/build setup>"
+VALIDATE_TEST="<your deterministic test command>"
+TRACKER_WRITERS=broker
+AGENT_SANDBOX_ENFORCED=true
+BROKER_LIFECYCLE_ROOT=/absolute/operator-owned/mode-0700/path
+```
+
+These are runtime settings, not prompt flags. A prompt that says "Turbo" does
+not enable the mode, create the protected lifecycle directory, or weaken a
+failed readiness check. Configure `config/team.config.md` in the installed
+Startup Factory bundle first. Use real project commands rather than no-op
+placeholders; for example, `WORKTREE_SETUP="uv sync --frozen"` with
+`VALIDATE_TEST="uv run pytest -q"`, or `WORKTREE_SETUP="npm ci"` with
+`VALIDATE_TEST="npm test"`.
+
+Once the operator-owned prerequisites exist, this prompt is the recommended
+entry point:
+
+```text
+Use the installed Startup Factory skill to deliver [FEATURE] with the
+full-stack team in Safe Turbo mode.
+
+Before launching agents, verify TURBO_MODE=safe, EXECUTION=parallel,
+MAX_ACTIVE_IMPLEMENTERS=2, TRACKER_WRITERS=broker, enforced agent sandboxing,
+a meaningful WORKTREE_SETUP and validation command, an external protected
+BROKER_LIFECYCLE_ROOT, and REVIEW_MODE=parallel. Run preflight and fail closed
+with a precise remediation message if any prerequisite is missing; do not
+bypass or weaken a gate.
+
+Plan dependency- and resource-safe tasks, dispatch at most two implementers in
+parallel, keep each attempt in its own worktree, and keep integration serialized.
+Run Principal Architect, Sceptical Principal Architect, QA, and risk-triggered
+Security review independently against the same immutable package, with Team
+Lead making the final decision.
+
+Monitor authenticated heartbeat and lifecycle status. For a stalled task, have
+Team Lead nudge the exact attempt, wait the configured grace period, and request
+an authenticated restart only if that same attempt is still stalled. Retire an
+idle gate role when its queue is empty. Report active workers, queued tasks,
+validation failures, restarts, review findings, and final integration status.
+```
+
+After the project has a proven stable Turbo configuration, the short form is:
+
+```text
+Deliver [FEATURE] with the installed Startup Factory skill, the full-stack
+preset, and Safe Turbo mode. Start with two parallel implementers, preserve all
+architecture, QA, security, and integration gates, monitor authenticated
+heartbeats, and use Team Lead nudge/restart/retire controls for stalled or idle
+agents. Fail closed if Turbo preflight is not green.
+```
+
+The selected team must also declare `REVIEW_MODE=parallel`; the full-stack
+preset is Turbo-ready. Startup refuses Safe Turbo when lifecycle authority,
+sandboxing, broker-only tracker writes, reproducible worktree setup, bounded
+parallelism, at least one meaningful validation command, or parallel independent
+review is missing. Start at two
+implementers, observe queue time and failure rate, and increase no higher than
+four only when the repository's tests and dependency graph remain stable.
+
+The fast path combines ten optimizations without removing a gate:
+
+1. event-driven dispatch with polling only as fallback;
+2. dependency/resource-aware bounded implementation waves;
+3. one branch and worktree per task attempt;
+4. one reproducible `WORKTREE_SETUP` per fresh attempt;
+5. lean immutable task packets instead of full-team prompt duplication;
+6. risk-aware fast/standard/strong model routing;
+7. one-shot gate roles consuming batched queues on demand;
+8. parallel Principal, Sceptical, QA, and risk-triggered Security review of the
+   same immutable package, with Team Lead still final;
+9. typed semantic heartbeat diagnostics joined to authenticated process state;
+10. attempt-fenced recovery with bounded restart/backoff and dirty-work
+    quarantine.
+
+`aggressive`, adaptive, and distributed modes are intentionally unsupported;
+unknown `TURBO_MODE` values are rejected.
+
+The launcher also HMAC-binds the selected preset and its exact trusted
+`teams/<preset>.md` source in broker-owned Git state. The generated
+`.teamwork/<team>/preset.env` is a display projection, never authorization:
+launcher, dispatcher, control worker, outbox, hold, progress, and integration
+paths verify the protected team context before consuming role or review policy.
+Deleting or editing a managed projection fails closed rather than downgrading
+the team to manual defaults.
 
 ---
 
@@ -975,8 +1089,8 @@ opt-out.
 ```
 TEAM_LEAD_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
 PRINCIPAL_ARCHITECT_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
-SCEPTICAL_ARCHITECT_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
-BACKEND_CMD="codex exec --full-auto \"$(cat '{prompt_file}')\""
+SCEPTICAL_ARCHITECT_CMD="codex exec --approve-for-me \"$(cat '{prompt_file}')\""
+BACKEND_CMD="codex exec --approve-for-me \"$(cat '{prompt_file}')\""
 REVIEWER_CMD="gemini --yolo \"$(cat '{prompt_file}')\""
 TEAM_DEFAULT_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
 ```
@@ -986,8 +1100,9 @@ Command templates for common CLIs:
 | LLM / CLI | Command template |
 |---|---|
 | Claude Code | `claude -p "$(cat '{prompt_file}')" --permission-mode acceptEdits` |
-| Codex CLI | `codex exec --full-auto "$(cat '{prompt_file}')"` |
+| Codex CLI | `codex exec --approve-for-me "$(cat '{prompt_file}')"` |
 | Gemini CLI | `gemini --yolo "$(cat '{prompt_file}')"` |
+| DeepSeek Harness | `dsh --profile headless "$(cat '{prompt_file}')"` |
 | Any file-reading CLI | `yourcli --prompt-file {prompt_file}` |
 
 Direct `claude` commands are detected automatically. If Claude is behind a
@@ -996,6 +1111,18 @@ wrapper, mark only that command template so mixed-model teams remain precise:
 ```bash
 FRONTEND_CMD="STARTUP_FACTORY_LLM_RUNTIME=claude /path/to/claude-wrapper {prompt_file}"
 ```
+
+DeepSeek Harness (`dsh`) needs Node.js and a one-time global install —
+`npm install -g @deepseek-ai/dsh` (pin a version; the project is in developer
+preview with breaking changes). Its one-shot mode prints only the final answer
+on stdout and exits non-zero on failure, so `doctor` and task dispatch work
+unchanged. It needs no auto-approve flag: headless sessions run under dsh's own
+`workspace-write` sandbox (writes confined to the working directory). Credentials
+and model defaults live under `$DSH_HOME` (default: under `$HOME`) —
+`.credentials.yaml` / `settings.yaml` — so when `AGENT_SANDBOX_HOME` is
+configured, place the reviewed dsh state inside that sandbox home (or allowlist
+a `DSH_HOME` pointing at reviewed state outside it). dsh is classified as
+runtime family `other`, like Codex and Gemini.
 
 **Mixing LLMs is the design intent** — e.g. Claude to lead and own the primary
 architecture position, Codex to challenge it independently and implement, and
@@ -1008,6 +1135,22 @@ classification, or a bounded low-risk fast path for documentation, formatting,
 and structurally small test/config tasks. Missing overrides fall back to the
 role command. A requested model profile can increase rigor but cannot downgrade
 the computed security-risk floor.
+
+DeepSeek Harness selects its model from the composed profile config rather than
+a CLI flag. To route task tiers to different models, write one small overlay per
+tier and reference it in the override command. Discover the exact row your dsh
+version composes with `dsh --profile headless --dump-config`, copy the
+`agent-default-model` row into e.g. `~/.dsh-overlays/strong.yml` with your
+`{provider, model}` choice, then:
+
+```
+TASK_STRONG_CMD="dsh --profile headless --patch \"$HOME/.dsh-overlays/strong.yml\" \"$(cat '{prompt_file}')\""
+```
+
+`--patch` is a launcher flag, so it must appear before the positional task text.
+Alternatively, point tiers at distinct `DSH_HOME` directories with different
+`settings.yaml` model defaults (requires allowlisting `DSH_HOME` or a wrapper
+script).
 
 `delivery-profile: auto|micro|standard` is a separate, diagnostic-only signal.
 The current `micro` assessor accepts only a bounded committed diff of ordinary
@@ -1055,8 +1198,9 @@ Omit the variable for Codex, Gemini, and other runtimes.
 why the many specialized preset-team roles need no per-role keys — set
 `TEAM_DEFAULT_CMD` once and only override the roles you want on a different model.
 
-> ⚠️ **Safety:** those templates use auto-approve flags (`acceptEdits`,
-> `--full-auto`, `--yolo`) so agents can work unattended. Workers may commit
+> ⚠️ **Safety:** those templates use unattended execution modes (`acceptEdits`,
+> `--approve-for-me`, `--yolo`). Codex keeps its workspace-write sandbox and
+> routes approval requests through automatic review. Workers may commit
 > untrusted checkpoints only to task branches; only the integrator writes the
 > feature branch. Every implementer is isolated in its own git worktree — but still run teams on a branch you can
 > throw away, and review the tracker before merging to your main branch.
@@ -1161,7 +1305,7 @@ feature status `Resolved`; disabled or unverified delivery remains non-terminal.
 | Coordination | `TEAMWORK_ROOT` (`.teamwork`), `AGENT_ENV_ALLOWLIST` (non-secret minimum), `POLL_INTERVAL_SECONDS` (120), `STUCK_AFTER_MINUTES` (15), `ESCALATE_AFTER_ATTEMPTS` (2), `TRACKER_WRITERS` (`broker`), `EXECUTION` (`sequential`), `MAX_ACTIVE_IMPLEMENTERS` (`null`) | Canonical symlink-free workspace paths; LLMs start with `env -i`; deterministic broker keeps tracker credentials out of every LLM role; event-driven supervision with polling fallback; bounded sequential/parallel scheduling |
 | Worktree provisioning | `WORKTREE_SETUP` | Non-empty setup command run once inside every fresh task worktree through the same sandbox boundary; autonomous mode rejects null/no-op provisioning. |
 | Agent isolation | `AGENT_SANDBOX_RUNNER`, `AGENT_SANDBOX_ENFORCED` | Protected external `runner --workdir ABSOLUTE -- /usr/bin/env -i …` boundary. The runner, not Startup Factory code, must enforce filesystem, process, network, and identity isolation. |
-| Lifecycle authority | `BROKER_LIFECYCLE_ROOT` | Absolute protected external mode-0700 root for HMAC-authenticated PID/start/tmux identities. Without it, manual processes are unmanaged and `stop` refuses to signal. |
+| Lifecycle authority | `BROKER_LIFECYCLE_ROOT` | Absolute protected external mode-0700 root for HMAC-authenticated PID/start/tmux identities, control evidence, and preserved dirty-attempt worktrees. Size it for worst-case WIP retention. Without it, manual processes are unmanaged and `stop` refuses to signal. |
 | Validation | `VALIDATE_BUILD`, `VALIDATE_TEST`, `VALIDATE_LINT`, `VALIDATE_FORMAT`, `VALIDATE_SCRIPT` | Your stack's commands; the integrator runs them before every merge (`null` = skip). `VALIDATE_SCRIPT` replaces all four with one repo-owned script that receives the changed-file list |
 
 Point the `VALIDATE_*` commands at your real build/test/lint (e.g.
@@ -1356,7 +1500,7 @@ your agent in the generic vocabulary:
    ```
 
    Skip this step when using native Startup Factory planning.
-4. Launch the preset's persistent supervision and gate roles:
+4. Launch the preset's supervision and one-shot gate queue consumers:
 
    ```bash
    "$SF_HOME/bin/launch-team.sh" gate-team deep-backend payments-revamp ENG-100
@@ -1373,7 +1517,8 @@ your agent in the generic vocabulary:
 
    ```bash
    tmux attach -t team-payments-revamp         # live agent windows, when tmux is used
-   "$SF_HOME/bin/launch-team.sh" status payments-revamp  # protected process state + heartbeat
+   "$SF_HOME/bin/launch-team.sh" status payments-revamp         # typed protected health table
+   "$SF_HOME/bin/launch-team.sh" status payments-revamp --json  # machine-readable JSONL
    ```
 
    Progress lands in your tracker; anything needing you lands in
@@ -1391,16 +1536,52 @@ your agent in the generic vocabulary:
 > Keep `SF_HOME` set in every shell that runs a launcher or dispatcher. For a
 > protected external automation installation, set it to that absolute path.
 
+### Preview or run exactly one task
+
+When an operator or harness requests one task, keep the execution boundary at
+that task. First prove the tracker scope, then preview the decision using the
+complete feature dependency/concurrency evidence, and finally launch only the
+named worker:
+
+```bash
+"$SF_HOME/bin/launch-team.sh" preflight payments-revamp ENG-100
+"$SF_HOME/bin/dispatch.sh" payments-revamp ENG-100 \
+  --once --dry-run --task ENG-142
+"$SF_HOME/bin/launch-team.sh" start-task \
+  payments-revamp ENG-100 senior-backend-engineer ENG-142 1 deep-backend
+```
+
+The targeted dispatcher form is deliberately read-only: it can explain the
+task's eligibility without claiming work, launching siblings, or emitting
+feature-wide closeout actions. Use `start-task` for the explicit mutation. The
+feature branch (the team name) must already exist; if it does not, the launcher
+stops before creating a task worktree and prints an exact branch-creation
+command.
+
+`preflight` uses a minimal feature-scoped tracker probe before any launch. It
+reports typed transport failures such as `AUTH`, `RATELIMITED`, `NOT_FOUND`,
+`NETWORK`, `TIMEOUT`, and `MALFORMED_RESPONSE`, preserving safe provider retry
+guidance when available. This makes credential/scope failures distinguishable
+from temporary service failures. Shipped adapters avoid broadly exporting task
+comments merely to test connectivity; custom backends retain their compatible
+export fallback.
+
+After launch, `launch-team.sh status <team>` combines authenticated process
+identity with the worker heartbeat. `active` and `starting` are live states;
+`stalled:*` names the missing progress condition, while `identity-mismatch`
+fails closed because the recorded process can no longer be authenticated. A
+worker-reported next-action deadline never extends the configured liveness TTL.
+
 **`bin/launch-team.sh` subcommands:**
 
 | Command | Purpose |
 |---|---|
-| `team <preset> <team> <featureId>` | Launch a whole preset roster |
-| `gate-team <preset> <team> <featureId>` | Launch only persistent supervision/review/integration gates; automation uses this and starts implementers per task |
+| `team <preset> <team> <featureId>` | Eagerly launch a whole preset roster; use only when every role should start immediately |
+| `gate-team <preset> <team> <featureId>` | Normal feature bootstrap: launch the supervision/review/integration gate queue consumers once; automation relaunches them on demand and dispatch starts implementers per task |
 | `planning-handoff <team> <spec-path> <plan-path>` | Bind committed Claude/Superpowers specification and plan inputs to this Startup Factory team |
 | `preflight <team> <featureId>` | Verify adapter access, workspace writability, and UTC pin — run once before any CLI team launch |
 | `start <team> <featureId> <role>…` | Launch specific roles (custom teams) |
-| `relaunch <team> <featureId> <role> [preset]` | Restart one crashed/wedged agent |
+| `relaunch <team> <featureId> <role> [preset]` | Compatibility ensure-running command: no-op when the protected role is live; reap and replace only an authenticated dead generation. Use Team Lead `restart-role` for a live wedged role |
 | `compose <team> <featureId> <role> [preset]` | Write a role's startup prompt **without spawning** — for running teammates as subagents inside your own harness (see `reference/orchestration.md` → *Harness mode*) |
 | `compose-review <team> <featureId> <role> <taskId> [preset]` | From a freshly exported normalized `tasks.json`, write a lean one-package review prompt and exact binding-manifest pointer without spawning or granting reviewer authority |
 | `start-task <team> <featureId> <role> <taskId> [attempt] [preset]` | Generate a packet and launch one task-scoped worker in its worktree |
@@ -1408,9 +1589,68 @@ your agent in the generic vocabulary:
 | `worktree <team> <role> <taskId> [attempt]` | Create an implementer's isolated task worktree |
 | `worktree-remove <team> <role> <taskId> [attempt]` | Remove a worktree only after protected lifecycle state proves its worker is stopped; unmanaged mode refuses |
 | `validate-board [config-path]` | Validate status structure, initial/terminal rules, transitions, reachability, owners, and marker-role references |
-| `status <team>` | Show authenticated process state plus last heartbeat when protected lifecycle authority is enabled; otherwise report that markers are non-authoritative |
+| `status <team> [--json]` | Join authenticated process identity to the bounded semantic heartbeat and report `starting`, `active`, `exited`, `identity-mismatch`, or `stalled:<reason>`; JSONL is available for automation |
 | `stop <team>` | Stop the managed team through authenticated lifecycle identities; unmanaged mode refuses to signal |
 | `stop-task <team> <taskId>` | Send bounded TERM→KILL to the authenticated launcher-managed process group/session for one [task], then revoke that [task]'s active publication capabilities; sibling workers and gate roles continue |
+
+### Team Lead worker control
+
+A launched Team Lead can request lifecycle actions without receiving raw PID or
+signal authority. First read `status --json`, then submit one bounded request:
+
+```bash
+# Ask the exact task attempt for its missing artifact.
+"$SF_HOME/bin/worker-control.py" request \
+  --action nudge-task --task ENG-142 --expected-attempt 2 \
+  --reason-code artifact-missing
+
+# Stop and replace only the still-current protected generation.
+"$SF_HOME/bin/worker-control.py" request \
+  --action restart-task --task ENG-142 --expected-attempt 2 \
+  --nudge-control-id control-0123456789abcdef0123456789abcdef \
+  --observed-created-at 2026-08-25T12:34:56Z --reason-code stale-live
+
+# Retire a no-longer-needed gate role after confirming its queue is empty.
+"$SF_HOME/bin/worker-control.py" request \
+  --action retire-role --role senior-qa-engineer \
+  --observed-created-at 2026-08-25T12:30:00Z --reason-code no-longer-needed
+```
+
+`restart-role` uses the same `--role` and `--observed-created-at` shape. These
+commands work only in the launcher's fixed gate-role environment; the broker
+accepts only the configured Team Lead capability. The next dispatcher pass
+revalidates the fresh tracker revision/status, ignored labels, `[Blocked]` hold,
+exact execution and claim digests, task attempt, lifecycle generation,
+role-specific prohibitions, expiry, and signature before doing anything. A task
+restart also requires a protected completed `nudge-task` for the same bound
+attempt and waits `STALE_NUDGE_GRACE_SECONDS`; omit `--nudge-control-id` to use
+the newest matching completed nudge. Completed and failed results are recorded under protected lifecycle
+authority and projected to
+`.teamwork/<team>/control-outbox/{done,failed}/`, so redelivery cannot invoke a
+restart twice. Each reconciliation pass is capped at 64 entries and 1 MiB of
+request bytes; overflow remains pending for a later pass. The broker retains 256
+full protected results, then records older consumed IDs in an authenticated,
+fsynced tombstone so retention cannot reopen a replay window.
+
+For task recovery, “kill” means the broker's bounded stop-and-replace sequence:
+signal only the authenticated process group, revoke publication capability,
+remove a clean worktree or quarantine a dirty one intact, then launch N+1.
+Quarantine inventories every tracked, untracked, ignored, binary, and symlink
+entry without following links. The preserved worktree and HMAC prepare/final
+receipts live under the broker-owned lifecycle root, so an agent-writable
+workspace parent cannot redirect the move; `.teamwork` retains only the
+operator-facing manifest. A crash after the move is replayable.
+Direct `restart-task`, `retire-role`, and `restart-role` launcher subcommands are
+broker-only and require an operation/generation-bound HMAC grant under the
+protected lifecycle root; an environment flag is not signal authority. The
+integrator cannot be retired or restarted through generic role control, and a
+bare retirement cannot target the Team Lead. The dispatcher may replace one
+stalled Team Lead generation automatically before the protected circuit breaker
+opens. A successful role restart durably binds its control ID to the exact
+replacement lifecycle generation, so replay remains at-most-once even after
+that replacement exits or its lifecycle record is later reaped. Circuit
+breakers use `MAX_AUTOMATIC_RESTARTS`,
+`MAX_AUTHORIZED_RESTARTS`, and `RESTART_BACKOFF_SECONDS`.
 
 Process-group stopping is lifecycle control, not a complete containment
 boundary. A subprocess that deliberately escapes with `setsid`, double-forking,
@@ -1423,7 +1663,8 @@ reject output from an escaped stale process.
 
 | Command | Purpose |
 |---|---|
-| `dispatch.sh <team> <featureId> --once [--dry-run]` | One deterministic read-and-act pass |
+| `dispatch.sh <team> <featureId> --once [--dry-run]` | One deterministic feature-wide read-and-act pass; inspect the first pass with `--dry-run` |
+| `dispatch.sh <team> <featureId> --once --dry-run --task <taskId>` | Read-only single-task scope preview that retains full dependency/concurrency evidence without emitting sibling actions |
 | `dispatch.sh <team> <featureId> --watch` | Wake on runtime events with `POLL_INTERVAL_SECONDS` as a fallback — run in a persistent shell (tmux/nohup); **you own this process** |
 
 > **CLI dispatch requires scriptable tracker access.** Linear and Jira default to MCP; set `LINEAR_ACCESS=rest` or `JIRA_ACCESS=rest` in `config/project-management.config.md` before running `dispatch.sh --watch`. Harness mode (`launch-team.sh compose`) supports MCP natively.
@@ -1432,6 +1673,7 @@ reject output from an escaped stale process.
 
 | Command | Purpose |
 |---|---|
+| `probe <featureId>` | Prove adapter access and exact feature scope with a minimal read; shipped remote adapters do not export task comments for this check. |
 | `state <taskId> <Status>` | Make and verify a legal generic `[task]` status write. Startup Factory rejects every outbound `[Blocked]` transition; a human must perform that move in the project-management tool. |
 | `feature-state <featureId> <Status>` | Make and verify a legal generic `[feature]` status write. |
 | `feature-reopen <featureId> <Status>` | PM-supervisor-only terminal-to-queued reopen for a new delivery generation. |
@@ -1525,7 +1767,7 @@ On every pass the supervisor:
    enforces task-scoped holds, validates any
    configured opt-in and exact preset routing, then bootstraps queued work for
    at most `maxFeaturesPerPass` new isolated feature runs;
-5. launches persistent gate roles, invokes one deterministic dispatch pass,
+5. launches gate queue consumers on demand, invokes one deterministic dispatch pass,
    reconciles holds/comments/recovery, and starts fresh task-scoped workers only
    when the state machine calls for them; and
 6. hands an all-integrated feature to the protected release executor, or leaves
@@ -1940,11 +2182,14 @@ exact protocol markers — never invent new ones.
 | Symptom | Fix |
 |---|---|
 | Agent says the tracker is unavailable | Re-check the adapter's *Access mechanisms* (MCP block or exported API-key env vars); the agent stops rather than fabricating — that's by design |
+| Preflight reports a typed tracker failure | Treat `AUTH`/`NOT_FOUND` as credential or exact-scope configuration problems. Respect the provider reset hint for `RATELIMITED`; retry `NETWORK`, `TIMEOUT`, or `SERVER` only after checking service health. `MALFORMED_RESPONSE` is an andon: inspect the adapter/provider contract instead of retrying blindly. |
+| `start-task` reports that the feature branch is missing | Run the exact `git branch '<branch>' <base-commit>` command printed by the launcher, inspect the branch, then retry. No task worktree was created. |
 | `launch-team.sh` can't find a role | The role needs a brief in `roles/` or `teams/roles/`, and its `<ROLE>_CMD` (or `TEAM_DEFAULT_CMD`) must be set |
 | A role won't launch in a preset | An optional role may have `<ROLE>_CMD=null`; remove the line to fall back to `TEAM_DEFAULT_CMD`. Team Lead, Principal Architect, and Sceptical Principal Architect are mandatory, distinct rostered reviewers. Security must have a distinct launchable mapping but stays out of ordinary startup rosters; Deep Infra and Deep Security require it in the roster. Invalid mappings or missing commands reject launch. |
 | No `tmux` | Agents run as background processes automatically. With protected lifecycle state use `status`/`stop`; otherwise supervise them externally. Logs remain under `.teamwork/<team>/pids/` |
 | `status` says lifecycle supervision is disabled | Provision `BROKER_LIFECYCLE_ROOT` as documented in `config/team.config.md`; unmanaged manual mode deliberately refuses `stop` rather than trusting workspace PID text |
-| Team seems stuck | With protected lifecycle state configured, `bin/launch-team.sh status <team>` shows authoritative process state plus heartbeats; the lead applies the recovery ladder, and anything needing you is in `.teamwork/<team>/ESCALATIONS.md`. A `[Blocked]` task is intentionally human-held and never changed outbound by automation. |
+| Team seems stuck | Run `bin/launch-team.sh status <team> --json`. A typed `stalled:<reason>` is semantic-heartbeat evidence joined to protected lifecycle identity; `exited` is normal idle state for a one-shot gate consumer, but an exited task worker without its required artifact is a recovery candidate. `identity-mismatch` is fail-closed and never signaled. The Team Lead uses one `worker-control.py request` rung at a time; inspect `.teamwork/<team>/control-outbox/{done,failed}/`, quarantine manifests, and `.teamwork/<team>/ESCALATIONS.md`. A `[Blocked]` task is intentionally human-held and never restarted by automation. |
+| `TURBO_MODE=safe` refuses launch | Safe Turbo requires protected lifecycle authority, enforced sandboxing, `TRACKER_WRITERS=broker`, `EXECUTION=parallel`, a meaningful non-no-op `WORKTREE_SETUP`, at least one meaningful `VALIDATE_SCRIPT`/`BUILD`/`TEST`/`LINT`/`FORMAT` command, `MAX_ACTIVE_IMPLEMENTERS` no higher than 4, and `REVIEW_MODE=parallel` in the selected preset. It never fixes conflicting settings silently. |
 | An eligible queued task never launches | Confirm automation is enabled and scheduled, the scriptable adapter has an exact scope, the task does not carry an `ignoredTaskLabels` value such as `human-work`, and `team-preset` is absent or exactly one allowed preset. If `requireMetadataOptIn` is true, also confirm the latest metadata says `automation: enabled`; conflicting or unordered metadata deliberately pauses. |
 | A human moved `[Blocked]` to queued but no fresh attempt starts | Inspect the generated resume-review request. A broker-authenticated `[resume-review]` must bind its exact hold and communication digest; changed requirements also need a later `[resume-plan]` and both architect design approvals, and the prior worktree must be clean. |
 | `--print-cron` rejects the scan interval | Conventional cron output supports minute divisors of 60 and whole-hour divisors of 24. Use a service timer or hosted scheduler for cadences such as seven minutes |

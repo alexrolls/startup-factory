@@ -4,6 +4,7 @@ set -euo pipefail
 umask 077
 
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+POLICY_SOURCE_ROOT="${STARTUP_FACTORY_TEAM_POLICY_SOURCE_ROOT:-$SKILL_DIR}"
 CONFIG="$SKILL_DIR/config/team.config.md"
 
 die() { echo "finalize-integrations: $*" >&2; exit 1; }
@@ -46,8 +47,33 @@ usage() {
 approval_evidence() {
   [ $# -ge 5 ] && [ $# -le 6 ] || usage
   local args=(validate "$1" "$2" "$3" "$4" "$5" "$SKILL_DIR/config/statuses.config.json")
-  if [ $# -eq 6 ] && [ -e "$6" ]; then args+=(--preset "$6"); fi
-  python3 "$SKILL_DIR/bin/review_evidence.py" "${args[@]}"
+  local policy_tmp="" policy_workspace policy_team policy_feature rc=0
+  if [ $# -eq 6 ]; then
+    [ "$(basename "$6")" = preset.env ] \
+      || die "team policy projection must be named preset.env"
+    policy_workspace="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).absolute().parent.resolve())' "$6")"
+    policy_team="$(basename "$policy_workspace")"
+    policy_feature="$(python3 - "$1" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1]))
+feature=value.get("featureId") if isinstance(value,dict) else None
+if not isinstance(feature,str) or not feature: raise SystemExit("finalize-integrations: evidence snapshot lacks featureId")
+print(feature)
+PY
+)"
+    policy_tmp="$(mktemp "${TMPDIR:-/tmp}/startup-factory-team-policy.XXXXXX")"
+    if ! python3 "$SKILL_DIR/bin/team_policy.py" \
+      --repo "$(git_unprivileged rev-parse --show-toplevel)" \
+      --workspace "$policy_workspace" --team "$policy_team" --feature "$policy_feature" \
+      --skill "$SKILL_DIR" --source-skill "$POLICY_SOURCE_ROOT" > "$policy_tmp"; then
+      rm -f -- "$policy_tmp"
+      return 1
+    fi
+    args+=(--preset "$policy_tmp")
+  fi
+  python3 "$SKILL_DIR/bin/review_evidence.py" "${args[@]}" || rc=$?
+  [ -z "$policy_tmp" ] || rm -f -- "$policy_tmp"
+  return "$rc"
 }
 
 if [ "${1:-}" = "--evidence" ]; then
@@ -256,16 +282,18 @@ PY
   [ ! -L "$snapshot" ] || die "authorization snapshot path is a symlink"
   "$SKILL_DIR/bin/tracker-ops.sh" export "$feature" "$snapshot" >/dev/null
   python3 - "$entry" "$snapshot" "$repo" "$workspace" "$team" "$feature" \
-    "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/bin/review_evidence.py" "$preset_file" <<'PY'
+    "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/bin/review_evidence.py" \
+    "$SKILL_DIR" "$POLICY_SOURCE_ROOT" <<'PY'
 import hashlib, json, os, re, stat, subprocess, sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-entry_raw,snapshot_raw,repo_raw,workspace_raw,team,feature,board_raw,review_module_raw,preset_raw=sys.argv[1:]
+entry_raw,snapshot_raw,repo_raw,workspace_raw,team,feature,board_raw,review_module_raw,skill_raw,policy_source_raw=sys.argv[1:]
 entry,snapshot,repo,workspace=Path(entry_raw),Path(snapshot_raw),Path(repo_raw).resolve(),Path(workspace_raw).resolve()
 sys.dont_write_bytecode=True; sys.path.insert(0,str(Path(review_module_raw).resolve().parent))
 from review_evidence import EvidenceError, SUPPORTING_GATE_MARKERS, request_binding, validate as validate_review_evidence
 from task_metadata import required_review_gates
+from team_policy import TeamPolicyError, load_team_policy
 def fail(message): raise SystemExit("finalize-integrations: prepared authorization: "+message)
 def regular(path,label,maximum=8*1024*1024):
     try: mode=path.lstat().st_mode
@@ -313,9 +341,8 @@ def assert_unheld(task):
     if record is not None and record.get("state") in {"blocked","resume-review-pending","manual-takeover"}:
         fail("task %s is held (%s)"%(task,record.get("state")))
 regular(entry,"prepared transaction",1024*1024); regular(snapshot,"fresh tracker snapshot",8*1024*1024)
-preset=Path(preset_raw); preset_text=""
-if os.path.lexists(preset):
-    regular(preset,"team preset",1024*1024); preset_text=preset.read_text()
+try: preset_text=load_team_policy(repo,workspace,team,feature,Path(skill_raw).resolve(),Path(policy_source_raw).resolve()).text
+except (OSError,TeamPolicyError) as exc: fail("cannot authenticate team policy: %s"%exc)
 try: preset_gates=required_review_gates(preset_text)
 except ValueError as exc: fail("invalid team preset review gates: %s"%exc)
 prepared_dir=(workspace/"integrations"/".prepared").resolve()
@@ -620,17 +647,21 @@ fi
 # evidence bindings. Output is a stable line protocol consumed below.
 validate_entry() {
   local entry="$1" snapshot="${2:-}"
-  python3 - "$entry" "$repo" "$workspace" "$team" "$feature" "$snapshot" "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/bin/review_evidence.py" "$(read_key BROKER_TASK_CLONE_ROOT)" "$(read_key AGENT_SANDBOX_ENFORCED)" <<'PY'
+  python3 - "$entry" "$repo" "$workspace" "$team" "$feature" "$snapshot" \
+    "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/bin/review_evidence.py" \
+    "$(read_key BROKER_TASK_CLONE_ROOT)" "$(read_key AGENT_SANDBOX_ENFORCED)" \
+    "$SKILL_DIR" "$POLICY_SOURCE_ROOT" <<'PY'
 import hashlib, json, os, re, stat, subprocess, sys
 from pathlib import Path
 
-entry_raw, repo_raw, workspace_raw, team, feature, snapshot_raw, board_raw, review_module_raw, clone_root_raw, enforced_raw = sys.argv[1:]
+entry_raw, repo_raw, workspace_raw, team, feature, snapshot_raw, board_raw, review_module_raw, clone_root_raw, enforced_raw, skill_raw, policy_source_raw = sys.argv[1:]
 repo, workspace = Path(repo_raw).resolve(), Path(workspace_raw).resolve()
 entry = Path(entry_raw)
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(review_module_raw).resolve().parent))
 from review_evidence import EvidenceError, SUPPORTING_GATE_MARKERS, request_binding, validate as validate_review_evidence
 from task_metadata import required_review_gates
+from team_policy import TeamPolicyError, load_team_policy
 GIT_ENV = {name: os.environ[name] for name in ("PATH", "TMPDIR", "LANG", "LC_ALL") if name in os.environ}
 GIT_ENV.setdefault("PATH", "/usr/bin:/bin")
 GIT_ENV.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
@@ -1097,7 +1128,6 @@ if data.get("transactionId") != expected_txid:
 
 # Preset structure is authorization state, so validate the three core reviewers
 # plus independently mapped on-demand specialists even in --validate-only mode.
-preset = workspace / "preset.env"
 expected_signers = {
     "TEAM_LEAD": "team-lead",
     "PRINCIPAL_ARCHITECT": "principal-architect",
@@ -1105,17 +1135,18 @@ expected_signers = {
     "SECURITY_REVIEWER": "senior-security-engineer",
     "QA": "qa",
 }
-preset_text = ""
 try:
-    preset_info = preset.lstat()
-except FileNotFoundError:
-    preset_info = None
-except OSError as exc:
-    fail("cannot inspect team preset: %s" % exc)
-if preset_info is not None:
-    if preset.is_symlink() or not stat.S_ISREG(preset_info.st_mode) or preset_info.st_size > 1024 * 1024:
-        fail("team preset must be a bounded non-symlink regular file")
-    preset_text = preset.read_text()
+    preset_text = load_team_policy(
+        repo,
+        workspace,
+        team,
+        feature,
+        Path(skill_raw).resolve(),
+        Path(policy_source_raw).resolve(),
+    ).text
+except (OSError, TeamPolicyError) as exc:
+    fail("cannot authenticate team policy: %s" % exc)
+if preset_text:
     expected_signers = {}
     for protocol_name in (
         "TEAM_LEAD",

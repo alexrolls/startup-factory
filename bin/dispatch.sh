@@ -3,7 +3,7 @@
 # Zero LLM per cycle. Logic spec: reference/dispatch.md.
 #
 # Usage:
-#   dispatch.sh <team> <featureId> --once [--dry-run]
+#   dispatch.sh <team> <featureId> --once [--dry-run] [--task <taskId>]
 #   dispatch.sh <team> <featureId> --watch
 set -euo pipefail
 
@@ -84,12 +84,54 @@ is_mcp_only() { # is_mcp_only <adapter> -> 0 if configured for MCP-only access
   esac
 }
 
-resolve_role() { # resolve_role <team> <protocol-role> -> concrete role (or same if no mapping)
-  local dir pf; dir="$(teamroot "$1")"; pf="$(team_path "$dir" preset.env)"
-  [ -f "$pf" ] || { printf '%s' "$2"; return; }
-  local key; key="PROTOCOL_$(printf '%s' "$2" | tr 'a-z-' 'A-Z_')"
-  local val; val="$(grep -m1 "^$key=" "$pf" | cut -d= -f2 || true)"
-  printf '%s' "${val:-$2}"
+trusted_team_preset() { # team feature -> protected preset identity, or empty for a manual team
+  local dir pf context probe_rc=0
+  dir="$(teamroot "$1")" || return $?
+  pf="$(team_path "$dir" preset.env)" || return $?
+  if [ ! -f "$pf" ]; then
+    python3 "$SKILL_DIR/bin/team-context.py" probe \
+      --repo "$REPO_ROOT" --workspace "$dir" --team "$1" --feature "$2" >/dev/null \
+      || probe_rc=$?
+    [ "$probe_rc" -eq 3 ] && return 0
+    [ "$probe_rc" -eq 0 ] || return "$probe_rc"
+  fi
+  context="$(python3 "$SKILL_DIR/bin/team-context.py" verify \
+    --repo "$REPO_ROOT" --workspace "$dir" --team "$1" --feature "$2" \
+    --skill "$SKILL_DIR")" || return $?
+  python3 -c 'import json,sys; value=json.load(sys.stdin)["preset"]; print("" if value=="-" else value,end="")' <<< "$context"
+}
+
+resolve_role() { # resolve_role <team> <feature> <protocol-role> -> concrete role
+  local preset
+  preset="$(trusted_team_preset "$1" "$2")" || return $?
+  [ -n "$preset" ] || { printf '%s' "$3"; return; }
+  python3 - "$SKILL_DIR/teams" "$preset" "$3" <<'PY'
+import re,stat,sys
+from pathlib import Path
+
+teams_dir, preset, protocol_role = map(Path, sys.argv[1:])
+
+def assignments(text):
+    values = {}
+    for line in text.splitlines():
+        if "=" not in line: continue
+        key, value = line.split("=", 1)
+        if key in values: raise SystemExit(f"dispatch: team preset repeats {key}")
+        values[key] = value.strip()
+    return values
+
+source_path = Path(teams_dir) / f"{preset}.md"
+source_info = source_path.lstat()
+if stat.S_ISLNK(source_info.st_mode) or not stat.S_ISREG(source_info.st_mode):
+    raise SystemExit("dispatch: protected team preset is unsafe")
+source = assignments(source_path.read_text(encoding="utf-8"))
+key = "PROTOCOL_" + str(protocol_role).upper().replace("-", "_")
+expected = source.get(key)
+if expected is None:
+    print(protocol_role, end="")
+else:
+    print(expected, end="")
+PY
 }
 
 teamroot() {
@@ -148,6 +190,23 @@ stop_task_or_quarantine() { # <team> <workspace> <taskId>
     || die "task $stop_task stop failed and publication authority could not be revoked"
 }
 
+process_worker_controls() { # team feature workspace tasks-snapshot
+  local control_team="$1" control_feature="$2" control_workspace="$3" control_tasks="$4"
+  local pending lifecycle_root entries
+  pending="$(team_path "$control_workspace" control-outbox/pending)"
+  [ -d "$pending" ] || return 0
+  entries="$(find "$pending" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)"
+  [ -n "$entries" ] || return 0
+  lifecycle_root="${STARTUP_FACTORY_LIFECYCLE_STATE_ROOT:-$(read_key BROKER_LIFECYCLE_ROOT)}"
+  [ -n "$lifecycle_root" ] \
+    || die "authenticated worker-control request is pending but protected lifecycle supervision is disabled"
+  python3 "$SKILL_DIR/bin/worker-control.py" reconcile \
+    --repo "$REPO_ROOT" --workspace "$control_workspace" --team "$control_team" \
+    --feature "$control_feature" --tasks "$control_tasks" \
+    --launcher "$SKILL_DIR/bin/launch-team.sh" --lifecycle-root "$lifecycle_root" \
+    || die "worker-control reconciliation failed"
+}
+
 next_mailbox_file() { # next_mailbox_file <mailbox-dir> -> path with next free NNN
   local mb="$1" max=0 n f
   mkdir -p "$mb"
@@ -157,6 +216,51 @@ next_mailbox_file() { # next_mailbox_file <mailbox-dir> -> path with next free N
     [ "$n" -gt "$max" ] && max=$n
   done
   printf '%s/%03d-dispatcher.md' "$mb" $((max + 1))
+}
+
+recover_team_lead_if_stalled() { # team feature workspace lifecycle-root health-json dry
+  local control_team="$1" control_feature="$2" control_workspace="$3" lifecycle_root="$4" health_json="$5" dry="$6"
+  local lead_role row verdict generation control_id output
+  lead_role="$(resolve_role "$control_team" "$control_feature" team-lead)" || die "could not resolve protected Team Lead mapping"
+  row="$(python3 - "$health_json" "$lead_role" <<'PY'
+import json,sys
+rows=json.loads(sys.argv[1]); role=sys.argv[2]
+matches=[item for item in rows if item.get("category")=="gate" and item.get("instance")==role]
+if len(matches)>1: raise SystemExit("dispatch: duplicate protected Team Lead lifecycle identity")
+if matches:
+    item=matches[0]
+    print(str(item.get("verdict") or "")+"\t"+str(item.get("createdAt") or ""))
+PY
+  )" || die "could not inspect authenticated Team Lead health"
+  [ -n "$row" ] || return 0
+  IFS=$'\t' read -r verdict generation <<< "$row"
+  # Gate roles are one-shot queue consumers. A normal exited generation is
+  # desired idle state and is relaunched only by a concrete dispatch-plan queue
+  # action. Automatic restart authority is reserved for a live, wedged Team
+  # Lead; the ordinary start path then observes it as live and cannot bypass a
+  # suppressed restart policy decision.
+  case "$verdict" in stalled:*) ;; *) return 0 ;; esac
+  [ -n "$generation" ] || die "stalled Team Lead health lacks a lifecycle generation"
+  control_id="control-$(python3 -c 'import hashlib,sys; print(hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest()[:32])' "$control_team" "$control_feature" "$lead_role" "$generation" automatic-lead-recovery)"
+  echo "plan: recover stalled Team Lead $lead_role ($verdict)"
+  [ "$dry" != yes ] || return 0
+  python3 "$SKILL_DIR/bin/control-grant.py" issue \
+    --root "$lifecycle_root" --repo "$REPO_ROOT" \
+    --team "$control_team" --feature "$control_feature" --action restart-role --target "$lead_role" \
+    --attempt 0 --generation "$generation" --control-id "$control_id" --reason automatic \
+    >/dev/null || die "could not issue protected Team Lead recovery grant"
+  if output="$(STARTUP_FACTORY_CONTROL_BROKER=1 STARTUP_FACTORY_CONTROL_REASON=automatic \
+      "$SKILL_DIR/bin/launch-team.sh" restart-role "$control_team" "$control_feature" \
+      "$lead_role" "$generation" "$control_id" 2>&1)"; then
+    printf '%s\n' "$output"
+    TEAM_LEAD_RECOVERED=yes
+    return 0
+  fi
+  # A stalled role is not a trustworthy recipient for its own recovery
+  # escalation. Keep this in the dispatcher/operator log; do not create a
+  # mailbox item that can be silently stranded behind the wedged generation.
+  echo "dispatch: automatic Team Lead recovery was suppressed: $output" >&2
+  echo "dispatch: inspect protected lifecycle/restart-policy records; human intervention is required" >&2
 }
 
 working_feature_status() {
@@ -197,8 +301,8 @@ print("dispatch-" + hashlib.sha256("\0".join(
 PY
 }
 
-dispatch_once() { # dispatch_once <team> <featureId> <dry:yes|no>
-  local team="$1" fid="$2" dry="$3"
+dispatch_once() { # dispatch_once <team> <featureId> <dry:yes|no> [target-task]
+  local team="$1" fid="$2" dry="$3" target_task="${4:-}"
   local dir lock tasks_file; dir="$(teamroot "$team")"
   lock="$(team_path "$dir" dispatch.lock)"
   tasks_file="$(team_path "$dir" tasks.json)"
@@ -330,16 +434,34 @@ EOF
     done <<EOF
 $(python3 -c 'import json,sys; [print(item) for item in json.loads(sys.argv[1]).get("stopTasks", [])]' "$hold_result")
 EOF
+    process_worker_controls "$team" "$fid" "$dir" "$tasks_file"
   fi
   if [ "$dry" != "yes" ]; then
     "$SKILL_DIR/bin/sync-progress.sh" "$team" "$fid" "$tasks_file"
   fi
   local stuck; stuck="$(read_key STUCK_AFTER_MINUTES)"; stuck="${stuck:-15}"
-  local execution max_active plan
+  local execution max_active plan health_json lifecycle_root trusted_preset
   execution="$(read_key EXECUTION)"; execution="${execution:-sequential}"
   max_active="$(read_key MAX_ACTIVE_IMPLEMENTERS)"
+  trusted_preset="$(trusted_team_preset "$team" "$fid")" \
+    || die "could not verify protected team preset authority"
+  health_json="[]"
+  lifecycle_root="${STARTUP_FACTORY_LIFECYCLE_STATE_ROOT:-$(read_key BROKER_LIFECYCLE_ROOT)}"
+  if [ -n "$lifecycle_root" ]; then
+    health_json="$("$SKILL_DIR/bin/launch-team.sh" status "$team" --json | python3 -c 'import json,sys; print(json.dumps([json.loads(line) for line in sys.stdin if line.strip()],separators=(",",":")))')" \
+      || die "could not build authenticated worker-health snapshot"
+    TEAM_LEAD_RECOVERED=no
+    recover_team_lead_if_stalled "$team" "$fid" "$dir" "$lifecycle_root" "$health_json" "$dry"
+    if [ "$TEAM_LEAD_RECOVERED" = yes ]; then
+      health_json="$("$SKILL_DIR/bin/launch-team.sh" status "$team" --json | python3 -c 'import json,sys; print(json.dumps([json.loads(line) for line in sys.stdin if line.strip()],separators=(",",":")))')" \
+        || die "could not refresh authenticated worker-health after Team Lead recovery"
+    fi
+  fi
   local planner_args=(--skill "$SKILL_DIR" --workdir "$dir" --team "$team" --feature "$fid" --stuck-minutes "$stuck" --execution "$execution")
+  [ -z "$trusted_preset" ] || planner_args+=(--preset "$trusted_preset")
+  planner_args+=(--health-json "$health_json")
   [ -z "$max_active" ] || planner_args+=(--max-active "$max_active")
+  [ -z "$target_task" ] || planner_args+=(--task "$target_task")
   planner_args+=(--ignored-labels-json "${STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON:-[]}")
   plan="$(python3 "$SKILL_DIR/bin/dispatch-plan.py" "${planner_args[@]}")"
   if [ -z "$plan" ]; then echo "dispatch: nothing actionable"; return 0; fi
@@ -349,7 +471,7 @@ EOF
       blocked-hold)
         echo "plan: keep $arg [Blocked] — human-held; Startup Factory cannot move it outbound" ;;
       launch)
-        local concrete; concrete="$(resolve_role "$team" "$arg")"
+        local concrete; concrete="$(resolve_role "$team" "$fid" "$arg")" || die "could not resolve protected role mapping"
         local _ck; _ck="$(role_cmd_key "$concrete")"
         if key_is_null "$_ck"; then
           echo "plan: launch $arg (→$concrete) — skipped (${_ck}=null; the team-lead routes this queue)"
@@ -376,7 +498,7 @@ EOF
           fi
         fi ;;
       claim-task)
-        local claim_role; claim_role="$(resolve_role "$team" "$arg")"
+        local claim_role; claim_role="$(resolve_role "$team" "$fid" "$arg")" || die "could not resolve protected claim role"
         if task_live "$team" "$claim_role" "$detail" "$extra"; then
           echo "plan: claim $detail for $claim_role - skipped (live task instance)"
         else
@@ -441,7 +563,7 @@ PY
           fi
         fi ;;
       launch-task)
-        local task_role; task_role="$(resolve_role "$team" "$arg")"
+        local task_role; task_role="$(resolve_role "$team" "$fid" "$arg")" || die "could not resolve protected task role"
         if task_any_live "$team" "$detail"; then
           echo "plan: launch task $detail as $task_role - skipped (another task attempt is live)"
         else
@@ -450,28 +572,91 @@ PY
             "$SKILL_DIR/bin/launch-team.sh" start-task "$team" "$fid" "$task_role" "$detail" "$extra"
           fi
         fi ;;
+      recover-task)
+        local recover_role control_id recover_key recover_instance lifecycle_row lifecycle_state lifecycle_generation
+        recover_role="$(resolve_role "$team" "$fid" "$arg")" || die "could not resolve protected recovery role"
+        if task_any_live "$team" "$detail"; then
+          echo "plan: recover task $detail as $recover_role - deferred (live instance; Team Lead authorization required)"
+        else
+          control_id="control-$(python3 -c 'import hashlib,sys; print(hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest()[:32])' "$team" "$fid" "$detail" "$extra" dead-worker)"
+          recover_key="$(python3 "$SKILL_DIR/bin/runtime-state.py" key "$detail")"
+          recover_instance="$recover_role--$recover_key--a$extra"
+          lifecycle_row="$(python3 "$SKILL_DIR/bin/process-lifecycle.py" list \
+            --root "$lifecycle_root" --repo "$REPO_ROOT" --team "$team" | \
+            python3 -c 'import json,sys; target=sys.argv[1]; rows=[json.loads(line) for line in sys.stdin if line.strip()]; matches=[r for r in rows if r.get("category")=="task" and r.get("instance")==target];
+assert len(matches)<=1, "duplicate lifecycle identities";
+print((matches[0]["state"]+"\t"+matches[0]["createdAt"]) if matches else "absent\t-")' "$recover_instance")" \
+            || die "could not authenticate dead-worker lifecycle generation"
+          IFS=$'\t' read -r lifecycle_state lifecycle_generation <<< "$lifecycle_row"
+          if [ "$lifecycle_state" = live ]; then
+            echo "plan: recover task $detail as $recover_role - deferred (a replacement became live)"
+            continue
+          fi
+          [ "$lifecycle_state" != identity-mismatch ] \
+            || die "automatic recovery refused an identity-mismatched lifecycle record for $detail"
+          echo "plan: recover exited task $detail as $recover_role (attempt $extra -> $((extra + 1)))"
+          if [ "$dry" != "yes" ]; then
+            python3 "$SKILL_DIR/bin/control-grant.py" issue \
+              --root "$lifecycle_root" --repo "$REPO_ROOT" \
+              --team "$team" --feature "$fid" --action restart-task --target "$detail" \
+              --attempt "$extra" --generation "$lifecycle_generation" --control-id "$control_id" --reason automatic \
+              >/dev/null || die "could not issue protected automatic-recovery grant"
+            if recovery_output="$(STARTUP_FACTORY_CONTROL_BROKER=1 STARTUP_FACTORY_CONTROL_REASON=automatic \
+                STARTUP_FACTORY_EXPECTED_LIFECYCLE_CREATED_AT="$lifecycle_generation" \
+                "$SKILL_DIR/bin/launch-team.sh" restart-task \
+                "$team" "$fid" "$detail" "$extra" "$control_id" 2>&1)"; then
+              printf '%s\n' "$recovery_output"
+            else
+              local lead_mailbox lead_message
+              lead_mailbox="$(team_path "$dir" mailbox/team-lead)"
+              lead_message="$(next_mailbox_file "$lead_mailbox")"
+              {
+                echo "From: dispatcher"
+                echo "Re: $detail"
+                echo "---"
+                echo "Automatic dead-worker recovery was suppressed: $recovery_output"
+                echo "Inspect protected status and restart policy; authorize a bounded recovery or escalate."
+              } > "$lead_message"
+              echo "plan: automatic recovery for $detail suppressed; Team Lead review queued" >&2
+            fi
+          fi
+        fi ;;
     esac
   done <<EOF
 $plan
 EOF
 }
 
-[ $# -ge 3 ] || die "usage: dispatch.sh <team> <featureId> --once|--watch [--dry-run]"
+[ $# -ge 3 ] || die "usage: dispatch.sh <team> <featureId> --once|--watch [--dry-run] [--task <taskId>]"
 TEAM="$1"; FID="$2"; MODE="$3"; shift 3
 DRY=no
-for opt in "$@"; do
-  case "$opt" in
+TARGET_TASK=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     --dry-run) DRY=yes ;;
+    --task)
+      [ $# -ge 2 ] || die "--task requires one taskId"
+      [ -z "$TARGET_TASK" ] || die "--task may be specified only once"
+      TARGET_TASK="$2"
+      shift ;;
+    --task=*)
+      [ -z "$TARGET_TASK" ] || die "--task may be specified only once"
+      TARGET_TASK="${1#--task=}"
+      [ -n "$TARGET_TASK" ] || die "--task requires one taskId" ;;
     --unblock=auto|--unblock=suggest|--unblock=off)
-      echo "dispatch: warning — $opt is deprecated and ignored; [Blocked] exits are human-only" >&2 ;;
-    --unblock=*) die "unknown legacy unblock option $opt" ;;
-    *) die "unknown option $opt" ;;
+      echo "dispatch: warning — $1 is deprecated and ignored; [Blocked] exits are human-only" >&2 ;;
+    --unblock=*) die "unknown legacy unblock option $1" ;;
+    *) die "unknown option $1" ;;
   esac
+  shift
 done
+[ -z "$TARGET_TASK" ] || [ "$DRY" = yes ] \
+  || die "--task is a read-only scope preview and requires --dry-run; execute one task with launch-team.sh start-task"
 case "$MODE" in
-  --once) dispatch_once "$TEAM" "$FID" "$DRY" ;;
+  --once) dispatch_once "$TEAM" "$FID" "$DRY" "$TARGET_TASK" ;;
   --watch)
     [ "$DRY" = "no" ] || die "--watch does not combine with --dry-run"
+    [ -z "$TARGET_TASK" ] || die "--watch does not combine with --task"
     INTERVAL="$(read_key POLL_INTERVAL_SECONDS)"; INTERVAL="${INTERVAL:-120}"
     echo "dispatch: watching (every ${INTERVAL}s) — this shell is the loop owner; keep it alive (tmux/nohup)"
     while true; do

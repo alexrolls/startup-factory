@@ -56,8 +56,8 @@ roster per [feature] — e.g. no frontend [tasks] → no frontend agent).
 TEAM_LEAD_CMD="claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits"
 PRINCIPAL_ARCHITECT_CMD="claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits"
 INTEGRATOR_CMD="claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits"
-BACKEND_CMD="codex exec --full-auto \"$(cat {prompt_file})\""
-FRONTEND_CMD="codex exec --full-auto \"$(cat {prompt_file})\""
+BACKEND_CMD="codex exec --approve-for-me \"$(cat {prompt_file})\""
+FRONTEND_CMD="codex exec --approve-for-me \"$(cat {prompt_file})\""
 QA_CMD=null
 REVIEWER_CMD="gemini --yolo \"$(cat {prompt_file})\""
 ```

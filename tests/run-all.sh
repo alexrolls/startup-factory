@@ -45,6 +45,12 @@ FULL_PYTHON_TESTS=(
   beads-prepared-payload-hardening-test.py
   beads-protected-runtime-test.py
   beads-protected-runtime-hostile-test.py
+  worker-control-test.py
+  protected-control-policy-test.py
+  team-context-test.py
+  team-policy-test.py
+  process-lifecycle-generation-test.py
+  safe-turbo-readiness-test.py
   retrospective-test.py
   product-acceptance-test.py
   superpowers-planning-test.py
@@ -53,6 +59,7 @@ FULL_PYTHON_TESTS=(
   evidence-provider-test.py
   release-lifecycle-test.py
   tracker-adapter-pagination-test.py
+  heartbeat-status-test.py
   task-hold-test.py
   custom-tracker-release-snapshot-test.py
 )
@@ -72,6 +79,13 @@ FULL_SHELL_TESTS=(
 )
 SMOKE_PYTHON_TESTS=(
   ticket-content-security-test.py
+  heartbeat-status-test.py
+  worker-control-test.py
+  protected-control-policy-test.py
+  team-context-test.py
+  team-policy-test.py
+  process-lifecycle-generation-test.py
+  safe-turbo-readiness-test.py
   retrospective-test.py
   product-acceptance-test.py
   superpowers-planning-test.py

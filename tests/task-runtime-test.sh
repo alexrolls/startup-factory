@@ -299,6 +299,46 @@ check "task pid uses task instance directory" test -d .teamwork/feature-runtime/
 "$OPS" claim "$TID" backend >/dev/null
 "$EVENT" feature-runtime "$FID" "$TID" 1 backend task.started implementing "writing endpoint" >/dev/null
 check "event journal records task event" grep -q '"type":"task.started"' .teamwork/feature-runtime/events.ndjson
+canonical_repo="$(pwd)"
+canonical_workspace="$canonical_repo/.teamwork/feature-runtime"
+fixed_event_env=(env
+  STARTUP_FACTORY_EXECUTION_KIND=task
+  STARTUP_FACTORY_TEAM=feature-runtime
+  STARTUP_FACTORY_FEATURE_ID="$FID"
+  STARTUP_FACTORY_ROLE=backend
+  STARTUP_FACTORY_TASK_ID="$TID"
+  STARTUP_FACTORY_ATTEMPT=1
+  STARTUP_FACTORY_INSTANCE="backend--$key--a1"
+  STARTUP_FACTORY_CANONICAL_REPO="$canonical_repo"
+  STARTUP_FACTORY_CANONICAL_WORKSPACE="$canonical_workspace")
+fixed_heartbeat=".teamwork/feature-runtime/heartbeats/backend--$key--a1"
+heartbeat_before="$(cat "$fixed_heartbeat" 2>/dev/null || true)"
+event_count_before="$(wc -l < .teamwork/feature-runtime/events.ndjson)"
+refuse "runtime event rejects fixed team mismatch" "team does not match fixed runtime identity" \
+  "${fixed_event_env[@]}" "$EVENT" other-team "$FID" "$TID" 1 backend forged.team implementing
+refuse "runtime event rejects fixed feature mismatch" "feature does not match fixed runtime identity" \
+  "${fixed_event_env[@]}" "$EVENT" feature-runtime wrong-feature "$TID" 1 backend forged.feature implementing
+refuse "runtime event rejects fixed actor mismatch" "actor does not match fixed runtime identity" \
+  "${fixed_event_env[@]}" "$EVENT" feature-runtime "$FID" "$TID" 1 frontend forged.actor implementing
+refuse "runtime event rejects fixed task mismatch" "task does not match fixed runtime identity" \
+  "${fixed_event_env[@]}" "$EVENT" feature-runtime "$FID" wrong-task 1 backend forged.task implementing
+refuse "runtime event rejects fixed attempt mismatch" "attempt does not match fixed runtime identity" \
+  "${fixed_event_env[@]}" "$EVENT" feature-runtime "$FID" "$TID" 2 backend forged.attempt implementing
+check "rejected fixed-identity events write nothing" test \
+  "$(wc -l < .teamwork/feature-runtime/events.ndjson)" = "$event_count_before"
+check "rejected fixed-identity events do not refresh heartbeat" test \
+  "$(cat "$fixed_heartbeat" 2>/dev/null || true)" = "$heartbeat_before"
+refuse "runtime event rejects canonical workspace mismatch" "canonical workspace does not match" \
+  "${fixed_event_env[@]}" STARTUP_FACTORY_CANONICAL_WORKSPACE="$canonical_repo/.teamwork/wrong-team" \
+  "$EVENT" feature-runtime "$FID" "$TID" 1 backend forged.workspace implementing
+ln -s "$canonical_repo" "$TMP/canonical-repo-link"
+refuse "runtime event rejects symlink canonical repository" "absolute non-symlink path" \
+  "${fixed_event_env[@]}" STARTUP_FACTORY_CANONICAL_REPO="$TMP/canonical-repo-link" \
+  "$EVENT" feature-runtime "$FID" "$TID" 1 backend forged.repo implementing
+refuse "runtime event rejects empty semantic heartbeat state before journaling" "heartbeat state must not be empty" \
+  "${fixed_event_env[@]}" "$EVENT" feature-runtime "$FID" "$TID" 1 backend forged.stage " "
+check "invalid semantic heartbeat state writes no event" test \
+  "$(wc -l < .teamwork/feature-runtime/events.ndjson)" = "$event_count_before"
 if grep -q 'agent-squad:progress:start' "$FID"; then
   echo "FAIL: worker wrote tracker directly in scribe mode"; FAILURES=$((FAILURES+1))
 else
@@ -322,6 +362,10 @@ git -C "$wt" commit -q -m 'Implement endpoint fixture'
 cat > task-submit-probe.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+"$STARTUP_FACTORY_CANONICAL_REPO/.agent-squad/bin/runtime-event.sh" \
+  "$STARTUP_FACTORY_TEAM" "$STARTUP_FACTORY_FEATURE_ID" "$STARTUP_FACTORY_TASK_ID" \
+  "$STARTUP_FACTORY_ATTEMPT" "$STARTUP_FACTORY_ROLE" task.linked-worktree implementing \
+  "canonical linked-worktree event" >/dev/null
 cat > linked-progress-note.md <<'BODY'
 [progress-note]
 Submitted from the linked task worktree through canonical routing.
@@ -339,13 +383,18 @@ rm -f ".teamwork/feature-runtime/pids/tasks/backend--$key--a1.pid" \
 TEAM_RUNNER=background "$LAUNCH" start-task feature-runtime "$FID" backend "$TID" 1 >/dev/null
 for _i in $(seq 1 50); do [ -s .teamwork/feature-runtime/linked-entry.path ] && break; sleep 0.1; done
 linked_entry="$(cat .teamwork/feature-runtime/linked-entry.path 2>/dev/null || true)"
+check "linked task event lands in canonical journal" \
+  grep -q '"type":"task.linked-worktree"' .teamwork/feature-runtime/events.ndjson
+check "linked task event refreshes canonical semantic heartbeat" \
+  grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z \\| $TID \\| implementing; attempt=1$" \
+  "$fixed_heartbeat"
 check "linked task submission lands in canonical outbox" python3 - "$linked_entry" "$(pwd)/.teamwork/feature-runtime/outbox/pending" <<'PY'
 import os,sys
 entry,pending=sys.argv[1:]
 assert os.path.isfile(entry)
 assert os.path.commonpath([os.path.realpath(entry), os.path.realpath(pending)]) == os.path.realpath(pending)
 PY
-check "linked task worktree gets no shadow outbox" test ! -e "$wt/.teamwork"
+check "linked task worktree gets no shadow runtime state" test ! -e "$wt/.teamwork"
 .agent-squad/bin/process-outbox.sh feature-runtime "$FID" "$linked_entry" >/dev/null
 check "broker accepts a legitimate launched-task signature" grep -q 'Submitted from the linked task worktree' "$FID"
 sed_i 's|^TASK_STRONG_CMD=.*|TASK_STRONG_CMD="cat {prompt_file} > task-strong-prompt.txt"|' "$CFG"
@@ -453,6 +502,9 @@ PROTOCOL_PRINCIPAL_ARCHITECT=principal-software-architect
 PROTOCOL_SCEPTICAL_ARCHITECT=sceptical-architect
 PROTOCOL_SECURITY_REVIEWER=senior-security-engineer
 EOF
+python3 .agent-squad/bin/team-context.py issue \
+  --repo "$PWD" --workspace "$PWD/.teamwork/feature-runtime" \
+  --team feature-runtime --feature "$FID" --preset - --skill "$PWD/.agent-squad" >/dev/null
 cat > gate-submit-probe.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -618,9 +670,12 @@ refuse "broker rejects a cross-role gate capability" "claimed actor does not mat
 
 missing_sceptical_mapping_entry="$(launch_gate_submission principal-software-architect architecture-approval architecture-verdict.md missing-sceptical-mapping.path)"
 sed_i '/^PROTOCOL_SCEPTICAL_ARCHITECT=/d' .teamwork/feature-runtime/preset.env
-refuse "broker rejects a preset that omits the mandatory Sceptical Architect" "must define one valid mandatory PROTOCOL_SCEPTICAL_ARCHITECT" \
+refuse "broker rejects a preset that omits the mandatory Sceptical Architect" "protected team preset authority" \
   .agent-squad/bin/process-outbox.sh feature-runtime "$FID" "$missing_sceptical_mapping_entry"
 printf 'PROTOCOL_SCEPTICAL_ARCHITECT=sceptical-architect\n' >> .teamwork/feature-runtime/preset.env
+python3 .agent-squad/bin/team-context.py issue \
+  --repo "$PWD" --workspace "$PWD/.teamwork/feature-runtime" \
+  --team feature-runtime --feature "$FID" --preset - --skill "$PWD/.agent-squad" >/dev/null
 
 architecture_entry="$(launch_gate_submission principal-software-architect architecture-approval architecture-verdict.md architecture.path)"
 .agent-squad/bin/process-outbox.sh feature-runtime "$FID" "$architecture_entry" >/dev/null
@@ -681,6 +736,9 @@ PROTOCOL_SCEPTICAL_ARCHITECT=sceptical-architect
 PROTOCOL_SECURITY_REVIEWER=senior-security-engineer
 PROTOCOL_PRODUCT_MANAGER=senior-technical-product-manager
 EOF
+python3 .agent-squad/bin/team-context.py issue \
+  --repo "$PWD" --workspace "$PWD/.teamwork/feature-runtime" \
+  --team feature-runtime --feature "$FID" --preset - --skill "$PWD/.agent-squad" >/dev/null
 cat > product-verdict.md <<'EOF'
 [product-approval]
 scope: feature
@@ -696,6 +754,9 @@ product_entry="$(launch_gate_submission senior-technical-product-manager product
 .agent-squad/bin/process-outbox.sh feature-runtime "$FID" "$product_entry" >/dev/null
 check "configured product-manager can publish product verdict" grep -q 'fixture: broker-role-ownership' "$FID"
 sed_i '/^PROTOCOL_PRODUCT_MANAGER=/d' .teamwork/feature-runtime/preset.env
+python3 .agent-squad/bin/team-context.py issue \
+  --repo "$PWD" --workspace "$PWD/.teamwork/feature-runtime" \
+  --team feature-runtime --feature "$FID" --preset - --skill "$PWD/.agent-squad" >/dev/null
 cat > fallback-verdict.md <<'EOF'
 [product-pushback]
 reason: fallback ownership fixture

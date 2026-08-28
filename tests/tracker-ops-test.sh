@@ -169,6 +169,9 @@ Call the endpoint.
 EOF
 T="feat/feature.md"
 
+# -- probe: minimal feature-local access check ---------------------------------
+check "probe verifies feature access without exporting tasks" "$OPS" probe "$T"
+
 # -- generated PM surfaces: one task progress block + one feature digest -------
 printf '[progress]\ncredential: %s\n' "$OUTBOUND_SECRET" | "$OPS" upsert-progress "$T#2" - >/dev/null
 check "progress projection never stores a raw credential" bash -c "! grep -Fq '$OUTBOUND_SECRET' '$T'"

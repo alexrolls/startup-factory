@@ -155,6 +155,10 @@ else
   echo "ok: non-Claude command excludes Superpowers planning instructions"
 fi
 check "synchronous managed launch retires process marker" test ! -e .teamwork/test-feature/pids/backend.pid
+for i in $(seq 1 100); do
+  [ -f backend-received.txt ] && grep -Fq "$PWD|/usr/bin/env|-i" "$SANDBOX_RUNNER_LOG" && break
+  sleep 0.1
+done
 check "enforced gate launch uses protected runner argv" grep -Fq "$PWD|/usr/bin/env|-i" "$SANDBOX_RUNNER_LOG"
 check "stub agent ran with prompt"  grep -q "Role: backend" backend-received.txt
 check "mailbox dir created"         test -d .teamwork/test-feature/mailbox/backend
@@ -176,7 +180,11 @@ cat > custom-wrapper <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
-chmod +x claude codex gemini custom-wrapper
+cat > dsh <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x claude codex gemini custom-wrapper dsh
 
 sed_i 's|^FRONTEND_CMD=.*|FRONTEND_CMD="./claude {prompt_file}"|' "$CFG_SANDBOX"
 unmarked_harness_prompt="$("$LAUNCH" compose native-harness FEAT-NATIVE-HARNESS frontend)"
@@ -205,6 +213,16 @@ if grep -q "Claude + obra/superpowers planning" "$gemini_prompt"; then
   echo "FAIL: Gemini CLI command received Superpowers planning instructions"; FAILURES=$((FAILURES+1))
 else
   echo "ok: Gemini CLI command excludes Superpowers planning instructions"
+fi
+
+sed_i 's|^FRONTEND_CMD=.*|FRONTEND_CMD="./dsh --profile headless \"$(cat '\''{prompt_file}'\'')\""|' "$CFG_SANDBOX"
+TEAM_RUNNER=background "$LAUNCH" start dsh-planning FEAT-DSH frontend
+dsh_prompt=.teamwork/dsh-planning/prompts/frontend.md
+check "DeepSeek Harness command is classified as non-Claude" grep -q "LLM runtime family: other" "$dsh_prompt"
+if grep -q "Claude + obra/superpowers planning" "$dsh_prompt"; then
+  echo "FAIL: DeepSeek Harness command received Superpowers planning instructions"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: DeepSeek Harness command excludes Superpowers planning instructions"
 fi
 
 sed_i 's|^FRONTEND_CMD=.*|FRONTEND_CMD="./custom-wrapper {prompt_file}"|' "$CFG_SANDBOX"
@@ -348,8 +366,8 @@ sed_i 's|^SENIOR_SECURITY_ENGINEER_CMD=.*|SENIOR_SECURITY_ENGINEER_CMD="cat '\''
 sed_i 's|^SENIOR_QA_ENGINEER_CMD=.*|SENIOR_QA_ENGINEER_CMD="cat '\''{prompt_file}'\''"|' .claude/skills/pm/config/team.config.md
 sed_i 's|^TEAM_DEFAULT_CMD=.*|TEAM_DEFAULT_CMD="cat '\''{prompt_file}'\''"|' .claude/skills/pm/config/team.config.md
 doctor_out="$("$LAUNCH" doctor full-stack doctor-team FEAT-DOCTOR)"
-printf '%s' "$doctor_out" | grep -q "every distinct configured command completed" \
-  && echo "ok: doctor completes prompt/auth round trips under the real agent environment" \
+printf '%s' "$doctor_out" | grep -Eq "distinct command\(s\) verified, covering [0-9]+ enabled roster role\(s\)" \
+  && echo "ok: doctor reports verified commands and covered roles accurately" \
   || { echo "FAIL: doctor did not complete: $doctor_out"; FAILURES=$((FAILURES+1)); }
 sed_i 's|^SENIOR_QA_ENGINEER_CMD=.*|SENIOR_QA_ENGINEER_CMD="false"|' .claude/skills/pm/config/team.config.md
 if doctor_out="$("$LAUNCH" doctor full-stack doctor-fail FEAT-DOCTOR 2>&1)"; then
@@ -494,6 +512,15 @@ else
 fi
 
 # -- worktree subcommand -------------------------------------------------------
+if missing_branch_out="$("$LAUNCH" worktree missing-feature backend T-MISSING 2>&1)"; then
+  echo "FAIL: missing feature branch was accepted"; FAILURES=$((FAILURES+1))
+elif printf '%s' "$missing_branch_out" | grep -q "feature branch 'missing-feature' does not exist.*git branch 'missing-feature' <base-commit>"; then
+  echo "ok: missing feature branch reports an actionable creation command"
+else
+  echo "FAIL: missing feature branch produced the wrong error: $missing_branch_out"; FAILURES=$((FAILURES+1))
+fi
+check "missing feature branch creates no task worktree" test ! -e .teamwork/missing-feature/worktrees
+
 T42_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key T-42)"
 T42_WT=".teamwork/test-feature/worktrees/backend#1-$T42_KEY"
 "$LAUNCH" worktree test-feature backend T-42
@@ -750,6 +777,34 @@ else
 fi
 sed_i '/^EXECUTION=parallel$/d;/^MAX_ACTIVE_IMPLEMENTERS=zero$/d' "$CFG"
 
+# -- Safe Turbo is explicit, bounded, and fail-closed -------------------------
+sed_i 's|^VALIDATE_TEST=null$|VALIDATE_TEST="test -e .git"|' "$CFG"
+cat >> "$CFG" <<'EOF'
+TURBO_MODE=safe
+EXECUTION=parallel
+MAX_ACTIVE_IMPLEMENTERS=2
+WORKTREE_SETUP="test -d ."
+EOF
+check "Safe Turbo accepts the parallel full-stack preset" \
+  "$LAUNCH" compose test-feature FEAT-1 backend full-stack
+if out="$("$LAUNCH" compose test-feature FEAT-1 backend deep-backend 2>&1)"; then
+  echo "FAIL: Safe Turbo accepted a preset without explicit parallel review"; FAILURES=$((FAILURES+1))
+elif printf '%s' "$out" | grep -q 'REVIEW_MODE=parallel'; then
+  echo "ok: Safe Turbo refuses a non-parallel review preset"
+else
+  echo "FAIL: Safe Turbo review refusal has wrong message: $out"; FAILURES=$((FAILURES+1))
+fi
+sed_i 's/^MAX_ACTIVE_IMPLEMENTERS=2$/MAX_ACTIVE_IMPLEMENTERS=5/' "$CFG"
+if out="$("$LAUNCH" compose test-feature FEAT-1 backend full-stack 2>&1)"; then
+  echo "FAIL: Safe Turbo accepted more than four implementers"; FAILURES=$((FAILURES+1))
+elif printf '%s' "$out" | grep -q 'from 1 to 4'; then
+  echo "ok: Safe Turbo enforces its concurrency ceiling"
+else
+  echo "FAIL: Safe Turbo ceiling refusal has wrong message: $out"; FAILURES=$((FAILURES+1))
+fi
+sed_i '/^TURBO_MODE=safe$/d;/^EXECUTION=parallel$/d;/^MAX_ACTIVE_IMPLEMENTERS=5$/d;/^WORKTREE_SETUP="test -d ."$/d' "$CFG"
+sed_i 's|^VALIDATE_TEST="test -e .git"$|VALIDATE_TEST=null|' "$CFG"
+
 # -- preflight: aborts before any launch when the adapter probe fails -----------
 cat > .claude/skills/pm/config/project-management.config.md <<'EOF'
 ```
@@ -832,6 +887,250 @@ MARKDOWN_ROOT=.
 STATUS_CONFIG=config/statuses.config.json
 ```
 EOF
+
+# -- dirty-attempt quarantine inventories ignored bytes and converges replay --
+cat > quarantine-feature.md <<'EOF'
+# Quarantine fixture [Active]
+
+## 1 Preserve ignored WIP [Active]
+
+**Assignee:** backend
+
+track: backend
+parallel-safe: true
+files: src/quarantine-one.txt
+resources: quarantine:one
+
+Preserve all abandoned attempt bytes before replacement.
+
+## 2 Resume a post-move quarantine [Active]
+
+**Assignee:** backend
+
+track: backend
+parallel-safe: true
+files: src/quarantine-two.txt
+resources: quarantine:two
+
+Converge a broker replay after the worktree move.
+EOF
+printf '\n/ignored-quarantine/\n' >> .git/info/exclude
+CFG_QUARANTINE=.claude/skills/pm/config/team.config.md
+cp "$CFG_QUARANTINE" "$TMP/team.config.before-quarantine"
+sed_i 's|^BACKEND_CMD=.*|BACKEND_CMD="true"|' "$CFG_QUARANTINE"
+QUARANTINE_FID=quarantine-feature.md
+
+wait_task_exit() { # team role task attempt
+  local _qt_i _qt_rc
+  for _qt_i in $(seq 1 80); do
+    if "$LAUNCH" live-task "$1" "$2" "$3" "$4" >/dev/null 2>&1; then
+      sleep 0.05
+    else
+      _qt_rc=$?
+      [ "$_qt_rc" -eq 3 ] && return 0
+      return "$_qt_rc"
+    fi
+  done
+  return 1
+}
+
+QUARANTINE_TEAM=quarantine-ignored
+QUARANTINE_TASK="$QUARANTINE_FID#1"
+QUARANTINE_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$QUARANTINE_TASK")"
+QUARANTINE_SOURCE="$PWD/.teamwork/$QUARANTINE_TEAM/worktrees/backend#1-$QUARANTINE_KEY"
+QUARANTINE_SUFFIX="$(python3 -c 'import hashlib; print(hashlib.sha256(b"attempt-2").hexdigest()[:12])')"
+QUARANTINE_MANIFEST="$PWD/.teamwork/$QUARANTINE_TEAM/quarantine/$QUARANTINE_KEY/attempt-1-$QUARANTINE_SUFFIX.json"
+git branch "$QUARANTINE_TEAM"
+mkdir -p "$PWD/.teamwork/$QUARANTINE_TEAM"
+TEAM_RUNNER=background "$LAUNCH" start-task \
+  "$QUARANTINE_TEAM" "$QUARANTINE_FID" backend "$QUARANTINE_TASK" 1 >/dev/null
+check "quarantine fixture attempt exits" wait_task_exit \
+  "$QUARANTINE_TEAM" backend "$QUARANTINE_TASK" 1
+QUARANTINE_DEST="$(python3 .claude/skills/pm/bin/quarantine-attempt.py destination \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$QUARANTINE_TEAM" \
+  --task-key "$QUARANTINE_KEY" --attempt 1 --suffix "$QUARANTINE_SUFFIX")"
+mkdir -p "$QUARANTINE_SOURCE/ignored-quarantine"
+printf 'ignored but valuable WIP\000with bytes\n' > "$QUARANTINE_SOURCE/ignored-quarantine/wip.bin"
+printf 'external target remains untouched\n' > "$TMP/outside-quarantine-target"
+ln -s "$TMP/outside-quarantine-target" "$QUARANTINE_SOURCE/ignored-quarantine/outside-link"
+TEAM_RUNNER=background "$LAUNCH" start-task \
+  "$QUARANTINE_TEAM" "$QUARANTINE_FID" backend "$QUARANTINE_TASK" 2 >/dev/null
+check "ignored-only WIP is quarantined, never removed as clean" test -d "$QUARANTINE_DEST"
+check "ignored WIP bytes survive quarantine" test -f "$QUARANTINE_DEST/ignored-quarantine/wip.bin"
+check "quarantine inventories symlink without replacing it" test -L "$QUARANTINE_DEST/ignored-quarantine/outside-link"
+check "quarantine never follows or changes external symlink target" \
+  grep -qx 'external target remains untouched' "$TMP/outside-quarantine-target"
+check "replacement attempt receives a fresh worktree" \
+  test -d "$PWD/.teamwork/$QUARANTINE_TEAM/worktrees/backend#2-$QUARANTINE_KEY"
+check "quarantine writes its workspace projection" test -f "$QUARANTINE_MANIFEST"
+check "quarantine receipts HMAC-bind every ignored byte and symlink" python3 - \
+    "$LIFECYCLE_ROOT" "$QUARANTINE_TEAM" "$QUARANTINE_MANIFEST" \
+    "$TMP/outside-quarantine-target" "$QUARANTINE_DEST" <<'PY'
+import base64
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+root, team, manifest_path, symlink_target, destination = sys.argv[1:]
+key = Path(root, "record-auth.key").read_bytes()
+receipts = Path(root, "quarantine-receipts")
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
+def authenticated(path):
+    value = json.loads(path.read_text(encoding="utf-8"))
+    supplied = value.pop("auth")
+    expected = "hmac-sha256:" + hmac.new(key, canonical(value), hashlib.sha256).hexdigest()
+    assert hmac.compare_digest(supplied, expected)
+    value["auth"] = supplied
+    return value
+
+
+prepares = [
+    authenticated(path)
+    for path in receipts.glob("*.prepare.json")
+    if json.loads(path.read_text())["operation"]["team"] == team
+]
+finals = [
+    authenticated(path)
+    for path in receipts.glob("*.final.json")
+    if json.loads(path.read_text())["operation"]["team"] == team
+]
+assert len(prepares) == len(finals) == 1
+prepare, final = prepares[0], finals[0]
+prepare_path = Path(next(path for path in receipts.glob("*.prepare.json") if json.loads(path.read_text())["operation"]["team"] == team))
+final_path = Path(next(path for path in receipts.glob("*.final.json") if json.loads(path.read_text())["operation"]["team"] == team))
+assert stat.S_IMODE(receipts.stat().st_mode) == 0o700
+assert stat.S_IMODE(prepare_path.stat().st_mode) == 0o600
+assert stat.S_IMODE(final_path.stat().st_mode) == 0o600
+entries = {
+    base64.b64decode(item["pathB64"]): item
+    for item in prepare["inventory"]["entries"]
+}
+
+
+def actual_entries(root_path):
+    result = {}
+
+    def visit(directory, prefix=b""):
+        for item in sorted(os.scandir(directory), key=lambda candidate: os.fsencode(candidate.name)):
+            name = os.fsencode(item.name)
+            relative = name if not prefix else prefix + b"/" + name
+            info = item.stat(follow_symlinks=False)
+            mode = stat.S_IMODE(info.st_mode)
+            if stat.S_ISREG(info.st_mode):
+                content = Path(item.path).read_bytes()
+                result[relative] = {
+                    "kind": "file",
+                    "mode": mode,
+                    "size": len(content),
+                    "sha256": "sha256:" + hashlib.sha256(content).hexdigest(),
+                }
+            elif stat.S_ISDIR(info.st_mode):
+                result[relative] = {"kind": "directory", "mode": mode}
+                visit(item.path, relative)
+            elif stat.S_ISLNK(info.st_mode):
+                target_bytes = os.fsencode(os.readlink(item.path))
+                result[relative] = {
+                    "kind": "symlink",
+                    "mode": mode,
+                    "size": len(target_bytes),
+                    "sha256": "sha256:" + hashlib.sha256(target_bytes).hexdigest(),
+                }
+            else:
+                raise AssertionError(f"unsupported fixture entry: {relative!r}")
+
+    visit(root_path)
+    return result
+
+
+assert {
+    path: {key: value for key, value in item.items() if key != "pathB64"}
+    for path, item in entries.items()
+} == actual_entries(destination)
+assert prepare["inventory"]["rootMode"] == stat.S_IMODE(Path(destination).stat().st_mode)
+wip = b"ignored but valuable WIP\x00with bytes\n"
+assert entries[b"ignored-quarantine/wip.bin"]["sha256"] == "sha256:" + hashlib.sha256(wip).hexdigest()
+target = symlink_target.encode()
+assert entries[b"ignored-quarantine/outside-link"]["kind"] == "symlink"
+assert entries[b"ignored-quarantine/outside-link"]["sha256"] == "sha256:" + hashlib.sha256(target).hexdigest()
+assert final["inventorySha256"] == prepare["inventory"]["treeSha256"]
+manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+assert manifest["schemaVersion"] == 2
+assert manifest["treeSha256"] == prepare["inventory"]["treeSha256"]
+assert Path(manifest["prepareReceipt"]).is_file()
+assert Path(manifest["finalReceipt"]).is_file()
+PY
+
+# Model the exact crash window: durable prepare receipt, successful Git move,
+# no final receipt or workspace projection. Starting N+1 must finalize that
+# operation rather than declaring the old source absent and silently returning.
+REPLAY_TEAM=quarantine-replay
+REPLAY_TASK="$QUARANTINE_FID#2"
+REPLAY_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$REPLAY_TASK")"
+REPLAY_SOURCE="$PWD/.teamwork/$REPLAY_TEAM/worktrees/backend#1-$REPLAY_KEY"
+REPLAY_MANIFEST="$PWD/.teamwork/$REPLAY_TEAM/quarantine/$REPLAY_KEY/attempt-1-$QUARANTINE_SUFFIX.json"
+REPLAY_BRANCH="agent-quarantine/$REPLAY_TEAM/$REPLAY_KEY/a1-$QUARANTINE_SUFFIX"
+git branch "$REPLAY_TEAM"
+mkdir -p "$PWD/.teamwork/$REPLAY_TEAM"
+TEAM_RUNNER=background "$LAUNCH" start-task \
+  "$REPLAY_TEAM" "$QUARANTINE_FID" backend "$REPLAY_TASK" 1 >/dev/null
+check "post-move replay fixture attempt exits" wait_task_exit \
+  "$REPLAY_TEAM" backend "$REPLAY_TASK" 1
+REPLAY_DEST="$(python3 .claude/skills/pm/bin/quarantine-attempt.py destination \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$REPLAY_TEAM" \
+  --task-key "$REPLAY_KEY" --attempt 1 --suffix "$QUARANTINE_SUFFIX")"
+mkdir -p "$REPLAY_SOURCE/ignored-quarantine"
+printf 'replay must preserve me\n' > "$REPLAY_SOURCE/ignored-quarantine/replay.txt"
+REPLAY_HEAD="$(git -C "$REPLAY_SOURCE" rev-parse HEAD)"
+git -C "$REPLAY_SOURCE" switch -q -c "$REPLAY_BRANCH"
+python3 .claude/skills/pm/bin/quarantine-attempt.py prepare \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" --workspace "$PWD/.teamwork/$REPLAY_TEAM" \
+  --team "$REPLAY_TEAM" --task "$REPLAY_TASK" --task-key "$REPLAY_KEY" \
+  --role backend --attempt 1 --control-id attempt-2 --branch "$REPLAY_BRANCH" \
+  --source "$REPLAY_SOURCE" --destination "$REPLAY_DEST" --head "$REPLAY_HEAD" >/dev/null
+git worktree move "$REPLAY_SOURCE" "$REPLAY_DEST"
+check "crash simulation has prepare but no final receipt" python3 - \
+    "$LIFECYCLE_ROOT" "$REPLAY_TEAM" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+root, team = sys.argv[1:]
+receipts = Path(root, "quarantine-receipts")
+prepare = [p for p in receipts.glob("*.prepare.json") if json.loads(p.read_text())["operation"]["team"] == team]
+final = [p for p in receipts.glob("*.final.json") if json.loads(p.read_text())["operation"]["team"] == team]
+assert len(prepare) == 1 and not final
+PY
+TEAM_RUNNER=background "$LAUNCH" start-task \
+  "$REPLAY_TEAM" "$QUARANTINE_FID" backend "$REPLAY_TASK" 2 >/dev/null
+check "post-move replay preserves quarantined bytes" \
+  grep -qx 'replay must preserve me' "$REPLAY_DEST/ignored-quarantine/replay.txt"
+check "post-move replay writes protected final receipt" python3 - \
+    "$LIFECYCLE_ROOT" "$REPLAY_TEAM" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+root, team = sys.argv[1:]
+matches = [
+    path
+    for path in Path(root, "quarantine-receipts").glob("*.final.json")
+    if json.loads(path.read_text())["operation"]["team"] == team
+]
+assert len(matches) == 1
+PY
+check "post-move replay reconstructs workspace projection" test -f "$REPLAY_MANIFEST"
+check "post-move replay launches replacement worktree" \
+  test -d "$PWD/.teamwork/$REPLAY_TEAM/worktrees/backend#2-$REPLAY_KEY"
+cp "$TMP/team.config.before-quarantine" "$CFG_QUARANTINE"
 
 # -- tmux liveness: pid file removed on agent exit; dead pane never blocks relaunch ----
 tmux_usable=no
@@ -1114,6 +1413,73 @@ wait "$identity_agent_pid" 2>/dev/null || true
 rm -f "$identity_record"
 
 sed_i 's|^BACKEND_CMD=.*|BACKEND_CMD="cat {prompt_file} > backend-received.txt"|' "$CFG_LIFECYCLE"
+
+# -- restart-role: one control has exactly one protected replacement generation --
+RESTART_ROLE_TEAM=restart-role-replay
+RESTART_ROLE_FEATURE=FEAT-RESTART-ROLE
+RESTART_ROLE_CONTROL="control-44444444444444444444444444444444"
+sed_i 's|^TEAM_LEAD_CMD=.*|TEAM_LEAD_CMD="sleep 30"|' "$CFG_LIFECYCLE"
+TEAM_RUNNER=background "$LAUNCH" start "$RESTART_ROLE_TEAM" "$RESTART_ROLE_FEATURE" team-lead >/dev/null
+restart_role_original_record="$(record_for "$RESTART_ROLE_TEAM" team-lead)"
+restart_role_original_created="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["createdAt"])' "$restart_role_original_record")"
+sed_i 's|^TEAM_LEAD_CMD=.*|TEAM_LEAD_CMD="true"|' "$CFG_LIFECYCLE"
+python3 .claude/skills/pm/bin/control-grant.py issue \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" \
+  --team "$RESTART_ROLE_TEAM" --feature "$RESTART_ROLE_FEATURE" \
+  --action restart-role --target team-lead --attempt 0 --generation "$restart_role_original_created" \
+  --control-id "$RESTART_ROLE_CONTROL" --reason authorized >/dev/null
+restart_role_first="$(TEAM_RUNNER=background STARTUP_FACTORY_CONTROL_BROKER=1 STARTUP_FACTORY_CONTROL_REASON=authorized \
+  "$LAUNCH" restart-role "$RESTART_ROLE_TEAM" "$RESTART_ROLE_FEATURE" team-lead \
+  "$restart_role_original_created" "$RESTART_ROLE_CONTROL")"
+echo "$restart_role_first" | grep -q 'restarted role team-lead' \
+  && echo "ok: restart-role launches one authorized replacement" \
+  || { echo "FAIL: restart-role did not launch its replacement: $restart_role_first"; FAILURES=$((FAILURES+1)); }
+for _i in $(seq 1 40); do
+  restart_role_state="$(python3 .claude/skills/pm/bin/process-lifecycle.py list \
+    --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$RESTART_ROLE_TEAM" | \
+    python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin if line.strip()]; print(rows[0]["state"] if len(rows)==1 else "")')"
+  [ "$restart_role_state" = dead ] && break
+  sleep 0.05
+done
+restart_role_replacement_record="$(record_for "$RESTART_ROLE_TEAM" team-lead)"
+restart_role_replacement_created="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["createdAt"])' "$restart_role_replacement_record")"
+check "restart-role replacement has a distinct lifecycle generation" \
+  test "$restart_role_replacement_created" != "$restart_role_original_created"
+check "restart-role short-lived replacement is retained as protected evidence" \
+  test "$restart_role_state" = dead
+
+restart_role_replay="$(TEAM_RUNNER=background STARTUP_FACTORY_CONTROL_BROKER=1 STARTUP_FACTORY_CONTROL_REASON=authorized \
+  "$LAUNCH" restart-role "$RESTART_ROLE_TEAM" "$RESTART_ROLE_FEATURE" team-lead \
+  "$restart_role_original_created" "$RESTART_ROLE_CONTROL")"
+echo "$restart_role_replay" | grep -q 'already completed with protected replacement generation' \
+  && echo "ok: restart-role dead-replacement replay converges from protected completion" \
+  || { echo "FAIL: restart-role dead-replacement replay did not converge: $restart_role_replay"; FAILURES=$((FAILURES+1)); }
+check "restart-role replay preserves the exact replacement generation" \
+  test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["createdAt"])' "$(record_for "$RESTART_ROLE_TEAM" team-lead)")" = "$restart_role_replacement_created"
+
+restart_role_policy="$(python3 .claude/skills/pm/bin/restart-policy.py check \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" \
+  --team "$RESTART_ROLE_TEAM" --feature "$RESTART_ROLE_FEATURE" \
+  --category gate --target team-lead --attempt 0 --generation "$restart_role_original_created" \
+  --control-id "$RESTART_ROLE_CONTROL" --reason authorized)"
+check "restart-role policy records one spend and the exact completed generation" python3 -c \
+  'import json,sys; p=json.loads(sys.argv[1]); assert p["authorizedCount"] == 1; assert p["completedControlId"] == sys.argv[2]; assert p["completedGeneration"] == sys.argv[3]' \
+  "$restart_role_policy" "$RESTART_ROLE_CONTROL" "$restart_role_replacement_created"
+
+# Simulate a later queue activation reaping the exited generation and crashing
+# before it can register another. The old control receipt must still prevent a
+# third launch even when no lifecycle record remains.
+python3 .claude/skills/pm/bin/process-lifecycle.py forget \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$RESTART_ROLE_TEAM" \
+  --category gate --instance team-lead --expected-created-at "$restart_role_replacement_created" >/dev/null
+restart_role_absent_replay="$(TEAM_RUNNER=background STARTUP_FACTORY_CONTROL_BROKER=1 STARTUP_FACTORY_CONTROL_REASON=authorized \
+  "$LAUNCH" restart-role "$RESTART_ROLE_TEAM" "$RESTART_ROLE_FEATURE" team-lead \
+  "$restart_role_original_created" "$RESTART_ROLE_CONTROL")"
+echo "$restart_role_absent_replay" | grep -q 'already completed with protected replacement generation' \
+  && echo "ok: restart-role replay cannot relaunch after completed replacement record is reaped" \
+  || { echo "FAIL: absent-record restart-role replay did not use protected completion: $restart_role_absent_replay"; FAILURES=$((FAILURES+1)); }
+check "restart-role completed-control replay remains at-most-once with no lifecycle record" \
+  test "$(record_count "$RESTART_ROLE_TEAM" team-lead)" -eq 0
 
 # -- task-scoped stop: exact collision-safe task selection, stale retirement, idempotence --
 STOP_TASK_TEAM=stop-task-scope

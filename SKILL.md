@@ -35,7 +35,8 @@ skill's directory):
   validation/indexing for commit-bound, non-authoritative provider evidence
 - `extensions/evidence-providers/` — preserved project-owned evidence workers;
   the Playwright reference never installs a browser or grants workflow authority
-- `bin/tracker-ops.sh` — ergonomic CLI for recurring tracker operations (scriptable mechanisms)
+- `bin/tracker-ops.sh` — ergonomic CLI for recurring tracker operations, including
+  a field-scoped `probe` that proves access without exporting every [task]
 - `extensions/tracker-backends/<Tool>.py` — project-owned primitive port for a custom tracker
 - `bin/update-installed-skill.sh` — install or refresh a legacy/source-managed bundle while preserving project config
 - `bin/runtime-state.py` + `bin/task-packet.sh` — durable events, PM projections,
@@ -188,7 +189,7 @@ each generic operation through the adapter's *Operations* table:
 | File a bug / follow-up found mid-work | 6 — File newly-discovered work |
 | Work is stuck / blocked / cannot proceed | 7 — Block a `[task]` |
 | (anything wrong / blocked / failed) | 8 — Andon cord: stop & report |
-| Run an agent team on a feature ("launch the team") | Team: keep the shipped `TEAM_MODE=true` default; persistent/batched gate roles use `start`/`compose`, one-package harness reviewers use `compose-review`, task workers use `start-task`/`compose-task`, and `dispatch.sh` owns claims and bounded scheduling |
+| Run an agent team on a feature ("launch the team") | Team: launch the bounded `gate-team` roster, inspect one `dispatch.sh --once --dry-run` plan, then let dispatch claim task-scoped workers. Use the eager full-roster `team` command only when the user explicitly wants every role started immediately. For one requested [task], preview `dispatch.sh --once --dry-run --task <taskId>` and execute only through `start-task`/`compose-task`; never widen it into a feature sweep. |
 | Connect a new tool / switch tools | 9 — Connect / switch |
 | Design/plan everything up front, sign off all designs before coding | 10 — Pre-flight design pass |
 | Monitor queued and Blocked work; launch eligible queued tasks automatically | 11 — Portfolio automation; install the skill outside the target checkout, provision an external mode-0700 lifecycle root outside every agent mount, set its absolute project/config environment, `scanIntervalMinutes` (default 3), and `ignoredTaskLabels` (default `human-work`), then run `bin/pm-agent.py --once` with protected Python `-I -S -E -s` |
@@ -198,6 +199,11 @@ each generic operation through the adapter's *Operations* table:
 
 - **Every status change is a real write** through the adapter's mechanism — then confirm
   it. Never claim a status you didn't set.
+- **Dispatch scope is explicit.** A one-[task] request never authorizes a
+  board-wide or feature-wide mutation pass. The targeted dispatcher mode is a
+  read-only evidence-preserving preview; task execution uses the exact
+  task-scoped launcher. Run an unscoped mutating pass only for an explicitly
+  requested feature/board run and inspect its first dry-run plan.
 - **If any operation fails, stop and report it** (Scenario 8). Never work around a failure
   or fabricate a result.
 - **Never skip a status transition.** Legal moves are the `transitions` graph in

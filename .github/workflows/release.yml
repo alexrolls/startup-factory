@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.sha }}
+  group: release-main
   cancel-in-progress: false
 
 jobs:
@@ -306,11 +306,59 @@ jobs:
         with:
           attestations: true
 
+  verify-uvx:
+    name: Verify the public uvx installation
+    needs:
+      - build
+      - publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Install the pinned uv client
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.6"
+          enable-cache: "false"
+
+      - name: Resolve the published release through uvx
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          exact_output=""
+          latest_output=""
+          for attempt in $(seq 1 18); do
+            if exact_output="$(uvx --refresh "startup-factory@$VERSION" version --json 2>&1)" &&
+              latest_output="$(uvx --refresh "startup-factory@latest" version --json 2>&1)"; then
+              python - "$VERSION" "$exact_output" "$latest_output" <<'PY'
+          import json
+          import sys
+
+          expected, *responses = sys.argv[1:]
+          for raw in responses:
+              result = json.loads(raw.splitlines()[-1])
+              if result != {"ok": True, "version": expected}:
+                  raise SystemExit(f"unexpected uvx version response: {result!r}")
+          PY
+              printf '%s\n' "$exact_output" "$latest_output"
+              exit 0
+            fi
+            printf 'uvx has not resolved startup-factory %s yet (attempt %s/18)\n' \
+              "$VERSION" "$attempt" >&2
+            sleep 10
+          done
+          printf '%s\n' "$exact_output" "$latest_output" >&2
+          exit 1
+
   github-release:
     name: Publish the exact tested GitHub release assets
     needs:
       - build
-      - publish
+      - verify-uvx
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

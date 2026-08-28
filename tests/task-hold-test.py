@@ -531,10 +531,32 @@ class TaskHoldTest(unittest.TestCase):
         lead_role = "principal-team-lead"
         architect_role = "principal-architect-concrete"
         sceptical_role = "sceptical-architect-concrete"
-        (self.workspace / "preset.env").write_text(
+        projection = (
             "PROTOCOL_TEAM_LEAD=%s\nPROTOCOL_PRINCIPAL_ARCHITECT=%s\n"
             "PROTOCOL_SCEPTICAL_ARCHITECT=%s\n"
             % (lead_role, architect_role, sceptical_role)
+        )
+        (self.workspace / "preset.env").write_text(projection)
+        subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "bin" / "team-context.py"),
+                "issue",
+                "--repo",
+                str(self.base),
+                "--workspace",
+                str(self.workspace),
+                "--team",
+                TEAM,
+                "--feature",
+                FEATURE,
+                "--preset",
+                "-",
+                "--skill",
+                str(ROOT),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
         )
         for role in (lead_role, architect_role, sceptical_role):
             self.capabilities[role] = mint(
@@ -594,6 +616,34 @@ class TaskHoldTest(unittest.TestCase):
                 ["summary: Independent challenge cleared"],
                 actor=sceptical_role,
             )
+        )
+
+        (self.workspace / "preset.env").write_text(
+            projection.replace(architect_role, "attacker-controlled-reviewer")
+        )
+        rejected = self.sync([queued], succeeds=False)
+        self.assertIsNone(rejected)
+        (self.workspace / "preset.env").write_text(projection)
+        subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "bin" / "team-context.py"),
+                "issue",
+                "--repo",
+                str(self.base),
+                "--workspace",
+                str(self.workspace),
+                "--team",
+                TEAM,
+                "--feature",
+                FEATURE,
+                "--preset",
+                "-",
+                "--skill",
+                str(ROOT),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
         )
 
         approved = self.sync([queued])

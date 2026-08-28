@@ -10,6 +10,8 @@ import shutil
 import sys
 import tempfile
 import unittest
+import urllib.error
+from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
 
@@ -46,6 +48,65 @@ def load_definitions(adapter, extra_config=""):
 def connection(nodes, has_next=False, cursor=None):
     return {"nodes": nodes,
             "pageInfo": {"hasNextPage": has_next, "endCursor": cursor}}
+
+
+class TrackerTransportTest(unittest.TestCase):
+    def setUp(self):
+        os.environ["LINEAR_API_KEY"] = "offline-test-key"
+        self.ns = load_definitions("Linear")
+
+    def test_rate_limit_error_is_typed_and_preserves_provider_guidance(self):
+        body = json.dumps({"userPresentableMessage": "Quota exhausted"}).encode()
+        error = urllib.error.HTTPError(
+            "https://tracker.example.test/api",
+            429,
+            "rate limited",
+            {"X-RateLimit-Requests-Reset": "2026-08-24T19:00:00Z"},
+            io.BytesIO(body),
+        )
+        stderr = io.StringIO()
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+                self.ns["http_json"]("https://tracker.example.test/api")
+        message = stderr.getvalue()
+        self.assertIn("RATELIMITED: HTTP 429", message)
+        self.assertIn("Quota exhausted", message)
+        self.assertIn("retry after rate-limit reset 2026-08-24T19:00:00Z", message)
+
+    def test_non_json_success_is_a_typed_contract_failure(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b"not json"
+
+        stderr = io.StringIO()
+        with mock.patch("urllib.request.urlopen", return_value=Response()):
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+                self.ns["http_json"]("https://tracker.example.test/api")
+        self.assertIn("MALFORMED_RESPONSE", stderr.getvalue())
+
+    def test_graphql_rate_limit_error_uses_presentable_message(self):
+        self.ns["http_json"] = lambda *_args, **_kwargs: {
+            "errors": [{
+                "message": "opaque provider message",
+                "extensions": {
+                    "code": "RATELIMITED",
+                    "userPresentableMessage": "Please retry when the quota resets",
+                },
+            }]
+        }
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            self.ns["Linear"]().gql("query { viewer { id } }")
+        self.assertIn(
+            "RATELIMITED: Linear API error: Please retry when the quota resets",
+            stderr.getvalue(),
+        )
 
 
 class LinearPaginationTest(unittest.TestCase):
@@ -238,6 +299,20 @@ class LinearPaginationTest(unittest.TestCase):
             project_id, self.ns["feature_status_by_name"]("Resolved"))
         self.assertEqual([None, "page-2"], cursors)
 
+    def test_probe_reads_only_the_feature_container(self):
+        project_id = "00000000-0000-0000-0000-000000000001"
+        calls = []
+
+        def gql(query, variables=None):
+            calls.append((query, variables))
+            self.assertNotIn("issues(", query)
+            self.assertNotIn("comments(", query)
+            return {"project": {"id": project_id}}
+
+        self.linear.gql = gql
+        self.linear.probe(project_id)
+        self.assertEqual(1, len(calls))
+
 
 class JiraPaginationTest(unittest.TestCase):
     def setUp(self):
@@ -400,6 +475,24 @@ class JiraPaginationTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.jira.search_all("project=PROJ", "summary,status")
 
+    def test_probe_reads_only_project_and_feature_identity(self):
+        calls = []
+
+        def api(path, payload=None, method=None):
+            calls.append((path, payload, method))
+            if path == "/rest/api/3/project/PROJ":
+                return {"key": "PROJ"}
+            if path == "/rest/api/3/issue/EPIC-1?fields=project":
+                return {
+                    "key": "EPIC-1",
+                    "fields": {"project": {"key": "PROJ"}},
+                }
+            self.fail("probe must not search or hydrate child tasks")
+
+        self.jira.api = api
+        self.jira.probe("EPIC-1")
+        self.assertEqual(2, len(calls))
+
 
 class GitHubPaginationTest(unittest.TestCase):
     @staticmethod
@@ -494,6 +587,11 @@ class GitHubPaginationTest(unittest.TestCase):
         self.assertEqual(["8", "9"], tasks[0]["blockedBy"])
         self.assertEqual([], tasks[1]["blockedBy"])
         self.assertEqual(6, len(calls))
+
+    def test_probe_resolves_only_the_feature_container(self):
+        self.github.milestone = mock.Mock(return_value=("owner/repo", {"number": 42}))
+        self.github.probe("delivery")
+        self.github.milestone.assert_called_once_with("delivery")
 
     def test_scan_exhausts_repository_issues_and_excludes_pull_requests(self):
         milestone = {"number": 7, "title": "portfolio", "state": "open"}

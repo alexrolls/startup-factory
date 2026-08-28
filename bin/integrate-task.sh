@@ -53,6 +53,10 @@ repo="$(git_unprivileged rev-parse --show-toplevel)"
 root="$(read_key TEAMWORK_ROOT)"; root="${root:-.teamwork}"
 workspace="$(python3 "$SKILL_DIR/bin/teamwork-path.py" workspace --repo "$repo" --root "$root" --team "$team")"
 preset_file="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative preset.env)"
+python3 "$SKILL_DIR/bin/team_policy.py" \
+  --repo "$repo" --workspace "$workspace" --team "$team" --feature "$feature" \
+  --skill "$SKILL_DIR" >/dev/null \
+  || die "protected team policy verification failed; integration remains stopped"
 key="$(python3 "$SKILL_DIR/bin/runtime-state.py" key "$task")"
 execution="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "executions/$key.json")"
 transaction="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "integrations/$key.json")"

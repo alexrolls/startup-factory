@@ -243,6 +243,20 @@ class CliInstallerTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("digest mismatch", error)
 
+    def test_install_supports_deepseek_harness_agent(self) -> None:
+        target = self.install(agent="deepseek-harness")
+        self.assertEqual(target, self.project / ".agents/skills/startup-factory")
+        self.assertTrue((target / "SKILL.md").is_file())
+        code, output, error = run_cli(
+            "verify",
+            "--agent",
+            "deepseek-harness",
+            "--project",
+            str(self.project),
+            "--json",
+        )
+        self.assertEqual((code, error), (0, ""), output + error)
+
     def test_update_preserves_config_and_custom_extensions(self) -> None:
         target = self.install()
         for relative in CONFIG_PATHS:

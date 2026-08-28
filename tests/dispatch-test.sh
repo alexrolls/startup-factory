@@ -53,6 +53,17 @@ EOF
 sed_i "s|^BROKER_LIFECYCLE_ROOT=.*|BROKER_LIFECYCLE_ROOT=\"$LIFECYCLE_ROOT\"|" .claude/skills/pm/config/team.config.md
 DISPATCH=".claude/skills/pm/bin/dispatch.sh"
 
+protect_preset() { # team feature preset: write canonical projection and protect it
+  local team="$1" feature="$2" preset="$3" workspace="$PWD/.teamwork/$1"
+  mkdir -p "$workspace"
+  { printf 'PRESET=%s\n' "$preset"; grep -E '^(REVIEW_MODE|REQUIRED_REVIEW_GATES|PROTOCOL_)' \
+      ".claude/skills/pm/teams/$preset.md" || true; } > "$workspace/preset.env"
+  python3 .claude/skills/pm/bin/team-context.py issue \
+    --repo "$PWD" --workspace "$workspace" --team "$team" --feature "$feature" \
+    --preset "$preset" --skill "$PWD/.claude/skills/pm" >/dev/null
+}
+LAUNCH=".claude/skills/pm/bin/launch-team.sh"
+
 mkdir -p feat
 cat > feat/feature.md <<'EOF'
 # Fixture [Active]
@@ -113,6 +124,8 @@ Independent.
 > [sceptical-architecture-approval] files ok — sceptical-architect
 
 > [security-approval] files ok — senior-security-engineer
+
+> [team-lead-approval] final gate after independent reviews — team-lead
 EOF
 FID="feat/feature.md"
 
@@ -132,6 +145,31 @@ echo "$plan" | grep -q "launch integrator" && echo "ok: plans integrator merge q
 check "dry-run does not move status" grep -q '^## 2 Blocked thing \[Blocked\]$' "$FID"
 check "dry-run launches nothing"     test ! -d .teamwork/feat-team/pids
 
+# -- targeted dry-run retains full evidence but emits only the requested scope -
+target_plan="$(TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once --dry-run --task "$FID#3")"
+echo "$target_plan" | grep -q "launch senior-security-engineer.*$FID#3" \
+  && echo "ok: targeted plan includes the requested task" \
+  || { echo "FAIL: targeted task was absent: $target_plan"; FAILURES=$((FAILURES+1)); }
+if echo "$target_plan" | grep -Eq "$FID#(2|4|5|6)"; then
+  echo "FAIL: targeted plan widened to sibling tasks: $target_plan"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: targeted plan does not widen to sibling tasks"
+fi
+if target_apply_out="$(TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once --task "$FID#3" 2>&1)"; then
+  echo "FAIL: targeted dispatch mutated without an explicit task launch"; FAILURES=$((FAILURES+1))
+elif printf '%s' "$target_apply_out" | grep -q "read-only scope preview and requires --dry-run"; then
+  echo "ok: targeted dispatch is a read-only scope preview"
+else
+  echo "FAIL: targeted live dispatch produced wrong error: $target_apply_out"; FAILURES=$((FAILURES+1))
+fi
+if missing_target_out="$(TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once --dry-run --task "$FID#99" 2>&1)"; then
+  echo "FAIL: targeted plan accepted an absent task"; FAILURES=$((FAILURES+1))
+elif printf '%s' "$missing_target_out" | grep -q "targeted dispatch task is absent.*$FID#99"; then
+  echo "ok: targeted plan identifies an absent task exactly"
+else
+  echo "FAIL: absent targeted task produced wrong error: $missing_target_out"; FAILURES=$((FAILURES+1))
+fi
+
 mkdir -p .teamwork/feat-missing-sceptical
 cat > .teamwork/feat-missing-sceptical/preset.env <<'EOF'
 PRESET=full-stack
@@ -139,9 +177,11 @@ PROTOCOL_TEAM_LEAD=team-lead
 PROTOCOL_PRINCIPAL_ARCHITECT=principal-software-architect
 PROTOCOL_SECURITY_REVIEWER=senior-security-engineer
 EOF
+protect_preset feat-missing-sceptical "$FID" full-stack
+sed_i '/^PROTOCOL_SCEPTICAL_ARCHITECT=/d' .teamwork/feat-missing-sceptical/preset.env
 if missing_sceptical_out="$(TEAM_RUNNER=background "$DISPATCH" feat-missing-sceptical "$FID" --once --dry-run 2>&1)"; then
   echo "FAIL: dispatch accepted a preset without its mandatory Sceptical Architect"; FAILURES=$((FAILURES+1))
-elif printf '%s' "$missing_sceptical_out" | grep -q 'must define exactly one mandatory PROTOCOL_SCEPTICAL_ARCHITECT'; then
+elif printf '%s' "$missing_sceptical_out" | grep -q 'protected team preset authority'; then
   echo "ok: dispatch refuses a preset missing the mandatory Sceptical Architect"
 else
   echo "FAIL: missing mandatory dispatch gate produced wrong error: $missing_sceptical_out"; FAILURES=$((FAILURES+1))
@@ -155,9 +195,11 @@ PROTOCOL_PRINCIPAL_ARCHITECT=principal-software-architect
 PROTOCOL_SCEPTICAL_ARCHITECT=sceptical-architect
 PROTOCOL_SECURITY_REVIEWER=team-lead
 EOF
+protect_preset feat-duplicate-review-board "$FID" full-stack
+sed_i 's/^PROTOCOL_SECURITY_REVIEWER=.*/PROTOCOL_SECURITY_REVIEWER=team-lead/' .teamwork/feat-duplicate-review-board/preset.env
 if duplicate_review_out="$(TEAM_RUNNER=background "$DISPATCH" feat-duplicate-review-board "$FID" --once --dry-run 2>&1)"; then
   echo "FAIL: dispatch accepted duplicate concrete agents on the mandatory review board"; FAILURES=$((FAILURES+1))
-elif printf '%s' "$duplicate_review_out" | grep -q 'security reviewer must be distinct from the core review board'; then
+elif printf '%s' "$duplicate_review_out" | grep -q 'protected team preset authority'; then
   echo "ok: dispatch refuses a security reviewer duplicated on the core review board"
 else
   echo "FAIL: duplicate review board produced wrong error: $duplicate_review_out"; FAILURES=$((FAILURES+1))
@@ -201,6 +243,24 @@ files: src/automatic.py
 >
 > [sceptical-design-approved] round 1
 > - sceptical-architect
+
+## 3 Automatic but human-dependent [Planned]
+
+**Assignee:** —
+**BlockedBy:** 1
+
+track: backend
+parallel-safe: true
+files: src/dependent.py
+
+> [design-note] round 1
+> - backend
+>
+> [design-approved] round 1
+> - principal-architect
+>
+> [sceptical-design-approved] round 1
+> - sceptical-architect
 EOF
 HUMAN_FID="feat/human-work.md"
 human_plan="$(STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='["human-work"]' TEAM_RUNNER=background "$DISPATCH" feat-human-team "$HUMAN_FID" --once --dry-run)"
@@ -212,6 +272,12 @@ fi
 echo "$human_plan" | grep -q "claim $HUMAN_FID#2.*backend" \
   && echo "ok: non-human sibling remains automatically claimable" \
   || { echo "FAIL: automatic sibling was not claimed: $human_plan"; FAILURES=$((FAILURES+1)); }
+human_dependency_plan="$(STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='["human-work"]' TEAM_RUNNER=background "$DISPATCH" feat-human-team "$HUMAN_FID" --once --dry-run --task "$HUMAN_FID#3")"
+if echo "$human_dependency_plan" | grep -q "claim $HUMAN_FID#3"; then
+  echo "FAIL: targeted scope ignored its human-owned dependency"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: targeted scope retains excluded sibling dependency evidence"
+fi
 
 # Ignored labels fence candidates, not graph visibility. A non-candidate
 # dependency must still prevent a dependant from becoming ready.
@@ -364,6 +430,57 @@ EOF
 out="$("$DISPATCH" feat-quiet-team feat/quiet.md --once --dry-run)"
 echo "$out" | grep -q "nothing actionable" && echo "ok: clean exit" || { echo "FAIL: clean exit"; FAILURES=$((FAILURES+1)); }
 
+# -- Team Lead desired state: one-shot exit is idle; only live stalls auto-restart --
+cat > feat/lead-queue.md <<'EOF'
+# Lead Queue [Active]
+
+## 1 Anomalous review [Review]
+
+**Assignee:** backend
+
+No review request was published, so Team Lead supervision is required.
+EOF
+LEAD_QUEUE_FID=feat/lead-queue.md
+EXITED_LEAD_TEAM=feat-exited-lead
+TEAM_RUNNER=background "$LAUNCH" start "$EXITED_LEAD_TEAM" "$LEAD_QUEUE_FID" team-lead >/dev/null
+exited_lead_status=""
+for _i in $(seq 1 40); do
+  exited_lead_status="$("$LAUNCH" status "$EXITED_LEAD_TEAM" --json)"
+  printf '%s\n' "$exited_lead_status" | grep -q '"verdict":"exited"' && break
+  sleep 0.05
+done
+exited_lead_plan="$(TEAM_RUNNER=background "$DISPATCH" "$EXITED_LEAD_TEAM" "$LEAD_QUEUE_FID" --once --dry-run 2>&1)"
+if printf '%s\n' "$exited_lead_plan" | grep -q 'recover stalled Team Lead'; then
+  echo "FAIL: normal one-shot Team Lead exit was treated as a crash: $exited_lead_plan"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: normal one-shot Team Lead exit does not consume automatic restart authority"
+fi
+printf '%s\n' "$exited_lead_plan" | grep -Eq 'launch .*team-lead' \
+  && echo "ok: exited Team Lead remains eligible for concrete queue-driven activation" \
+  || { echo "FAIL: exited Team Lead was not available to its real queue: $exited_lead_plan"; FAILURES=$((FAILURES+1)); }
+
+STALLED_LEAD_TEAM=feat-stalled-lead
+printf '\nMAX_AUTOMATIC_RESTARTS=0\n' >> .claude/skills/pm/config/team.config.md
+sed_i 's|^TEAM_DEFAULT_CMD=.*|TEAM_DEFAULT_CMD="sleep 30"|' .claude/skills/pm/config/team.config.md
+TEAM_RUNNER=background "$LAUNCH" start "$STALLED_LEAD_TEAM" "$LEAD_QUEUE_FID" team-lead >/dev/null
+sed_i 's|^TEAM_DEFAULT_CMD=.*|TEAM_DEFAULT_CMD="true"|' .claude/skills/pm/config/team.config.md
+printf '2020-01-01T00:00:00Z | - | reviewing queue | 2020-01-01T00:01:00Z\n' \
+  > ".teamwork/$STALLED_LEAD_TEAM/heartbeats/team-lead"
+stalled_lead_out="$(TEAM_RUNNER=background "$DISPATCH" "$STALLED_LEAD_TEAM" "$LEAD_QUEUE_FID" --once 2>&1)"
+printf '%s\n' "$stalled_lead_out" | grep -q 'automatic Team Lead recovery was suppressed' \
+  && echo "ok: live stalled Team Lead is governed by the protected restart circuit breaker" \
+  || { echo "FAIL: stalled Team Lead did not report protected recovery suppression: $stalled_lead_out"; FAILURES=$((FAILURES+1)); }
+printf '%s\n' "$stalled_lead_out" | grep -q 'skipped (live instance)' \
+  && echo "ok: ordinary queue start cannot bypass suppressed live Team Lead recovery" \
+  || { echo "FAIL: suppressed Team Lead recovery was bypassed by ordinary start: $stalled_lead_out"; FAILURES=$((FAILURES+1)); }
+if find ".teamwork/$STALLED_LEAD_TEAM/mailbox/team-lead" -type f -print -quit 2>/dev/null | grep -q .; then
+  echo "FAIL: dispatcher wrote recovery escalation into the stalled Team Lead mailbox"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: suppressed Team Lead recovery stays in operator logs, not the stalled role mailbox"
+fi
+"$LAUNCH" stop "$STALLED_LEAD_TEAM" >/dev/null
+sed_i '/^MAX_AUTOMATIC_RESTARTS=0$/d' .claude/skills/pm/config/team.config.md
+
 # -- all-terminal product closeout routes exact release request -----------------
 cat > feat/product-close.md <<'EOF'
 # Product Close [Active]
@@ -383,6 +500,7 @@ PROTOCOL_SCEPTICAL_ARCHITECT=sceptical-architect
 PROTOCOL_SECURITY_REVIEWER=senior-security-engineer
 PROTOCOL_PRODUCT_MANAGER=senior-technical-product-manager
 EOF
+protect_preset "$PRODUCT_TEAM" "$PRODUCT_FID" full-stack
 python3 - "$PRODUCT_FID" ".teamwork/$PRODUCT_TEAM/product-acceptance-request.json" ".claude/skills/pm/bin" <<'PY'
 import json,sys
 sys.path.insert(0,sys.argv[3])
@@ -730,6 +848,7 @@ PROTOCOL_INTEGRATOR=integrator
 PROTOCOL_BACKEND=senior-full-stack-engineer
 PROTOCOL_FRONTEND=senior-full-stack-engineer
 EOF
+protect_preset feat-preset-team "$PT_FID" full-stack
 preset_plan="$(TEAM_RUNNER=background "$DISPATCH" feat-preset-team "$PT_FID" --once --dry-run 2>&1)"
 echo "$preset_plan" | grep -q "launch principal-architect (→principal-software-architect)" \
   && echo "ok: preset: PA routes to principal-software-architect" \
@@ -776,6 +895,7 @@ PROTOCOL_LLM=senior-llm-engineer
 PROTOCOL_BACKEND=senior-staff-backend-engineer
 PROTOCOL_FRONTEND=senior-llm-full-stack-engineer
 EOF
+protect_preset feat-llm-track-team "$LLM_FID" deep-llm
 llm_track_plan="$(TEAM_RUNNER=background "$DISPATCH" feat-llm-track-team "$LLM_FID" --once --dry-run 2>&1)"
 echo "$llm_track_plan" | grep -q "claim $LLM_FID#1 for senior-llm-engineer" \
   && echo "ok: deep-llm specialist track routes to Senior LLM Engineer" \
@@ -840,6 +960,7 @@ PROTOCOL_INTEGRATOR=integrator
 PROTOCOL_BACKEND=senior-full-stack-engineer
 PROTOCOL_FRONTEND=senior-full-stack-engineer
 EOF
+protect_preset feat-signer-team "$SIG_FID" full-stack
 signer_plan="$(TEAM_RUNNER=background "$DISPATCH" feat-signer-team "$SIG_FID" --once --dry-run 2>&1)"
 echo "$signer_plan" | grep -q "\\[security-approval\\] signed by 'reviewer', expected required gate 'senior-security-engineer'" \
   && echo "ok: wrong security signer: warning printed" \
@@ -943,6 +1064,7 @@ PROTOCOL_INTEGRATOR=integrator
 PROTOCOL_BACKEND=senior-full-stack-engineer
 PROTOCOL_FRONTEND=senior-full-stack-engineer
 EOF
+protect_preset feat-ml-team "$ML_FID" full-stack
 ml_plan="$(TEAM_RUNNER=background "$DISPATCH" feat-ml-team "$ML_FID" --once --dry-run 2>&1)"
 echo "$ml_plan" | grep -q "launch integrator.*ml-signer.*#1" \
   && echo "ok: multiline security approval unlocks integrator" \
@@ -1139,9 +1261,11 @@ fi
 rm ".teamwork/$PATH_TEAM/executions/$PATH_KEY.json"
 ln -s /etc/passwd ".teamwork/$PATH_TEAM/heartbeats/forged"
 heartbeat_out="$(TEAM_RUNNER=background "$DISPATCH" "$PATH_TEAM" "$PATH_FID" --once --dry-run 2>&1)"
-echo "$heartbeat_out" | grep -q 'unsafe non-file heartbeat' \
-  && echo "ok: planner reports heartbeat symlinks without following them" \
-  || { echo "FAIL: heartbeat symlink was not surfaced: $heartbeat_out"; FAILURES=$((FAILURES+1)); }
+if echo "$heartbeat_out" | grep -q 'unsafe non-file heartbeat\|root:'; then
+  echo "FAIL: managed planner trusted or exposed an agent-controlled heartbeat: $heartbeat_out"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: managed planner ignores agent-controlled heartbeats in favor of protected health"
+fi
 
 # -- remote adapters may not persist role names in the assignee field ---------
 cat > feat/remote-claim-test.md <<'EOF'
@@ -1209,11 +1333,11 @@ review-gates: qa
 
 > [review-request] ready — backend
 >
-> [architecture-approval] approved — principal-architect
+> [architecture-approval] approved — principal-llm-architect
 >
-> [sceptical-architecture-approval] approved — sceptical-architect
+> [sceptical-architecture-approval] approved — sceptical-principal-llm-architect
 >
-> [security-approval] approved — senior-security-engineer
+> [security-approval] approved — senior-llm-security-engineer
 
 ## 2 Awaiting team lead after QA [Review]
 
@@ -1223,13 +1347,13 @@ review-gates: qa
 
 > [review-request] ready — backend
 >
-> [review-approval] verified — senior-qa-engineer
+> [review-approval] verified — senior-llm-qa-engineer
 >
-> [architecture-approval] approved — principal-architect
+> [architecture-approval] approved — principal-llm-architect
 >
-> [sceptical-architecture-approval] approved — sceptical-architect
+> [sceptical-architecture-approval] approved — sceptical-principal-llm-architect
 >
-> [security-approval] approved — senior-security-engineer
+> [security-approval] approved — senior-llm-security-engineer
 
 ## 3 Fully approved [Review]
 
@@ -1239,15 +1363,17 @@ review-gates: qa
 
 > [review-request] ready — backend
 >
-> [review-approval] verified — senior-qa-engineer
+> [review-approval] verified — senior-llm-qa-engineer
 >
 > [team-lead-approval] approved — team-lead
 >
-> [architecture-approval] approved — principal-architect
+> [architecture-approval] approved — principal-llm-architect
 >
-> [sceptical-architecture-approval] approved — sceptical-architect
+> [sceptical-architecture-approval] approved — sceptical-principal-llm-architect
 >
-> [security-approval] approved — senior-security-engineer
+> [security-approval] approved — senior-llm-security-engineer
+
+> [team-lead-approval] final approval after all independent gates — team-lead
 
 ## 4 Early team-lead verdict [Review]
 
@@ -1259,13 +1385,13 @@ review-gates: qa
 >
 > [team-lead-approval] approved too early — team-lead
 >
-> [review-approval] verified — senior-qa-engineer
+> [review-approval] verified — senior-llm-qa-engineer
 >
-> [architecture-approval] approved — principal-architect
+> [architecture-approval] approved — principal-llm-architect
 >
-> [sceptical-architecture-approval] approved — sceptical-architect
+> [sceptical-architecture-approval] approved — sceptical-principal-llm-architect
 >
-> [security-approval] approved — senior-security-engineer
+> [security-approval] approved — senior-llm-security-engineer
 EOF
 QA_GATE_FID="feat/qa-gate-test.md"
 mkdir -p .teamwork/feat-qa-gate-team
@@ -1278,8 +1404,9 @@ PROTOCOL_SECURITY_REVIEWER=senior-security-engineer
 PROTOCOL_QA=senior-qa-engineer
 PROTOCOL_INTEGRATOR=integrator
 EOF
+protect_preset feat-qa-gate-team "$QA_GATE_FID" deep-llm
 qa_gate_plan="$(TEAM_RUNNER=background "$DISPATCH" feat-qa-gate-team "$QA_GATE_FID" --once --dry-run 2>&1)"
-echo "$qa_gate_plan" | grep -q "launch senior-qa-engineer.*qa-gate-test.md#1" \
+echo "$qa_gate_plan" | grep -q "launch senior-llm-qa-engineer.*qa-gate-test.md#1" \
   && echo "ok: declared QA gate routes the task to the configured QA role" \
   || { echo "FAIL: missing QA gate launch: $qa_gate_plan"; FAILURES=$((FAILURES+1)); }
 echo "$qa_gate_plan" | grep -q "launch team-lead.*qa-gate-test.md#2.*qa-gate-test.md#4" \
@@ -1318,6 +1445,7 @@ PROTOCOL_SECURITY_REVIEWER=senior-security-engineer
 PROTOCOL_QA=senior-qa-engineer
 PROTOCOL_INTEGRATOR=integrator
 EOF
+protect_preset feat-infra-gate-team "$INFRA_GATE_FID" deep-infra
 infra_gate_plan="$(TEAM_RUNNER=background "$DISPATCH" feat-infra-gate-team "$INFRA_GATE_FID" --once --dry-run 2>&1)"
 echo "$infra_gate_plan" | grep -q "launch senior-security-engineer.*infra-security-gate-test.md#1" \
   && echo "ok: Deep Infra activates Security through its preset-required gate" \

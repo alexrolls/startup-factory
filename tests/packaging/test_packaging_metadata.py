@@ -26,7 +26,10 @@ except ModuleNotFoundError:  # pragma: no cover - metadata tests run on 3.11+
 ROOT = Path(__file__).resolve().parents[2]
 PYPROJECT = ROOT / "pyproject.toml"
 PROJECT_MANAGEMENT_CONFIG = ROOT / "config" / "project-management.config.md"
+TEAM_CONFIG = ROOT / "config" / "team.config.md"
+README = ROOT / "README.md"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+PACKAGE_CI_WORKFLOW = ROOT / ".github" / "workflows" / "package-ci.yml"
 RESOURCE_ARCHIVE = "startup_factory_cli/resources/startup-factory.tar.gz"
 RESOURCE_CHECKSUM = f"{RESOURCE_ARCHIVE}.sha256"
 
@@ -121,10 +124,35 @@ class ProjectMetadataTests(unittest.TestCase):
         self.assertEqual(build_system["build-backend"], "setuptools.build_meta")
         self.assertEqual(build_system["requires"], ["setuptools==83.0.0"])
 
+    def test_codex_command_templates_use_automatic_review(self) -> None:
+        team_config = TEAM_CONFIG.read_text(encoding="utf-8")
+        readme = README.read_text(encoding="utf-8")
+        codex_commands = [
+            line
+            for line in team_config.splitlines()
+            if line.startswith(
+                (
+                    "SCEPTICAL_ARCHITECT_CMD=",
+                    "SENIOR_SECURITY_ENGINEER_CMD=",
+                    "BACKEND_CMD=",
+                    "FRONTEND_CMD=",
+                )
+            )
+            and "codex exec" in line
+        ]
+
+        self.assertEqual(len(codex_commands), 4)
+        self.assertTrue(
+            all("--approve-for-me" in command for command in codex_commands)
+        )
+        self.assertNotIn("--full-auto", team_config)
+        self.assertIn("codex exec --approve-for-me", readme)
+        self.assertNotIn("codex exec --full-auto", readme)
+
     def test_public_package_metadata(self) -> None:
         project = self.config["project"]
         self.assertEqual(project["name"], "startup-factory")
-        self.assertEqual(project["version"], "0.1.9")
+        self.assertEqual(project["version"], "0.1.15")
         self.assertEqual(project["requires-python"], ">=3.10")
         self.assertEqual(project["license"], "MIT")
         self.assertEqual(project["license-files"], ["LICENSE"])
@@ -251,6 +279,13 @@ class BundledDefaultsTests(unittest.TestCase):
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def test_pull_requests_must_use_an_unreleased_version(self) -> None:
+        workflow = PACKAGE_CI_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("Require an unreleased version before merge", workflow)
+        self.assertIn("if: github.event_name == 'pull_request'", workflow)
+        self.assertIn("project.version must increase before merge", workflow)
+        self.assertIn('refs/tags/v$VERSION^{commit}', workflow)
+
     def test_release_runs_for_merged_main_commits(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("    branches:\n      - main", workflow)
@@ -258,6 +293,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('test "$GITHUB_REF" = "refs/heads/main"', workflow)
         self.assertIn('test "$commit" = "$GITHUB_SHA"', workflow)
         self.assertIn("bump project.version", workflow)
+        self.assertIn("  group: release-main", workflow)
 
     def test_github_release_tag_comes_from_the_package_version(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
@@ -280,6 +316,19 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_github_release_commands_have_explicit_repository_context(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("          GH_REPO: ${{ github.repository }}", workflow)
+
+    def test_public_uvx_install_is_verified_before_github_release(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("  verify-uvx:\n", workflow)
+        self.assertIn("    name: Verify the public uvx installation", workflow)
+        self.assertIn(
+            "        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1",
+            workflow,
+        )
+        self.assertIn('uvx --refresh "startup-factory@$VERSION" version --json', workflow)
+        self.assertIn('uvx --refresh "startup-factory@latest" version --json', workflow)
+        github_release = workflow.split("  github-release:\n", 1)[1]
+        self.assertIn("      - verify-uvx", github_release.split("    runs-on:", 1)[0])
 
     def test_draft_release_target_is_verified_before_the_tag_exists(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
@@ -369,7 +418,7 @@ class BuiltDistributionIdentityTests(unittest.TestCase):
             license_bytes = archive.read(license_names[0])
 
         self.assertEqual(metadata["Name"], "startup-factory")
-        self.assertEqual(metadata["Version"], "0.1.9")
+        self.assertEqual(metadata["Version"], "0.1.15")
         self.assertEqual(metadata["Requires-Python"], ">=3.10")
         self.assertEqual(metadata["License-Expression"], "MIT")
         self.assertEqual(metadata.get_all("License-File", []), ["LICENSE"])

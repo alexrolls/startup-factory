@@ -21,6 +21,7 @@ if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
 from outbox_capability import CapabilityError, verify_published_entry
 from broker_evidence import EvidenceError, verify_delivery
+from team_policy import TeamPolicyError, load_team_policy
 
 
 MARKER_RE = re.compile(r"^\s*\[([\w-]+)\]")
@@ -309,30 +310,30 @@ def existing_directory(root: Path, *parts: str) -> Path | None:
     return current
 
 
-def concrete_marker_role(workspace: Path, marker: str) -> str | None:
+def concrete_marker_role(
+    repository: Path,
+    workspace: Path,
+    team: str,
+    feature: str,
+    marker: str,
+) -> str | None:
     """Resolve a protocol signer to the concrete role selected by the preset."""
     protocol_role = MARKER_ROLES.get(marker)
     if protocol_role is None:
         return None
-    preset = workspace / "preset.env"
     try:
-        info = preset.lstat()
-    except FileNotFoundError:
-        # Generic/manual teams use protocol role names directly.
+        text = load_team_policy(
+            repository,
+            workspace,
+            team,
+            feature,
+            Path(__file__).resolve().parent.parent,
+        ).text
+    except (OSError, TeamPolicyError) as exc:
+        raise HoldError("cannot authenticate team policy: %s" % exc) from exc
+    if not text:
+        # Generic/manual teams with no projection use protocol names directly.
         return protocol_role
-    except OSError as exc:
-        raise HoldError("cannot inspect team preset: %s" % exc) from exc
-    if (
-        stat.S_ISLNK(info.st_mode)
-        or not stat.S_ISREG(info.st_mode)
-        or info.st_size <= 0
-        or info.st_size > 1024 * 1024
-    ):
-        raise HoldError("team preset must be a bounded non-symlink regular file")
-    try:
-        text = preset.read_text()
-    except (OSError, UnicodeError) as exc:
-        raise HoldError("cannot read team preset: %s" % exc) from exc
     key = PROTOCOL_ROLE_KEYS[protocol_role]
     matches = re.findall(r"(?m)^%s=([^\s#]+)" % re.escape(key), text)
     if len(matches) != 1:
@@ -533,7 +534,8 @@ def broker_receipt(
         return False
     if (
         verified.get("executionKind") != "gate"
-        or verified.get("role") != concrete_marker_role(workspace, marker)
+        or verified.get("role")
+        != concrete_marker_role(repository, workspace, team, feature, marker)
     ):
         return False
     # Hold-control markers require no broker-side body transformation. Bind the

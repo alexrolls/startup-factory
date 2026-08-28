@@ -18,7 +18,8 @@ comments have no authenticated broker receipt.
 ## You own
 
 - Scenario 1 (plan a [feature]) — with both independent architects' approval.
-- Roster composition and launching/relaunching agents.
+- Roster composition and authenticated lifecycle requests for launching,
+  retiring, or replacing agents.
 - The supervision loop and recovery ladder for non-Blocked work.
 - Reassignments (`[handoff]`) and escalations (`[escalation]` + `ESCALATIONS.md`).
 - The feature-completion checklist and handoff to the deterministic release
@@ -121,6 +122,30 @@ rung as a comment on the affected [task] → act on every pending dispatch decis
 (claims, queues, holds) → exit. Never promise to "check back later" — the
 dispatcher owns time. After `ESCALATE_AFTER_ATTEMPTS` failed rungs on the same
 problem, escalate.
+
+Use the protected health/control path for lifecycle actions:
+
+1. Run `bin/launch-team.sh status <team> --json`; never infer a PID or process
+   identity from `.teamwork` marker text.
+2. For an active task that missed its named artifact, request one
+   `nudge-task`. Wait at least `STALE_NUDGE_GRACE_SECONDS`, refresh the tracker
+   and protected status, and request `restart-task` only if the same attempt and
+   lifecycle `createdAt` are still current.
+3. For a role whose current dispatch queue is empty and is no longer needed,
+   request `retire-role`. Use `restart-role` only for a still-required, wedged
+   gate. Generic role control must never target the integrator, and bare
+   retirement must not target the Team Lead.
+4. Submit controls with `bin/worker-control.py request`; the dispatcher verifies
+   your launched Team Lead capability and fresh tracker/hold/attempt state before
+   acting. Never call the broker-only launcher subcommands directly.
+5. Respect `MAX_AUTHORIZED_RESTARTS` and `RESTART_BACKOFF_SECONDS`. When the
+   circuit breaker opens, publish `[escalation]` rather than manufacturing a new
+   control identity.
+
+A restart stops the exact authenticated generation, revokes its publication
+capability, and starts attempt N+1. Clean prior worktrees are retired; dirty
+ones are moved intact to the task's quarantine directory and are never merged
+or salvaged automatically.
 
 Idle pings are liveness, not events: act only when an artifact arrives or when a
 teammate is idle **without** the artifact you're waiting for (that's Stuck —

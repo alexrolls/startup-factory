@@ -535,6 +535,64 @@ def revoke_task(repository: str, workspace: str, team: str, task: str) -> int:
     return revoked
 
 
+def revoke_role(repository: str, workspace: str, team: str, role: str) -> int:
+    """Revoke active gate capabilities for one exact concrete role."""
+    repo = _repo(repository)
+    workspace_path = Path(workspace)
+    if not workspace_path.is_absolute():
+        raise CapabilityError("canonical workspace path must be absolute")
+    workspace_real = Path(os.path.realpath(workspace_path))
+    if workspace_real != workspace_path or not workspace_real.is_dir():
+        raise CapabilityError("canonical workspace must be a non-symlink directory")
+    _safe_text(team, "team", 63)
+    if not ROLE.fullmatch(role):
+        raise CapabilityError("invalid capability role")
+
+    records, active = state_directories(repo)
+    revoked = 0
+    for pointer in sorted(active.iterdir(), key=lambda item: item.name):
+        try:
+            info = pointer.lstat()
+        except OSError as exc:
+            raise CapabilityError("cannot inspect active capability pointer: %s" % exc) from exc
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o077
+        ):
+            raise CapabilityError("active capability pointer is not an owner-only regular file")
+        raw_id = _read_protected(pointer, "active capability", 256)
+        try:
+            capability_id = raw_id.decode("ascii", errors="strict").strip()
+        except UnicodeError as exc:
+            raise CapabilityError("active capability identity is not ASCII") from exc
+        if not CAPABILITY_ID.fullmatch(capability_id):
+            raise CapabilityError("active capability identity is invalid")
+        try:
+            record = json.loads(
+                _read_protected(
+                    records / (capability_id + ".json"), "capability record"
+                )
+            )
+        except (UnicodeError, ValueError) as exc:
+            raise CapabilityError("invalid capability record") from exc
+        if not isinstance(record, dict) or record.get("id") != capability_id:
+            raise CapabilityError("capability record identity mismatch")
+        if pointer.name != _active_key(record) + ".id":
+            raise CapabilityError("active capability pointer identity mismatch")
+        if (
+            record.get("canonicalRepo") == str(repo)
+            and record.get("canonicalWorkspace") == str(workspace_real)
+            and record.get("team") == team
+            and record.get("executionKind") == "gate"
+            and record.get("role") == role
+        ):
+            pointer.unlink()
+            revoked += 1
+    return revoked
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -557,6 +615,11 @@ def main() -> int:
     revoke_parser.add_argument("--workspace", required=True)
     revoke_parser.add_argument("--team", required=True)
     revoke_parser.add_argument("--task", required=True)
+    revoke_role_parser = subparsers.add_parser("revoke-role")
+    revoke_role_parser.add_argument("--repo", required=True)
+    revoke_role_parser.add_argument("--workspace", required=True)
+    revoke_role_parser.add_argument("--team", required=True)
+    revoke_role_parser.add_argument("--role", required=True)
     args = parser.parse_args()
     try:
         if args.command == "mint":
@@ -569,6 +632,10 @@ def main() -> int:
             return 0
         if args.command == "revoke-task":
             count = revoke_task(args.repo, args.workspace, args.team, args.task)
+            print(json.dumps({"revoked": count}, sort_keys=True, separators=(",", ":")))
+            return 0
+        if args.command == "revoke-role":
+            count = revoke_role(args.repo, args.workspace, args.team, args.role)
             print(json.dumps({"revoked": count}, sort_keys=True, separators=(",", ":")))
             return 0
     except CapabilityError as exc:

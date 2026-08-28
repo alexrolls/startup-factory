@@ -265,10 +265,16 @@ def main() -> None:
     parser.add_argument("--workdir", required=True)
     parser.add_argument("--team", required=True)
     parser.add_argument("--feature", required=True)
+    parser.add_argument("--preset")
     parser.add_argument("--stuck-minutes", type=int, required=True)
+    parser.add_argument(
+        "--health-json",
+        help="authenticated lifecycle/heartbeat verdicts from launch-team status --json",
+    )
     parser.add_argument("--execution", choices=["sequential", "parallel"], required=True)
     parser.add_argument("--max-active", type=int)
     parser.add_argument("--ignored-labels-json", default="[]")
+    parser.add_argument("--task", action="append", dest="task_scope", default=[])
     args = parser.parse_args()
 
     skill = Path(args.skill)
@@ -345,7 +351,10 @@ def main() -> None:
     # The graph is always complete. Ignored labels fence autonomous candidates
     # only; their nodes and statuses remain dependency-visible.
     tasks = payload["tasks"]
+    if not isinstance(tasks, list):
+        raise RuntimeError("tracker snapshot tasks must be a list")
     excluded = ignored_labels(args.ignored_labels_json)
+    evidence_tasks = []
     filtered_tasks = []
     for task in tasks:
         labels = task.get("labels")
@@ -356,10 +365,31 @@ def main() -> None:
             raise RuntimeError(
                 "tracker snapshot task labels must be a list of non-empty canonical label names"
             )
+        evidence_tasks.append(task)
         if excluded.intersection(label.casefold() for label in labels):
             continue
         filtered_tasks.append(task)
-    tasks = filtered_tasks
+    all_tasks = filtered_tasks
+    task_scope = set(args.task_scope)
+    if len(task_scope) != len(args.task_scope):
+        raise RuntimeError("targeted dispatch contains a duplicate --task identity")
+    all_ids = {str(task.get("taskId")) for task in all_tasks}
+    missing_scope = sorted(task_scope - all_ids)
+    if missing_scope:
+        raise RuntimeError(
+            "targeted dispatch task is absent from the feature snapshot: %s"
+            % ", ".join(missing_scope)
+        )
+    tasks = [
+        task for task in all_tasks
+        if not task_scope or str(task.get("taskId")) in task_scope
+    ]
+    if str(payload.get("featureId") or "") != args.feature:
+        raise RuntimeError("tracker snapshot featureId does not match the dispatcher invocation")
+    # Scope selects actions, not evidence. Dependency and concurrency checks
+    # retain the complete feature snapshot so a narrow plan cannot ignore a
+    # blocker or active sibling.
+    by_id = {str(task["taskId"]): task for task in evidence_tasks}
     by_kind = {
         status.get("kind"): status["name"]
         for status in status_records
@@ -376,13 +406,32 @@ def main() -> None:
     protocol_security_reviewer = "senior-security-engineer"
     protocol_product_manager = None
     protocol_qa: str | None = "qa"
+    # Preserve the historical no-preset behavior: independent gates are
+    # parallel unless a selected preset deliberately chooses another mode.
+    review_mode = "parallel"
     specialist_dispatch_tracks: set[str] = set()
-    try:
-        preset_text = read_regular_at(workdir_fd, "preset.env", "team preset", 1024 * 1024)
-    except FileNotFoundError:
-        preset_text = None
+    preset_text = None
+    if args.preset is not None:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,62}", args.preset):
+            raise RuntimeError("protected team preset identity is invalid")
+        preset_path = skill / "teams" / f"{args.preset}.md"
+        try:
+            preset_info = preset_path.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"protected team preset is unavailable: {exc}") from exc
+        if stat.S_ISLNK(preset_info.st_mode) or not stat.S_ISREG(preset_info.st_mode):
+            raise RuntimeError("protected team preset must be a non-symlink regular file")
+        if preset_info.st_size <= 0 or preset_info.st_size > 1024 * 1024:
+            raise RuntimeError("protected team preset must contain 1..1048576 bytes")
+        preset_text = preset_path.read_text(encoding="utf-8")
     if preset_text is not None:
         protocol_qa = None
+        review_matches = re.findall(r"^REVIEW_MODE=([^\r\n]+)$", preset_text, re.M)
+        if len(review_matches) > 1:
+            raise RuntimeError("team preset must not duplicate REVIEW_MODE")
+        review_mode = review_matches[0].strip() if review_matches else "sequential"
+        if review_mode not in {"sequential", "parallel", "tiered"}:
+            raise RuntimeError("team preset has an invalid REVIEW_MODE")
         required_protocol_roles = {
             "TEAM_LEAD": "team-lead",
             "PRINCIPAL_ARCHITECT": "principal-architect",
@@ -598,10 +647,16 @@ def main() -> None:
             if required and current
         ]
         supporting_current = qa_current and security_current
+        architects_current = architecture_approval > request and sceptical_approval > request
         team_lead_current = (
             team_lead_approval > request
             and supporting_current
-            and all(team_lead_approval > index for index in supporting_approvals)
+            and architects_current
+            and all(
+                team_lead_approval > index
+                for index in supporting_approvals
+                + [architecture_approval, sceptical_approval]
+            )
         )
         approvals = {
             "team-lead-approval": (
@@ -634,7 +689,7 @@ def main() -> None:
                 continue
             merge_queue.append(task_id)
         else:
-            if not team_lead_current and supporting_current:
+            if not team_lead_current and supporting_current and architects_current:
                 team_lead_review_queue.append(task_id)
             if architecture_approval <= request:
                 architecture_queue.append(task_id)
@@ -648,8 +703,10 @@ def main() -> None:
     product_closeout_role = None
     product_closeout_detail = None
     product_request = workdir / "product-acceptance-request.json"
-    all_terminal = bool(tasks) and all(task.get("status") in terminal for task in tasks)
-    if all_terminal:
+    all_terminal = bool(evidence_tasks) and all(
+        task.get("status") in terminal for task in evidence_tasks
+    )
+    if all_terminal and not task_scope:
         try:
             request_text = read_regular_at(
                 workdir_fd, "product-acceptance-request.json", "product-acceptance request", 1024 * 1024
@@ -691,48 +748,68 @@ def main() -> None:
                     "do not author an approval from guessed values." % str(exc)[:300]
                 )
 
-    if design_queue or architecture_queue:
+    selected_architecture = architecture_queue
+    selected_sceptical = sceptical_architecture_queue
+    selected_security = security_queue
+    selected_qa = qa_queue
+    selected_team_lead = team_lead_review_queue
+    if review_mode == "sequential":
+        review_queues = [
+            ("architecture", selected_architecture),
+            ("sceptical", selected_sceptical),
+            ("security", selected_security),
+            ("qa", selected_qa),
+            ("team-lead", selected_team_lead),
+        ]
+        first = next((name for name, queue in review_queues if queue), None)
+        selected_architecture = architecture_queue if first == "architecture" else []
+        selected_sceptical = sceptical_architecture_queue if first == "sceptical" else []
+        selected_security = security_queue if first == "security" else []
+        selected_qa = qa_queue if first == "qa" else []
+        selected_team_lead = team_lead_review_queue if first == "team-lead" else []
+
+    if design_queue or selected_architecture:
         emit(
             "launch",
             "principal-architect",
             "Dispatch queue - design gates: %s; architecture reviews: %s. Drain every item and exit."
-            % (", ".join(design_queue) or "none", ", ".join(architecture_queue) or "none"),
-            "|".join(architecture_queue),
+            % (", ".join(design_queue) or "none", ", ".join(selected_architecture) or "none"),
+            "|".join(selected_architecture),
         )
-    if sceptical_design_queue or sceptical_architecture_queue:
+    if sceptical_design_queue or selected_sceptical:
         emit(
             "launch",
             "sceptical-architect",
             "Dispatch queue - independent design challenges: %s; release-bound architecture reviews: %s. Drain every item and exit."
             % (
                 ", ".join(sceptical_design_queue) or "none",
-                ", ".join(sceptical_architecture_queue) or "none",
+                ", ".join(selected_sceptical) or "none",
             ),
-            "|".join(sceptical_architecture_queue),
+            "|".join(selected_sceptical),
         )
-    if security_queue:
+    if selected_security:
         emit(
             "launch",
             protocol_security_reviewer,
             "Dispatch queue - independent security reviews: %s. Drain every item and exit."
-            % ", ".join(security_queue),
-            "|".join(security_queue),
+            % ", ".join(selected_security),
+            "|".join(selected_security),
         )
-    if qa_queue:
+    if selected_qa:
         emit(
             "launch",
             protocol_qa or "qa",
             "Dispatch queue - required specialist QA reviews: %s. Drain every item and exit."
-            % ", ".join(qa_queue),
-            "|".join(qa_queue),
+            % ", ".join(selected_qa),
+            "|".join(selected_qa),
         )
-    if team_lead_review_queue:
+    if selected_team_lead:
         emit(
             "launch",
             "team-lead",
             "Dispatch queue - final quality reviews: %s. Drain every item and exit."
-            % ", ".join(team_lead_review_queue),
-            "|".join(team_lead_review_queue),
+            % ", ".join(selected_team_lead),
+            "|".join(selected_team_lead),
         )
     if merge_queue:
         emit(
@@ -788,18 +865,27 @@ def main() -> None:
         findings = last(task, "review-findings")
         if request < 0 or findings > request:
             if findings > request:
-                attempt += 1
-            emit("launch-task", role, task_id, attempt)
+                # Planned review rework is a normal next attempt, not a crash;
+                # it must not consume the automatic dead-worker restart budget.
+                next_attempt = (execution[1] if execution is not None else attempt) + 1
+                emit("launch-task", role, task_id, next_attempt)
+            elif execution is not None:
+                # A prior protected attempt existed but no live worker remains.
+                # Recovery must fence/quarantine that exact attempt before N+1;
+                # a plain start may silently reuse partial work.
+                emit("recover-task", role, task_id, execution[1])
+            else:
+                emit("launch-task", role, task_id, attempt)
 
     active_count = sum(
         1
-        for task in tasks
+        for task in evidence_tasks
         if task.get("status") == working_status
         and not task_is_held(str(task["taskId"]))
     )
     unintegrated = [
         task
-        for task in tasks
+        for task in evidence_tasks
         if task.get("status") in {working_status, review_status}
         and not task_is_held(str(task["taskId"]))
     ]
@@ -907,28 +993,64 @@ def main() -> None:
         slots -= 1
 
     stale = []
-    try:
-        heartbeat_fd = open_child_directory(workdir_fd, "heartbeats", "heartbeat directory")
-    except FileNotFoundError:
-        heartbeat_fd = None
-    if heartbeat_fd is not None:
-        now = time.time()
-        for name in os.listdir(heartbeat_fd):
-            info = os.stat(name, dir_fd=heartbeat_fd, follow_symlinks=False)
-            if not stat.S_ISREG(info.st_mode):
-                stale.append(name + " (unsafe non-file heartbeat)")
-            elif now - info.st_mtime > args.stuck_minutes * 60:
-                stale.append(name)
+    if not task_scope:
+        if args.health_json is not None:
+            try:
+                health = json.loads(args.health_json)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"authenticated worker health is not valid JSON: {exc}"
+                ) from exc
+            if not isinstance(health, list):
+                raise RuntimeError("authenticated worker health must be a JSON list")
+            seen_health: set[str] = set()
+            for item in health:
+                if not isinstance(item, dict):
+                    raise RuntimeError("authenticated worker health contains a non-object")
+                instance = item.get("instance")
+                verdict = item.get("verdict")
+                if (
+                    not isinstance(instance, str)
+                    or not instance
+                    or not isinstance(verdict, str)
+                    or not verdict
+                    or instance in seen_health
+                ):
+                    raise RuntimeError(
+                        "authenticated worker health has a malformed or duplicate identity"
+                    )
+                seen_health.add(instance)
+                if verdict == "identity-mismatch" or verdict.startswith("stalled:"):
+                    stale.append(f"{instance} ({verdict})")
+        else:
+            # Compatibility fallback for unmanaged callers. The file mtime is
+            # only advisory; managed dispatch supplies authenticated verdicts.
+            try:
+                heartbeat_fd = open_child_directory(
+                    workdir_fd, "heartbeats", "heartbeat directory"
+                )
+            except FileNotFoundError:
+                heartbeat_fd = None
+            if heartbeat_fd is not None:
+                now = time.time()
+                for name in os.listdir(heartbeat_fd):
+                    info = os.stat(name, dir_fd=heartbeat_fd, follow_symlinks=False)
+                    if not stat.S_ISREG(info.st_mode):
+                        stale.append(name + " (unsafe non-file heartbeat)")
+                    elif now - info.st_mtime > args.stuck_minutes * 60:
+                        stale.append(name)
 
     resume_pending = [
         entry["taskId"]
         for entry in hold_entries.values()
         if entry.get("state") == "resume-review-pending"
+        and (not task_scope or entry["taskId"] in task_scope)
     ]
     manual_takeovers = [
         entry["taskId"]
         for entry in hold_entries.values()
         if entry.get("state") == "manual-takeover"
+        and (not task_scope or entry["taskId"] in task_scope)
     ]
     if (
         missing_gate
