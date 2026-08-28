@@ -291,14 +291,12 @@ def heartbeat_value(
     workspace: Path,
     workspace_descriptor: int | None,
     instance: str,
-    *,
-    read: bool = True,
 ) -> str | None:
     try:
         teamwork_path.child(str(workspace_host), workspace, f"heartbeats/{instance}")
     except (OSError, RuntimeError, SystemExit) as exc:
         raise AgentHealthError("cannot resolve managed heartbeat path") from exc
-    if not read or workspace_descriptor is None:
+    if workspace_descriptor is None:
         return None
     heartbeats_descriptor = open_directory_at(
         workspace_descriptor, "heartbeats", "managed heartbeats directory"
@@ -401,47 +399,61 @@ def build_snapshot(
         if category == "release":
             non_agent_processes_omitted += 1
             continue
-        try:
-            workspace = teamwork_path.workspace(str(workspace_host), teamwork_root, team)
-        except (OSError, RuntimeError, SystemExit) as exc:
-            raise AgentHealthError(f"cannot resolve managed team workspace for {team}") from exc
-        workspace_descriptor = open_workspace_descriptor(workspace_host, workspace)
-        try:
-            binding = (
-                execution_binding(
-                    workspace_host, workspace, workspace_descriptor, instance
-                )
-                if category == "task"
-                else None
+        binding = None
+        if record.get("state") in {"dead", "identity-mismatch"}:
+            assessment = assessment_for(
+                record,
+                None,
+                None,
+                now,
+                stuck_minutes,
+                start_grace_seconds,
             )
-            if category == "task" and binding is None:
-                warnings.append(
-                    f"Managed task agent {team}/{instance} has no unique current execution binding; assignment and percentage were omitted."
-                )
+        else:
             try:
-                heartbeat = heartbeat_value(
-                    workspace_host,
-                    workspace,
-                    workspace_descriptor,
-                    instance,
-                    read=record.get("state") not in {"dead", "identity-mismatch"},
+                workspace = teamwork_path.workspace(
+                    str(workspace_host), teamwork_root, team
                 )
-            except heartbeat_status.HeartbeatError as exc:
-                assessment = heartbeat_status.stalled(
-                    "stalled:invalid-heartbeat", None, str(exc)
+            except (OSError, RuntimeError, SystemExit) as exc:
+                raise AgentHealthError(
+                    f"cannot resolve managed team workspace for {team}"
+                ) from exc
+            workspace_descriptor = open_workspace_descriptor(workspace_host, workspace)
+            try:
+                binding = (
+                    execution_binding(
+                        workspace_host, workspace, workspace_descriptor, instance
+                    )
+                    if category == "task"
+                    else None
                 )
-            else:
-                assessment = assessment_for(
-                    record,
-                    heartbeat,
-                    binding,
-                    now,
-                    stuck_minutes,
-                    start_grace_seconds,
-                )
-        finally:
-            if workspace_descriptor is not None:
-                os.close(workspace_descriptor)
+                if category == "task" and binding is None:
+                    warnings.append(
+                        f"Managed task agent {team}/{instance} has no unique current execution binding; assignment and percentage were omitted."
+                    )
+                try:
+                    heartbeat = heartbeat_value(
+                        workspace_host,
+                        workspace,
+                        workspace_descriptor,
+                        instance,
+                    )
+                except heartbeat_status.HeartbeatError as exc:
+                    assessment = heartbeat_status.stalled(
+                        "stalled:invalid-heartbeat", None, str(exc)
+                    )
+                else:
+                    assessment = assessment_for(
+                        record,
+                        heartbeat,
+                        binding,
+                        now,
+                        stuck_minutes,
+                        start_grace_seconds,
+                    )
+            finally:
+                if workspace_descriptor is not None:
+                    os.close(workspace_descriptor)
         try:
             created = heartbeat_status.parse_time(record.get("createdAt"), "lifecycle createdAt")
         except heartbeat_status.HeartbeatError as exc:

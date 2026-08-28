@@ -184,6 +184,58 @@ class AgentHealthTest(unittest.TestCase):
         self.assertIsNone(row["progressPercent"])
         self.assertIn("identity-mismatch", agent_health.render_table(snapshot))
 
+    def test_dead_agent_bypasses_hostile_team_workspace(self):
+        outside = self.repo / "outside-dead-workspace"
+        outside.mkdir()
+        self.workspace.rename(self.repo / "workspace-before-dead-swap")
+        self.workspace.symlink_to(outside, target_is_directory=True)
+
+        with mock.patch.object(
+            agent_health,
+            "execution_binding",
+            side_effect=AssertionError("terminal agent must not read execution state"),
+        ), mock.patch.object(
+            agent_health,
+            "heartbeat_value",
+            side_effect=AssertionError("terminal agent must not read heartbeat state"),
+        ):
+            snapshot = self.snapshot(lifecycle_record(state="dead"))
+
+        row = snapshot["agents"][0]
+        self.assertEqual("exited", row["verdict"])
+        self.assertEqual("backend", row["role"])
+        self.assertIsNone(row["taskId"])
+        self.assertIsNone(row["progressPercent"])
+        self.assertIsNone(row["progressSource"])
+        self.assertIsNone(row["elapsedSeconds"])
+        self.assertIn("exited", agent_health.render_table(snapshot))
+
+    def test_identity_mismatch_agent_bypasses_hostile_team_workspace(self):
+        outside = self.repo / "outside-identity-workspace"
+        outside.mkdir()
+        self.workspace.rename(self.repo / "workspace-before-identity-swap")
+        self.workspace.symlink_to(outside, target_is_directory=True)
+
+        with mock.patch.object(
+            agent_health,
+            "execution_binding",
+            side_effect=AssertionError("terminal agent must not read execution state"),
+        ), mock.patch.object(
+            agent_health,
+            "heartbeat_value",
+            side_effect=AssertionError("terminal agent must not read heartbeat state"),
+        ):
+            snapshot = self.snapshot(lifecycle_record(state="identity-mismatch"))
+
+        row = snapshot["agents"][0]
+        self.assertEqual("identity-mismatch", row["verdict"])
+        self.assertEqual("backend", row["role"])
+        self.assertIsNone(row["taskId"])
+        self.assertIsNone(row["progressPercent"])
+        self.assertIsNone(row["progressSource"])
+        self.assertIsNone(row["elapsedSeconds"])
+        self.assertIn("identity-mismatch", agent_health.render_table(snapshot))
+
     def test_symlinked_heartbeat_directory_fails_closed(self):
         outside = self.repo / "outside-heartbeats"
         outside.mkdir()
