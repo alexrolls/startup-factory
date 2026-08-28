@@ -50,6 +50,7 @@ RECORD_KEYS_V2 = RECORD_KEYS_V1 | {
     "sessionId",
     "tmuxPanePid",
 }
+RECORD_KEYS_V3 = RECORD_KEYS_V2 | {"repositoryId"}
 
 
 class LifecycleError(RuntimeError):
@@ -208,14 +209,62 @@ def initialize(raw_root: str, repository: str) -> tuple[Path, Path, bytes]:
     return root, records, key
 
 
-def record_path(records: Path, team: str, category: str, instance: str) -> Path:
-    digest = hashlib.sha256(
-        team.encode("utf-8")
+def project_identity(repository_raw: str) -> str:
+    repository = Path(repository_raw).resolve(strict=True)
+    git = "/usr/bin/git" if Path("/usr/bin/git").is_file() else "git"
+    try:
+        result = subprocess.run(
+            [
+                git,
+                "-C",
+                str(repository),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        fail(f"cannot resolve canonical Git common directory: {exc}")
+    common_raw = result.stdout.strip()
+    if result.returncode != 0 or not common_raw or "\n" in common_raw:
+        fail("agent repository is not inside a valid Git worktree")
+    try:
+        common = Path(common_raw).resolve(strict=True)
+        metadata = common.stat()
+    except OSError as exc:
+        fail(f"cannot inspect canonical Git common directory: {exc}")
+    if not stat.S_ISDIR(metadata.st_mode):
+        fail("canonical Git common directory is not a directory")
+    material = (
+        os.fsencode(common)
         + b"\0"
-        + category.encode("ascii")
+        + str(metadata.st_dev).encode("ascii")
         + b"\0"
-        + instance.encode("utf-8")
-    ).hexdigest()
+        + str(metadata.st_ino).encode("ascii")
+    )
+    return hashlib.sha256(material).hexdigest()
+
+
+def record_path(
+    records: Path,
+    team: str,
+    category: str,
+    instance: str,
+    repository_id: str | None = None,
+) -> Path:
+    components = [
+        team.encode("utf-8"),
+        category.encode("ascii"),
+        instance.encode("utf-8"),
+    ]
+    if repository_id is not None:
+        components.insert(0, repository_id.encode("ascii"))
+    digest = hashlib.sha256(b"\0".join(components)).hexdigest()
     return records / f"{digest}.json"
 
 
@@ -232,6 +281,7 @@ def authenticate(record: dict[str, Any], key: bytes, path: Path) -> None:
     expected_keys = {
         1: RECORD_KEYS_V1,
         2: RECORD_KEYS_V2,
+        3: RECORD_KEYS_V3,
     }.get(record.get("schemaVersion"))
     if expected_keys is None or set(record) != expected_keys:
         fail(f"lifecycle record has an unexpected schema: {path}")
@@ -246,8 +296,16 @@ def authenticate(record: dict[str, Any], key: bytes, path: Path) -> None:
 
 
 def validate_record(record: dict[str, Any], path: Path, records: Path) -> None:
-    if record["schemaVersion"] not in {1, 2}:
+    version = record["schemaVersion"]
+    if version not in {1, 2, 3}:
         fail(f"unsupported lifecycle record version: {path}")
+    repository_id: str | None = None
+    if version == 3:
+        repository_id = record["repositoryId"]
+        if not isinstance(repository_id, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", repository_id
+        ):
+            fail(f"lifecycle record has an invalid project identity: {path}")
     for label in ("team", "instance"):
         value = record[label]
         if not isinstance(value, str):
@@ -273,7 +331,7 @@ def validate_record(record: dict[str, Any], path: Path, records: Path) -> None:
             fail(f"tmux lifecycle record is missing its protected target: {path}")
     elif any(value is not None for value in tmux_values):
         fail(f"background lifecycle record contains a tmux target: {path}")
-    if record["schemaVersion"] == 2:
+    if version in {2, 3}:
         group_values = (record["processGroupId"], record["sessionId"])
         if any(
             not isinstance(value, int) or isinstance(value, bool) or value <= 1
@@ -288,7 +346,13 @@ def validate_record(record: dict[str, Any], path: Path, records: Path) -> None:
                 fail(f"tmux lifecycle record has an unsafe pane PID: {path}")
         elif pane_pid is not None:
             fail(f"background lifecycle record must not claim a tmux pane PID: {path}")
-    expected = record_path(records, record["team"], record["category"], record["instance"])
+    expected = record_path(
+        records,
+        record["team"],
+        record["category"],
+        record["instance"],
+        repository_id,
+    )
     if expected.name != path.name:
         fail(f"lifecycle record filename does not match its identity: {path}")
 
@@ -436,7 +500,7 @@ def leader_matches_group(record: dict[str, Any], identity: str | None) -> bool:
 
 def record_state(record: dict[str, Any]) -> str:
     current = process_identity(record["pid"])
-    if record["schemaVersion"] == 2:
+    if record["schemaVersion"] in {2, 3}:
         if not leader_matches_group(record, current):
             return "identity-mismatch"
         return "live" if group_exists(record["processGroupId"]) else "dead"
@@ -480,15 +544,42 @@ def atomic_write(path: Path, record: dict[str, Any]) -> None:
                 pass
 
 
+def find_records(
+    records: Path,
+    key: bytes,
+    repository_id: str,
+    team: str,
+    category: str,
+    instance: str,
+) -> list[tuple[Path, dict[str, Any]]]:
+    result: list[tuple[Path, dict[str, Any]]] = []
+    for path in (
+        record_path(records, team, category, instance, repository_id),
+        record_path(records, team, category, instance),
+    ):
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        result.append((path, load_record(path, records, key)))
+    return result
+
+
 def find_record(
-    records: Path, key: bytes, team: str, category: str, instance: str
+    records: Path,
+    key: bytes,
+    repository_id: str,
+    team: str,
+    category: str,
+    instance: str,
 ) -> tuple[Path, dict[str, Any]] | None:
-    path = record_path(records, team, category, instance)
-    try:
-        path.lstat()
-    except FileNotFoundError:
-        return None
-    return path, load_record(path, records, key)
+    found = find_records(records, key, repository_id, team, category, instance)
+    if len(found) > 1:
+        fail(
+            f"ambiguous protected lifecycle records for {team}/{instance}; "
+            "resolve the legacy generation before continuing"
+        )
+    return found[0] if found else None
 
 
 def all_records(records: Path, key: bytes) -> list[tuple[Path, dict[str, Any]]]:
@@ -531,7 +622,7 @@ def safe_signal(record: dict[str, Any], signal_number: int) -> None:
 
 
 def safe_signal_group(record: dict[str, Any], signal_number: int) -> None:
-    if record["schemaVersion"] != 2:
+    if record["schemaVersion"] not in {2, 3}:
         fail("legacy lifecycle record has no authenticated process-group authority")
     if record["kind"] not in {"background", "tmux"}:
         fail("unsupported process kind for process-group authority")
@@ -565,8 +656,9 @@ def safe_signal_group(record: dict[str, Any], signal_number: int) -> None:
         fail(f"cannot signal protected process group {process_group_id}: {exc}")
 
 
-def base_context(args: argparse.Namespace) -> tuple[Path, Path, bytes]:
-    return initialize(args.root, args.repo)
+def base_context(args: argparse.Namespace) -> tuple[Path, Path, bytes, str]:
+    root, records, key = initialize(args.root, args.repo)
+    return root, records, key, project_identity(args.repo)
 
 
 def enforce_expected_generation(record: dict[str, Any], args: argparse.Namespace) -> None:
@@ -583,24 +675,44 @@ def enforce_expected_generation(record: dict[str, Any], args: argparse.Namespace
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    root, _, _ = base_context(args)
+    root, _, _, _ = base_context(args)
     print(root)
     return 0
 
 
 def cmd_register(args: argparse.Namespace) -> int:
-    _, records, key = base_context(args)
+    _, records, key, repository_id = base_context(args)
     validate_identifier("team", args.team)
     validate_identifier("instance", args.instance)
     identity = process_identity(args.pid)
     if identity is None:
         fail(f"cannot register PID {args.pid}: process is not live")
-    path = record_path(records, args.team, args.category, args.instance)
-    if path.exists():
-        existing = load_record(path, records, key)
+    path = record_path(
+        records, args.team, args.category, args.instance, repository_id
+    )
+    existing_records = find_records(
+        records,
+        key,
+        repository_id,
+        args.team,
+        args.category,
+        args.instance,
+    )
+    if len(existing_records) > 1:
+        fail(
+            f"ambiguous protected lifecycle records for {args.team}/{args.instance}; "
+            "resolve the legacy generation before registering a replacement"
+        )
+    if existing_records:
+        existing_path, existing = existing_records[0]
         if record_state(existing) == "live":
             fail(
                 f"refusing to replace a live lifecycle record for {args.team}/{args.instance}"
+            )
+        if existing_path != path:
+            fail(
+                f"refusing to shadow a legacy lifecycle record for "
+                f"{args.team}/{args.instance}; forget it before registering v3"
             )
     if args.kind == "tmux":
         if not (
@@ -637,7 +749,8 @@ def cmd_register(args: argparse.Namespace) -> int:
         else:
             fail("lifecycle process must lead a dedicated process group and session")
     payload: dict[str, Any] = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
+        "repositoryId": repository_id,
         "team": args.team,
         "category": args.category,
         "instance": args.instance,
@@ -660,8 +773,10 @@ def cmd_register(args: argparse.Namespace) -> int:
 
 
 def cmd_probe(args: argparse.Namespace) -> int:
-    _, records, key = base_context(args)
-    found = find_record(records, key, args.team, args.category, args.instance)
+    _, records, key, repository_id = base_context(args)
+    found = find_record(
+        records, key, repository_id, args.team, args.category, args.instance
+    )
     if found is None:
         return NOT_LIVE
     _, record = found
@@ -673,9 +788,11 @@ def cmd_probe(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    _, records, key = base_context(args)
+    _, records, key, repository_id = base_context(args)
     for _, record in all_records(records, key):
         if record["team"] != args.team:
+            continue
+        if record["schemaVersion"] == 3 and record["repositoryId"] != repository_id:
             continue
         view = dict(record)
         view["state"] = record_state(record)
@@ -685,11 +802,48 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_project_list(args: argparse.Namespace) -> int:
+    _, records, key, repository_id = base_context(args)
+    project_records: list[dict[str, Any]] = []
+    legacy_omitted = 0
+    for _, record in all_records(records, key):
+        if record["schemaVersion"] in {1, 2}:
+            legacy_omitted += 1
+            continue
+        if record["repositoryId"] != repository_id:
+            continue
+        view = dict(record)
+        view["state"] = record_state(record)
+        del view["auth"]
+        del view["launchToken"]
+        project_records.append(view)
+    project_records.sort(
+        key=lambda item: (item["team"], item["category"], item["instance"])
+    )
+    warnings = []
+    if legacy_omitted:
+        warnings.append(
+            f"Omitted {legacy_omitted} unbound legacy lifecycle "
+            f"record{'s' if legacy_omitted != 1 else ''}."
+        )
+    envelope = {
+        "schemaVersion": "project-lifecycle-list-v1",
+        "repositoryId": repository_id,
+        "records": project_records,
+        "legacyOmitted": legacy_omitted,
+        "warnings": warnings,
+    }
+    print(json.dumps(envelope, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
 def cmd_any_live(args: argparse.Namespace) -> int:
-    _, records, key = base_context(args)
+    _, records, key, repository_id = base_context(args)
     needle = f"--{args.task_key}--a" if args.task_key else None
     for _, record in all_records(records, key):
         if record["team"] != args.team or record["category"] != args.category:
+            continue
+        if record["schemaVersion"] == 3 and record["repositoryId"] != repository_id:
             continue
         if needle is not None and needle not in record["instance"]:
             continue
@@ -699,8 +853,10 @@ def cmd_any_live(args: argparse.Namespace) -> int:
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
-    _, records, key = base_context(args)
-    found = find_record(records, key, args.team, args.category, args.instance)
+    _, records, key, repository_id = base_context(args)
+    found = find_record(
+        records, key, repository_id, args.team, args.category, args.instance
+    )
     if found is None:
         return NOT_LIVE
     _, record = found
@@ -717,8 +873,10 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_signal(args: argparse.Namespace) -> int:
-    _, records, key = base_context(args)
-    found = find_record(records, key, args.team, args.category, args.instance)
+    _, records, key, repository_id = base_context(args)
+    found = find_record(
+        records, key, repository_id, args.team, args.category, args.instance
+    )
     if found is None:
         return NOT_LIVE
     _, record = found
@@ -734,8 +892,10 @@ def cmd_signal(args: argparse.Namespace) -> int:
 
 
 def cmd_forget(args: argparse.Namespace) -> int:
-    _, records, key = base_context(args)
-    found = find_record(records, key, args.team, args.category, args.instance)
+    _, records, key, repository_id = base_context(args)
+    found = find_record(
+        records, key, repository_id, args.team, args.category, args.instance
+    )
     if found is None:
         return 0
     path, record = found
@@ -786,6 +946,8 @@ def parser() -> argparse.ArgumentParser:
     listing = common("list")
     listing.add_argument("--team", required=True)
     listing.set_defaults(handler=cmd_list)
+
+    common("project-list").set_defaults(handler=cmd_project_list)
 
     any_live = common("any-live")
     any_live.add_argument("--team", required=True)
