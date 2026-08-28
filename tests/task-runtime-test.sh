@@ -312,8 +312,34 @@ fixed_event_env=(env
   STARTUP_FACTORY_CANONICAL_REPO="$canonical_repo"
   STARTUP_FACTORY_CANONICAL_WORKSPACE="$canonical_workspace")
 fixed_heartbeat=".teamwork/feature-runtime/heartbeats/backend--$key--a1"
+progress_event="$("${fixed_event_env[@]}" "$EVENT" feature-runtime "$FID" "$TID" 1 backend \
+  task.progress implementing "endpoint slice" --progress-percent 42)"
+check "runtime event journals self-reported progress" python3 -c \
+  'import json,sys; value=json.loads(sys.argv[1]); assert value["progressPercent"] == 42' \
+  "$progress_event"
+check "runtime event keeps progress inside the existing heartbeat state field" \
+  grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z \\| $TID \\| implementing; attempt=1; progress=42$" \
+  "$fixed_heartbeat"
 heartbeat_before="$(cat "$fixed_heartbeat" 2>/dev/null || true)"
 event_count_before="$(wc -l < .teamwork/feature-runtime/events.ndjson)"
+for invalid_progress in -1 101 1.5 true; do
+  refuse "runtime event rejects invalid progress $invalid_progress" "progress percent must be an integer from 0 to 100" \
+    "${fixed_event_env[@]}" "$EVENT" feature-runtime "$FID" "$TID" 1 backend \
+    forged.progress implementing --progress-percent "$invalid_progress"
+done
+refuse "runtime event rejects empty progress" "progress percent must be an integer from 0 to 100" \
+  "${fixed_event_env[@]}" "$EVENT" feature-runtime "$FID" "$TID" 1 backend \
+  forged.progress implementing --progress-percent ""
+refuse "runtime event rejects duplicate progress" "progress percent must be an integer from 0 to 100" \
+  "${fixed_event_env[@]}" "$EVENT" feature-runtime "$FID" "$TID" 1 backend \
+  forged.progress implementing --progress-percent 40 --progress-percent 41
+refuse "runtime event reserves structured progress metadata for the validated option" "heartbeat state contains reserved semantic metadata" \
+  "${fixed_event_env[@]}" "$EVENT" feature-runtime "$FID" "$TID" 1 backend \
+  forged.progress "implementing; progress=99"
+check "invalid progress writes no event" test \
+  "$(wc -l < .teamwork/feature-runtime/events.ndjson)" = "$event_count_before"
+check "invalid progress does not refresh heartbeat" test \
+  "$(cat "$fixed_heartbeat" 2>/dev/null || true)" = "$heartbeat_before"
 refuse "runtime event rejects fixed team mismatch" "team does not match fixed runtime identity" \
   "${fixed_event_env[@]}" "$EVENT" other-team "$FID" "$TID" 1 backend forged.team implementing
 refuse "runtime event rejects fixed feature mismatch" "feature does not match fixed runtime identity" \

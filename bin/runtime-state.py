@@ -61,6 +61,15 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def progress_percent(raw: str) -> int:
+    if not re.fullmatch(r"0|[1-9][0-9]*", raw):
+        raise argparse.ArgumentTypeError("progress percent must be an integer from 0 to 100")
+    value = int(raw)
+    if value > 100:
+        raise argparse.ArgumentTypeError("progress percent must be an integer from 0 to 100")
+    return value
+
+
 def safe_key(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()[:32] or "task"
     digest = hashlib.sha256(value.encode()).hexdigest()[:10]
@@ -209,18 +218,31 @@ def execution_for(workspace: Path, task_id: str) -> dict:
     return read_json(workspace / "executions" / (safe_key(task_id) + ".json"), {})
 
 
-def progress_body(task_id: str, stage: str, actor: str, attempt: int, summary: str) -> str:
-    return "\n".join(
-        [
-            "[progress]",
-            "task: %s" % task_id,
-            "stage: %s" % stage,
-            "actor: %s" % (actor or "unassigned"),
-            "attempt: %s" % attempt,
-            "updated-at: %s" % utc_now(),
-            "summary: %s" % summary,
-        ]
-    )
+def progress_body(
+    task_id: str,
+    stage: str,
+    actor: str,
+    attempt: int,
+    summary: str,
+    progress: int | None = None,
+) -> str:
+    lines = [
+        "[progress]",
+        "task: %s" % task_id,
+        "stage: %s" % stage,
+        "actor: %s" % (actor or "unassigned"),
+        "attempt: %s" % attempt,
+        "updated-at: %s" % utc_now(),
+        "summary: %s" % summary,
+    ]
+    if progress is not None:
+        lines.extend(
+            [
+                "progress-percent: %s" % progress,
+                "progress-source: self-reported (presentation-only)",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def run_tracker(tracker_ops: str, *args: str) -> None:
@@ -245,13 +267,24 @@ def cmd_emit(args) -> None:
             "stage": args.stage,
             "summary": args.summary,
             "artifact": args.artifact,
+            "progressPercent": args.progress_percent,
         },
     )
     if args.tracker_ops and args.task != "-":
         body_dir = workspace / "pm"
         body_dir.mkdir(parents=True, exist_ok=True)
         body_file = body_dir / (safe_key(args.task) + "-progress.md")
-        body_file.write_text(progress_body(args.task, args.stage, args.actor, args.attempt, args.summary) + "\n")
+        body_file.write_text(
+            progress_body(
+                args.task,
+                args.stage,
+                args.actor,
+                args.attempt,
+                args.summary,
+                args.progress_percent,
+            )
+            + "\n"
+        )
         run_tracker(args.tracker_ops, "upsert-progress", args.task, str(body_file))
     print(json.dumps(event, ensure_ascii=False))
 
@@ -863,6 +896,7 @@ def build_parser() -> argparse.ArgumentParser:
     emit.add_argument("--type", required=True)
     emit.add_argument("--stage", required=True)
     emit.add_argument("--summary", default="")
+    emit.add_argument("--progress-percent", type=progress_percent)
     emit.add_argument("--artifact")
     emit.add_argument("--tracker-ops")
     emit.set_defaults(func=cmd_emit)

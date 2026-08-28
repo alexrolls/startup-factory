@@ -91,6 +91,19 @@ class HeartbeatStatusTest(unittest.TestCase):
             "stalled:no-heartbeat", self.classify(heartbeat, at(18, 1, 1))["verdict"]
         )
 
+    def test_starting_with_semantic_metadata_remains_starting(self):
+        result = self.classify(
+            "2026-08-24T18:00:00Z | TASK-1 | starting; attempt=2; progress=0 | "
+            "2026-08-24T18:01:00Z",
+            at(18, 0, 30),
+            expected_task="TASK-1",
+            expected_role="backend",
+            expected_attempt=2,
+        )
+        self.assertEqual("starting", result["verdict"])
+        self.assertEqual("starting", result["activity"])
+        self.assertEqual(0, result["progressPercent"])
+
     def test_malformed_deadline_is_visible(self):
         result = self.classify(
             "2026-08-24T18:10:00Z | TASK-1 | implementing | someday", at(18, 12)
@@ -146,6 +159,60 @@ class HeartbeatStatusTest(unittest.TestCase):
             with self.subTest(expectation=expectation):
                 result = self.classify(heartbeat, at(18, 12), **expectation)
                 self.assertEqual("stalled:binding-mismatch", result["verdict"])
+
+    def test_progress_boundaries_are_exposed_for_the_current_attempt(self):
+        for percent in (0, 100):
+            with self.subTest(percent=percent):
+                result = self.classify(
+                    "2026-08-24T18:10:00Z | TASK-1 | "
+                    f"implementing; attempt=2; progress={percent}",
+                    at(18, 12),
+                    expected_task="TASK-1",
+                    expected_role="backend",
+                    expected_attempt=2,
+                )
+                self.assertEqual("active", result["verdict"])
+                self.assertEqual(percent, result["progressPercent"])
+                self.assertEqual("2026-08-24T18:10:00Z", result["observedAt"])
+
+    def test_progress_is_presentation_only_when_metadata_is_invalid(self):
+        for state in (
+            "implementing; attempt=2; progress=-1",
+            "implementing; attempt=2; progress=101",
+            "implementing; attempt=2; progress=1.5",
+            "implementing; attempt=2; progress=40; progress=41",
+            "implementing; attempt=1; progress=40",
+        ):
+            with self.subTest(state=state):
+                result = self.classify(
+                    f"2026-08-24T18:10:00Z | TASK-1 | {state}",
+                    at(18, 12),
+                    expected_task="TASK-1",
+                    expected_role="backend",
+                    expected_attempt=2,
+                )
+                self.assertEqual("active", result["verdict"])
+                self.assertIsNone(result["progressPercent"])
+
+    def test_progress_freshness_rejects_stale_and_future_values(self):
+        stale = self.classify(
+            "2026-08-24T18:06:59Z | TASK-1 | implementing; attempt=2; progress=40",
+            at(18, 12),
+            expected_task="TASK-1",
+            expected_role="backend",
+            expected_attempt=2,
+        )
+        future = self.classify(
+            "2026-08-24T18:12:30Z | TASK-1 | implementing; attempt=2; progress=40",
+            at(18, 12),
+            expected_task="TASK-1",
+            expected_role="backend",
+            expected_attempt=2,
+        )
+        self.assertEqual("active", stale["verdict"])
+        self.assertEqual("active", future["verdict"])
+        self.assertIsNone(stale["progressPercent"])
+        self.assertIsNone(future["progressPercent"])
 
     def test_gate_role_binding_uses_the_protected_gate_instance(self):
         self.record.update(

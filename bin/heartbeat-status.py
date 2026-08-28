@@ -16,6 +16,7 @@ from typing import Any
 
 MAX_HEARTBEAT_BYTES = 4096
 DEFAULT_MAX_CLOCK_SKEW_SECONDS = 60
+DEFAULT_PROGRESS_MAX_AGE_SECONDS = 300
 TASK_INSTANCE_RE = re.compile(
     r"^(?P<role>[a-z0-9-]+)--(?P<task_key>.+)--a(?P<attempt>[1-9][0-9]*)$"
 )
@@ -91,13 +92,60 @@ def read_heartbeat(path: Path) -> str | None:
         os.close(descriptor)
 
 
-def stalled(verdict: str, heartbeat: str | None, detail: str) -> dict[str, str]:
+def stalled(verdict: str, heartbeat: str | None, detail: str) -> dict[str, Any]:
     return {
         "verdict": verdict,
         "nextActionBy": "-",
         "heartbeat": heartbeat or "-",
         "detail": detail,
+        "activity": None,
+        "observedAt": None,
+        "progressPercent": None,
     }
+
+
+def semantic_state(raw: str) -> tuple[str, int | None, int | None]:
+    """Parse bounded presentation metadata from the heartbeat state field.
+
+    Unknown metadata remains part of the human-readable state contract and is
+    ignored. Known metadata is fail-closed independently: malformed or repeated
+    attempt/progress values suppress progress without changing liveness.
+    """
+
+    parts = [part.strip() for part in raw.split(";")]
+    activity = parts[0]
+    attempt: int | None = None
+    progress: int | None = None
+    invalid: set[str] = set()
+    seen: set[str] = set()
+    for item in parts[1:]:
+        if "=" not in item:
+            continue
+        name, value = (piece.strip() for piece in item.split("=", 1))
+        if name not in {"attempt", "progress"}:
+            continue
+        if name in seen:
+            invalid.add(name)
+            continue
+        seen.add(name)
+        if not re.fullmatch(r"0|[1-9][0-9]*", value):
+            invalid.add(name)
+            continue
+        parsed = int(value)
+        if name == "attempt":
+            if parsed < 1:
+                invalid.add(name)
+            else:
+                attempt = parsed
+        elif parsed > 100:
+            invalid.add(name)
+        else:
+            progress = parsed
+    if "attempt" in invalid:
+        attempt = None
+    if "progress" in invalid:
+        progress = None
+    return activity, attempt, progress
 
 
 def record_binding_error(
@@ -156,7 +204,7 @@ def classify(
     expected_instance: str | None = None,
     start_grace: timedelta | None = None,
     max_clock_skew: timedelta = timedelta(seconds=DEFAULT_MAX_CLOCK_SKEW_SECONDS),
-) -> dict[str, str]:
+) -> dict[str, Any]:
     if max_clock_skew < timedelta(0):
         raise HeartbeatError("maximum clock skew must not be negative")
     if expected_attempt is not None and expected_attempt < 1:
@@ -168,12 +216,18 @@ def classify(
             "verdict": "exited",
             "nextActionBy": "-",
             "heartbeat": heartbeat or "-",
+            "activity": None,
+            "observedAt": None,
+            "progressPercent": None,
         }
     if state == "identity-mismatch":
         return {
             "verdict": "identity-mismatch",
             "nextActionBy": "-",
             "heartbeat": heartbeat or "-",
+            "activity": None,
+            "observedAt": None,
+            "progressPercent": None,
         }
     if state != "live":
         raise HeartbeatError(f"unsupported lifecycle state {state!r}")
@@ -195,6 +249,9 @@ def classify(
             "verdict": verdict,
             "nextActionBy": iso(deadline),
             "heartbeat": "-",
+            "activity": None,
+            "observedAt": None,
+            "progressPercent": None,
         }
 
     parts = [part.strip() for part in heartbeat.split("|")]
@@ -213,6 +270,7 @@ def classify(
 
     try:
         observed_at = parse_time(parts[0], "heartbeat timestamp")
+        activity, heartbeat_attempt, reported_progress = semantic_state(parts[2])
         ttl_deadline = observed_at + ttl
         if len(parts) == 4:
             requested_deadline = parse_time(parts[3], "heartbeat next-action-by")
@@ -237,18 +295,28 @@ def classify(
             "heartbeat timestamp predates the protected lifecycle instance",
         )
 
-    if parts[2].casefold() == "starting":
+    progress_age = (now - observed_at).total_seconds()
+    progress = None
+    if (
+        reported_progress is not None
+        and expected_attempt is not None
+        and heartbeat_attempt == expected_attempt
+        and 0 <= progress_age <= DEFAULT_PROGRESS_MAX_AGE_SECONDS
+    ):
+        progress = reported_progress
+
+    if activity.casefold() == "starting":
         verdict = "starting" if now <= deadline else "stalled:no-heartbeat"
     elif now <= deadline:
         verdict = "active"
     else:
         target = parts[1]
-        activity = parts[2].casefold()
+        normalized_activity = activity.casefold()
         idle_words = ("idle", "unassigned", "no assignment", "awaiting assignment", "ready")
         gate_words = ("gate", "review", "approval", "blocked", "waiting")
-        if target == "-" and any(word in activity for word in idle_words):
+        if target == "-" and any(word in normalized_activity for word in idle_words):
             verdict = "stalled:idle-no-assignment"
-        elif any(word in activity for word in gate_words):
+        elif any(word in normalized_activity for word in gate_words):
             verdict = "stalled:waiting-on-gate"
         else:
             verdict = "stalled:no-progress"
@@ -256,6 +324,9 @@ def classify(
         "verdict": verdict,
         "nextActionBy": iso(deadline),
         "heartbeat": heartbeat,
+        "activity": activity,
+        "observedAt": iso(observed_at),
+        "progressPercent": progress,
     }
 
 

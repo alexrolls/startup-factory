@@ -42,6 +42,7 @@
     "bin/dispatch.sh",
     "bin/delivery_profile.py",
     "bin/evidence_provider.py",
+    "bin/agent-health.py",
     "bin/heartbeat-status.py",
     "bin/launch-team.sh",
     "bin/quarantine-attempt.py",
