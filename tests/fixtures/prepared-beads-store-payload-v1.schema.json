@@ -1,0 +1,144 @@
+{
+  "carrierAliases": [],
+  "carrierDigestMeaning": "nested-domain-separated-planSha256",
+  "carrierNames": [
+    "readBackPlanCandidate",
+    "readBackPlanCandidateSha256"
+  ],
+  "executableFields": [
+    "device",
+    "inode",
+    "linkCount",
+    "mode",
+    "mtimeNs",
+    "pathLocatorSha256",
+    "sha256",
+    "size",
+    "sourceCommit",
+    "uid",
+    "version"
+  ],
+  "expectedBindingFields": [
+    "authority_epoch",
+    "beads_root_locator_sha256",
+    "cleanup_observation_sha256",
+    "config_envelope_canonical_sha256",
+    "database_name",
+    "derivation_journal_head_sha256",
+    "generic_status_config_sha256",
+    "metadata_sha256",
+    "payload_sha256",
+    "post_store_observation_sha256",
+    "pre_store_observation_sha256",
+    "predecessor_prepared_store_payload_sha256",
+    "preparation_mode",
+    "preparation_plan_sha256",
+    "project_root_locator_sha256",
+    "read_back_plan_candidate_sha256",
+    "release_manifest_sha256",
+    "repository_locator_sha256",
+    "runtime_api_manifest_sha256",
+    "status_profile_derivation_policy_sha256",
+    "status_profile_dynamic_bindings_sha256",
+    "status_profile_expected_bindings_sha256",
+    "status_profile_payload_sha256",
+    "status_profile_static_bindings_sha256",
+    "store_state_sha256"
+  ],
+  "immutableFileFields": [
+    "path",
+    "sha256",
+    "size",
+    "stat"
+  ],
+  "kind": "prepared-beads-store-payload-schema-v1",
+  "lastTouchedPolicyFields": [
+    "absentAllowed",
+    "exactMutationPostcondition",
+    "maximumBytes",
+    "presentMode",
+    "relativePath"
+  ],
+  "maximumCanonicalBytes": 32768,
+  "metadataFields": [
+    "backend",
+    "database",
+    "doltDatabase",
+    "doltMode",
+    "projectId",
+    "sha256"
+  ],
+  "ownershipAndDacPolicy": {
+    "executableLinkCount": 1,
+    "executableMode": "0500",
+    "gid": "not-carried-by-StatV1",
+    "immutableFileLinkCount": 1,
+    "immutableFileModes": [
+      "0400",
+      "0600"
+    ],
+    "relativePaths": "NFC-safe-POSIX-no-C0-C1-control-backslash-absolute-or-dot-segments",
+    "rootLinkCount": "positive",
+    "rootMode": "0700",
+    "uid": "all-root-file-and-executable-identities-equal"
+  },
+  "nullability": {
+    "create": {
+      "cleanupObservationSha256": "non-null",
+      "predecessorPreparedStorePayloadSha256": "null"
+    },
+    "reattest": {
+      "cleanupObservationSha256": "null",
+      "predecessorPreparedStorePayloadSha256": "non-null"
+    }
+  },
+  "payloadDomain": "startup-factory/prepared-beads-store-payload/v1\\0",
+  "schemaVersion": 1,
+  "statFields": [
+    "device",
+    "inode",
+    "linkCount",
+    "mode",
+    "size",
+    "uid"
+  ],
+  "topLevelFields": [
+    "authorityEpoch",
+    "beadsRootLocatorSha256",
+    "beadsRootRelative",
+    "beadsRootStat",
+    "cleanupObservationSha256",
+    "configEnvelopeCanonicalSha256",
+    "databaseDoltRootStat",
+    "databaseName",
+    "databaseRootRelative",
+    "databaseRootStat",
+    "derivationJournalHeadSha256",
+    "embeddedDataRootRelative",
+    "embeddedDataRootStat",
+    "executable",
+    "genericStatusConfigSha256",
+    "immutableFiles",
+    "kind",
+    "lastTouchedPolicy",
+    "metadata",
+    "postStoreObservationSha256",
+    "preStoreObservationSha256",
+    "predecessorPreparedStorePayloadSha256",
+    "preparationMode",
+    "preparationPlanSha256",
+    "projectRootLocatorSha256",
+    "readBackPlanCandidate",
+    "readBackPlanCandidateSha256",
+    "releaseManifestSha256",
+    "repositoryLocatorSha256",
+    "runtimeApiManifestSha256",
+    "schemaVersion",
+    "statusProfileDerivationPolicySha256",
+    "statusProfileDynamicBindingsSha256",
+    "statusProfileExpectedBindingsSha256",
+    "statusProfilePayloadSha256",
+    "statusProfileStaticBindingsSha256",
+    "storeStateSha256"
+  ]
+}

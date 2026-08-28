@@ -2,30 +2,140 @@ policy_module(startup_factory_beads_v27, 1.0)
 
 type beads_controller_t;
 type beads_controller_exec_t;
+type beads_launcher_exec_t;
 type beads_supervisor_exec_t;
-type beads_native_supervisor_t;
+type startup_factory_beads_controller_t alias beads_native_supervisor_t;
 type beads_worker_t;
+type beads_runtime_result_t;
+type startup_factory_beads_pause_t;
+type startup_factory_beads_pause_exec_t;
+type startup_factory_beads_conmon_t;
+type startup_factory_beads_conmon_exec_t;
+type startup_factory_beads_runtime_t;
+type startup_factory_beads_runtime_exec_t;
+type startup_factory_beads_payload_t;
+type startup_factory_beads_payload_exec_t;
+type startup_factory_beads_podman_exec_t;
 
 init_daemon_domain(beads_controller_t, beads_controller_exec_t)
-domain_type(beads_native_supervisor_t)
+domain_type(startup_factory_beads_controller_t)
 domain_type(beads_worker_t)
 files_type(beads_supervisor_exec_t)
+files_type(beads_launcher_exec_t)
+files_type(beads_runtime_result_t)
+domain_type(startup_factory_beads_pause_t)
+domain_type(startup_factory_beads_conmon_t)
+domain_type(startup_factory_beads_runtime_t)
+domain_type(startup_factory_beads_payload_t)
+files_type(startup_factory_beads_pause_exec_t)
+files_type(startup_factory_beads_conmon_exec_t)
+files_type(startup_factory_beads_runtime_exec_t)
+files_type(startup_factory_beads_payload_exec_t)
+files_type(startup_factory_beads_podman_exec_t)
 
-domain_entry_file(beads_native_supervisor_t, beads_supervisor_exec_t)
-domtrans_pattern(beads_controller_t, beads_supervisor_exec_t, beads_native_supervisor_t)
-allow beads_native_supervisor_t self:process { fork sigchld sigkill };
-allow beads_native_supervisor_t self:unix_stream_socket create_socket_perms;
+domain_entry_file(startup_factory_beads_controller_t, beads_supervisor_exec_t)
+domtrans_pattern(beads_controller_t, beads_supervisor_exec_t, startup_factory_beads_controller_t)
+can_exec(beads_controller_t, beads_launcher_exec_t)
+
+# systemd sets NoNewPrivileges before the controller invokes the launcher.
+# The host base policy must expose policycap nnp_nosuid_transition; the
+# installed-service fixture verifies that capability before this explicit
+# process2 edge can be treated as usable evidence.
+allow beads_controller_t startup_factory_beads_controller_t:process2 nnp_transition;
+
+# The accepted container policy has one separate pre-NNP pause edge and the
+# four post-NNP edges below.  Automatic transitions carry the executable
+# source permissions, target entrypoint, process transition and type_transition
+# supplied by domtrans_pattern; process2 permission is explicit.
+domtrans_pattern(startup_factory_beads_controller_t, startup_factory_beads_pause_exec_t, startup_factory_beads_pause_t)
+can_exec(startup_factory_beads_controller_t, startup_factory_beads_podman_exec_t)
+domtrans_pattern(startup_factory_beads_controller_t, startup_factory_beads_conmon_exec_t, startup_factory_beads_conmon_t)
+allow startup_factory_beads_controller_t startup_factory_beads_conmon_t:process2 nnp_transition;
+domtrans_pattern(startup_factory_beads_controller_t, startup_factory_beads_runtime_exec_t, startup_factory_beads_runtime_t)
+allow startup_factory_beads_controller_t startup_factory_beads_runtime_t:process2 nnp_transition;
+domtrans_pattern(startup_factory_beads_conmon_t, startup_factory_beads_runtime_exec_t, startup_factory_beads_runtime_t)
+allow startup_factory_beads_conmon_t startup_factory_beads_runtime_t:process2 nnp_transition;
+
+# The fourth edge is explicit OCI setexec, never an automatic transition.
+allow startup_factory_beads_runtime_t startup_factory_beads_payload_exec_t:file {
+    execute getattr map open read
+};
+allow startup_factory_beads_payload_t startup_factory_beads_payload_exec_t:file entrypoint;
+allow startup_factory_beads_runtime_t startup_factory_beads_payload_t:process transition;
+allow startup_factory_beads_runtime_t startup_factory_beads_payload_t:process2 {
+    nnp_transition nosuid_transition
+};
+allow startup_factory_beads_runtime_t self:process setexec;
+
+# Deliberately absent: conmon -> podman execute/execute_no_trans,
+# conmon -> podman type_transition, and conmon self:setexec.
+
+# tmpfiles labels the root.  Dynamic operation directories and their FD5
+# operation.lock, FD10 result/evidence/disposition files retain this single
+# closed type; no protected controller key or repository type is granted.
+type_transition beads_controller_t beads_runtime_result_t:dir beads_runtime_result_t;
+type_transition beads_controller_t beads_runtime_result_t:file beads_runtime_result_t;
+type_transition startup_factory_beads_controller_t beads_runtime_result_t:dir beads_runtime_result_t;
+type_transition startup_factory_beads_controller_t beads_runtime_result_t:file beads_runtime_result_t;
+manage_dirs_pattern(beads_controller_t, beads_runtime_result_t, beads_runtime_result_t)
+manage_files_pattern(beads_controller_t, beads_runtime_result_t, beads_runtime_result_t)
+allow startup_factory_beads_controller_t beads_runtime_result_t:dir {
+    add_name getattr open read search write
+};
+allow startup_factory_beads_controller_t beads_runtime_result_t:file {
+    create getattr lock open read write
+};
+# FD5's independent-OFD proof reopens only the already-custodied inode through
+# the kernel procfd magic link, then verifies dev/ino/mode/uid/nlink equality.
+allow startup_factory_beads_controller_t proc_t:lnk_file { getattr read };
+
+# The unit delegates only its own cgroup subtree. These permissions cover the
+# descriptor-pinned supervisor/payload directories, cgroup.procs placement,
+# Podman 5.4.1's two split children, cgroup.kill, and recursive populated=0
+# reads. DAC keeps S and P controller-owned and non-worker-writable. Only the
+# exact controller-created lifecycle leaf Li (0770) and its procs, threads,
+# and subtree-control interfaces (0660) are delegated to the worker's private
+# primary group. P's resource controls remain 0600/0400 and prevent movement
+# into P or a sibling Li. There is deliberately no mount, relabel, or
+# Podman/Docker API socket access in this module.
+allow beads_controller_t cgroup_t:filesystem getattr;
+allow beads_controller_t cgroup_t:dir {
+    add_name create getattr open read remove_name rmdir search write
+};
+allow beads_controller_t cgroup_t:file {
+    getattr open read write
+};
+allow startup_factory_beads_controller_t cgroup_t:filesystem getattr;
+allow startup_factory_beads_controller_t cgroup_t:dir {
+    add_name create getattr open read remove_name rmdir search write
+};
+allow startup_factory_beads_controller_t cgroup_t:file {
+    getattr open read write
+};
+# Podman (still startup_factory_beads_controller_t) creates `runtime`; the
+# transitioned OCI runtime creates `libpod-payload-<id>` from the pinned spec.
+# Conmon and the payload never create or write cgroup topology directly.
+allow startup_factory_beads_runtime_t cgroup_t:filesystem getattr;
+allow startup_factory_beads_runtime_t cgroup_t:dir {
+    add_name create getattr open read remove_name rmdir search write
+};
+allow startup_factory_beads_runtime_t cgroup_t:file {
+    getattr open read write
+};
+
+allow startup_factory_beads_controller_t self:process { fork sigchld sigkill };
+allow startup_factory_beads_controller_t self:unix_stream_socket create_socket_perms;
 
 corecmd_exec_bin(beads_controller_t)
-corecmd_exec_bin(beads_native_supervisor_t)
+corecmd_exec_bin(startup_factory_beads_controller_t)
 files_read_etc_files(beads_controller_t)
 files_read_usr_files(beads_controller_t)
-files_read_usr_files(beads_native_supervisor_t)
+files_read_usr_files(startup_factory_beads_controller_t)
 kernel_read_system_state(beads_controller_t)
-kernel_read_system_state(beads_native_supervisor_t)
+kernel_read_system_state(startup_factory_beads_controller_t)
 logging_send_syslog_msg(beads_controller_t)
 miscfiles_read_localization(beads_controller_t)
-miscfiles_read_localization(beads_native_supervisor_t)
+miscfiles_read_localization(startup_factory_beads_controller_t)
 
 # Podman/conmon policy is deliberately expected from the pinned host policy.
 # No Docker/Podman API socket, tracker credential, cloud credential, broker

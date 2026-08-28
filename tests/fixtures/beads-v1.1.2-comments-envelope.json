@@ -1,0 +1,19 @@
+{
+  "data": [
+    {
+      "id": "01a034a0-1f41-755a-9ae2-478eef0b97fb",
+      "issue_id": "task-1",
+      "author": "startup-factory",
+      "text": "claim receipt",
+      "created_at": "2026-08-24T16:35:04Z"
+    },
+    {
+      "id": "01a034a0-21f6-707d-b978-aeec8d45324d",
+      "issue_id": "task-1",
+      "author": "startup-factory",
+      "text": "reviewed",
+      "created_at": "2026-08-24T16:35:05Z"
+    }
+  ],
+  "schema_version": 1
+}

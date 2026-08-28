@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "kind": "beads-v1.1.2-wire-fixture-provenance",
+  "upstreamRepository": "https://github.com/gastownhall/beads",
+  "releaseTag": "v1.1.2",
+  "sourceCommit": "20e493e569c922d1253bdeff068c5e56c94957fb",
+  "asset": {
+    "name": "beads_1.1.2_linux_amd64.tar.gz",
+    "publishedSha256": "a72d71ed374955dc9f83a0f90b54bd7b6a0016709dd1676ae2e368651ed401c2",
+    "bdBinarySha256": "6d767629e90560506d0ea3de9823aef48386414f5425d8853e2ae3312cad9a82"
+  },
+  "capture": {
+    "containerImage": "public.ecr.aws/sam/build-python3.12:latest-x86_64",
+    "databaseName": "startup_factory",
+    "environment": {
+      "BD_JSON_ENVELOPE": "1"
+    },
+    "commands": [
+      ["bd", "--db", "$E", "--json", "--readonly", "--sandbox", "list", "--id", "task-1", "--all", "--limit", "0"],
+      ["bd", "--db", "$E", "--json", "--readonly", "--sandbox", "label", "list", "task-1"],
+      ["bd", "--db", "$E", "--json", "--readonly", "--sandbox", "comments", "task-1"],
+      ["bd", "--db", "$E", "--json", "--readonly", "--sandbox", "dep", "list", "task-1", "--direction", "down"]
+    ]
+  },
+  "fixtures": {
+    "beads-v1.1.2-issue-envelope.json": {"bytes": 837, "sha256": "cfbf5696dca6dc93d7289b668349df697217b92db9bc6f591097de17ade40a17"},
+    "beads-v1.1.2-labels-envelope.json": {"bytes": 92, "sha256": "3b6ed6544cef0c7cf89af49ab38d40dfe976a80f46648b37b80bf1a97d07e6b0"},
+    "beads-v1.1.2-comments-envelope.json": {"bytes": 441, "sha256": "ba0d5e2f1615621077b578146153104cb3ae2e3e723ec01b990d83fc62ab7874"},
+    "beads-v1.1.2-down-dependencies-envelope.json": {"bytes": 392, "sha256": "f05aeebe5490973765b45c679fe27e42ea8ef311a56f0f5f70484121a4e97c86"}
+  }
+}

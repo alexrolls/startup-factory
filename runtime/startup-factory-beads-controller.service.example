@@ -9,12 +9,16 @@ Type=simple
 # root:transport 0750 tmpfiles directory, then irreversibly drops itself to the
 # closed controller UID and transport GID before listen().
 ExecCondition=/usr/local/bin/startup-factory-beads-controller require-enabled
+# Root-owned tmpfiles performs the sole `Z` relabel. After its irreversible
+# UID/GID/capability drop, the worker reads the actual security.selinux xattr
+# and refuses readiness before receiving authority if it differs from the
+# pinned context. The service never receives relabel authority.
 ExecStart=/usr/local/bin/startup-factory-beads-controller serve
 SELinuxContext=system_u:system_r:beads_controller_t:s0
 Restart=on-failure
 RestartSec=2s
 Delegate=yes
-DelegateSubgroup=supervisor
+DelegateSubgroup=controller
 KillMode=control-group
 TimeoutStopSec=15s
 CapabilityBoundingSet=CAP_CHOWN CAP_SETGID CAP_SETUID
@@ -32,7 +36,7 @@ ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectSystem=strict
 RemoveIPC=true
-ReadWritePaths=/run/startup-factory /var/lib/startup-factory/beads-boundary-controller/v1
+ReadWritePaths=/run/startup-factory /run/user/991/startup-factory-beads-results /run/user/993/startup-factory-beads-results /run/user/993 /var/lib/startup-factory/beads-boundary-controller/v1 /var/lib/startup-factory/beads-worker /var/lib/startup-factory/beads-handoff
 RestrictAddressFamilies=AF_UNIX
 RestrictSUIDSGID=true
 SystemCallArchitectures=native

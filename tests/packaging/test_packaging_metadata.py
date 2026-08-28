@@ -171,8 +171,11 @@ class BundledDefaultsTests(unittest.TestCase):
         linux_probe = ROOT / "tests" / "beads-boundary-controller-linux-opt-in.py"
         native_linux_probe = ROOT / "tests" / "beads-native-boundary-linux-opt-in.py"
         native_assets = (
+            ROOT / "runtime" / "beads-v27" / "startup-factory-beads-launcher-v27.c",
             ROOT / "runtime" / "beads-v27" / "startup-factory-beads-supervisor-v27.c",
+            ROOT / "runtime" / "beads-v27" / "startup-factory-v27-crypto.h",
             ROOT / "runtime" / "beads-v27" / "build.sh",
+            ROOT / "runtime" / "beads-v27" / "generate-native-manifest-v27.py",
             ROOT / "runtime" / "beads-v27" / "Containerfile",
             ROOT / "runtime" / "beads-v27" / "startup_factory_beads_v27.te",
             ROOT / "runtime" / "beads-v27" / "startup_factory_beads_v27.fc",
@@ -237,6 +240,14 @@ class BundledDefaultsTests(unittest.TestCase):
         self.assertNotIn('"runtime/startup-factory-beads-controller.socket.example"', spec)
         self.assertIn('"tests/beads-boundary-controller-linux-opt-in.py"', spec)
         self.assertIn('"tests/beads-native-boundary-linux-opt-in.py"', spec)
+        for name in (
+            "beads-v1.1.2-issue-envelope.json",
+            "beads-v1.1.2-labels-envelope.json",
+            "beads-v1.1.2-comments-envelope.json",
+            "beads-v1.1.2-down-dependencies-envelope.json",
+            "beads-v1.1.2-wire-provenance.json",
+        ):
+            self.assertIn(f'"tests/fixtures/{name}"', spec)
 
 
 class ReleaseWorkflowTests(unittest.TestCase):

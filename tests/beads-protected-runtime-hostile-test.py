@@ -335,6 +335,7 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
     def seed_preparation_pointer(self, suffix: str):
         store = self.store()
         sequence = self.sequence()
+        expected_bindings = runtime.canonical_bytes({"schemaVersion": 1})
         result = runtime._signed_record(
             store,
             "FinishBeadsPreparationResultV1",
@@ -347,6 +348,12 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 "statusProfileRecordSha256": digest(f"status:{suffix}"),
                 "preparedPayloadCanonicalSha256": digest(f"payload:{suffix}"),
                 "preparedPayloadCanonicalJson": '{"schemaVersion":1}',
+                "preparedExpectedBindingsCanonicalSha256": runtime.sha256(
+                    expected_bindings
+                ),
+                "preparedExpectedBindingsCanonicalJson": expected_bindings.decode(
+                    "utf-8"
+                ),
                 "installIntentRecordSha256": None,
                 "installObservedRecordSha256": None,
                 "cleanupIntentRecordSha256": None,
@@ -438,6 +445,13 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                 adapterReleaseManifestRecordSha256=release_manifest.record_sha256,
                 bootstrapRuntimeCoreSha256=core.payload["bootstrapRuntimeCoreSha256"],
                 adapterReleaseCoreSha256=core.payload["adapterReleaseCoreSha256"],
+                genericStatusConfigSha256=digest(f"generic-status:{suffix}"),
+                statusProfileStaticBindingsSha256=digest(
+                    f"status-static:{suffix}"
+                ),
+                statusProfileDerivationPolicySha256=digest(
+                    f"status-policy:{suffix}"
+                ),
                 createStageDatabasePath=str(stage),
                 executablePath=str(executable),
                 repositoryPath=str(repository),
@@ -1396,6 +1410,15 @@ class ProtectedRuntimeHostileTest(unittest.TestCase):
                         adapterReleaseManifestRecordSha256=release_manifest.record_sha256,
                         bootstrapRuntimeCoreSha256=digest("wrong-bootstrap-core"),
                         adapterReleaseCoreSha256=core.payload["adapterReleaseCoreSha256"],
+                        genericStatusConfigSha256=digest(
+                            "wrong-core-generic-status"
+                        ),
+                        statusProfileStaticBindingsSha256=digest(
+                            "wrong-core-status-static"
+                        ),
+                        statusProfileDerivationPolicySha256=digest(
+                            "wrong-core-status-policy"
+                        ),
                         createStageDatabasePath=str(stage),
                         installedSelectorPath=None,
                         selectedStorePath=None,

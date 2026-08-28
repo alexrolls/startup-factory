@@ -39,6 +39,7 @@ from . import beads_boundary_controller as _boundary_controller
 
 SCHEMA_VERSION: Final = 1
 BEADS_BASELINE_COMMIT: Final = "20e493e569c922d1253bdeff068c5e56c94957fb"
+_BEADS_BASELINE_VERSION: Final = "1.1.2"
 MAX_GENERATION: Final = 99_999_999_999_999_999_999
 MAX_CANONICAL_BYTES: Final = 1_048_576
 MAX_EXECUTABLE_BYTES: Final = 67_108_864
@@ -442,6 +443,8 @@ _REQUEST_FIELDS: dict[str, set[str]] = {
         "installedSelectorPath", "selectedStorePath", "doltRootPath", "executablePath",
         "repositoryPath", "databaseName", "installPath", "cleanupPath", "statusConfigValue",
         "sourceAuthorityTransitionReceiptRecordSha256", "sourcePreparationPointerRecordSha256",
+        "genericStatusConfigSha256", "statusProfileStaticBindingsSha256",
+        "statusProfileDerivationPolicySha256",
     },
     "BeginBeadsPreparationRequestV1": _STORE_FIELDS | {"authorizationRecordSha256", "leaseNonce", "expiresAtUnix"},
     "AdvanceBeadsPreparationRequestV1": _STORE_FIELDS | {
@@ -453,8 +456,24 @@ _REQUEST_FIELDS: dict[str, set[str]] = {
     },
     "FinishBeadsPreparationRequestV1": _STORE_FIELDS | {
         "leaseRecordSha256", "preObservationRecordSha256", "postObservationRecordSha256",
-        "dynamicBindingsCanonicalJson", "statusProfilePayloadCanonicalJson",
-        "preparedStorePayloadCanonicalJson", "expectedCurrentPointerFullBytesSha256",
+        "preparationMode", "preparationPlanSha256",
+        "preparationAuthorizationRecordSha256", "authorityEpoch",
+        "runtimeApiManifestRecordSha256", "adapterReleaseManifestRecordSha256",
+        "genericStatusConfigSha256", "cleanupObservationSha256",
+        "storeStateSha256", "configEnvelopeCanonicalSha256",
+        "statusProfileStaticBindingsCanonicalJson",
+        "statusProfileStaticBindingsSha256", "statusProfileStaticBindingsSize",
+        "statusProfileDerivationPolicyCanonicalJson",
+        "statusProfileDerivationPolicySha256", "statusProfileDerivationPolicySize",
+        "dynamicBindingsCanonicalJson", "dynamicBindingsSha256", "dynamicBindingsSize",
+        "statusProfileExpectedBindingsCanonicalJson",
+        "statusProfileExpectedBindingsSha256", "statusProfileExpectedBindingsSize",
+        "statusProfilePayloadCanonicalJson", "statusProfilePayloadSha256",
+        "statusProfilePayloadSize", "preparedStorePayloadCanonicalJson",
+        "preparedStorePayloadSha256", "preparedStorePayloadSize",
+        "preparedStoreExpectedBindingsCanonicalJson",
+        "preparedStoreExpectedBindingsSha256", "preparedStoreExpectedBindingsSize",
+        "expectedCurrentPointerFullBytesSha256", "requestNonce",
     },
     "RecordBeadsChangePlanCoreRequestV1": _STORE_FIELDS | {
         "bootstrapRuntimeCoreCanonicalJson", "adapterReleaseCoreCanonicalJson",
@@ -510,6 +529,12 @@ _PREPARATION_AUTHORIZATION = _SEQUENCED | {
     "cleanupObservationA", "cleanupTreeObservationA", "revokedAuthorityRecordSha256",
     "sourceAuthorityTransitionReceiptRecordSha256", "sourcePreparationPointerRecordSha256",
     "verifiedInstalledSelector",
+    "authorityEpoch", "genericStatusConfigSha256",
+    "statusProfileStaticBindingsSha256",
+    "statusProfileDerivationPolicySha256",
+    "projectRootLocatorSha256", "beadsRootLocatorSha256",
+    "beadsRootStat", "embeddedDataRootStat", "preparedExecutable",
+    "preparedStoreMetadata",
 }
 _PREPARATION_LEASE = (_PREPARATION_AUTHORIZATION - {"authorizationNonce"}) | {
     "authorizationRecordSha256", "leaseNonce", "transactionIntentSha256", "nextCommandOrdinal",
@@ -531,6 +556,8 @@ _PREPARATION_TERMINAL = _SEQUENCED | {
     "postObservationRecordSha256", "statusProfileRecordSha256", "preparedPayloadCanonicalSha256",
     "preparedPayloadCanonicalJson", "transactionIntentSha256", "installIntentRecordSha256",
     "installObservedRecordSha256", "cleanupIntentRecordSha256", "cleanupObservedRecordSha256",
+    "preparedExpectedBindingsCanonicalSha256",
+    "preparedExpectedBindingsCanonicalJson",
 }
 _AUTHORITY_STATE = _SEQUENCED | {
     "repositoryLocatorSha256", "generation", "authorityState", "candidate",
@@ -577,10 +604,10 @@ _RESULT_FIELDS: dict[str, set[str]] = {
     "BeadsPreparationLeaseV1": _PREPARATION_LEASE,
     "BeadsPreparationCommandIntentV1": _SEQUENCED | {"repositoryLocatorSha256", "leaseRecordSha256", "commandOrdinal", "commandKind", "argv", "argvSha256", "transactionIntentSha256"},
     "BeadsStoreStateProjectionV1": {"primaryStore", "executableObservation", "installObservation", "cleanupObservation", "selectedStoreObservation", "doltRootObservation"},
-    "BeadsStoreObservationV1": _SEQUENCED | {"repositoryLocatorSha256", "leaseRecordSha256", "observationPhase", "stateProjection", "storeStateSha256", "acceptedConfigEnvelopeSha256", "predecessorObservationRecordSha256", "configReadbackStepRecordSha256", "transactionIntentSha256"},
+    "BeadsStoreObservationV1": _SEQUENCED | {"repositoryLocatorSha256", "leaseRecordSha256", "observationPhase", "stateProjection", "storeStateSha256", "acceptedConfigEnvelopeSha256", "predecessorObservationRecordSha256", "configReadbackStepRecordSha256", "transactionIntentSha256", "preparedDatabaseEvidence"},
     "BeadsPreparationStepV1": _PREPARATION_STEP,
-    "BeadsStatusProfileDynamicBindingsV1": {"schemaVersion", "repositoryLocatorSha256", "preparationLeaseRecordSha256", "preObservationRecordSha256", "postObservationRecordSha256", "storeStateSha256", "acceptedConfigEnvelopeCanonicalSha256"} | _SEQUENCE_FIELDS,
-    "VerifiedBeadsStatusProfileDynamicBindingsV1": {"schemaVersion", "repositoryLocatorSha256", "preparationLeaseRecordSha256", "preObservationRecordSha256", "postObservationRecordSha256", "storeStateSha256", "acceptedConfigEnvelopeCanonicalSha256"} | _SEQUENCE_FIELDS,
+    "BeadsStatusProfileDynamicBindingsV1": _SIGNED | {"repositoryLocatorSha256", "preparationLeaseRecordSha256", "preObservationRecordSha256", "postObservationRecordSha256", "storeStateSha256", "acceptedConfigEnvelopeCanonicalSha256"} | _SEQUENCE_FIELDS,
+    "VerifiedBeadsStatusProfileDynamicBindingsV1": _SIGNED | {"repositoryLocatorSha256", "preparationLeaseRecordSha256", "preObservationRecordSha256", "postObservationRecordSha256", "storeStateSha256", "acceptedConfigEnvelopeCanonicalSha256"} | _SEQUENCE_FIELDS,
     "FinishBeadsPreparationResultV1": _PREPARATION_TERMINAL,
     "BeadsStatusProfileV1": _SEQUENCED | {"repositoryLocatorSha256", "leaseRecordSha256", "payloadCanonicalSha256", "payloadCanonicalJson", "dynamicBindingsCanonicalSha256", "transactionIntentSha256"},
     "BeadsPreparationCurrentV1": _SEQUENCED | {"repositoryLocatorSha256", "generation", "predecessorCurrentFullBytesSha256", "leaseRecordSha256", "resultRecordSha256", "resultStoredJournalHeadSha256", "statusProfileRecordSha256", "transactionIntentSha256", "installIntentRecordSha256", "installObservedRecordSha256", "cleanupIntentRecordSha256", "cleanupObservedRecordSha256"},
@@ -704,7 +731,9 @@ _TYPE_NULLABLE_FIELDS.update({
     "BeadsPreparationStepV1": set(_SEQUENCE_NULLABLE) | set(_PREPARATION_STEP_VARIANT_NULLABLE),
     "BeadsStatusProfileDynamicBindingsV1": set(_SEQUENCE_NULLABLE),
     "VerifiedBeadsStatusProfileDynamicBindingsV1": set(_SEQUENCE_NULLABLE),
-    "FinishBeadsPreparationRequestV1": {"expectedCurrentPointerFullBytesSha256"},
+    "FinishBeadsPreparationRequestV1": {
+        "cleanupObservationSha256", "expectedCurrentPointerFullBytesSha256"
+    },
     "FinishBeadsPreparationResultV1": set(_SEQUENCE_NULLABLE) | set(_TERMINAL_INSTALL_NULLABLE),
     "BeadsStatusProfileV1": set(_SEQUENCE_NULLABLE),
     "BeadsPreparationCurrentV1": set(_SEQUENCE_NULLABLE) | set(_TERMINAL_INSTALL_NULLABLE) | {
@@ -2613,8 +2642,6 @@ def advance_atomic_claim_v1(request: AdvanceAtomicClaimRequestV1) -> AtomicClaim
     payload = _request(request, "AdvanceAtomicClaimRequestV1")
     _required(payload, "leaseRecordSha256", "observedRevision", "observedStatus", "claimSucceeded")
     store = _Store(payload)
-    if not isinstance(payload["claimSucceeded"], bool):
-        raise BeadsProtectedRuntimeError("claimSucceeded must be boolean")
     with store.locked():
         intent_digest, directory = _transaction_intent(store, "advance-atomic-claim", payload)
         resumed = _resume_transaction_result(
@@ -2631,16 +2658,35 @@ def advance_atomic_claim_v1(request: AdvanceAtomicClaimRequestV1) -> AtomicClaim
         )
         if prior.payload.get("claimState") != "prepared":
             raise BeadsStaleAuthorityError("atomic claim lease is not in prepared state")
+        native_result = _execute_supervised_beads_effect_v27(
+            authorization_record_sha256=prior.record_sha256,
+        )
+        projection = native_result.get("readBackProjection")
+        if not isinstance(projection, Mapping):
+            raise BeadsProtectedRuntimeError(
+                "native claim CAS returned no authenticated task projection"
+            )
+        if projection.get("id") != prior.payload.get("taskId"):
+            raise BeadsStaleAuthorityError(
+                "native claim CAS read-back selected another task"
+            )
+        observed_revision = projection.get("revision")
+        observed_status = projection.get("status")
+        if not isinstance(observed_revision, str) or not isinstance(observed_status, str):
+            raise BeadsProtectedRuntimeError(
+                "native claim CAS read-back lacks revision/status"
+            )
+        claim_succeeded = native_result.get("exitCode") == 0
         _consume_capability(store, "atomic-claim-successors", prior, intent_digest)
-        if payload["claimSucceeded"] and payload["observedRevision"] == prior.payload.get("expectedRevision"):
+        if claim_succeeded and observed_revision == prior.payload.get("expectedRevision"):
             raise BeadsStaleAuthorityError("successful conditional claim must return a new revision")
-        state = "claimed" if payload["claimSucceeded"] else "stale"
+        state = "claimed" if claim_succeeded else "stale"
         result_payload = {
             **{key: value for key, value in prior.payload.items() if key not in {"kind", "schemaVersion", "claimState"}},
             "claimState": state,
             "predecessorLeaseRecordSha256": prior.record_sha256,
-            "observedRevision": payload["observedRevision"],
-            "observedStatus": payload["observedStatus"],
+            "observedRevision": observed_revision,
+            "observedStatus": observed_status,
         }
         result = _signed_record(store, "AtomicClaimLeaseV1", "atomic-claim-lease", result_payload, "claims")
         _transaction_receipt(store, directory, "advance-atomic-claim", result)
@@ -2666,9 +2712,19 @@ def record_atomic_claim_receipt_v1(request: RecordAtomicClaimReceiptRequestV1) -
         )
         if lease.payload.get("claimState") != "claimed":
             raise BeadsStaleAuthorityError("claim receipt requires a successful claimed lease")
-        if payload["readBackRevision"] != lease.payload.get("observedRevision") or payload["readBackStatus"] != lease.payload.get("observedStatus"):
+        native_result = _execute_supervised_beads_effect_v27(
+            authorization_record_sha256=lease.record_sha256,
+        )
+        projection = native_result.get("readBackProjection")
+        if not isinstance(projection, Mapping):
+            raise BeadsProtectedRuntimeError(
+                "native receipt comment returned no authenticated task projection"
+            )
+        read_back_revision = projection.get("revision")
+        read_back_status = projection.get("status")
+        if read_back_revision != lease.payload.get("observedRevision") or read_back_status != lease.payload.get("observedStatus"):
             raise BeadsStaleAuthorityError("claim read-back no longer matches the atomic observation")
-        _digest(payload["claimIdentitySha256"], "claimIdentitySha256")
+        claim_identity = sha256(canonical_bytes(projection))
         _consume_capability(store, "atomic-claim-receipt-successors", lease, intent_digest)
         result = _signed_record(
             store,
@@ -2678,9 +2734,9 @@ def record_atomic_claim_receipt_v1(request: RecordAtomicClaimReceiptRequestV1) -
                 "repositoryLocatorSha256": store.repository_digest,
                 "leaseRecordSha256": lease.record_sha256,
                 "taskId": lease.payload["taskId"],
-                "revision": payload["readBackRevision"],
-                "status": payload["readBackStatus"],
-                "claimIdentitySha256": payload["claimIdentitySha256"],
+                "revision": read_back_revision,
+                "status": read_back_status,
+                "claimIdentitySha256": claim_identity,
                 "activeAuthorityRecordSha256": lease.payload["activeAuthorityRecordSha256"],
             },
             "claim-receipts",
@@ -2936,17 +2992,7 @@ def finish_beads_mutation_v1(request: FinishBeadsMutationRequestV1) -> BeadsMuta
             _revalidate_preparation_physical(lease)
         _consume_capability(store, "beads-mutation-intent-successors", intent, intent_digest)
         native_result = _execute_supervised_beads_effect_v27(
-            operation_class=(
-                "ordinary"
-                if intent.payload.get("mutationClass") == "ordinary"
-                else (
-                    "create-preparation"
-                    if lease.payload.get("preparationMode") == "create"
-                    else "reattest-preparation"
-                )
-            ),
-            argv=list(intent.payload["argv"]),
-            repository_path=repository_path,
+            authorization_record_sha256=intent.record_sha256,
         )
         result_payload = {
             **{key: value for key, value in intent.payload.items() if key not in {"kind", "schemaVersion"}},
@@ -3023,6 +3069,8 @@ def _observe_executable(path: Path, expected_sha256: str) -> dict[str, Any]:
     return {
         "pathSha256": sha256(os.fsencode(str(path))),
         "bytesSha256": observed,
+        "size": metadata.st_size,
+        "mtimeNs": metadata.st_mtime_ns,
         **_directory_identity(metadata),
     }
 
@@ -3043,6 +3091,8 @@ def _open_verified_executable_descriptor(path: Path, expected_observation: Mappi
         observed = {
             "pathSha256": sha256(os.fsencode(str(path))),
             "bytesSha256": sha256(data),
+            "size": metadata.st_size,
+            "mtimeNs": metadata.st_mtime_ns,
             **_directory_identity(metadata),
         }
         if canonical_bytes(observed) != canonical_bytes(expected_observation):
@@ -3054,6 +3104,174 @@ def _open_verified_executable_descriptor(path: Path, expected_observation: Mappi
         raise
     finally:
         os.close(parent)
+
+
+def _prepared_stat_projection(path: Path, label: str) -> dict[str, Any]:
+    parent, leaf = _open_absolute_parent(path, label)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            leaf,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent,
+        )
+        observed = os.fstat(descriptor)
+        named = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or observed.st_uid != os.getuid()
+            or stat.S_IMODE(observed.st_mode) != 0o700
+            or (
+                observed.st_dev, observed.st_ino, observed.st_mode,
+                observed.st_uid, observed.st_nlink,
+            ) != (
+                named.st_dev, named.st_ino, named.st_mode,
+                named.st_uid, named.st_nlink,
+            )
+        ):
+            raise BeadsProtectedRuntimeError(
+                f"{label} is not an exact broker-owned mode-0700 directory"
+            )
+        return {
+            "device": observed.st_dev,
+            "inode": observed.st_ino,
+            "uid": observed.st_uid,
+            "mode": "0700",
+            "linkCount": observed.st_nlink,
+            "size": observed.st_size,
+        }
+    except OSError as exc:
+        raise BeadsProtectedRuntimeError(
+            f"cannot capture {label} without following links: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def _prepared_executable_projection(
+    observation: Mapping[str, Any],
+) -> dict[str, Any]:
+    required = {
+        "pathSha256", "bytesSha256", "device", "inode", "owner", "mode",
+        "linkCount", "size", "mtimeNs",
+    }
+    if not isinstance(observation, Mapping) or set(observation) != required:
+        raise BeadsProtectedRuntimeError(
+            "protected Beads executable observation is incomplete"
+        )
+    return {
+        "pathLocatorSha256": observation["pathSha256"],
+        "sha256": observation["bytesSha256"],
+        "device": observation["device"],
+        "inode": observation["inode"],
+        "uid": observation["owner"],
+        "mode": f"{int(observation['mode']):04o}",
+        "linkCount": observation["linkCount"],
+        "size": observation["size"],
+        "mtimeNs": observation["mtimeNs"],
+        "version": _BEADS_BASELINE_VERSION,
+        "sourceCommit": BEADS_BASELINE_COMMIT,
+    }
+
+
+def _prepared_store_metadata(
+    repository_locator_sha256: str, database_name: str
+) -> dict[str, str]:
+    identity = {
+        "repositoryLocatorSha256": repository_locator_sha256,
+        "databaseName": database_name,
+    }
+    return {
+        "database": "dolt",
+        "backend": "dolt",
+        "doltMode": "embedded",
+        "doltDatabase": database_name,
+        "projectId": "startup-factory-" + repository_locator_sha256[7:39],
+        "sha256": sha256(
+            b"startup-factory/beads/prepared-store-metadata/v1\0"
+            + canonical_bytes(identity)
+        ),
+    }
+
+
+def _prepared_database_evidence(path: Path, label: str) -> dict[str, Any]:
+    root, _ancestry = _open_absolute_directory(path, label, private=True)
+    immutable: list[dict[str, Any]] = []
+    try:
+        root_stat = _prepared_stat_projection(path, label)
+        dolt_path = path / ".dolt"
+        dolt_stat = _prepared_stat_projection(dolt_path, f"{label} Dolt root")
+        for name in sorted(entry.name for entry in os.scandir(root)):
+            if name in {".dolt", "last-touched"}:
+                continue
+            if name in {"", ".", ".."} or len(os.fsencode(name)) > 255:
+                raise BeadsProtectedRuntimeError(
+                    f"{label} has an unsafe immutable-file name"
+                )
+            metadata = os.stat(name, dir_fd=root, follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise BeadsProtectedRuntimeError(
+                    f"{label} has an unsupported non-file outside .dolt"
+                )
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root,
+            )
+            try:
+                opened = os.fstat(descriptor)
+                data = _read_regular_descriptor(
+                    descriptor,
+                    f"{label} immutable file {name}",
+                    max_bytes=MAX_CANONICAL_BYTES,
+                )
+            finally:
+                os.close(descriptor)
+            if (
+                opened.st_dev, opened.st_ino, opened.st_mode,
+                opened.st_uid, opened.st_nlink, opened.st_size,
+            ) != (
+                metadata.st_dev, metadata.st_ino, metadata.st_mode,
+                metadata.st_uid, metadata.st_nlink, metadata.st_size,
+            ) or stat.S_IMODE(opened.st_mode) not in {0o400, 0o600}:
+                raise BeadsProtectedRuntimeError(
+                    f"{label} immutable file {name} identity/mode changed"
+                )
+            immutable.append(
+                {
+                    "path": name,
+                    "sha256": sha256(data),
+                    "size": len(data),
+                    "stat": {
+                        "device": opened.st_dev,
+                        "inode": opened.st_ino,
+                        "uid": opened.st_uid,
+                        "mode": f"{stat.S_IMODE(opened.st_mode):04o}",
+                        "linkCount": opened.st_nlink,
+                        "size": opened.st_size,
+                    },
+                }
+            )
+        if not immutable or len(immutable) > 64:
+            raise BeadsProtectedRuntimeError(
+                f"{label} must expose 1..64 immutable top-level files"
+            )
+        rebound = _prepared_stat_projection(path, f"{label} final rebind")
+        if canonical_bytes(rebound) != canonical_bytes(root_stat):
+            raise BeadsProtectedRuntimeError(
+                f"{label} changed while prepared-store evidence was captured"
+            )
+        return {
+            "databaseRootStat": root_stat,
+            "databaseDoltRootStat": dolt_stat,
+            "immutableFiles": immutable,
+        }
+    finally:
+        os.close(root)
 
 
 def _install_pinned_executable(
@@ -3086,51 +3304,17 @@ def _install_pinned_executable(
 
 def _execute_supervised_beads_effect_v27(
     *,
-    operation_class: str,
-    argv: Sequence[str],
-    repository_path: Path,
+    authorization_record_sha256: str,
 ) -> Mapping[str, Any]:
     """Execute only through the controller's durable worker/native boundary."""
 
     _require_boundary_operation(mutation=True)
     session = _validate_live_boundary_session()
     try:
-        raw = _boundary_controller._read_root_owned(
-            session.config.native_boundary_manifest_path,
-            "installed native boundary V27 manifest for execution plan",
-        )
-        if _boundary_controller._sha(raw) != session.config.native_boundary_manifest_sha256:
-            raise _boundary_controller.ControllerProtocolError(
-                "native boundary manifest changed before execution-plan construction"
-            )
-        parsed = json.loads(raw)
-        native = _boundary_controller.native_boundary_v27
-        if native.canonical_bytes(parsed) + b"\n" != raw:
-            raise native.NativeBoundaryV27Error(
-                "native boundary manifest is not canonical JSON plus LF"
-            )
-        manifest = native.parse_native_boundary_manifest_v27(parsed)
-        if not argv:
-            raise BeadsProtectedRuntimeError("protected Beads effect argv is empty")
-        container_argv = ["/usr/local/bin/bd"]
-        for item in argv[1:]:
-            text = str(item)
-            candidate = Path(text)
-            if candidate.is_absolute() and (
-                candidate == repository_path or repository_path in candidate.parents
-            ):
-                relative = candidate.relative_to(repository_path)
-                text = str(Path("/workspace") / relative)
-            container_argv.append(text)
-        plan = native.reference_supervised_effect_plan_v27(
-            manifest,
-            operation_id=str(session.response["operationId"]),
-            operation_class=operation_class,
-            argv=container_argv,
-            repository_path=str(repository_path),
-        )
         result = _boundary_controller.execute_native_effect_v27(
-            session.config, session.response, plan
+            session.config,
+            session.response,
+            _digest(authorization_record_sha256, "authorizationRecordSha256"),
         )
     except (
         OSError,
@@ -3142,11 +3326,68 @@ def _execute_supervised_beads_effect_v27(
         raise _boundary_refusal(
             f"durable V27 native supervisor execution failed: {exc}"
         ) from exc
+    if result.get("segmentState") == "command-completed":
+        required_segment = {
+            "schemaVersion", "profile", "segmentState", "stageStart", "stageEnd",
+            "payloadStageKey", "exitCode", "stdoutBase64", "stderrBase64",
+            "stdoutSha256", "stderrSha256", "lifecycle",
+            "observedByNativeSupervisor",
+        }
+        if (
+            set(result) != required_segment
+            or result.get("schemaVersion") != 27
+            or result.get("profile") != "startup-factory/beads-native-boundary/v27"
+            or result.get("observedByNativeSupervisor") is not True
+            or type(result.get("stageStart")) is not int
+            or type(result.get("stageEnd")) is not int
+            or result["stageEnd"] - result["stageStart"] != 12
+            or list(result.get("lifecycle", ()))
+            != ["create", "init", "start-attach", "terminal", "cleanup", "rm"]
+            or type(result.get("exitCode")) is not int
+        ):
+            raise _boundary_refusal(
+                "native supervisor preparation segment is not exact V27 evidence"
+            )
+        for field in ("stdoutSha256", "stderrSha256"):
+            _digest(result[field], field)
+        return result
+    if result.get("preparationState") == "sequence-completed":
+        required_terminal = {
+            "schemaVersion", "profile", "preparationState", "operationClass",
+            "commandCount", "commandStages", "commandResultsSha256",
+            "observedByNativeSupervisor",
+        }
+        if (
+            set(result) != required_terminal
+            or result.get("schemaVersion") != 27
+            or result.get("profile") != "startup-factory/beads-native-boundary/v27"
+            or result.get("observedByNativeSupervisor") is not True
+            or result.get("operationClass")
+            not in {"create-preparation", "reattest-preparation"}
+            or not isinstance(result.get("commandResultsSha256"), list)
+            or result.get("commandCount") != len(result["commandResultsSha256"])
+        ):
+            raise _boundary_refusal(
+                "native supervisor preparation terminal is not exact V27 evidence"
+            )
+        for digest in result["commandResultsSha256"]:
+            _digest(digest, "preparation command result")
+        return result
     required = {
         "exitCode",
         "stdoutSha256",
         "stderrSha256",
         "readBackSha256",
+        "readBackProjection",
+        "readBacksSha256",
+        "physicalEqualityPasses",
+        "repeatabilityPasses",
+        "repeatabilityEvidenceSha256",
+        "rollingJoinPasses",
+        "rollingJoinEvidenceSha256",
+        "crossWindowNoEffect",
+        "crossWindowNoEffectEvidenceSha256",
+        "independentReadCount",
         "lifecycle",
         "observedByNativeSupervisor",
     }
@@ -3155,10 +3396,28 @@ def _execute_supervised_beads_effect_v27(
         or result.get("observedByNativeSupervisor") is not True
         or list(result.get("lifecycle", ()))
         != ["create", "init", "start-attach", "terminal", "cleanup", "rm"]
+        or result.get("independentReadCount") != 4
+        or result.get("physicalEqualityPasses") != [True, True]
+        or result.get("repeatabilityPasses") != [True] * 6
+        or result.get("rollingJoinPasses") != [True] * 5
+        or result.get("crossWindowNoEffect") is not True
     ):
         raise _boundary_refusal("native supervisor result is not the closed V27 observation")
-    for field in ("stdoutSha256", "stderrSha256", "readBackSha256"):
+    for field in (
+        "stdoutSha256", "stderrSha256", "readBackSha256",
+        "repeatabilityEvidenceSha256", "rollingJoinEvidenceSha256",
+        "crossWindowNoEffectEvidenceSha256",
+    ):
         _digest(result[field], field)
+    if (
+        not isinstance(result["readBacksSha256"], list)
+        or len(result["readBacksSha256"]) != 4
+    ):
+        raise _boundary_refusal("native supervisor four-read evidence is invalid")
+    for digest_value in result["readBacksSha256"]:
+        _digest(digest_value, "readBacksSha256")
+    if not isinstance(result["readBackProjection"], (Mapping, list)):
+        raise _boundary_refusal("native supervisor read-back projection is invalid")
     if type(result["exitCode"]) is not int:
         raise _boundary_refusal("native supervisor exit code is invalid")
     return MappingProxyType(dict(result))
@@ -3775,16 +4034,31 @@ def authorize_beads_preparation_v1(request: AuthorizeBeadsPreparationRequestV1) 
         "planSha256", "executableSha256", "operatorIdentitySha256", "authorizationNonce",
         "expiresAtUnix", "runtimeApiManifestRecordSha256", "adapterReleaseManifestRecordSha256",
         "bootstrapRuntimeCoreSha256", "adapterReleaseCoreSha256",
+        "genericStatusConfigSha256", "statusProfileStaticBindingsSha256",
+        "statusProfileDerivationPolicySha256", "statusConfigValue",
     )
     fields = _preparation_sequence_fields(payload)
     for field in (
         "planSha256", "executableSha256", "operatorIdentitySha256",
         "runtimeApiManifestRecordSha256", "adapterReleaseManifestRecordSha256",
         "bootstrapRuntimeCoreSha256", "adapterReleaseCoreSha256",
+        "genericStatusConfigSha256", "statusProfileStaticBindingsSha256",
+        "statusProfileDerivationPolicySha256",
     ):
         _digest(payload[field], field)
     _identifier(payload["authorizationNonce"], "authorizationNonce")
     _expiry(payload)
+    if (
+        not isinstance(payload["statusConfigValue"], str)
+        or not payload["statusConfigValue"]
+        or len(payload["statusConfigValue"].encode("utf-8")) > 65_536
+        or any(not item for item in payload["statusConfigValue"].split(","))
+        or len(set(payload["statusConfigValue"].split(",")))
+        != len(payload["statusConfigValue"].split(","))
+    ):
+        raise BeadsProtectedRuntimeError(
+            "statusConfigValue must be a bounded unique comma-delimited literal"
+        )
     store = _Store(payload)
     with store.locked():
         _verify_current_preparation_core_bindings(store, payload)
@@ -3799,8 +4073,6 @@ def authorize_beads_preparation_v1(request: AuthorizeBeadsPreparationRequestV1) 
         repository_path = Path(str(payload["repositoryPath"]))
         _capture_directory(repository_path, "Beads repository")
         database_name = _identifier(payload["databaseName"], "databaseName")
-        if not isinstance(payload["statusConfigValue"], str) or not payload["statusConfigValue"] or len(payload["statusConfigValue"].encode("utf-8")) > 65536:
-            raise BeadsProtectedRuntimeError("statusConfigValue must be a bounded non-empty literal")
         stage_path = Path(str(payload["createStageDatabasePath"]))
         install_path = Path(str(payload["installPath"]))
         cleanup_path = Path(str(payload["cleanupPath"]))
@@ -3887,6 +4159,7 @@ def authorize_beads_preparation_v1(request: AuthorizeBeadsPreparationRequestV1) 
             **expected_paths,
             "repositoryPath": source_locator.payload["repositoryPath"],
             "databaseName": source_locator.payload["databaseName"],
+            "statusConfigValue": payload["statusConfigValue"],
             "sourceAuthorityTransitionReceiptRecordSha256": source_receipt.record_sha256,
             "sourcePreparationPointerRecordSha256": payload["sourcePreparationPointerRecordSha256"],
             "verifiedInstalledSelector": _plain(verified_selector.payload),
@@ -3909,6 +4182,32 @@ def authorize_beads_preparation_v1(request: AuthorizeBeadsPreparationRequestV1) 
                 "pinnedExecutableObservation": pinned_executable_observation,
             }
         )
+        prepared_repository = Path(str(path_bindings["repositoryPath"]))
+        prepared_database_name = str(path_bindings["databaseName"])
+        prepared_beads_root = prepared_repository / ".beads"
+        prepared_embedded_root = prepared_beads_root / "embeddeddolt"
+        path_bindings.update(
+            {
+                "projectRootLocatorSha256": sha256(
+                    os.fsencode(str(prepared_repository))
+                ),
+                "beadsRootLocatorSha256": sha256(
+                    os.fsencode(str(prepared_beads_root))
+                ),
+                "beadsRootStat": _prepared_stat_projection(
+                    prepared_beads_root, "prepared Beads root"
+                ),
+                "embeddedDataRootStat": _prepared_stat_projection(
+                    prepared_embedded_root, "prepared embedded-data root"
+                ),
+                "preparedExecutable": _prepared_executable_projection(
+                    executable_observation
+                ),
+                "preparedStoreMetadata": _prepared_store_metadata(
+                    store.repository_digest, prepared_database_name
+                ),
+            }
+        )
         authorization_payload = {
             "repositoryLocatorSha256": store.repository_digest,
             "planSha256": payload["planSha256"],
@@ -3920,6 +4219,22 @@ def authorize_beads_preparation_v1(request: AuthorizeBeadsPreparationRequestV1) 
             "adapterReleaseManifestRecordSha256": release_manifest.record_sha256,
             "bootstrapRuntimeCoreSha256": payload["bootstrapRuntimeCoreSha256"],
             "adapterReleaseCoreSha256": payload["adapterReleaseCoreSha256"],
+            "authorityEpoch": hashlib.sha256(
+                b"startup-factory/beads/preparation-authority-epoch/v1\0"
+                + canonical_bytes(
+                    {
+                        "authorityRecordSha256": authority.record_sha256,
+                        "authorityStateFullBytesSha256": authority.full_bytes_sha256,
+                    }
+                )
+            ).hexdigest()[:32],
+            "genericStatusConfigSha256": payload["genericStatusConfigSha256"],
+            "statusProfileStaticBindingsSha256": payload[
+                "statusProfileStaticBindingsSha256"
+            ],
+            "statusProfileDerivationPolicySha256": payload[
+                "statusProfileDerivationPolicySha256"
+            ],
             "revokedAuthorityRecordSha256": authority.record_sha256,
             **path_bindings,
             **fields,
@@ -4329,17 +4644,7 @@ def advance_beads_preparation_v1(request: AdvanceBeadsPreparationRequestV1) -> B
         # environment from its closed profile.
         _frozen_preparation_environment(store, lease, intent_digest)
         native_result = _execute_supervised_beads_effect_v27(
-            operation_class=(
-                "create-preparation"
-                if lease.payload.get("preparationMode") == "create"
-                else "reattest-preparation"
-            ),
-            argv=list(exact_argv),
-            repository_path=(
-                Path(str(lease.payload["createStageDatabasePath"])).parent
-                if lease.payload.get("preparationMode") == "create"
-                else Path(str(lease.payload["repositoryPath"]))
-            ),
+            authorization_record_sha256=mutation_intent.record_sha256,
         )
         exit_code = int(native_result["exitCode"])
         outcome = "succeeded" if exit_code == 0 else "failed"
@@ -4433,11 +4738,18 @@ def observe_beads_store_v1(request: ObserveBeadsStoreRequestV1) -> BeadsStoreObs
             if lease.payload.get("nextCommandOrdinal") != expected_ordinal:
                 raise BeadsStaleAuthorityError("create observation is outside the config-readback boundary")
             primary = _observe_directory_tree(Path(str(lease.payload["createStageDatabasePath"])), "create stage database")
+            prepared_database_path = Path(
+                str(lease.payload["createStageDatabasePath"])
+            )
         else:
             expected_ordinal = 0 if phase == "pre" else 1
             if lease.payload.get("nextCommandOrdinal") != expected_ordinal:
                 raise BeadsStaleAuthorityError("reattest observation is outside the config-readback boundary")
             primary = _observe_directory_tree(Path(str(lease.payload["installedSelectorPath"])), "installed selector tree")
+            prepared_database_path = Path(str(lease.payload["selectedStorePath"]))
+        prepared_database_evidence = _prepared_database_evidence(
+            prepared_database_path, "prepared Beads database"
+        )
         state = {
             "primaryStore": primary,
             "executableObservation": _observe_executable(
@@ -4472,6 +4784,7 @@ def observe_beads_store_v1(request: ObserveBeadsStoreRequestV1) -> BeadsStoreObs
             "predecessorObservationRecordSha256": payload.get("predecessorObservationRecordSha256"),
             "configReadbackStepRecordSha256": payload.get("configReadbackStepRecordSha256"),
             "transactionIntentSha256": intent_digest,
+            "preparedDatabaseEvidence": prepared_database_evidence,
             **_preparation_sequence_fields(lease.payload),
         }
         if phase == "pre":
@@ -4483,7 +4796,14 @@ def observe_beads_store_v1(request: ObserveBeadsStoreRequestV1) -> BeadsStoreObs
         else:
             _digest(observation_payload["acceptedConfigEnvelopeSha256"], "acceptedConfigEnvelopeSha256")
             predecessor = _load_record(store, "BeadsStoreObservationV1", "beads-store-observation", "store-observations", observation_payload["predecessorObservationRecordSha256"])
-            if predecessor.payload.get("observationPhase") != "pre" or predecessor.payload.get("storeStateSha256") != state_digest:
+            if (
+                predecessor.payload.get("observationPhase") != "pre"
+                or predecessor.payload.get("storeStateSha256") != state_digest
+                or canonical_bytes(
+                    predecessor.payload.get("preparedDatabaseEvidence")
+                )
+                != canonical_bytes(prepared_database_evidence)
+            ):
                 raise BeadsProtectedRuntimeError("post observation physical state differs from pre observation")
             step = _load_record(
                 store,
@@ -4545,7 +4865,6 @@ def derive_beads_status_profile_dynamic_bindings_v1(
     if post.payload.get("acceptedConfigEnvelopeSha256") != config_digest:
         raise BeadsProtectedRuntimeError("dynamic binding config envelope digest mismatch")
     result = {
-        "schemaVersion": 1,
         "repositoryLocatorSha256": lease.payload.get("repositoryLocatorSha256"),
         "preparationLeaseRecordSha256": lease.record_sha256,
         "preObservationRecordSha256": pre.record_sha256,
@@ -4554,8 +4873,75 @@ def derive_beads_status_profile_dynamic_bindings_v1(
         "acceptedConfigEnvelopeCanonicalSha256": config_digest,
         **_preparation_sequence_fields(lease.payload),
     }
-    digest = sha256(canonical_bytes(result))
-    return VerifiedBeadsStatusProfileDynamicBindingsV1(payload=result, record_sha256=digest, full_bytes_sha256=digest)
+    with store.locked():
+        _require_current_authority_record(
+            store, lease.payload.get("revokedAuthorityRecordSha256"), "revoked"
+        )
+        protected = _signed_record(
+            store,
+            "BeadsStatusProfileDynamicBindingsV1",
+            "beads-status-profile-dynamic-bindings",
+            result,
+            "status-profile-dynamic-bindings",
+        )
+    return VerifiedBeadsStatusProfileDynamicBindingsV1(
+        payload=protected.payload,
+        auth=protected.auth,
+        record_sha256=protected.record_sha256,
+        full_bytes_sha256=protected.full_bytes_sha256,
+    )
+
+
+def _reopen_status_profile_dynamic_bindings_v1(
+    store: _Store,
+    lease: _WireRecord,
+    pre: _WireRecord,
+    post: _WireRecord,
+    accepted_config_envelope_canonical_sha256: str,
+) -> VerifiedBeadsStatusProfileDynamicBindingsV1:
+    """Reopen, but never mint, the exact prior protected derivation record."""
+
+    result = {
+        "repositoryLocatorSha256": lease.payload.get("repositoryLocatorSha256"),
+        "preparationLeaseRecordSha256": lease.record_sha256,
+        "preObservationRecordSha256": pre.record_sha256,
+        "postObservationRecordSha256": post.record_sha256,
+        "storeStateSha256": pre.payload.get("storeStateSha256"),
+        "acceptedConfigEnvelopeCanonicalSha256": (
+            accepted_config_envelope_canonical_sha256
+        ),
+        **_preparation_sequence_fields(lease.payload),
+    }
+    _envelope, _auth, expected_record, expected_full = store.sign(
+        "beads-status-profile-dynamic-bindings", result
+    )
+    protected = _load_record(
+        store,
+        "BeadsStatusProfileDynamicBindingsV1",
+        "beads-status-profile-dynamic-bindings",
+        "status-profile-dynamic-bindings",
+        expected_record,
+    )
+    if (
+        protected.full_bytes_sha256 != expected_full
+        or canonical_bytes(protected.payload)
+        != canonical_bytes(
+            {
+                "kind": "beads-status-profile-dynamic-bindings",
+                "schemaVersion": 1,
+                **result,
+            }
+        )
+    ):
+        raise BeadsProtectedRuntimeError(
+            "protected dynamic derivation record differs from its exact lease/observation projection"
+        )
+    return VerifiedBeadsStatusProfileDynamicBindingsV1(
+        payload=protected.payload,
+        auth=protected.auth,
+        record_sha256=protected.record_sha256,
+        full_bytes_sha256=protected.full_bytes_sha256,
+    )
 
 
 def _canonical_json_text(value: Any, label: str) -> bytes:
@@ -4569,6 +4955,279 @@ def _canonical_json_text(value: Any, label: str) -> bytes:
     if canonical_bytes(parsed) != raw:
         raise BeadsProtectedRuntimeError(f"{label} is not exact compact sorted-key JSON")
     return raw
+
+
+def _finish_artifact_v1(
+    payload: Mapping[str, Any],
+    prefix: str,
+    *,
+    maximum: int,
+    domain: bytes | None,
+) -> tuple[bytes, Any]:
+    raw = _canonical_json_text(payload[f"{prefix}CanonicalJson"], prefix)
+    size = payload[f"{prefix}Size"]
+    if type(size) is not int or size != len(raw) or not 1 <= size <= maximum:
+        raise BeadsProtectedRuntimeError(f"{prefix} size binding changed")
+    observed = sha256((b"" if domain is None else domain) + raw)
+    if payload[f"{prefix}Sha256"] != observed:
+        raise BeadsProtectedRuntimeError(f"{prefix} digest binding changed")
+    return raw, json.loads(raw)
+
+
+def _verify_finish_expected_bindings_v1(
+    payload: Mapping[str, Any],
+    store: _Store,
+    lease: _WireRecord,
+    pre: _WireRecord,
+    post: _WireRecord,
+    dynamic: VerifiedBeadsStatusProfileDynamicBindingsV1,
+) -> dict[str, Any]:
+    static_raw, static = _finish_artifact_v1(
+        payload,
+        "statusProfileStaticBindings",
+        maximum=16_384,
+        domain=b"startup-factory/beads-status-profile-static-bindings/v1\0",
+    )
+    policy_raw, _policy = _finish_artifact_v1(
+        payload,
+        "statusProfileDerivationPolicy",
+        maximum=16_384,
+        domain=b"startup-factory/beads-status-profile-derivation-policy/v1\0",
+    )
+    dynamic_raw, dynamic_value = _finish_artifact_v1(
+        payload,
+        "dynamicBindings",
+        maximum=16_384,
+        domain=None,
+    )
+    expected_raw, expected = _finish_artifact_v1(
+        payload,
+        "statusProfileExpectedBindings",
+        maximum=20_480,
+        domain=b"startup-factory/beads-status-profile-expected-bindings/v1\0",
+    )
+    status_raw, _status = _finish_artifact_v1(
+        payload,
+        "statusProfilePayload",
+        maximum=16_384,
+        domain=b"startup-factory/beads-status-profile-payload/v1\0",
+    )
+    prepared_raw, prepared = _finish_artifact_v1(
+        payload,
+        "preparedStorePayload",
+        maximum=32_768,
+        domain=b"startup-factory/prepared-beads-store-payload/v1\0",
+    )
+    prepared_expected_raw, prepared_expected = _finish_artifact_v1(
+        payload,
+        "preparedStoreExpectedBindings",
+        maximum=16_384,
+        domain=None,
+    )
+    if (
+        dynamic.auth is None
+        or dynamic.record_sha256 is None
+        or dynamic.full_bytes_sha256 is None
+        or dynamic_raw != canonical_bytes(dynamic.payload)
+        or dynamic_value != dynamic.payload
+    ):
+        raise BeadsProtectedRuntimeError(
+            "finish dynamic bytes differ from task-3 protected derivation"
+        )
+    if payload["statusProfileStaticBindingsSha256"] != lease.payload.get(
+        "statusProfileStaticBindingsSha256"
+    ) or payload["statusProfileDerivationPolicySha256"] != lease.payload.get(
+        "statusProfileDerivationPolicySha256"
+    ):
+        raise BeadsProtectedRuntimeError(
+            "finish static/policy bytes differ from the protected operator plan"
+        )
+    expected_derived = {
+        "schemaVersion": 1,
+        "kind": "beads-status-profile-expected-bindings-v1",
+        "static": static,
+        "dynamic": dynamic_value,
+    }
+    expected_derived_raw = canonical_bytes(expected_derived)
+    expected_derived_digest = sha256(
+        b"startup-factory/beads-status-profile-expected-bindings/v1\0"
+        + expected_derived_raw
+    )
+    if expected_raw != expected_derived_raw or payload[
+        "statusProfileExpectedBindingsSha256"
+    ] != expected_derived_digest:
+        raise BeadsProtectedRuntimeError(
+            "finish composite expected bindings do not contain exact static/dynamic bytes"
+        )
+    allowed = str(lease.payload.get("statusConfigValue", "")).split(",")
+    status_derived = {
+        "allowed": allowed,
+        "dynamicBindingsSha256": sha256(dynamic_raw),
+        "expectedBindingsSha256": expected_derived_digest,
+        "schemaVersion": 1,
+        "staticBindingsSha256": payload[
+            "statusProfileStaticBindingsSha256"
+        ],
+    }
+    status_derived_raw = canonical_bytes(status_derived)
+    status_derived_digest = sha256(
+        b"startup-factory/beads-status-profile-payload/v1\0"
+        + status_derived_raw
+    )
+    if status_raw != status_derived_raw or payload[
+        "statusProfilePayloadSha256"
+    ] != status_derived_digest:
+        raise BeadsProtectedRuntimeError(
+            "finish status payload is not derived from protected config/static/dynamic evidence"
+        )
+    if not isinstance(prepared, dict) or not isinstance(prepared_expected, dict):
+        raise BeadsProtectedRuntimeError("finish prepared payload/bindings are not objects")
+    cleanup = (
+        sha256(canonical_bytes(lease.payload.get("cleanupObservationA")))
+        if lease.payload.get("preparationMode") == "create"
+        else None
+    )
+    predecessor_payload_digest: str | None = None
+    if lease.payload.get("preparationMode") == "reattest":
+        pointer = _load_record(
+            store,
+            "BeadsPreparationCurrentV1",
+            "beads-preparation-current",
+            "preparation-current",
+            str(lease.payload.get("sourcePreparationPointerRecordSha256")),
+        )
+        result = _verify_preparation_pointer(store, pointer, historical=True)
+        predecessor_raw = str(
+            result.payload.get("preparedPayloadCanonicalJson", "")
+        ).encode("utf-8")
+        predecessor_payload_digest = sha256(
+            b"startup-factory/prepared-beads-store-payload/v1\0"
+            + predecessor_raw
+        )
+    database_evidence = pre.payload.get("preparedDatabaseEvidence")
+    if (
+        not isinstance(database_evidence, Mapping)
+        or canonical_bytes(database_evidence)
+        != canonical_bytes(post.payload.get("preparedDatabaseEvidence"))
+    ):
+        raise BeadsProtectedRuntimeError(
+            "finish lacks exact protected prepared-database evidence"
+        )
+    try:
+        from bin import beads_contract as protected_contract
+
+        inputs = protected_contract.PreparedBeadsStorePayloadInputsV1(
+            preparation_mode=str(lease.payload["preparationMode"]),
+            repository_locator_sha256=str(lease.payload["repositoryLocatorSha256"]),
+            project_root_locator_sha256=str(lease.payload["projectRootLocatorSha256"]),
+            beads_root_locator_sha256=str(lease.payload["beadsRootLocatorSha256"]),
+            beads_root_stat=_plain(lease.payload["beadsRootStat"]),
+            embedded_data_root_stat=_plain(lease.payload["embeddedDataRootStat"]),
+            database_name=str(lease.payload["databaseName"]),
+            database_root_stat=_plain(database_evidence["databaseRootStat"]),
+            database_dolt_root_stat=_plain(
+                database_evidence["databaseDoltRootStat"]
+            ),
+            executable=_plain(lease.payload["preparedExecutable"]),
+            immutable_files=_plain(database_evidence["immutableFiles"]),
+            metadata=_plain(lease.payload["preparedStoreMetadata"]),
+            status_profile_payload_sha256=status_derived_digest,
+            status_profile_static_bindings_sha256=str(
+                lease.payload["statusProfileStaticBindingsSha256"]
+            ),
+            status_profile_derivation_policy_sha256=str(
+                lease.payload["statusProfileDerivationPolicySha256"]
+            ),
+            status_profile_dynamic_bindings_sha256=sha256(dynamic_raw),
+            status_profile_expected_bindings_sha256=expected_derived_digest,
+            derivation_journal_head_sha256=str(dynamic.record_sha256),
+            runtime_api_manifest_sha256=str(
+                lease.payload["runtimeApiManifestRecordSha256"]
+            ),
+            release_manifest_sha256=str(
+                lease.payload["adapterReleaseManifestRecordSha256"]
+            ),
+            generic_status_config_sha256=str(
+                lease.payload["genericStatusConfigSha256"]
+            ),
+            pre_store_observation_sha256=str(pre.record_sha256),
+            post_store_observation_sha256=str(post.record_sha256),
+            store_state_sha256=str(pre.payload["storeStateSha256"]),
+            config_envelope_canonical_sha256=str(
+                post.payload["acceptedConfigEnvelopeSha256"]
+            ),
+            cleanup_observation_sha256=cleanup,
+            preparation_plan_sha256=str(lease.payload["planSha256"]),
+            authority_epoch=str(lease.payload["authorityEpoch"]),
+            predecessor_prepared_store_payload_sha256=predecessor_payload_digest,
+        )
+        derived_prepared_raw = (
+            protected_contract.build_prepared_beads_store_payload_v1(inputs)
+        )
+        derived_prepared = json.loads(derived_prepared_raw)
+        derived_prepared_digest = sha256(
+            b"startup-factory/prepared-beads-store-payload/v1\0"
+            + derived_prepared_raw
+        )
+        independently_expected = (
+            protected_contract.PreparedBeadsStoreExpectedBindingsV1(
+                preparation_mode=inputs.preparation_mode,
+                repository_locator_sha256=inputs.repository_locator_sha256,
+                project_root_locator_sha256=inputs.project_root_locator_sha256,
+                beads_root_locator_sha256=inputs.beads_root_locator_sha256,
+                database_name=inputs.database_name,
+                metadata_sha256=str(inputs.metadata["sha256"]),
+                status_profile_payload_sha256=inputs.status_profile_payload_sha256,
+                status_profile_static_bindings_sha256=inputs.status_profile_static_bindings_sha256,
+                status_profile_derivation_policy_sha256=inputs.status_profile_derivation_policy_sha256,
+                status_profile_dynamic_bindings_sha256=inputs.status_profile_dynamic_bindings_sha256,
+                status_profile_expected_bindings_sha256=inputs.status_profile_expected_bindings_sha256,
+                derivation_journal_head_sha256=inputs.derivation_journal_head_sha256,
+                runtime_api_manifest_sha256=inputs.runtime_api_manifest_sha256,
+                release_manifest_sha256=inputs.release_manifest_sha256,
+                generic_status_config_sha256=inputs.generic_status_config_sha256,
+                pre_store_observation_sha256=inputs.pre_store_observation_sha256,
+                post_store_observation_sha256=inputs.post_store_observation_sha256,
+                store_state_sha256=inputs.store_state_sha256,
+                config_envelope_canonical_sha256=inputs.config_envelope_canonical_sha256,
+                cleanup_observation_sha256=inputs.cleanup_observation_sha256,
+                preparation_plan_sha256=inputs.preparation_plan_sha256,
+                authority_epoch=inputs.authority_epoch,
+                predecessor_prepared_store_payload_sha256=inputs.predecessor_prepared_store_payload_sha256,
+                read_back_plan_candidate_sha256=str(
+                    derived_prepared["readBackPlanCandidateSha256"]
+                ),
+                payload_sha256=derived_prepared_digest,
+            )
+        )
+    except (KeyError, TypeError, ValueError, BeadsProtectedRuntimeError) as exc:
+        raise BeadsProtectedRuntimeError(
+            f"cannot derive prepared payload from protected evidence: {exc}"
+        ) from exc
+    independently_expected_raw = canonical_bytes(
+        dataclasses.asdict(independently_expected)
+    )
+    if (
+        prepared_raw != derived_prepared_raw
+        or payload["preparedStorePayloadSha256"] != derived_prepared_digest
+        or prepared_expected_raw != independently_expected_raw
+        or payload["preparedStoreExpectedBindingsSha256"]
+        != sha256(independently_expected_raw)
+    ):
+        raise BeadsProtectedRuntimeError(
+            "finish typed prepared expected bindings differ from protected evidence"
+        )
+    return {
+        "preparedExpectedBindingsCanonicalJson": independently_expected_raw.decode("utf-8"),
+        "preparedExpectedBindingsCanonicalSha256": sha256(independently_expected_raw),
+        "preparedPayloadCanonicalJson": derived_prepared_raw.decode("utf-8"),
+        "preparedPayloadCanonicalSha256": sha256(derived_prepared_raw),
+        "statusProfileExpectedBindingsCanonicalSha256": sha256(expected_derived_raw),
+        "statusProfilePayloadCanonicalJson": status_derived_raw.decode("utf-8"),
+        "statusProfilePayloadCanonicalSha256": sha256(status_derived_raw),
+        "statusProfileStaticBindingsCanonicalSha256": sha256(static_raw),
+        "statusProfileDerivationPolicyCanonicalSha256": sha256(policy_raw),
+    }
 
 
 def _install_and_cleanup_create(
@@ -4824,12 +5483,36 @@ def finish_beads_preparation_v1(request: FinishBeadsPreparationRequestV1) -> Fin
     _required(
         payload,
         "leaseRecordSha256", "preObservationRecordSha256", "postObservationRecordSha256",
-        "dynamicBindingsCanonicalJson", "statusProfilePayloadCanonicalJson",
-        "preparedStorePayloadCanonicalJson", "expectedCurrentPointerFullBytesSha256",
+        "preparationMode", "preparationPlanSha256",
+        "preparationAuthorizationRecordSha256", "authorityEpoch",
+        "runtimeApiManifestRecordSha256", "adapterReleaseManifestRecordSha256",
+        "genericStatusConfigSha256", "storeStateSha256",
+        "configEnvelopeCanonicalSha256", "statusProfileStaticBindingsCanonicalJson",
+        "statusProfileStaticBindingsSha256", "statusProfileStaticBindingsSize",
+        "statusProfileDerivationPolicyCanonicalJson",
+        "statusProfileDerivationPolicySha256", "statusProfileDerivationPolicySize",
+        "dynamicBindingsCanonicalJson", "dynamicBindingsSha256", "dynamicBindingsSize",
+        "statusProfileExpectedBindingsCanonicalJson",
+        "statusProfileExpectedBindingsSha256", "statusProfileExpectedBindingsSize",
+        "statusProfilePayloadCanonicalJson", "statusProfilePayloadSha256",
+        "statusProfilePayloadSize", "preparedStorePayloadCanonicalJson",
+        "preparedStorePayloadSha256", "preparedStorePayloadSize",
+        "preparedStoreExpectedBindingsCanonicalJson",
+        "preparedStoreExpectedBindingsSha256", "preparedStoreExpectedBindingsSize",
+        "requestNonce",
     )
-    dynamic_bytes = _canonical_json_text(payload["dynamicBindingsCanonicalJson"], "dynamic bindings")
-    status_bytes = _canonical_json_text(payload["statusProfilePayloadCanonicalJson"], "status profile payload")
-    prepared_bytes = _canonical_json_text(payload["preparedStorePayloadCanonicalJson"], "prepared store payload")
+    for field in (
+        "preparationPlanSha256", "preparationAuthorizationRecordSha256",
+        "runtimeApiManifestRecordSha256", "adapterReleaseManifestRecordSha256",
+        "genericStatusConfigSha256", "preObservationRecordSha256",
+        "postObservationRecordSha256", "storeStateSha256",
+        "configEnvelopeCanonicalSha256", "cleanupObservationSha256",
+    ):
+        _digest(payload[field], field, nullable=field == "cleanupObservationSha256")
+    if not isinstance(payload["requestNonce"], str) or re.fullmatch(
+        r"[0-9a-f]{32}", payload["requestNonce"]
+    ) is None:
+        raise BeadsProtectedRuntimeError("finish requestNonce must be 32 lowercase hex")
     expected_current = _digest(payload["expectedCurrentPointerFullBytesSha256"], "expectedCurrentPointerFullBytesSha256", nullable=True)
     store = _Store(payload)
     with store.locked():
@@ -4843,27 +5526,22 @@ def finish_beads_preparation_v1(request: FinishBeadsPreparationRequestV1) -> Fin
         ):
             raise BeadsStaleAuthorityError("preparation finish no longer binds the current revoked authority")
         _verify_current_preparation_core_bindings(store, lease.payload)
-        intent_digest, directory = _transaction_intent(store, "finish-beads-preparation", payload)
-        resumed_pointer = _resume_transaction_result(
-            store,
-            directory,
-            "finish-beads-preparation",
-            "BeadsPreparationCurrentV1",
-            "beads-preparation-current",
-            "preparation-current",
-        )
-        if resumed_pointer is None:
-            resumed_pointer = _recover_current_transaction_result(
-                store,
-                directory,
-                "finish-beads-preparation",
-                "BeadsPreparationCurrentV1",
-                "beads-preparation-current",
-                "preparation-current",
-                intent_digest,
+        if (
+            payload["preparationMode"] != lease.payload.get("preparationMode")
+            or payload["preparationPlanSha256"] != lease.payload.get("planSha256")
+            or payload["preparationAuthorizationRecordSha256"]
+            != lease.payload.get("authorizationRecordSha256")
+            or payload["authorityEpoch"] != lease.payload.get("authorityEpoch")
+            or payload["runtimeApiManifestRecordSha256"]
+            != lease.payload.get("runtimeApiManifestRecordSha256")
+            or payload["adapterReleaseManifestRecordSha256"]
+            != lease.payload.get("adapterReleaseManifestRecordSha256")
+            or payload["genericStatusConfigSha256"]
+            != lease.payload.get("genericStatusConfigSha256")
+        ):
+            raise BeadsStaleAuthorityError(
+                "finish request differs from the protected operator plan/lease"
             )
-        if resumed_pointer is not None:
-            return _finish_preparation_projection(store, resumed_pointer)
         pre = _load_record(store, "BeadsStoreObservationV1", "beads-store-observation", "store-observations", payload["preObservationRecordSha256"])
         post = _load_record(store, "BeadsStoreObservationV1", "beads-store-observation", "store-observations", payload["postObservationRecordSha256"])
         expected_stage_identity = post.payload.get("stateProjection", {}).get(
@@ -4899,15 +5577,56 @@ def finish_beads_preparation_v1(request: FinishBeadsPreparationRequestV1) -> Fin
             )
         else:
             _revalidate_preparation_physical(lease)
-        with use_beads_protected_runtime_v1(str(payload["protectedRoot"]), str(payload["hmacKeyPath"])):
-            dynamic = derive_beads_status_profile_dynamic_bindings_v1(
-                lease,
-                pre,
-                post,
-                str(post.payload.get("acceptedConfigEnvelopeSha256")),
+        dynamic = _reopen_status_profile_dynamic_bindings_v1(
+            store,
+            lease,
+            pre,
+            post,
+            str(post.payload.get("acceptedConfigEnvelopeSha256")),
+        )
+        finish_evidence = _verify_finish_expected_bindings_v1(
+            payload, store, lease, pre, post, dynamic
+        )
+        if (
+            payload["storeStateSha256"] != pre.payload.get("storeStateSha256")
+            or payload["configEnvelopeCanonicalSha256"]
+            != post.payload.get("acceptedConfigEnvelopeSha256")
+            or payload["cleanupObservationSha256"]
+            != (
+                sha256(canonical_bytes(lease.payload.get("cleanupObservationA")))
+                if lease.payload.get("preparationMode") == "create"
+                else None
             )
-        if canonical_bytes(dynamic.payload) != dynamic_bytes:
-            raise BeadsProtectedRuntimeError("task-#2 dynamic binding bytes differ from task-#3 derivation")
+        ):
+            raise BeadsProtectedRuntimeError(
+                "finish request observation bindings differ from protected evidence"
+            )
+        # Only after every independently protected binding and every bounded
+        # task-2 byte descriptor has reopened successfully may this request
+        # create transaction state or consume its one-use successor.
+        intent_digest, directory = _transaction_intent(
+            store, "finish-beads-preparation", payload
+        )
+        resumed_pointer = _resume_transaction_result(
+            store,
+            directory,
+            "finish-beads-preparation",
+            "BeadsPreparationCurrentV1",
+            "beads-preparation-current",
+            "preparation-current",
+        )
+        if resumed_pointer is None:
+            resumed_pointer = _recover_current_transaction_result(
+                store,
+                directory,
+                "finish-beads-preparation",
+                "BeadsPreparationCurrentV1",
+                "beads-preparation-current",
+                "preparation-current",
+                intent_digest,
+            )
+        if resumed_pointer is not None:
+            return _finish_preparation_projection(store, resumed_pointer)
         _consume_capability(store, "preparation-finish-successors", lease, intent_digest)
         if lease.payload.get("preparationMode") == "create":
             installation_evidence = _install_and_cleanup_create(store, lease, post, intent_digest)
@@ -4918,6 +5637,13 @@ def finish_beads_preparation_v1(request: FinishBeadsPreparationRequestV1) -> Fin
                 "cleanupIntentRecordSha256": None,
                 "cleanupObservedRecordSha256": None,
             }
+        sequence_terminal = _execute_supervised_beads_effect_v27(
+            authorization_record_sha256=str(lease.record_sha256),
+        )
+        if sequence_terminal.get("preparationState") != "sequence-completed":
+            raise BeadsProtectedRuntimeError(
+                "preparation finish lacks the exact protected sequence terminal"
+            )
         generation = 1
         current_path = store.directory("preparation-current") / "current.json"
         if store.exists(current_path):
@@ -4936,9 +5662,15 @@ def finish_beads_preparation_v1(request: FinishBeadsPreparationRequestV1) -> Fin
             {
                 "repositoryLocatorSha256": store.repository_digest,
                 "leaseRecordSha256": lease.record_sha256,
-                "payloadCanonicalSha256": sha256(status_bytes),
-                "payloadCanonicalJson": payload["statusProfilePayloadCanonicalJson"],
-                "dynamicBindingsCanonicalSha256": sha256(dynamic_bytes),
+                "payloadCanonicalSha256": finish_evidence[
+                    "statusProfilePayloadCanonicalSha256"
+                ],
+                "payloadCanonicalJson": finish_evidence[
+                    "statusProfilePayloadCanonicalJson"
+                ],
+                "dynamicBindingsCanonicalSha256": sha256(
+                    canonical_bytes(dynamic.payload)
+                ),
                 "transactionIntentSha256": intent_digest,
                 **_preparation_sequence_fields(lease.payload),
             },
@@ -4954,8 +5686,18 @@ def finish_beads_preparation_v1(request: FinishBeadsPreparationRequestV1) -> Fin
                 "preObservationRecordSha256": pre.record_sha256,
                 "postObservationRecordSha256": post.record_sha256,
                 "statusProfileRecordSha256": status_record.record_sha256,
-                "preparedPayloadCanonicalSha256": sha256(prepared_bytes),
-                "preparedPayloadCanonicalJson": payload["preparedStorePayloadCanonicalJson"],
+                "preparedPayloadCanonicalSha256": finish_evidence[
+                    "preparedPayloadCanonicalSha256"
+                ],
+                "preparedPayloadCanonicalJson": finish_evidence[
+                    "preparedPayloadCanonicalJson"
+                ],
+                "preparedExpectedBindingsCanonicalSha256": finish_evidence[
+                    "preparedExpectedBindingsCanonicalSha256"
+                ],
+                "preparedExpectedBindingsCanonicalJson": finish_evidence[
+                    "preparedExpectedBindingsCanonicalJson"
+                ],
                 "transactionIntentSha256": intent_digest,
                 **installation_evidence,
                 **_preparation_sequence_fields(lease.payload),

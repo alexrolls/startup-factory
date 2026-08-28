@@ -215,6 +215,7 @@ release gradually, and monitor drift, failures, and spend.
 - [Ten easy prompts for startup delivery](#ten-easy-prompts-for-startup-delivery)
 - [Why Startup Factory](#why-startup-factory)
 - [Layered safety boundaries for AI builders](#layered-safety-boundaries-for-ai-builders)
+- [Protected Beads boundary (off by default)](#protected-beads-boundary-off-by-default)
 - [Superpowers + Startup Factory](#superpowers--startup-factory-split-the-sdlc-by-strength)
 - [Full transparency in your tracker](#full-transparency-in-your-tracker)
 - [Choose your operating mode](#choose-your-operating-mode)
@@ -289,6 +290,53 @@ tracker, the workflow actor, workflow approvals, production approval ID, and
 policy denials for each delivery. Authenticated production approver identity
 remains in protected transaction state; tracker authorship is never treated as
 authentication.
+
+## Protected Beads boundary (off by default)
+
+Yes: giving an agent more rights than its current action needs is a security
+risk. A mistaken or compromised agent can otherwise change unrelated tracker
+state, retain filesystem or process handles, read secrets, or turn an ambiguous
+restart into a repeated mutation. Prompt instructions and role names do not
+prevent those failures; the operating-system identity, descriptors, policy,
+and one-use protocol must enforce the boundary.
+
+The protected Beads runtime therefore ships with `"beadsEnabled": false` in
+[`runtime/beads-boundary-controller-v1.example.json`](runtime/beads-boundary-controller-v1.example.json).
+Its authority is deliberately split:
+
+The five main improvements are:
+
+1. **A smaller security blast radius.** Each agent receives only the files,
+   process access, and one-use authority required for its current operation.
+2. **Safer concurrent work.** Four independent read-only snapshots prevent one
+   reader from silently changing the state observed by another reader.
+3. **Crash recovery without duplicate mutations.** Durable intents, results,
+   and receipts allow same-step recovery while consumed but unproved authority
+   is quarantined instead of replayed.
+4. **Protection against tampering and races.** Descriptor-bound identities,
+   authenticated evidence, no-follow traversal, and compare-before-publication
+   checks reject substituted files, stale state, and concurrent producer edits.
+5. **Stronger auditability.** The controller retains authenticated evidence of
+   what was authorized, which inputs and rights were used, what ran, and why a
+   result was accepted or quarantined.
+
+| Boundary | Enforced scope |
+|---|---|
+| **Controller** | A dedicated controller identity owns the HMAC key, state machine, exact command/schema projection, repository staging, publication decision, and recovery records. Caller-provided paths, argv, process claims, snapshots, and tracker comments grant no authority. |
+| **Worker and native supervisor** | A separate worker identity receives one request-bound operation at a time, no controller key, no ambient capabilities, and no direct producer-repository path. Fixed native code validates the sealed plan and returns authenticated evidence. |
+| **Repository access** | The controller copies the producer `.beads` tree into a private stage, creates four independent read snapshots, and exposes only one HMAC-named leaf for the active operation. Mutation/preparation gets the exact read-write leaf; each reader gets its own read-only leaf. Device, inode, owner, mode, link count, size, and content are rebound before and after use. |
+| **Revocation** | After the delegated process cgroup is drained, the worker must prove that its own descriptor inventory and mount table retain no stage identity. The controller then revokes group access recursively. A missing, replayed, malformed, or ambiguous proof fails closed. |
+| **Mutation and recovery** | Every irreversible action has a durable intent before execution and an authenticated result/receipt afterward. Consumed authority without a proved result is quarantined, not replayed. Publication compares the descriptor-pinned producer prestate and installs only the authenticated staged candidate. |
+
+Do not enable this boundary merely because portable unit tests pass. The
+installed host must also pass the opt-in gates for the exact packaged bytes:
+systemd 254 or newer with delegated cgroup v2, the pinned rootless Podman,
+conmon and crun identities, an enforcing compiled/loaded SELinux policy with
+the expected transitions, distinct controller/worker identities, and the full
+installed Beads mutation plus four-read lifecycle. The native manifest example
+contains zero binary placeholders on purpose; generate and verify the installed
+manifest after building the native binaries instead of editing those digests by
+hand. If any gate is unavailable or non-green, leave `beadsEnabled` false.
 
 ## Superpowers + Startup Factory: split the SDLC by strength
 

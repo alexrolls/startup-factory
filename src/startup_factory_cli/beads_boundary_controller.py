@@ -10,8 +10,12 @@ connection before using current authority.
 from __future__ import annotations
 
 import argparse
+import array
+import base64
 import ctypes
 import dataclasses
+import errno
+import fcntl
 import grp
 import hashlib
 import hmac
@@ -36,6 +40,9 @@ from . import beads_native_boundary_v27 as native_boundary_v27
 CONFIG_PATH: Final = Path("/etc/startup-factory/beads-boundary-controller-v1.json")
 ENDPOINT_PATH: Final = Path("/run/startup-factory/beads-boundary-controller-v1.sock")
 STATE_ROOT: Final = Path("/var/lib/startup-factory/beads-boundary-controller/v1")
+REPOSITORY_HANDOFF_ROOT_V27: Final = Path(
+    "/var/lib/startup-factory/beads-handoff"
+)
 CONTROLLER_KEY_PATH: Final = Path("/etc/startup-factory/beads-boundary-controller-v1.key")
 OPERATOR_KEY_PATH: Final = Path("/etc/startup-factory/beads-local-operator-v1.key")
 OPERATOR_STATE_PATH: Final = Path("/etc/startup-factory/beads-local-operator-v1.state.json")
@@ -54,6 +61,53 @@ _EMPTY_SHA256 = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b
 _OPERATOR_HMAC_DOMAIN: Final = b"startup-factory/beads/local-operator-state/v1\0"
 _WORKER_PROTOCOL: Final = "startup-factory/beads-native-worker/v27"
 _WORKER_WAIT_SECONDS: Final = 150.0
+_WORKER_RESULT_SELINUX_CONTEXT_V27: Final = (
+    b"system_u:object_r:beads_runtime_result_t:s0"
+)
+_WORKER_STATUS_MAX_BYTES_V27: Final = 65_536
+_WORKER_CGROUP_ROLES_V27: Final = (
+    "worker-directory",
+    "payload-directory",
+    "payload-events",
+    "payload-kill",
+)
+_CGROUP2_SUPER_MAGIC_V27: Final = 0x63677270
+_SUPERVISOR_CGROUP_MODE_V27: Final = 0o2710
+_WORKER_CGROUP_MODE_V27: Final = 0o700
+_PAYLOAD_CGROUP_MODE_V27: Final = 0o2710
+_LIFECYCLE_CGROUP_MODE_V27: Final = 0o770
+_DELEGATED_CONTROLLERS_V27: Final = ("cpu", "memory", "pids")
+_SPLIT_RUNTIME_MODE_V27: Final = 0o750
+_SPLIT_PAYLOAD_MODE_V27: Final = 0o755
+_SPLIT_PAYLOAD_NAME_V27 = re.compile(r"\Alibpod-payload-[0-9a-f]{64}\Z")
+_CGROUP_STAT_CONTROLLER_V27 = re.compile(r"\A[a-z][a-z0-9_]{0,31}\Z")
+_CGROUP_RETIRE_RETRIES_V27: Final = 20
+_CGROUP_DYING_QUIESCENCE_SECONDS_V27: Final = 5.0
+_RESULT_ARENA_CONTROLLER_DOMAIN_V27: Final = (
+    b"startup-factory/beads/v27/controller-result-arena\0"
+)
+_RETIREMENT_CONTROLLER_DOMAINS_V27: Final = {
+    "intent": b"startup-factory/beads/v27/controller-retirement-intent\0",
+    "receipt": b"startup-factory/beads/v27/controller-retirement-receipt\0",
+}
+_WORKER_RESULT_OFFER_DOMAIN_V27: Final = (
+    b"startup-factory/beads/v27/worker-result-offer\0"
+)
+_WORKER_RESULT_OFFER_ACK_DOMAIN_V27: Final = (
+    b"startup-factory/beads/v27/worker-result-offer-ack\0"
+)
+_WORKER_PRE_EFFECT_FAILURE_DOMAIN_V27: Final = (
+    b"startup-factory/beads/v27/worker-launch-pre-effect-failed\0"
+)
+_WORKER_LAUNCH_UNRESOLVED_DOMAIN_V27: Final = (
+    b"startup-factory/beads/v27/worker-launch-unresolved\0"
+)
+_CONTROLLER_PRE_EFFECT_PROOF_DOMAIN_V27: Final = (
+    b"startup-factory/beads/v27/controller-launch-pre-effect-proof\0"
+)
+_REPOSITORY_CUSTODY_RELEASE_DOMAIN_V27: Final = (
+    b"startup-factory/beads/v27/repository-custody-release\0"
+)
 
 ALLOWED_OPERATIONS: Final = (
     "prepare_atomic_claim_v1",
@@ -172,7 +226,7 @@ _EXECUTE_FIELDS = {
     "sessionNonce",
     "executionNonce",
     "predecessorReceiptSha256",
-    "plan",
+    "authorizationRecordSha256",
 }
 _RESPONSE_FIELDS = {
     "schemaVersion",
@@ -224,6 +278,368 @@ def _canonical(value: Any) -> bytes:
 
 def _sha(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _controller_result_arena_envelope_v27(
+    preparation: Mapping[str, Any], plan: Mapping[str, Any],
+    request_key: bytes, controller_key: bytes,
+) -> dict[str, Any]:
+    try:
+        verified = native_boundary_v27._validate_result_arena_request_v27(
+            preparation, plan, request_key
+        )
+    except native_boundary_v27.NativeBoundaryV27Error as exc:
+        raise ControllerProtocolError(str(exc)) from exc
+    unsigned = {
+        "arena": verified["arena"],
+        "requestKeyHmac": verified["requestKeyHmac"],
+    }
+    return {
+        **unsigned,
+        "controllerHmac": "hmac-sha256:" + hmac.new(
+            controller_key,
+            _RESULT_ARENA_CONTROLLER_DOMAIN_V27 + _canonical(unsigned),
+            hashlib.sha256,
+        ).hexdigest(),
+    }
+
+
+def _verify_controller_result_arena_v27(
+    value: Any, controller_key: bytes, *, payload_name: str,
+    stage_plan_sha256: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "arena", "requestKeyHmac", "controllerHmac"
+    } or not isinstance(value["arena"], Mapping):
+        raise ControllerProtocolError(
+            "controller-authenticated result arena shape changed"
+        )
+    unsigned = {
+        "arena": dict(value["arena"]),
+        "requestKeyHmac": value["requestKeyHmac"],
+    }
+    expected = "hmac-sha256:" + hmac.new(
+        controller_key,
+        _RESULT_ARENA_CONTROLLER_DOMAIN_V27 + _canonical(unsigned),
+        hashlib.sha256,
+    ).hexdigest()
+    arena = unsigned["arena"]
+    if (
+        not hmac.compare_digest(str(value["controllerHmac"]), expected)
+        or arena.get("payloadName") != payload_name
+        or arena.get("stagePlanSha256") != stage_plan_sha256
+        or not isinstance(arena.get("operationLock"), Mapping)
+        or not isinstance(arena.get("resultDirectory"), Mapping)
+    ):
+        raise ControllerProtocolError(
+            "controller-authenticated result arena binding changed"
+        )
+    return {**unsigned, "controllerHmac": expected}
+
+
+def _controller_retirement_envelope_v27(
+    *, kind: str, plan: Mapping[str, Any], payload_name: str,
+    payload_identity: Mapping[str, Any], arena_record_sha256: str,
+    predecessor_artifact_sha256: str | None, body: Mapping[str, Any],
+    controller_key: bytes,
+) -> dict[str, Any]:
+    if kind not in _RETIREMENT_CONTROLLER_DOMAINS_V27:
+        raise ControllerProtocolError("controller retirement artifact kind changed")
+    artifact = {
+        "schemaVersion": 27,
+        "kind": kind,
+        "operationId": plan["operationId"],
+        "stageLocation": plan["stageLocation"],
+        "stagePlanSha256": plan["stagePlanSha256"],
+        "requestKeyId": plan["requestKeyId"],
+        "payloadName": payload_name,
+        "payloadIdentity": dict(payload_identity),
+        "arenaRecordSha256": arena_record_sha256,
+        "predecessorArtifactSha256": predecessor_artifact_sha256,
+        "body": dict(body),
+    }
+    return {
+        "artifact": artifact,
+        "controllerHmac": "hmac-sha256:" + hmac.new(
+            controller_key,
+            _RETIREMENT_CONTROLLER_DOMAINS_V27[kind] + _canonical(artifact),
+            hashlib.sha256,
+        ).hexdigest(),
+    }
+
+
+def _verify_controller_retirement_envelope_v27(
+    value: Any, *, kind: str, controller_key: bytes, payload_name: str,
+    stage_plan_sha256: str, arena_record_sha256: str,
+    predecessor_artifact_sha256: str | None,
+) -> tuple[dict[str, Any], str]:
+    if (
+        kind not in _RETIREMENT_CONTROLLER_DOMAINS_V27
+        or not isinstance(value, Mapping)
+        or set(value) != {"artifact", "controllerHmac"}
+        or not isinstance(value["artifact"], Mapping)
+    ):
+        raise ControllerProtocolError(
+            "controller retirement authentication envelope changed"
+        )
+    artifact = dict(value["artifact"])
+    if set(artifact) != {
+        "schemaVersion", "kind", "operationId", "stageLocation",
+        "stagePlanSha256", "requestKeyId", "payloadName", "payloadIdentity",
+        "arenaRecordSha256", "predecessorArtifactSha256", "body",
+    }:
+        raise ControllerProtocolError(
+            "controller retirement authentication fields changed"
+        )
+    expected = "hmac-sha256:" + hmac.new(
+        controller_key,
+        _RETIREMENT_CONTROLLER_DOMAINS_V27[kind] + _canonical(artifact),
+        hashlib.sha256,
+    ).hexdigest()
+    if (
+        artifact["schemaVersion"] != 27
+        or artifact["kind"] != kind
+        or artifact["payloadName"] != payload_name
+        or artifact["stagePlanSha256"] != stage_plan_sha256
+        or artifact["arenaRecordSha256"] != arena_record_sha256
+        or artifact["predecessorArtifactSha256"]
+        != predecessor_artifact_sha256
+        or not hmac.compare_digest(str(value["controllerHmac"]), expected)
+    ):
+        raise ControllerProtocolError(
+            "controller retirement authentication binding changed"
+        )
+    try:
+        if kind == "intent":
+            body = native_boundary_v27._decode_controller_retirement_intent_v27(
+                artifact["body"]
+            )
+            if artifact["payloadIdentity"] != body["payloadIdentity"]:
+                raise ControllerProtocolError(
+                    "controller retirement intent payload identity changed"
+                )
+        else:
+            raw_body = artifact["body"]
+            if not isinstance(raw_body, Mapping):
+                raise ControllerProtocolError(
+                    "controller retirement receipt body changed"
+                )
+            body = native_boundary_v27._decode_controller_retirement_v27(
+                raw_body, raw_body.get("placementMask")
+            )
+        native_boundary_v27._retirement_payload_identity_v27(
+            artifact["payloadIdentity"]
+        )
+    except native_boundary_v27.NativeBoundaryV27Error as exc:
+        raise ControllerProtocolError(str(exc)) from exc
+    envelope = {"artifact": artifact, "controllerHmac": expected}
+    return body, _sha(_canonical(envelope))
+
+
+def _verify_controller_retirement_chain_v27(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    request_key: bytes,
+    controller_key: bytes,
+    expected_placement_mask: int | None,
+) -> dict[str, Any]:
+    """Verify the controller-only arena -> intent -> receipt authority chain."""
+
+    if not isinstance(value, Mapping) or set(value) != {
+        "arena", "intent", "receipt"
+    }:
+        raise ControllerProtocolError(
+            "controller retirement recovery chain shape changed"
+        )
+    payload_name = _payload_cgroup_name_v27(plan)
+    arena_value = value["arena"]
+    arena = _verify_controller_result_arena_v27(
+        arena_value,
+        controller_key,
+        payload_name=payload_name,
+        stage_plan_sha256=plan["stagePlanSha256"],
+    )
+    try:
+        request_verified = native_boundary_v27._validate_result_arena_request_v27(
+            {
+                "arena": arena["arena"],
+                "requestKeyHmac": arena["requestKeyHmac"],
+            },
+            plan,
+            request_key,
+        )
+    except native_boundary_v27.NativeBoundaryV27Error as exc:
+        raise ControllerProtocolError(str(exc)) from exc
+    arena_body = request_verified["arena"]
+    if (
+        arena_body.get("operationId") != plan["operationId"]
+        or arena_body.get("stageLocation") != plan["stageLocation"]
+        or arena_body.get("stagePlanSha256") != plan["stagePlanSha256"]
+        or arena_body.get("requestKeyId") != plan["requestKeyId"]
+        or arena_body.get("payloadName") != payload_name
+    ):
+        raise ControllerProtocolError(
+            "controller retirement recovery arena differs from the stage plan"
+        )
+    arena_sha256 = _sha(_canonical(dict(arena_value)))
+    intent, intent_sha256 = _verify_controller_retirement_envelope_v27(
+        value["intent"],
+        kind="intent",
+        controller_key=controller_key,
+        payload_name=payload_name,
+        stage_plan_sha256=plan["stagePlanSha256"],
+        arena_record_sha256=arena_sha256,
+        predecessor_artifact_sha256=None,
+    )
+    receipt, _receipt_sha256 = _verify_controller_retirement_envelope_v27(
+        value["receipt"],
+        kind="receipt",
+        controller_key=controller_key,
+        payload_name=payload_name,
+        stage_plan_sha256=plan["stagePlanSha256"],
+        arena_record_sha256=arena_sha256,
+        predecessor_artifact_sha256=intent_sha256,
+    )
+    intent_artifact = value["intent"]["artifact"]
+    receipt_artifact = value["receipt"]["artifact"]
+    for label, artifact in (
+        ("intent", intent_artifact),
+        ("receipt", receipt_artifact),
+    ):
+        if (
+            artifact["operationId"] != plan["operationId"]
+            or artifact["stageLocation"] != plan["stageLocation"]
+            or artifact["stagePlanSha256"] != plan["stagePlanSha256"]
+            or artifact["requestKeyId"] != plan["requestKeyId"]
+            or artifact["payloadName"] != payload_name
+        ):
+            raise ControllerProtocolError(
+                f"controller retirement {label} differs from the stage plan"
+            )
+    if (
+        intent_artifact["payloadIdentity"] != intent["payloadIdentity"]
+        or receipt_artifact["payloadIdentity"] != intent["payloadIdentity"]
+        or receipt["visibleDescendants"] != intent["visibleDescendants"]
+        or receipt["placementMask"] != intent["placementMask"]
+        or receipt["controllerTrackedPlacementMask"]
+        != intent["placementMask"]
+        or receipt["initControllers"] != intent["initControllers"]
+        or receipt["preRemovalCgroupStat"] != intent["preRemovalCgroupStat"]
+        or receipt["terminalCgroupStat"]["nr_descendants"] != 0
+        or (
+            expected_placement_mask is not None
+            and receipt["placementMask"] != expected_placement_mask
+        )
+    ):
+        raise ControllerProtocolError(
+            "controller retirement recovery chain bodies differ"
+        )
+    return receipt
+
+
+def _controller_pre_effect_proof_envelope_v27(
+    *,
+    plan: Mapping[str, Any],
+    payload_name: str,
+    arena_record_sha256: str,
+    consumed_current_record_sha256: str,
+    worker_failure: Mapping[str, Any],
+    first_empty_observation: Mapping[str, Any],
+    second_empty_observation: Mapping[str, Any],
+    controller_retirement: Mapping[str, Any],
+    controller_key: bytes,
+) -> dict[str, Any]:
+    """Authenticate the exact no-launch proof with a controller-only key."""
+
+    retirement_sha256 = _sha(_canonical(dict(controller_retirement)))
+    proof = {
+        "schemaVersion": 27,
+        "operationId": plan["operationId"],
+        "stageLocation": plan["stageLocation"],
+        "stagePlanSha256": plan["stagePlanSha256"],
+        "requestKeyId": plan["requestKeyId"],
+        "payloadName": payload_name,
+        "arenaRecordSha256": arena_record_sha256,
+        "consumedCurrentRecordSha256": consumed_current_record_sha256,
+        "workerFailure": dict(worker_failure),
+        "firstEmptyObservation": dict(first_empty_observation),
+        "secondEmptyObservation": dict(second_empty_observation),
+        "controllerRetirement": dict(controller_retirement),
+        "controllerRetirementSha256": retirement_sha256,
+    }
+    return {
+        "proof": proof,
+        "controllerHmac": "hmac-sha256:" + hmac.new(
+            controller_key,
+            _CONTROLLER_PRE_EFFECT_PROOF_DOMAIN_V27 + _canonical(proof),
+            hashlib.sha256,
+        ).hexdigest(),
+    }
+
+
+def _verify_controller_pre_effect_proof_v27(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    controller_key: bytes,
+    arena_record_sha256: str,
+    retirement: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify a relayed proof; the worker never establishes its authority."""
+
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"proof", "controllerHmac"}
+        or not isinstance(value["proof"], Mapping)
+    ):
+        raise ControllerProtocolError(
+            "controller pre-effect proof envelope changed"
+        )
+    proof = dict(value["proof"])
+    if set(proof) != {
+        "schemaVersion", "operationId", "stageLocation",
+        "stagePlanSha256", "requestKeyId", "payloadName",
+        "arenaRecordSha256", "consumedCurrentRecordSha256",
+        "workerFailure", "firstEmptyObservation", "secondEmptyObservation",
+        "controllerRetirement", "controllerRetirementSha256",
+    }:
+        raise ControllerProtocolError("controller pre-effect proof fields changed")
+    expected_hmac = "hmac-sha256:" + hmac.new(
+        controller_key,
+        _CONTROLLER_PRE_EFFECT_PROOF_DOMAIN_V27 + _canonical(proof),
+        hashlib.sha256,
+    ).hexdigest()
+    worker_failure = proof["workerFailure"]
+    first_empty = proof["firstEmptyObservation"]
+    second_empty = proof["secondEmptyObservation"]
+    retirement_sha256 = _sha(_canonical(dict(retirement)))
+    if (
+        proof["schemaVersion"] != 27
+        or proof["operationId"] != plan["operationId"]
+        or proof["stageLocation"] != plan["stageLocation"]
+        or proof["stagePlanSha256"] != plan["stagePlanSha256"]
+        or proof["requestKeyId"] != plan["requestKeyId"]
+        or proof["payloadName"] != _payload_cgroup_name_v27(plan)
+        or proof["arenaRecordSha256"] != arena_record_sha256
+        or not isinstance(proof["consumedCurrentRecordSha256"], str)
+        or not _DIGEST.fullmatch(proof["consumedCurrentRecordSha256"])
+        or not isinstance(worker_failure, Mapping)
+        or set(worker_failure) != {"evidenceSha256", "classification"}
+        or not isinstance(first_empty, Mapping)
+        or first_empty != second_empty
+        or first_empty.get("schemaVersion") != 27
+        or first_empty.get("knownNoChild") is not True
+        or first_empty.get("placementMask") != 0
+        or proof["controllerRetirement"] != dict(retirement)
+        or proof["controllerRetirementSha256"] != retirement_sha256
+        or retirement.get("placementMask") != 0
+        or not hmac.compare_digest(str(value["controllerHmac"]), expected_hmac)
+    ):
+        raise ControllerProtocolError(
+            "controller pre-effect proof authentication or binding changed"
+        )
+    return proof
 
 
 def _closed_mapping(value: Any, fields: set[str], label: str) -> dict[str, Any]:
@@ -1062,12 +1478,22 @@ def _verify_native_platform_gate(
 ) -> None:
     observations = (
         (
+            manifest.launcher_path,
+            "installed native launcher",
+            manifest.launcher_sha256,
+        ),
+        (
             manifest.supervisor_path,
             "installed native supervisor",
             manifest.supervisor_sha256,
         ),
         (manifest.podman_path, "installed native Podman", manifest.podman_sha256),
         (manifest.conmon_path, "installed native conmon", manifest.conmon_sha256),
+        (
+            manifest.oci_runtime_path,
+            "installed native OCI runtime",
+            manifest.oci_runtime_sha256,
+        ),
     )
     for path, label, expected in observations:
         observed = _sha(_read_root_owned(path, label, executable=True))
@@ -1100,11 +1526,114 @@ def _worker_packet_v27(value: Any, label: str) -> dict[str, Any]:
     return parsed
 
 
+def _recv_credentialed_packet_v27(
+    channel: socket.socket,
+    *,
+    expected_pid: int,
+    expected_uid: int,
+    expected_gid: int,
+    label: str,
+) -> bytes:
+    """Receive one record and authenticate the credentials of this send."""
+
+    channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    credential_size = struct.calcsize("3i")
+    packet, ancillary, flags, _address = channel.recvmsg(
+        MAX_MESSAGE_BYTES + 1,
+        socket.CMSG_SPACE(credential_size),
+    )
+    credentials: list[tuple[int, int, int]] = []
+    for level, kind, payload in ancillary:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_CREDENTIALS:
+            if len(payload) != credential_size:
+                raise ControllerProtocolError(f"{label} credentials are truncated")
+            credentials.append(struct.unpack("3i", payload))
+        elif level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            raise ControllerProtocolError(f"{label} smuggled descriptor rights")
+        else:
+            raise ControllerProtocolError(f"{label} has unknown ancillary data")
+    if (
+        flags & (getattr(socket, "MSG_TRUNC", 0) | getattr(socket, "MSG_CTRUNC", 0))
+        or not packet
+        or len(packet) > MAX_MESSAGE_BYTES
+        or credentials != [(expected_pid, expected_uid, expected_gid)]
+    ):
+        raise ControllerProtocolError(f"{label} packet/credential identity is invalid")
+    return packet
+
+
+def _recv_worker_execute_packet_v27(
+    channel: socket.socket,
+    *,
+    expected_pid: int,
+    expected_uid: int,
+    expected_gid: int,
+) -> tuple[bytes, tuple[int, ...]]:
+    """Receive zero, recovery-key-only, or cgroup-plus-key descriptor rights."""
+
+    channel.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    credential_size = struct.calcsize("3i")
+    rights_size = array.array("i").itemsize * (
+        len(_WORKER_CGROUP_ROLES_V27) + 1
+    )
+    packet, ancillary, flags, _address = channel.recvmsg(
+        MAX_MESSAGE_BYTES + 1,
+        socket.CMSG_SPACE(credential_size) + socket.CMSG_SPACE(rights_size),
+    )
+    credentials: list[tuple[int, int, int]] = []
+    rights: list[tuple[int, ...]] = []
+    try:
+        for level, kind, payload in ancillary:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_CREDENTIALS:
+                if len(payload) != credential_size:
+                    raise ControllerProtocolError(
+                        "native worker request credentials are truncated"
+                    )
+                credentials.append(struct.unpack("3i", payload))
+            elif level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                values = array.array("i")
+                usable = len(payload) - (len(payload) % values.itemsize)
+                values.frombytes(payload[:usable])
+                rights.append(tuple(values))
+                if len(values) not in {
+                    1, len(_WORKER_CGROUP_ROLES_V27) + 1
+                }:
+                    raise ControllerProtocolError(
+                        "native worker request descriptor rights are truncated"
+                    )
+            else:
+                raise ControllerProtocolError(
+                    "native worker request has unknown ancillary data"
+                )
+        if (
+            flags
+            & (getattr(socket, "MSG_TRUNC", 0) | getattr(socket, "MSG_CTRUNC", 0))
+            or not packet
+            or len(packet) > MAX_MESSAGE_BYTES
+            or credentials != [(expected_pid, expected_uid, expected_gid)]
+            or len(rights) > 1
+        ):
+            raise ControllerProtocolError(
+                "native worker request packet/credential identity is invalid"
+            )
+        return packet, rights[0] if rights else ()
+    except BaseException:
+        for group in rights:
+            for descriptor in group:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        raise
+
+
 def _worker_result_packet_v27(
     plan_sha256: str, result: Mapping[str, Any]
 ) -> bytes:
     try:
-        observation = native_boundary_v27._decode_supervisor_result(result)
+        observation = native_boundary_v27._decode_native_stage_result_v27(
+            result, require_discriminants=True
+        )
     except native_boundary_v27.NativeBoundaryV27Error as exc:
         raise ControllerProtocolError(
             f"native worker result is invalid: {exc}"
@@ -1114,8 +1643,289 @@ def _worker_result_packet_v27(
             "schemaVersion": 27,
             "protocol": _WORKER_PROTOCOL,
             "status": "completed",
-            "planSha256": plan_sha256,
-            "nativeObservation": observation,
+            "stagePlanSha256": plan_sha256,
+            "nativeStageObservation": observation,
+        }
+    )
+
+
+def _worker_result_offer_packet_v27(
+    plan_sha256: str, result: Mapping[str, Any], request_key: bytes
+) -> bytes:
+    packet = json.loads(_worker_result_packet_v27(plan_sha256, result))
+    observation = packet["nativeStageObservation"]
+    observation_sha256 = _sha(_canonical(observation))
+    body = {
+        "schemaVersion": 27,
+        "protocol": _WORKER_PROTOCOL,
+        "status": "result-offer",
+        "stagePlanSha256": plan_sha256,
+        "nativeResultSha256": observation_sha256,
+        "resultKind": observation["resultKind"],
+        "resultPredecessorKind": observation["resultPredecessorKind"],
+        "failureEvidenceSha256": observation["failureEvidenceSha256"],
+        "placementMask": observation["placementMask"],
+    }
+    body["offerHmac"] = "hmac-sha256:" + hmac.new(
+        request_key,
+        _WORKER_RESULT_OFFER_DOMAIN_V27 + _canonical(body),
+        hashlib.sha256,
+    ).hexdigest()
+    return _canonical(body)
+
+
+def _worker_result_offer_ack_v27(
+    *, plan_sha256: str, native_result_sha256: str,
+    authorization_record_sha256: str, request_key: bytes,
+) -> bytes:
+    body = {
+        "schemaVersion": 27,
+        "protocol": _WORKER_PROTOCOL,
+        "action": "ACK-RESULT-OFFER",
+        "stagePlanSha256": plan_sha256,
+        "nativeResultSha256": native_result_sha256,
+        "authorizationRecordSha256": authorization_record_sha256,
+    }
+    body["ackHmac"] = "hmac-sha256:" + hmac.new(
+        request_key,
+        _WORKER_RESULT_OFFER_ACK_DOMAIN_V27 + _canonical(body),
+        hashlib.sha256,
+    ).hexdigest()
+    return _canonical(body)
+
+
+def _worker_pre_effect_failure_packet_v27(
+    plan_sha256: str,
+    *,
+    evidence_sha256: str,
+    classification: Mapping[str, Any],
+    request_key: bytes,
+) -> bytes:
+    body = {
+        "schemaVersion": 27,
+        "protocol": _WORKER_PROTOCOL,
+        "status": "launch-pre-effect-failed",
+        "stagePlanSha256": plan_sha256,
+        "evidenceSha256": evidence_sha256,
+        "classification": dict(classification),
+    }
+    body["packetHmac"] = "hmac-sha256:" + hmac.new(
+        request_key,
+        _WORKER_PRE_EFFECT_FAILURE_DOMAIN_V27 + _canonical(body),
+        hashlib.sha256,
+    ).hexdigest()
+    return _canonical(body)
+
+
+def _worker_launch_unresolved_packet_v27(
+    plan_sha256: str,
+    recovered: Mapping[str, Any],
+    request_key: bytes,
+) -> bytes:
+    if not native_boundary_v27._is_native_supervisor_loss_v27(recovered):
+        raise ControllerProtocolError(
+            "native launch unresolved packet lacks a closed loss observation"
+        )
+    body = {
+        "schemaVersion": 27,
+        "protocol": _WORKER_PROTOCOL,
+        "status": "launch-unresolved",
+        "stagePlanSha256": plan_sha256,
+        "nativeSupervisorLoss": dict(recovered["nativeSupervisorLoss"]),
+    }
+    body["packetHmac"] = "hmac-sha256:" + hmac.new(
+        request_key,
+        _WORKER_LAUNCH_UNRESOLVED_DOMAIN_V27 + _canonical(body),
+        hashlib.sha256,
+    ).hexdigest()
+    return _canonical(body)
+
+
+def _validate_worker_launch_unresolved_v27(
+    value: Mapping[str, Any],
+    *,
+    plan: Mapping[str, Any],
+    request_key: bytes,
+) -> dict[str, Any]:
+    fields = {
+        "schemaVersion", "protocol", "status", "stagePlanSha256",
+        "nativeSupervisorLoss", "packetHmac",
+    }
+    body = {field: value[field] for field in fields if field != "packetHmac"} if (
+        isinstance(value, Mapping) and set(value) == fields
+    ) else None
+    recovered = (
+        {"nativeSupervisorLoss": value["nativeSupervisorLoss"]}
+        if body is not None
+        else None
+    )
+    if (
+        body is None
+        or value["schemaVersion"] != 27
+        or value["protocol"] != _WORKER_PROTOCOL
+        or value["status"] != "launch-unresolved"
+        or value["stagePlanSha256"] != plan["stagePlanSha256"]
+        or recovered is None
+        or not native_boundary_v27._is_native_supervisor_loss_v27(recovered)
+        or not hmac.compare_digest(
+            str(value["packetHmac"]),
+            "hmac-sha256:" + hmac.new(
+                request_key,
+                _WORKER_LAUNCH_UNRESOLVED_DOMAIN_V27 + _canonical(body),
+                hashlib.sha256,
+            ).hexdigest(),
+        )
+    ):
+        raise ControllerProtocolError(
+            "native launch unresolved packet authentication changed"
+        )
+    return dict(recovered)
+
+
+def _validate_worker_pre_effect_failure_v27(
+    value: Mapping[str, Any],
+    *,
+    plan: Mapping[str, Any],
+    manifest: native_boundary_v27.NativeBoundaryManifestV27,
+    request_key: bytes,
+) -> dict[str, Any]:
+    fields = {
+        "schemaVersion", "protocol", "status", "stagePlanSha256",
+        "evidenceSha256", "classification", "packetHmac",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ControllerProtocolError(
+            "native launch pre-effect packet shape changed"
+        )
+    classification = value["classification"]
+    if not isinstance(classification, Mapping) or set(classification) != {
+        "classification", "setupStep", "failureKind",
+        "executablePathSha256", "errno", "processCreated"
+    }:
+        raise ControllerProtocolError(
+            "native launch pre-effect classification shape changed"
+        )
+    expected_path_sha256 = native_boundary_v27.sha256(
+        str(manifest.launcher_path).encode("utf-8")
+    )
+    if (
+        value["schemaVersion"] != 27
+        or value["protocol"] != _WORKER_PROTOCOL
+        or value["status"] != "launch-pre-effect-failed"
+        or value["stagePlanSha256"] != plan["stagePlanSha256"]
+        or classification["classification"]
+        != "pre-popen-descriptor-preflight-failed"
+        or classification["setupStep"] != "source-descriptor-preflight"
+        or classification["failureKind"] != "policy-rejection"
+        or classification["executablePathSha256"] != expected_path_sha256
+        or classification["errno"] is not None
+        or classification["processCreated"] is not False
+    ):
+        raise ControllerProtocolError(
+            "native launch pre-effect classification changed"
+        )
+    expected_evidence = native_boundary_v27.sha256(
+        b"startup-factory/beads/v27/launch-pre-effect-failed\0"
+        + native_boundary_v27.canonical_bytes(dict(classification))
+    )
+    body = {field: value[field] for field in fields if field != "packetHmac"}
+    expected_hmac = "hmac-sha256:" + hmac.new(
+        request_key,
+        _WORKER_PRE_EFFECT_FAILURE_DOMAIN_V27 + _canonical(body),
+        hashlib.sha256,
+    ).hexdigest()
+    if (
+        value["evidenceSha256"] != expected_evidence
+        or not hmac.compare_digest(str(value["packetHmac"]), expected_hmac)
+    ):
+        raise ControllerProtocolError(
+            "native launch pre-effect packet authentication changed"
+        )
+    return {
+        "evidenceSha256": expected_evidence,
+        "classification": dict(classification),
+    }
+
+
+def _worker_recovery_packet_v27(
+    plan_sha256: str, result: Mapping[str, Any]
+) -> bytes:
+    if isinstance(result, Mapping) and set(result) == {
+        "nativeLaunchPreEffectProof", "_controllerRetirementChain"
+    }:
+        return _canonical(
+            {
+                "schemaVersion": 27,
+                "protocol": _WORKER_PROTOCOL,
+                "status": "launch-pre-effect-proved",
+                "stagePlanSha256": plan_sha256,
+                "nativeLaunchPreEffectProof": result[
+                    "nativeLaunchPreEffectProof"
+                ],
+                "controllerRetirementChain": result[
+                    "_controllerRetirementChain"
+                ],
+            }
+        )
+    if native_boundary_v27._is_native_supervisor_loss_v27(result):
+        if set(result) != {
+            "nativeSupervisorLoss", "_controllerRetirementChain"
+        }:
+            raise ControllerProtocolError(
+                "native worker loss recovery lacks the controller retirement chain"
+            )
+        return _canonical(
+            {
+                "schemaVersion": 27,
+                "protocol": _WORKER_PROTOCOL,
+                "status": "loss",
+                "stagePlanSha256": plan_sha256,
+                "nativeSupervisorLoss": result["nativeSupervisorLoss"],
+                "controllerRetirementChain": result[
+                    "_controllerRetirementChain"
+                ],
+            }
+        )
+    if not isinstance(result, Mapping) or set(result) not in ({
+        "exitCode", "stdout", "stderr", "lifecycle", "placementMask",
+        "resultKind", "resultPredecessorKind", "failureEvidenceSha256",
+        "_controllerRetirementChain",
+    }, {
+        "exitCode", "stdout", "stderr", "lifecycle", "placementMask",
+        "resultKind", "resultPredecessorKind", "failureEvidenceSha256",
+        "_controllerRetirementChain", "_nativeCreatorArtifactBinding",
+    }):
+        raise ControllerProtocolError(
+            "native worker recovery lacks exact controller envelope relays"
+        )
+    stage_result = {
+        key: value
+        for key, value in result.items()
+        if key not in {
+            "_controllerRetirementChain", "_nativeCreatorArtifactBinding"
+        }
+    }
+    try:
+        observation = native_boundary_v27._decode_native_stage_result_v27(
+            stage_result, require_discriminants=True
+        )
+    except native_boundary_v27.NativeBoundaryV27Error as exc:
+        raise ControllerProtocolError(
+            f"native worker recovered result is invalid: {exc}"
+        ) from exc
+    return _canonical(
+        {
+            "schemaVersion": 27,
+            "protocol": _WORKER_PROTOCOL,
+            "status": "completed",
+            "stagePlanSha256": plan_sha256,
+            "nativeStageObservation": observation,
+            "controllerRetirementChain": result[
+                "_controllerRetirementChain"
+            ],
+            "nativeCreatorArtifactBinding": result.get(
+                "_nativeCreatorArtifactBinding"
+            ),
         }
     )
 
@@ -1181,6 +1991,2993 @@ def _drop_to_worker_identity_v27(config: ControllerConfig) -> None:
     _assert_worker_dac_isolation_v27(config)
 
 
+def _validate_zero_worker_capabilities_v27(raw_status: bytes) -> None:
+    try:
+        status = raw_status.decode("ascii", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ControllerProtocolError(
+            "worker Linux capability state is not ASCII"
+        ) from exc
+    observed: dict[str, str] = {}
+    for line in status.splitlines():
+        match = re.fullmatch(r"(CapInh|CapPrm|CapEff|CapAmb):\s*([0-9A-Fa-f]+)", line)
+        if match is None:
+            continue
+        name, value = match.groups()
+        if name in observed:
+            raise ControllerProtocolError(
+                "worker Linux capability state has duplicate fields"
+            )
+        observed[name] = value
+    required = {"CapInh", "CapPrm", "CapEff", "CapAmb"}
+    if set(observed) != required:
+        raise ControllerProtocolError(
+            "worker Linux capability state is incomplete"
+        )
+    if any(int(value, 16) != 0 for value in observed.values()):
+        raise ControllerProtocolError(
+            "worker retained Linux capabilities after identity drop"
+        )
+
+
+def _assert_worker_has_no_linux_capabilities_v27() -> None:
+    status_path = Path("/proc") / str(os.getpid()) / "status"
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(status_path, flags)
+    except OSError as exc:
+        raise ControllerProtocolError(
+            f"worker cannot open its Linux capability state: {exc}"
+        ) from exc
+    try:
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            try:
+                chunk = os.read(
+                    descriptor,
+                    min(16_384, _WORKER_STATUS_MAX_BYTES_V27 + 1 - size),
+                )
+            except InterruptedError:
+                continue
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > _WORKER_STATUS_MAX_BYTES_V27:
+                raise ControllerProtocolError(
+                    "worker Linux capability state exceeds the byte cap"
+                )
+        _validate_zero_worker_capabilities_v27(b"".join(chunks))
+    finally:
+        os.close(descriptor)
+
+
+def _verify_worker_result_root_label_v27(config: ControllerConfig) -> None:
+    """Verify the actual result-root label after the irreversible UID drop."""
+
+    result_root = (
+        Path("/run/user")
+        / str(config.worker_uid)
+        / "startup-factory-beads-results"
+    )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(result_root, flags)
+    except OSError as exc:
+        raise ControllerProtocolError(
+            f"worker result root is not an accessible no-follow directory: {exc}"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_uid != config.worker_uid
+            or metadata.st_gid != os.getegid()
+            or metadata.st_nlink < 2
+        ):
+            raise ControllerProtocolError(
+                "worker result root type, owner, mode, or link count changed"
+            )
+        try:
+            raw_context = os.getxattr(descriptor, "security.selinux")
+        except (AttributeError, OSError, TypeError) as exc:
+            raise ControllerProtocolError(
+                f"worker cannot read the actual result root SELinux label: {exc}"
+            ) from exc
+        if raw_context.endswith(b"\0"):
+            raw_context = raw_context[:-1]
+        if (
+            raw_context != _WORKER_RESULT_SELINUX_CONTEXT_V27
+            or b"\0" in raw_context
+        ):
+            raise ControllerProtocolError(
+                "worker result root SELinux label differs from the pinned context"
+            )
+        _assert_worker_has_no_linux_capabilities_v27()
+    finally:
+        os.close(descriptor)
+
+
+def _payload_cgroup_name_v27(plan: Mapping[str, Any]) -> str:
+    operation_id = str(plan.get("operationId", ""))
+    stage_location = plan.get("stageLocation")
+    stage_digest = str(plan.get("stagePlanSha256", ""))
+    if (
+        not _OPERATION_ID.fullmatch(operation_id)
+        or type(stage_location) is not int
+        or not 1 <= stage_location <= 77
+        or not _DIGEST.fullmatch(stage_digest)
+    ):
+        raise ControllerProtocolError(
+            "native cgroup plan identity is invalid"
+        )
+    return (
+        f"payload-{operation_id}-s{stage_location}-"
+        f"{stage_digest.removeprefix('sha256:')[:16]}"
+    )
+
+
+def _process_start_time_v27(pid: int, *, proc_root: Path = Path("/proc")) -> str:
+    try:
+        raw = (proc_root / str(pid) / "stat").read_bytes()
+    except OSError as exc:
+        raise ControllerProtocolError(
+            f"controller cannot read worker process identity: {exc}"
+        ) from exc
+    closing = raw.rfind(b")")
+    if closing <= 0:
+        raise ControllerProtocolError("controller worker process identity is malformed")
+    fields = raw[closing + 1 :].split()
+    if len(fields) < 20 or not re.fullmatch(rb"(?:0|[1-9][0-9]*)", fields[19]):
+        raise ControllerProtocolError("controller worker process identity is malformed")
+    return fields[19].decode("ascii")
+
+
+def _process_parent_pid_v27(pid: int, *, proc_root: Path = Path("/proc")) -> int:
+    try:
+        raw = (proc_root / str(pid) / "stat").read_bytes()
+    except OSError as exc:
+        raise ControllerProtocolError(
+            f"controller cannot read process parent identity: {exc}"
+        ) from exc
+    closing = raw.rfind(b")")
+    fields = raw[closing + 1 :].split() if closing > 0 else []
+    if len(fields) < 2 or not re.fullmatch(rb"[1-9][0-9]*", fields[1]):
+        raise ControllerProtocolError("controller process parent identity is malformed")
+    return int(fields[1])
+
+
+def _assert_worker_pidfd_identity_v27(
+    worker_pid: int,
+    pidfd: int,
+    start_time: str,
+    *,
+    proc_root: Path = Path("/proc"),
+) -> None:
+    if select.select([pidfd], [], [], 0)[0]:
+        raise ControllerProtocolError("native worker pidfd is terminal")
+    if _process_start_time_v27(worker_pid, proc_root=proc_root) != start_time:
+        raise ControllerProtocolError("native worker PID identity changed")
+
+
+def _place_persistent_worker_v27(
+    process_fd: int,
+    *,
+    worker_pid: int,
+    pidfd: int,
+    start_time: str,
+    expected_relative: str,
+    proc_root: Path = Path("/proc"),
+) -> dict[str, Any]:
+    _assert_worker_pidfd_identity_v27(
+        worker_pid, pidfd, start_time, proc_root=proc_root
+    )
+    native_boundary_v27._write_all_v27(
+        process_fd, f"{worker_pid}\n".encode("ascii")
+    )
+    _assert_worker_pidfd_identity_v27(
+        worker_pid, pidfd, start_time, proc_root=proc_root
+    )
+    observed = native_boundary_v27._unified_cgroup_relative_v27(
+        (proc_root / str(worker_pid) / "cgroup").read_bytes()
+    )
+    if observed != expected_relative:
+        raise ControllerProtocolError(
+            "native worker did not enter the exact controller-issued cgroup"
+        )
+    return {
+        "schemaVersion": 27,
+        "workerPid": worker_pid,
+        "workerStartTime": start_time,
+        "cgroupRelative": expected_relative,
+    }
+
+
+def _validate_supervisor_process_control_v27(
+    descriptor: int, *, worker_uid: int
+) -> None:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid == worker_uid
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE
+        != os.O_WRONLY
+    ):
+        raise ControllerProtocolError(
+            "supervisor cgroup.procs is not controller-custodied and worker-denied"
+        )
+
+
+def _prepare_supervisor_process_control_v27(
+    supervisor_fd: int,
+    *,
+    controller_uid: int,
+    worker_uid: int,
+    worker_gid: int,
+    cgroup2_observer: Any = None,
+) -> int:
+    """Root-delegate the common-ancestor attach control to only the controller.
+
+    Linux checks write access to the common ancestor's ``cgroup.procs`` when
+    moving a process from W to a lifecycle leaf.  Chowning S itself does not
+    change this kernfs interface.  The only admitted incomplete bootstrap is
+    the exact root-owned initial interface or the atomic-fchown-completed,
+    chmod-pending state; every other identity is substituted evidence.
+    """
+
+    descriptor = -1
+    try:
+        before = os.stat(
+            "cgroup.procs", dir_fd=supervisor_fd, follow_symlinks=False
+        )
+        descriptor = os.open(
+            "cgroup.procs",
+            os.O_WRONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=supervisor_fd,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(opened.st_mode)
+            or _cgroup_entry_identity_v27(opened)
+            != _cgroup_entry_identity_v27(before)
+            or opened.st_nlink != 1
+        ):
+            raise ControllerProtocolError(
+                "supervisor cgroup.procs changed before descriptor open"
+            )
+        root = _prove_cgroup2_supervisor_fd_v27(
+            supervisor_fd, observer=cgroup2_observer
+        )
+        if opened.st_dev != root["device"]:
+            raise ControllerProtocolError(
+                "supervisor cgroup.procs filesystem identity changed"
+            )
+
+        mode = stat.S_IMODE(opened.st_mode)
+        exact_root_state = (
+            opened.st_uid == 0
+            and opened.st_gid in {0, worker_gid}
+            and mode in {0o644, 0o600}
+        )
+        exact_chown_half_state = (
+            opened.st_uid == controller_uid
+            and opened.st_gid == worker_gid
+            and mode == 0o644
+        )
+        exact_final_state = (
+            opened.st_uid == controller_uid
+            and opened.st_gid == worker_gid
+            and mode == 0o600
+        )
+        if exact_root_state:
+            if os.geteuid() != 0:
+                raise ControllerProtocolError(
+                    "supervisor cgroup.procs root bootstrap requires root"
+                )
+            os.fchown(descriptor, controller_uid, worker_gid)
+            os.fchmod(descriptor, 0o600)
+        elif exact_chown_half_state:
+            if os.geteuid() != 0:
+                raise ControllerProtocolError(
+                    "supervisor cgroup.procs half-state requires root"
+                )
+            os.fchmod(descriptor, 0o600)
+        elif not exact_final_state:
+            raise ControllerProtocolError(
+                "supervisor cgroup.procs has substituted owner or mode"
+            )
+
+        final = os.fstat(descriptor)
+        rebound = os.stat(
+            "cgroup.procs", dir_fd=supervisor_fd, follow_symlinks=False
+        )
+        if (
+            _cgroup_entry_identity_v27(final)
+            != _cgroup_entry_identity_v27(rebound)
+            or final.st_uid != controller_uid
+            or final.st_gid != worker_gid
+            or stat.S_IMODE(final.st_mode) != 0o600
+        ):
+            raise ControllerProtocolError(
+                "supervisor cgroup.procs delegation did not reach its exact identity"
+            )
+        _validate_supervisor_process_control_v27(
+            descriptor, worker_uid=worker_uid
+        )
+        return descriptor
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def _read_cgroup_tokens_v27(descriptor: int, label: str) -> tuple[str, ...]:
+    try:
+        raw = os.pread(descriptor, 4096, 0)
+    except OSError as exc:
+        raise ControllerProtocolError(f"cannot read exact {label}: {exc}") from exc
+    if len(raw) == 4096 or b"\x00" in raw:
+        raise ControllerProtocolError(f"exact {label} is malformed")
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ControllerProtocolError(f"exact {label} is malformed") from exc
+    tokens = tuple(text.split())
+    if len(tokens) != len(set(tokens)) or any(
+        not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", token) for token in tokens
+    ):
+        raise ControllerProtocolError(f"exact {label} is malformed")
+    return tokens
+
+
+def _enable_exact_subtree_controllers_v27(directory_fd: int) -> None:
+    """Enable the closed resource set only after proving no internal process."""
+
+    procs = controllers = subtree = -1
+    try:
+        procs = os.open(
+            "cgroup.procs",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        if os.pread(procs, 4096, 0).strip():
+            raise ControllerProtocolError(
+                "delegated cgroup has an internal process before controller enablement"
+            )
+        controllers = os.open(
+            "cgroup.controllers",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        available = _read_cgroup_tokens_v27(controllers, "cgroup.controllers")
+        if not set(_DELEGATED_CONTROLLERS_V27).issubset(available):
+            raise ControllerProtocolError(
+                "delegated cgroup lacks the exact required controllers"
+            )
+        subtree = os.open(
+            "cgroup.subtree_control",
+            os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        before = _read_cgroup_tokens_v27(subtree, "cgroup.subtree_control")
+        if not set(before).issubset(_DELEGATED_CONTROLLERS_V27):
+            raise ControllerProtocolError(
+                "delegated cgroup has an extra enabled controller"
+            )
+        native_boundary_v27._write_all_v27(
+            subtree,
+            (" ".join("+" + item for item in _DELEGATED_CONTROLLERS_V27) + "\n").encode("ascii"),
+        )
+        after = _read_cgroup_tokens_v27(subtree, "cgroup.subtree_control")
+        if set(after) != set(_DELEGATED_CONTROLLERS_V27):
+            raise ControllerProtocolError(
+                "delegated cgroup controller enablement did not reach the exact set"
+            )
+    except OSError as exc:
+        raise ControllerProtocolError(
+            f"cannot enable exact delegated cgroup controllers: {exc}"
+        ) from exc
+    finally:
+        for descriptor in (subtree, controllers, procs):
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
+def _cgroup_descriptor_binding_v27(role: str, descriptor: int) -> dict[str, Any]:
+    if role not in _WORKER_CGROUP_ROLES_V27:
+        raise ControllerProtocolError("native cgroup descriptor role is invalid")
+    metadata = os.fstat(descriptor)
+    access_mode = fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE
+    entry_type = (
+        "directory"
+        if stat.S_ISDIR(metadata.st_mode)
+        else "file"
+        if stat.S_ISREG(metadata.st_mode)
+        else "unsupported"
+    )
+    return {
+        "role": role,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+        "type": entry_type,
+        "accessMode": access_mode,
+    }
+
+
+@dataclasses.dataclass(slots=True)
+class _ControllerCgroupCustodyV27:
+    supervisor_fd: int
+    supervisor_process_fd: int
+    worker_fd: int
+    worker_relative: str
+    payload_name: str
+    binding: dict[str, Any]
+    owned_descriptors: tuple[int, int, int, int, int, int]
+    controller_uid: int
+    worker_uid: int
+    worker_gid: int
+    cgroup2_observer: Any = None
+    cgroup_mode_observer: Any = None
+    lifecycle_leaves: dict[int, tuple[int, ...]] = dataclasses.field(
+        default_factory=dict
+    )
+
+    @property
+    def transfer_descriptors(self) -> tuple[int, ...]:
+        _payload, _procs, _threads, _subtree, events, kill = self.owned_descriptors
+        return (self.worker_fd, _payload, events, kill)
+
+    @property
+    def payload_procs_fd(self) -> int:
+        return self.owned_descriptors[1]
+
+    def place_lifecycle_child(
+        self,
+        *,
+        child_pid: int,
+        child_start_time: str,
+        supervisor_pid: int,
+        ordinal: int,
+        placement_nonce: str,
+        proc_root: Path = Path("/proc"),
+    ) -> dict[str, Any]:
+        """Controller-only placement of one still-blocked lifecycle child."""
+
+        if (
+            type(supervisor_pid) is not int
+            or supervisor_pid <= 1
+            or type(ordinal) is not int
+            or not 0 <= ordinal < 6
+            or not re.fullmatch(r"[0-9a-f]{64}", placement_nonce)
+        ):
+            raise ControllerProtocolError("lifecycle child placement request is invalid")
+        observed_mask = sum(1 << item for item in self.lifecycle_leaves)
+        if (
+            ordinal in self.lifecycle_leaves
+            or not native_boundary_v27._lifecycle_placement_transition_allowed_v27(
+                observed_mask, ordinal
+            )
+        ):
+            raise ControllerProtocolError(
+                "lifecycle child placement ordinal is reordered or replayed"
+            )
+        if not hasattr(os, "pidfd_open"):
+            raise ControllerProtocolError("lifecycle child placement requires pidfd_open")
+        # Reopen the common-ancestor permission proof immediately before every
+        # controller-only W -> Li attach.  The worker never receives this FD.
+        supervisor_process = os.fstat(self.supervisor_process_fd)
+        if (
+            not stat.S_ISREG(supervisor_process.st_mode)
+            or supervisor_process.st_uid != self.controller_uid
+            or supervisor_process.st_gid != self.worker_gid
+            or stat.S_IMODE(supervisor_process.st_mode) != 0o600
+            or fcntl.fcntl(self.supervisor_process_fd, fcntl.F_GETFL)
+            & os.O_ACCMODE
+            != os.O_WRONLY
+        ):
+            raise ControllerProtocolError(
+                "supervisor cgroup.procs custody changed before lifecycle placement"
+            )
+        pidfd = os.pidfd_open(child_pid, 0)
+        supervisor_pidfd = -1
+        try:
+            supervisor_pidfd = os.pidfd_open(supervisor_pid, 0)
+            if select.select([supervisor_pidfd], [], [], 0)[0]:
+                raise ControllerProtocolError("native supervisor pidfd is terminal")
+            _assert_worker_pidfd_identity_v27(
+                child_pid, pidfd, child_start_time, proc_root=proc_root
+            )
+            if (
+                _process_parent_pid_v27(supervisor_pid, proc_root=proc_root)
+                != self.binding["workerPid"]
+                or _process_parent_pid_v27(child_pid, proc_root=proc_root)
+                != supervisor_pid
+            ):
+                raise ControllerProtocolError(
+                    "lifecycle child parent identity changed before placement"
+                )
+            payload_fd = self.owned_descriptors[0]
+            leaf_name = f"lifecycle-{ordinal}"
+            try:
+                os.mkdir(leaf_name, _LIFECYCLE_CGROUP_MODE_V27, dir_fd=payload_fd)
+            except OSError as exc:
+                raise ControllerProtocolError(
+                    f"controller cannot create exact lifecycle cgroup: {exc}"
+                ) from exc
+            leaf_fd = -1
+            leaf_controls: list[int] = []
+            try:
+                leaf_fd = os.open(
+                    leaf_name,
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=payload_fd,
+                )
+                os.fchmod(leaf_fd, _LIFECYCLE_CGROUP_MODE_V27)
+                leaf_metadata = os.fstat(leaf_fd)
+                if (
+                    not stat.S_ISDIR(leaf_metadata.st_mode)
+                    or leaf_metadata.st_uid != self.controller_uid
+                    or leaf_metadata.st_gid != self.worker_gid
+                    or stat.S_IMODE(leaf_metadata.st_mode)
+                    != _LIFECYCLE_CGROUP_MODE_V27
+                ):
+                    raise ControllerProtocolError(
+                        "controller lifecycle cgroup owner/mode/type changed"
+                    )
+                for control in (
+                    "cgroup.procs", "cgroup.threads", "cgroup.subtree_control"
+                ):
+                    descriptor = os.open(
+                        control,
+                        os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=leaf_fd,
+                    )
+                    os.fchmod(descriptor, 0o660)
+                    metadata = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_uid != self.controller_uid
+                        or metadata.st_gid != self.worker_gid
+                        or stat.S_IMODE(metadata.st_mode) != 0o660
+                    ):
+                        os.close(descriptor)
+                        raise ControllerProtocolError(
+                            f"controller lifecycle {control} identity changed"
+                        )
+                    leaf_controls.append(descriptor)
+            except BaseException:
+                for descriptor in reversed(leaf_controls):
+                    os.close(descriptor)
+                if leaf_fd >= 0:
+                    os.close(leaf_fd)
+                raise
+            payload_relative = (
+                self.worker_relative.rsplit("/", 1)[0]
+                + "/" + self.payload_name + "/" + leaf_name
+            )
+            evidence = _place_persistent_worker_v27(
+                leaf_controls[0],
+                worker_pid=child_pid,
+                pidfd=pidfd,
+                start_time=child_start_time,
+                expected_relative=payload_relative,
+                proc_root=proc_root,
+            )
+            if select.select([supervisor_pidfd], [], [], 0)[0]:
+                raise ControllerProtocolError(
+                    "native supervisor terminated during lifecycle placement"
+                )
+            self.lifecycle_leaves[ordinal] = (leaf_fd, *leaf_controls)
+            return {
+                **evidence,
+                "supervisorPid": supervisor_pid,
+                "ordinal": ordinal,
+                "placementNonce": placement_nonce,
+            }
+        finally:
+            if supervisor_pidfd >= 0:
+                os.close(supervisor_pidfd)
+            os.close(pidfd)
+
+    def kill_and_wait(self) -> None:
+        _payload, _procs, _threads, _subtree, events, kill = self.owned_descriptors
+        try:
+            native_boundary_v27._write_all_v27(kill, b"1\n")
+        except OSError as exc:
+            raise ControllerProtocolError(
+                f"controller cannot kill the exact payload cgroup: {exc}"
+            ) from exc
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                observed = os.pread(events, 4096, 0)
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                raise ControllerProtocolError(
+                    f"controller cannot read payload cgroup.events: {exc}"
+                ) from exc
+            if b"populated 0\n" in observed:
+                return
+            time.sleep(0.02)
+        raise ControllerProtocolError(
+            "controller payload cgroup remained populated after cgroup.kill"
+        )
+
+    def drain(self, *, persist_intent: Any) -> dict[str, Any]:
+        self.kill_and_wait()
+        return _retire_lifecycle_cgroups_v27(
+            self.owned_descriptors[0],
+            controller_uid=self.controller_uid,
+            worker_uid=self.worker_uid,
+            worker_gid=self.worker_gid,
+            cgroup2_observer=self.cgroup2_observer,
+            cgroup_mode_observer=self.cgroup_mode_observer,
+            persist_intent=persist_intent,
+        )
+
+    def close(self, *, retire: bool) -> None:
+        for leaf_descriptors in reversed(tuple(self.lifecycle_leaves.values())):
+            for descriptor in reversed(leaf_descriptors):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        for descriptor in reversed(self.owned_descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if retire:
+            try:
+                os.rmdir(self.payload_name, dir_fd=self.supervisor_fd)
+            except OSError as exc:
+                raise ControllerProtocolError(
+                    f"controller cannot retire the exact payload cgroup: {exc}"
+                ) from exc
+
+
+def _pre_effect_descriptor_identity_v27(
+    descriptor: int, *, expected_type: str
+) -> dict[str, Any]:
+    metadata = os.fstat(descriptor)
+    observed_type = (
+        "directory"
+        if stat.S_ISDIR(metadata.st_mode)
+        else "file"
+        if stat.S_ISREG(metadata.st_mode)
+        else "unsupported"
+    )
+    if observed_type != expected_type or metadata.st_nlink < 1:
+        raise ControllerProtocolError(
+            "pre-effect cgroup descriptor type or link identity changed"
+        )
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+        "nlink": metadata.st_nlink,
+        "type": observed_type,
+        "accessMode": fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE,
+    }
+
+
+def _controller_pre_effect_empty_observation_v27(
+    custody: _ControllerCgroupCustodyV27,
+) -> dict[str, Any]:
+    """Prove a failed Popen left no child/effect in exact S/P/O custody."""
+
+    if custody.lifecycle_leaves:
+        raise ControllerProtocolError(
+            "pre-effect failure has a controller-tracked lifecycle child"
+        )
+    payload_fd, payload_procs, _threads, _subtree, events_fd, _kill = (
+        custody.owned_descriptors
+    )
+    names = tuple(sorted(os.listdir(payload_fd)))
+    child_directories: list[str] = []
+    for name in names:
+        metadata = os.stat(name, dir_fd=payload_fd, follow_symlinks=False)
+        if stat.S_ISDIR(metadata.st_mode):
+            child_directories.append(name)
+        elif not stat.S_ISREG(metadata.st_mode):
+            raise ControllerProtocolError(
+                "pre-effect payload cgroup contains a symlink or special entry"
+            )
+    if child_directories:
+        raise ControllerProtocolError(
+            "pre-effect payload cgroup contains an untracked child"
+        )
+    procs = os.pread(payload_procs, 4096, 0)
+    if len(procs) == 4096 or procs.strip():
+        raise ControllerProtocolError(
+            "pre-effect payload cgroup contains an internal process"
+        )
+    events_raw = os.pread(events_fd, 4096, 0)
+    try:
+        event_lines = events_raw.decode("ascii").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ControllerProtocolError(
+            "pre-effect payload cgroup.events is malformed"
+        ) from exc
+    events: dict[str, int] = {}
+    for line in event_lines:
+        fields = line.split(" ")
+        if (
+            len(fields) != 2
+            or fields[0] not in {"populated", "frozen"}
+            or fields[0] in events
+            or fields[1] not in {"0", "1"}
+        ):
+            raise ControllerProtocolError(
+                "pre-effect payload cgroup.events is malformed"
+            )
+        events[fields[0]] = int(fields[1])
+    if events.get("populated") != 0 or any(events.values()):
+        raise ControllerProtocolError("pre-effect payload cgroup is populated")
+    stat_fd = -1
+    try:
+        stat_fd = os.open(
+            "cgroup.stat",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=payload_fd,
+        )
+        stat_identity = _pre_effect_descriptor_identity_v27(
+            stat_fd, expected_type="file"
+        )
+        cgroup_stat = _decode_cgroup_stat_bytes_v27(
+            os.pread(stat_fd, 4096, 0)
+        )
+    except OSError as exc:
+        raise ControllerProtocolError(
+            f"cannot observe pre-effect payload cgroup.stat: {exc}"
+        ) from exc
+    finally:
+        if stat_fd >= 0:
+            os.close(stat_fd)
+    if cgroup_stat["nr_descendants"] != 0 or any(
+        value != 0
+        for key, value in cgroup_stat.items()
+        if key == "nr_dying_descendants" or key.startswith("nr_dying_subsys_")
+    ):
+        raise ControllerProtocolError(
+            "pre-effect payload cgroup has visible or dying descendants"
+        )
+    return {
+        "schemaVersion": 27,
+        "knownNoChild": True,
+        "S": _pre_effect_descriptor_identity_v27(
+            custody.supervisor_fd, expected_type="directory"
+        ),
+        "P": _pre_effect_descriptor_identity_v27(
+            payload_fd, expected_type="directory"
+        ),
+        "O": {
+            "operationId": custody.binding["operationId"],
+            "stageLocation": custody.binding["stageLocation"],
+            "stagePlanSha256": custody.binding["stagePlanSha256"],
+            "payloadName": custody.payload_name,
+            "payloadProcs": _pre_effect_descriptor_identity_v27(
+                payload_procs, expected_type="file"
+            ),
+            "cgroupStat": stat_identity,
+        },
+        "payloadEntries": list(names),
+        "events": events,
+        "cgroupStat": cgroup_stat,
+        "placementMask": 0,
+    }
+
+
+def _cgroup2_supervisor_observation_v27(descriptor: int) -> dict[str, Any]:
+    """Bind a supervisor dirfd to the Linux cgroup2 kernfs instance."""
+
+    metadata = os.fstat(descriptor)
+    buffer = (ctypes.c_byte * 256)()
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.fstatfs(descriptor, ctypes.byref(buffer)) != 0:
+        error = ctypes.get_errno()
+        raise ControllerProtocolError(
+            f"controller cannot prove cgroup2 supervisor filesystem: "
+            f"{os.strerror(error)}"
+        )
+    return {
+        "schemaVersion": 27,
+        "filesystemMagic": ctypes.c_long.from_buffer(buffer).value,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+        "type": "directory" if stat.S_ISDIR(metadata.st_mode) else "unsupported",
+    }
+
+
+def _prove_cgroup2_supervisor_fd_v27(
+    descriptor: int,
+    *,
+    observer: Any = None,
+) -> dict[str, Any]:
+    observation = (
+        _cgroup2_supervisor_observation_v27(descriptor)
+        if observer is None
+        else observer(descriptor)
+    )
+    metadata = os.fstat(descriptor)
+    expected = {
+        "schemaVersion": 27,
+        "filesystemMagic": _CGROUP2_SUPER_MAGIC_V27,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+        "type": "directory",
+    }
+    if observation != expected:
+        raise ControllerProtocolError(
+            "controller supervisor descriptor is not the exact cgroup2 kernfs directory"
+        )
+    return dict(expected)
+
+
+def _cgroup_entry_identity_v27(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_mode,
+        metadata.st_nlink,
+    )
+
+
+def _observed_cgroup_mode_v27(descriptor: int, observer: Any = None) -> int:
+    if observer is None:
+        return stat.S_IMODE(os.fstat(descriptor).st_mode)
+    value = observer(descriptor)
+    if type(value) is not int or value < 0 or value > 0o7777:
+        raise ControllerProtocolError("controller cgroup mode proof is invalid")
+    return value
+
+
+def _open_rebound_cgroup_interface_v27(parent_fd: int, name: str) -> None:
+    before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            getattr(os, "O_PATH", os.O_RDONLY)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        after = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(after.st_mode)
+            or _cgroup_entry_identity_v27(after)
+            != _cgroup_entry_identity_v27(before)
+        ):
+            raise ControllerProtocolError(
+                "controller cgroup interface changed before descriptor open"
+            )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _decode_cgroup_stat_bytes_v27(raw: bytes) -> dict[str, int]:
+    """Decode one bounded descriptor-read modern cgroup.stat payload."""
+
+    if len(raw) >= 4096 or not raw.endswith(b"\n"):
+        raise ControllerProtocolError("controller cgroup.stat is not bounded")
+    fields: dict[str, int] = {}
+    for line in raw.splitlines():
+        parts = line.split(b" ")
+        if len(parts) != 2:
+            raise ControllerProtocolError("controller cgroup.stat is malformed")
+        try:
+            key = parts[0].decode("ascii")
+            encoded_value = parts[1].decode("ascii")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ControllerProtocolError(
+                "controller cgroup.stat is malformed"
+            ) from exc
+        if not re.fullmatch(r"(?:0|[1-9][0-9]{0,19})", encoded_value):
+            raise ControllerProtocolError("controller cgroup.stat is malformed")
+        value = int(encoded_value, 10)
+        controller_name = None
+        for prefix in ("nr_subsys_", "nr_dying_subsys_"):
+            if key.startswith(prefix):
+                controller_name = key.removeprefix(prefix)
+                break
+        if (
+            key in fields
+            or value > (1 << 64) - 1
+            or (
+                key not in {"nr_descendants", "nr_dying_descendants"}
+                and (
+                    controller_name is None
+                    or not _CGROUP_STAT_CONTROLLER_V27.fullmatch(controller_name)
+                )
+            )
+        ):
+            raise ControllerProtocolError("controller cgroup.stat is malformed")
+        fields[key] = value
+    if not {"nr_descendants", "nr_dying_descendants"}.issubset(fields):
+        raise ControllerProtocolError("controller cgroup.stat is malformed")
+    live = {
+        key.removeprefix("nr_subsys_")
+        for key in fields
+        if key.startswith("nr_subsys_")
+    }
+    dying = {
+        key.removeprefix("nr_dying_subsys_")
+        for key in fields
+        if key.startswith("nr_dying_subsys_")
+    }
+    if live != dying:
+        raise ControllerProtocolError("controller cgroup.stat is malformed")
+    return fields
+
+
+def _read_cgroup_stat_v27(payload_fd: int) -> dict[str, int]:
+    """Read modern cgroup-v2 counters without assuming a controller set.
+
+    The kernel exposes zero or more per-controller counter pairs independently
+    of delegation enablement at this node.  Admission therefore binds a closed
+    controller-name grammar and requires every observed live counter to have
+    its dying-counter peer (and conversely), rather than guessing from
+    cgroup.controllers or cgroup.subtree_control.
+    """
+
+    descriptor = os.open(
+        "cgroup.stat",
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=payload_fd,
+    )
+    try:
+        raw = os.pread(descriptor, 4096, 0)
+    finally:
+        os.close(descriptor)
+    return _decode_cgroup_stat_bytes_v27(raw)
+
+
+def _cgroup_stat_matches_visible_v27(fields: Mapping[str, int], visible: int) -> bool:
+    return (
+        fields.get("nr_descendants") == visible
+        and all(
+            value == 0
+            for key, value in fields.items()
+            if key == "nr_dying_descendants"
+            or key.startswith("nr_dying_subsys_")
+        )
+    )
+
+
+def _split_cgroup_children_v27(
+    payload_fd: int,
+    *,
+    cgroup2_observer: Any,
+    expected_device: int,
+    worker_uid: int,
+    worker_gid: int,
+) -> dict[str, tuple[int, tuple[int, ...]]]:
+    """Open the closed Podman 5.4.1 split topology below one private P."""
+
+    opened: dict[str, tuple[int, tuple[int, ...]]] = {}
+    payload_names = 0
+    try:
+        for name in sorted(os.listdir(payload_fd), key=os.fsencode):
+            before = os.stat(name, dir_fd=payload_fd, follow_symlinks=False)
+            if stat.S_ISREG(before.st_mode):
+                _open_rebound_cgroup_interface_v27(payload_fd, name)
+                continue
+            if not stat.S_ISDIR(before.st_mode):
+                raise ControllerProtocolError(
+                    "controller split cgroup contains a symlink or special entry"
+                )
+            if name == "runtime":
+                expected_mode = _SPLIT_RUNTIME_MODE_V27
+            elif _SPLIT_PAYLOAD_NAME_V27.fullmatch(name):
+                payload_names += 1
+                expected_mode = _SPLIT_PAYLOAD_MODE_V27
+            else:
+                raise ControllerProtocolError(
+                    "controller split cgroup topology has an unexpected directory"
+                )
+            if name in opened or payload_names > 1 or len(opened) >= 2:
+                raise ControllerProtocolError(
+                    "controller split cgroup topology is duplicated"
+                )
+            descriptor = os.open(
+                name,
+                getattr(os, "O_PATH", os.O_RDONLY)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=payload_fd,
+            )
+            after = os.fstat(descriptor)
+            identity = _cgroup_entry_identity_v27(before)
+            if _cgroup_entry_identity_v27(after) != identity:
+                os.close(descriptor)
+                raise ControllerProtocolError(
+                    "controller split cgroup changed before descriptor open"
+                )
+            proof = _prove_cgroup2_supervisor_fd_v27(
+                descriptor, observer=cgroup2_observer
+            )
+            if (
+                proof["device"] != expected_device
+                or after.st_uid != worker_uid
+                or after.st_gid != worker_gid
+                or stat.S_IMODE(after.st_mode) != expected_mode
+            ):
+                os.close(descriptor)
+                raise ControllerProtocolError(
+                    "controller split cgroup owner/mode/filesystem changed"
+                )
+            opened[name] = (descriptor, identity)
+        return opened
+    except BaseException:
+        for descriptor, _identity in opened.values():
+            os.close(descriptor)
+        raise
+
+
+def _retire_split_cgroup_children_v27(
+    payload_fd: int,
+    *,
+    controller_uid: int,
+    worker_uid: int,
+    worker_gid: int,
+    cgroup2_observer: Any = None,
+    monotonic_clock: Any = None,
+    sleeper: Any = None,
+) -> None:
+    """Retire only the exact Podman split descendants after P is drained."""
+
+    root = _prove_cgroup2_supervisor_fd_v27(
+        payload_fd, observer=cgroup2_observer
+    )
+    root_metadata = os.fstat(payload_fd)
+    if (
+        root_metadata.st_uid != controller_uid
+        or root_metadata.st_gid != worker_gid
+        or stat.S_IMODE(root_metadata.st_mode) != _LIFECYCLE_CGROUP_MODE_V27
+    ):
+        raise ControllerProtocolError(
+            "controller payload cgroup owner/mode changed during recovery"
+        )
+    opened = _split_cgroup_children_v27(
+        payload_fd,
+        cgroup2_observer=cgroup2_observer,
+        expected_device=int(root["device"]),
+        worker_uid=worker_uid,
+        worker_gid=worker_gid,
+    )
+    initial_names = set(opened)
+    try:
+        initial_stat = _read_cgroup_stat_v27(payload_fd)
+        if initial_stat["nr_descendants"] != len(opened):
+            raise ControllerProtocolError(
+                "controller split cgroup descendant count changed"
+        )
+        for name in sorted(opened, key=os.fsencode, reverse=True):
+            descriptor, identity = opened[name]
+            os.close(descriptor)
+            opened[name] = (-1, identity)
+            for attempt in range(_CGROUP_RETIRE_RETRIES_V27):
+                try:
+                    os.rmdir(name, dir_fd=payload_fd)
+                    initial_names.remove(name)
+                    current = _split_cgroup_children_v27(
+                        payload_fd,
+                        cgroup2_observer=cgroup2_observer,
+                        expected_device=int(root["device"]),
+                        worker_uid=worker_uid,
+                        worker_gid=worker_gid,
+                    )
+                    try:
+                        current_stat = _read_cgroup_stat_v27(payload_fd)
+                        if (
+                            set(current) != initial_names
+                            or current_stat["nr_descendants"] != len(current)
+                        ):
+                            raise ControllerProtocolError(
+                                "controller split cgroup changed after retirement"
+                            )
+                    finally:
+                        for current_fd, _ in current.values():
+                            os.close(current_fd)
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EBUSY, errno.ENOTEMPTY}:
+                        raise ControllerProtocolError(
+                            f"controller cannot retire split cgroup {name}: {exc}"
+                        ) from exc
+                    current = _split_cgroup_children_v27(
+                        payload_fd,
+                        cgroup2_observer=cgroup2_observer,
+                        expected_device=int(root["device"]),
+                        worker_uid=worker_uid,
+                        worker_gid=worker_gid,
+                    )
+                    try:
+                        if set(current) != initial_names:
+                            raise ControllerProtocolError(
+                                "controller split cgroup changed during retirement"
+                            )
+                        if current[name][1] != identity:
+                            raise ControllerProtocolError(
+                                "controller split cgroup was replaced during retirement"
+                            )
+                        retry_stat = _read_cgroup_stat_v27(payload_fd)
+                        if retry_stat["nr_descendants"] != len(current):
+                            raise ControllerProtocolError(
+                                "controller split cgroup descendant count changed"
+                            )
+                    finally:
+                        for current_fd, _ in current.values():
+                            os.close(current_fd)
+                    if attempt + 1 == _CGROUP_RETIRE_RETRIES_V27:
+                        raise ControllerProtocolError(
+                            "controller split cgroup retirement timed out"
+                        ) from exc
+                    (sleeper or time.sleep)(0.02)
+        final = _split_cgroup_children_v27(
+            payload_fd,
+            cgroup2_observer=cgroup2_observer,
+            expected_device=int(root["device"]),
+            worker_uid=worker_uid,
+            worker_gid=worker_gid,
+        )
+        try:
+            final_stat = _read_cgroup_stat_v27(payload_fd)
+            if final or final_stat["nr_descendants"] != 0:
+                raise ControllerProtocolError(
+                    "controller split cgroup descendants remain after retirement"
+                )
+            # Dying CSS counters describe already-unlinked kernel objects and
+            # have no bounded lifetime.  Preserve their observation for the
+            # enclosing terminal receipt; correctness is instead the fresh
+            # zero-visible/zero-descendant proof followed by successful P rmdir.
+        finally:
+            for descriptor, _ in final.values():
+                os.close(descriptor)
+    finally:
+        for descriptor, _identity in opened.values():
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
+def _retire_lifecycle_cgroups_v27(
+    payload_fd: int,
+    *,
+    controller_uid: int,
+    worker_uid: int,
+    worker_gid: int,
+    cgroup2_observer: Any = None,
+    cgroup_mode_observer: Any = None,
+    retirement_intent: Mapping[str, Any] | None = None,
+    persist_intent: Any = None,
+    phase_hook: Any = None,
+) -> dict[str, Any]:
+    """Retire the closed Podman 5.4.1 lifecycle-leaf topology below P.
+
+    Source contract: the init command (L1) computes its OCI payload path from
+    L1 before CreateContainer moves Podman/conmon into sibling ``runtime``.
+    Thus only L1 may contain the exact runtime + libpod-payload sibling pair;
+    L0 and L2..L5 have no descendants.
+    """
+
+    root = _prove_cgroup2_supervisor_fd_v27(payload_fd, observer=cgroup2_observer)
+    root_metadata = os.fstat(payload_fd)
+    if (
+        root_metadata.st_uid != controller_uid
+        or root_metadata.st_gid != worker_gid
+        or _observed_cgroup_mode_v27(payload_fd, cgroup_mode_observer)
+        != _PAYLOAD_CGROUP_MODE_V27
+    ):
+        raise ControllerProtocolError(
+            "controller payload cgroup owner/mode changed during recovery"
+        )
+
+    def normalize_preparation_half_state(directory_fd: int) -> bool:
+        """Repair only an empty controller-created Li chmod crash prefix."""
+
+        directory = os.fstat(directory_fd)
+        mode = _observed_cgroup_mode_v27(
+            directory_fd, cgroup_mode_observer
+        )
+        controls: list[tuple[int, int]] = []
+        try:
+            for name in (
+                "cgroup.procs", "cgroup.threads", "cgroup.subtree_control"
+            ):
+                descriptor = os.open(
+                    name,
+                    os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+                metadata = os.fstat(descriptor)
+                control_mode = stat.S_IMODE(metadata.st_mode)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != controller_uid
+                    or metadata.st_gid != worker_gid
+                    or metadata.st_nlink != 1
+                    or control_mode not in {0o644, 0o660}
+                ):
+                    raise ControllerProtocolError(
+                        "controller lifecycle preparation control is substituted"
+                    )
+                controls.append((descriptor, control_mode))
+            incomplete = mode == (
+                _LIFECYCLE_CGROUP_MODE_V27 | stat.S_ISGID
+            ) or any(control_mode != 0o660 for _, control_mode in controls)
+            if not incomplete:
+                return False
+            if (
+                directory.st_uid != controller_uid
+                or directory.st_gid != worker_gid
+                or mode not in {
+                    _LIFECYCLE_CGROUP_MODE_V27,
+                    _LIFECYCLE_CGROUP_MODE_V27 | stat.S_ISGID,
+                }
+            ):
+                raise ControllerProtocolError(
+                    "controller lifecycle preparation directory is substituted"
+                )
+            for name in sorted(os.listdir(directory_fd), key=os.fsencode):
+                entry = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if stat.S_ISREG(entry.st_mode):
+                    _open_rebound_cgroup_interface_v27(directory_fd, name)
+                    continue
+                raise ControllerProtocolError(
+                    "controller lifecycle preparation half-state is not empty"
+                )
+            if os.pread(controls[0][0], 4096, 0).strip():
+                raise ControllerProtocolError(
+                    "controller lifecycle preparation half-state is populated"
+                )
+            fields = _read_cgroup_stat_v27(directory_fd)
+            if fields["nr_descendants"] != 0 or any(
+                value != 0
+                for key, value in fields.items()
+                if key == "nr_dying_descendants"
+                or key.startswith("nr_dying_subsys_")
+            ):
+                raise ControllerProtocolError(
+                    "controller lifecycle preparation half-state has descendants"
+                )
+            os.fchmod(directory_fd, _LIFECYCLE_CGROUP_MODE_V27)
+            for descriptor, _control_mode in controls:
+                os.fchmod(descriptor, 0o660)
+            if (
+                _observed_cgroup_mode_v27(
+                    directory_fd, cgroup_mode_observer
+                ) != _LIFECYCLE_CGROUP_MODE_V27
+                or any(
+                    stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o660
+                    for descriptor, _ in controls
+                )
+            ):
+                raise ControllerProtocolError(
+                    "controller lifecycle preparation half-state normalization failed"
+                )
+            return True
+        finally:
+            for descriptor, _mode in reversed(controls):
+                os.close(descriptor)
+
+    def directories(directory_fd: int) -> list[str]:
+        result: list[str] = []
+        for name in sorted(os.listdir(directory_fd), key=os.fsencode):
+            before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISREG(before.st_mode):
+                _open_rebound_cgroup_interface_v27(directory_fd, name)
+                continue
+            if not stat.S_ISDIR(before.st_mode):
+                raise ControllerProtocolError(
+                    "controller lifecycle cgroup contains a symlink or special entry"
+                )
+            result.append(name)
+        return result
+
+    def delegated_controls(directory_fd: int) -> tuple[str, ...]:
+        opened_controls: list[int] = []
+        try:
+            for name in (
+                "cgroup.procs", "cgroup.threads", "cgroup.subtree_control"
+            ):
+                descriptor = os.open(
+                    name,
+                    os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+                opened_controls.append(descriptor)
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != controller_uid
+                    or metadata.st_gid != worker_gid
+                    or stat.S_IMODE(metadata.st_mode) != 0o660
+                ):
+                    raise ControllerProtocolError(
+                        "controller lifecycle delegated control identity changed"
+                    )
+            return _read_cgroup_tokens_v27(
+                opened_controls[2], "lifecycle cgroup.subtree_control"
+            )
+        finally:
+            for descriptor in reversed(opened_controls):
+                os.close(descriptor)
+
+    leaf_names = directories(payload_fd)
+    ordinals: list[int] = []
+    for name in leaf_names:
+        match = re.fullmatch(r"lifecycle-([0-5])", name)
+        if match is None:
+            raise ControllerProtocolError(
+                "controller lifecycle cgroup topology is reordered or unexpected"
+            )
+        ordinals.append(int(match.group(1)))
+    mask = sum(1 << ordinal for ordinal in ordinals)
+    if len(ordinals) != len(set(ordinals)) or (
+        retirement_intent is None
+        and mask not in native_boundary_v27._LIFECYCLE_RECOVERY_MASKS_V27
+    ):
+        raise ControllerProtocolError(
+            "controller lifecycle cgroup topology is reordered or unexpected"
+        )
+    opened: list[int] = []
+    removal: list[tuple[int, str, tuple[int, ...]]] = []
+    expected_by_parent: dict[int, set[str]] = {payload_fd: set(leaf_names)}
+    visible = len(leaf_names)
+    init_controllers: tuple[str, ...] = ()
+    try:
+        for leaf_name, ordinal in zip(leaf_names, ordinals):
+            leaf_fd = os.open(
+                leaf_name,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=payload_fd,
+            )
+            opened.append(leaf_fd)
+            leaf = os.fstat(leaf_fd)
+            proof = _prove_cgroup2_supervisor_fd_v27(
+                leaf_fd, observer=cgroup2_observer
+            )
+            if (
+                proof["device"] != root["device"]
+                or leaf.st_uid != controller_uid
+                or leaf.st_gid != worker_gid
+            ):
+                raise ControllerProtocolError(
+                    "controller lifecycle cgroup owner/mode/filesystem changed"
+                )
+            normalize_preparation_half_state(leaf_fd)
+            if (
+                _observed_cgroup_mode_v27(leaf_fd, cgroup_mode_observer)
+                != _LIFECYCLE_CGROUP_MODE_V27
+            ):
+                raise ControllerProtocolError(
+                    "controller lifecycle cgroup owner/mode/filesystem changed"
+                )
+            enabled = delegated_controls(leaf_fd)
+            descendants = directories(leaf_fd)
+            expected_by_parent[leaf_fd] = set(descendants)
+            if ordinal != 1:
+                if descendants or enabled:
+                    raise ControllerProtocolError(
+                        "non-init lifecycle cgroup acquired split descendants"
+                    )
+                removal.append(
+                    (
+                        payload_fd,
+                        leaf_name,
+                        _cgroup_entry_identity_v27(
+                            os.stat(leaf_name, dir_fd=payload_fd, follow_symlinks=False)
+                        ),
+                    )
+                )
+                continue
+            split = _split_cgroup_children_v27(
+                leaf_fd,
+                cgroup2_observer=cgroup2_observer,
+                expected_device=int(root["device"]),
+                worker_uid=worker_uid,
+                worker_gid=worker_gid,
+            )
+            try:
+                init_controllers = tuple(enabled)
+                if split and set(enabled) != set(_DELEGATED_CONTROLLERS_V27):
+                    raise ControllerProtocolError(
+                        "init lifecycle controllers are not the exact enabled set"
+                    )
+                if not split and not set(enabled).issubset(
+                    _DELEGATED_CONTROLLERS_V27
+                ):
+                    raise ControllerProtocolError(
+                        "init lifecycle controllers contain an unexpected member"
+                    )
+                if set(split) != set(descendants):
+                    raise ControllerProtocolError(
+                        "init lifecycle split topology changed during admission"
+                    )
+                visible += len(split)
+                for name, (descriptor, _identity) in split.items():
+                    if directories(descriptor):
+                        raise ControllerProtocolError(
+                            "controller split child has an unexpected directory"
+                        )
+                    removal.append(
+                        (
+                            leaf_fd,
+                            name,
+                            _cgroup_entry_identity_v27(
+                                os.stat(name, dir_fd=leaf_fd, follow_symlinks=False)
+                            ),
+                        )
+                    )
+            finally:
+                for descriptor, _identity in split.values():
+                    os.close(descriptor)
+            leaf_identity = _cgroup_entry_identity_v27(
+                os.stat(leaf_name, dir_fd=payload_fd, follow_symlinks=False)
+            )
+            if descendants:
+                leaf_identity = (
+                    *leaf_identity[:-1], leaf_identity[-1] - len(descendants)
+                )
+            removal.append(
+                (
+                    payload_fd,
+                    leaf_name,
+                    leaf_identity,
+                )
+            )
+        observed_stat = _read_cgroup_stat_v27(payload_fd)
+        if observed_stat["nr_descendants"] != visible:
+            raise ControllerProtocolError(
+                "controller lifecycle cgroup descendant count changed"
+            )
+        parent_names = {
+            payload_fd: "payload",
+            **{
+                descriptor: "lifecycle-1"
+                for descriptor in expected_by_parent
+                if descriptor != payload_fd
+            },
+        }
+        current_plan = [
+            {
+                "parent": parent_names[parent_fd],
+                "name": name,
+                "identity": {
+                    "device": identity[0],
+                    "inode": identity[1],
+                    "uid": identity[2],
+                    "gid": identity[3],
+                    "mode": f"{stat.S_IMODE(identity[4]):04o}",
+                    "nlink": identity[5],
+                },
+            }
+            for parent_fd, name, identity in removal
+        ]
+        payload_identity = {
+            "device": root_metadata.st_dev,
+            "inode": root_metadata.st_ino,
+            "uid": root_metadata.st_uid,
+            "gid": root_metadata.st_gid,
+            "mode": f"{_observed_cgroup_mode_v27(payload_fd, cgroup_mode_observer):04o}",
+        }
+        if retirement_intent is None:
+            intent = native_boundary_v27._decode_controller_retirement_intent_v27(
+                {
+                    "schemaVersion": 27,
+                    "payloadIdentity": payload_identity,
+                    "placementMask": mask,
+                    "visibleDescendants": visible,
+                    "initControllers": list(init_controllers),
+                    "preRemovalCgroupStat": dict(observed_stat),
+                    "removalPlan": current_plan,
+                }
+            )
+        else:
+            intent = native_boundary_v27._decode_controller_retirement_intent_v27(
+                retirement_intent
+            )
+            if intent["payloadIdentity"] != payload_identity:
+                raise ControllerProtocolError(
+                    "controller retirement intent payload identity changed"
+                )
+            full_plan = intent["removalPlan"]
+            suffixes = [
+                index for index in range(len(full_plan) + 1)
+                if full_plan[index:] == current_plan
+            ]
+            if len(suffixes) != 1:
+                raise ControllerProtocolError(
+                    "controller retirement state is not an exact removal suffix"
+                )
+        if callable(persist_intent):
+            persist_intent(intent)
+        if callable(phase_hook):
+            phase_hook("retirement-intent-durable")
+        for removal_index, (parent_fd, name, identity) in enumerate(removal):
+            for attempt in range(_CGROUP_RETIRE_RETRIES_V27):
+                current_names = set(directories(parent_fd))
+                if current_names != expected_by_parent[parent_fd]:
+                    raise ControllerProtocolError(
+                        "controller lifecycle topology changed during retirement"
+                    )
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if _cgroup_entry_identity_v27(current) != identity:
+                    raise ControllerProtocolError(
+                        "controller lifecycle cgroup was replaced during retirement"
+                    )
+                try:
+                    os.rmdir(name, dir_fd=parent_fd)
+                except OSError as exc:
+                    if exc.errno not in {errno.EBUSY, errno.ENOTEMPTY}:
+                        raise
+                    if attempt + 1 == _CGROUP_RETIRE_RETRIES_V27:
+                        raise ControllerProtocolError(
+                            "controller lifecycle cgroup retirement timed out"
+                        ) from exc
+                    time.sleep(0.02)
+                    continue
+                expected_by_parent[parent_fd].remove(name)
+                if set(directories(parent_fd)) != expected_by_parent[parent_fd]:
+                    raise ControllerProtocolError(
+                        "controller lifecycle topology changed after retirement"
+                    )
+                if callable(phase_hook):
+                    phase_hook(
+                        f"retirement-remove-{removal_index}-"
+                        f"{parent_names[parent_fd]}-{name}"
+                    )
+                break
+        final_names = directories(payload_fd)
+        final_stat = _read_cgroup_stat_v27(payload_fd)
+        if final_names or final_stat["nr_descendants"] != 0:
+            raise ControllerProtocolError(
+                "controller lifecycle cgroup descendants remain after retirement"
+            )
+        return {
+            "schemaVersion": 27,
+            "visibleDescendants": intent["visibleDescendants"],
+            "placementMask": intent["placementMask"],
+            "initControllers": list(intent["initControllers"]),
+            "preRemovalCgroupStat": dict(intent["preRemovalCgroupStat"]),
+            "terminalCgroupStat": dict(final_stat),
+        }
+    except OSError as exc:
+        raise ControllerProtocolError(
+            f"controller cannot retire lifecycle cgroup topology: {exc}"
+        ) from exc
+    finally:
+        for descriptor in reversed(opened):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _p_only_recovery_envelope_v27(
+    *, kind: str, payload_name: str, payload_identity: Mapping[str, Any],
+    predecessor_sha256: str | None, body: Mapping[str, Any],
+    controller_key: bytes,
+) -> dict[str, Any]:
+    if kind not in {"custody", "intent", "receipt"}:
+        raise ControllerProtocolError("P-only recovery artifact kind changed")
+    artifact = {
+        "schemaVersion": 27,
+        "kind": "p-only-" + kind,
+        "payloadName": payload_name,
+        "payloadIdentity": dict(payload_identity),
+        "predecessorSha256": predecessor_sha256,
+        "body": dict(body),
+    }
+    domain = (
+        b"startup-factory/beads/v27/controller-p-only-recovery-"
+        + kind.encode("ascii") + b"\0"
+    )
+    return {
+        "artifact": artifact,
+        "controllerHmac": "hmac-sha256:" + hmac.new(
+            controller_key, domain + _canonical(artifact), hashlib.sha256
+        ).hexdigest(),
+    }
+
+
+def _verify_p_only_recovery_envelope_v27(
+    value: Any, *, kind: str, payload_name: str,
+    payload_identity: Mapping[str, Any], predecessor_sha256: str | None,
+    controller_key: bytes,
+) -> tuple[dict[str, Any], str]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"artifact", "controllerHmac"}
+        or not isinstance(value["artifact"], Mapping)
+    ):
+        raise ControllerProtocolError("P-only recovery envelope changed")
+    artifact = dict(value["artifact"])
+    domain = (
+        b"startup-factory/beads/v27/controller-p-only-recovery-"
+        + kind.encode("ascii") + b"\0"
+    )
+    expected = "hmac-sha256:" + hmac.new(
+        controller_key, domain + _canonical(artifact), hashlib.sha256
+    ).hexdigest()
+    if set(artifact) != {
+        "schemaVersion", "kind", "payloadName", "payloadIdentity",
+        "predecessorSha256", "body",
+    } or (
+        artifact["schemaVersion"] != 27
+        or artifact["kind"] != "p-only-" + kind
+        or artifact["payloadName"] != payload_name
+        or artifact["payloadIdentity"] != payload_identity
+        or artifact["predecessorSha256"] != predecessor_sha256
+        or not hmac.compare_digest(str(value["controllerHmac"]), expected)
+    ):
+        raise ControllerProtocolError("P-only recovery binding changed")
+    if kind == "custody":
+        candidate = artifact["body"]
+        if (
+            not isinstance(candidate, Mapping)
+            or set(candidate) != {"schemaVersion", "payloadIdentity"}
+            or candidate["schemaVersion"] != 27
+            or candidate["payloadIdentity"] != payload_identity
+        ):
+            raise ControllerProtocolError("P-only recovery custody changed")
+        body = {
+            "schemaVersion": 27,
+            "payloadIdentity": dict(payload_identity),
+        }
+    elif kind == "intent":
+        body = native_boundary_v27._decode_controller_retirement_intent_v27(
+            artifact["body"]
+        )
+    else:
+        candidate = artifact["body"]
+        if not isinstance(candidate, Mapping):
+            raise ControllerProtocolError("P-only recovery receipt changed")
+        body = native_boundary_v27._decode_controller_retirement_v27(
+            candidate, candidate.get("placementMask")
+        )
+    return body, _sha(_canonical(dict(value)))
+
+
+def _recover_p_only_payload_v27(
+    payload_fd: int,
+    *, payload_name: str, payload_identity: Mapping[str, Any],
+    controller_uid: int, worker_uid: int, worker_gid: int,
+    controller_key: bytes, recovery_journal_root: Path,
+    cgroup2_observer: Any = None, cgroup_mode_observer: Any = None,
+    phase_hook: Any = None,
+) -> dict[str, Any]:
+    """Retire a pre-arena P only through a controller-authenticated journal."""
+
+    parent_fd = os.open(
+        recovery_journal_root.parent,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        try:
+            os.mkdir(recovery_journal_root.name, 0o700, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except FileExistsError:
+            pass
+        root_fd = os.open(
+            recovery_journal_root.name,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+    finally:
+        os.close(parent_fd)
+    root_metadata = os.fstat(root_fd)
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != os.geteuid()
+        or root_metadata.st_gid != os.getegid()
+        or stat.S_IMODE(root_metadata.st_mode) != 0o700
+    ):
+        os.close(root_fd)
+        raise ControllerProtocolError("P-only recovery journal root changed")
+    journal_fd = kill = events = -1
+    try:
+        try:
+            os.mkdir(payload_name, 0o700, dir_fd=root_fd)
+            os.fsync(root_fd)
+        except FileExistsError:
+            pass
+        journal_fd = os.open(
+            payload_name,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_fd,
+        )
+        journal_metadata = os.fstat(journal_fd)
+        if (
+            not stat.S_ISDIR(journal_metadata.st_mode)
+            or journal_metadata.st_uid != os.geteuid()
+            or journal_metadata.st_gid != os.getegid()
+            or stat.S_IMODE(journal_metadata.st_mode) != 0o700
+        ):
+            raise ControllerProtocolError("P-only recovery journal changed")
+
+        def read(kind: str, predecessor: str | None):
+            filename = {
+                "custody": "controller-custody.json",
+                "intent": "controller-retirement.intent.json",
+                "receipt": "controller-retirement.json",
+            }[kind]
+            temporary_name = "." + filename + ".tmp"
+            final_metadata = temporary_metadata = None
+            temporary_descriptor = -1
+            try:
+                descriptor = os.open(
+                    filename,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=journal_fd,
+                )
+            except FileNotFoundError:
+                descriptor = -1
+            try:
+                temporary_descriptor = os.open(
+                    temporary_name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=journal_fd,
+                )
+            except FileNotFoundError:
+                temporary_descriptor = -1
+            if descriptor < 0 and temporary_descriptor < 0:
+                return None
+
+            def inspect(
+                descriptor: int, label: str, *, allow_incomplete: bool = False
+            ) -> tuple[bytes, os.stat_result]:
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != os.geteuid()
+                    or metadata.st_gid != os.getegid()
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                    or metadata.st_nlink not in {1, 2}
+                    or not (
+                        0 <= metadata.st_size <= MAX_MESSAGE_BYTES
+                        if allow_incomplete
+                        else 1 <= metadata.st_size <= MAX_MESSAGE_BYTES
+                    )
+                ):
+                    raise ControllerProtocolError(
+                        f"P-only recovery {label} identity changed"
+                    )
+                content = os.pread(descriptor, metadata.st_size + 1, 0)
+                if len(content) != metadata.st_size:
+                    raise ControllerProtocolError(
+                        f"P-only recovery {label} is truncated"
+                    )
+                return content, metadata
+
+            try:
+                if descriptor >= 0:
+                    raw, final_metadata = inspect(descriptor, "artifact")
+                else:
+                    raw, temporary_metadata = inspect(
+                        temporary_descriptor,
+                        "temporary artifact",
+                        allow_incomplete=True,
+                    )
+                if descriptor >= 0 and temporary_descriptor >= 0:
+                    temporary_raw, temporary_metadata = inspect(
+                        temporary_descriptor, "temporary artifact"
+                    )
+                    if (
+                        temporary_raw != raw
+                        or (temporary_metadata.st_dev, temporary_metadata.st_ino)
+                        != (final_metadata.st_dev, final_metadata.st_ino)
+                        or temporary_metadata.st_nlink != 2
+                        or final_metadata.st_nlink != 2
+                    ):
+                        raise ControllerProtocolError(
+                            "P-only recovery installed temporary changed"
+                        )
+            finally:
+                for item in (temporary_descriptor, descriptor):
+                    if item >= 0:
+                        os.close(item)
+            try:
+                value = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                if descriptor < 0 and temporary_metadata.st_nlink == 1:
+                    # A crash before/full-write prefix is not authority.  Its
+                    # bytes remain in place and the deterministic writer must
+                    # prove they are an exact prefix of the expected envelope
+                    # before any later destructive suffix can run.
+                    return None
+                raise ControllerProtocolError(
+                    "P-only recovery artifact is malformed"
+                ) from exc
+            if _canonical(value) != raw:
+                raise ControllerProtocolError(
+                    "P-only recovery artifact is noncanonical"
+                )
+            verified = _verify_p_only_recovery_envelope_v27(
+                value,
+                kind=kind,
+                payload_name=payload_name,
+                payload_identity=payload_identity,
+                predecessor_sha256=predecessor,
+                controller_key=controller_key,
+            )
+            if descriptor < 0:
+                try:
+                    os.link(
+                        temporary_name,
+                        filename,
+                        src_dir_fd=journal_fd,
+                        dst_dir_fd=journal_fd,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError as exc:
+                    raise ControllerProtocolError(
+                        "P-only recovery final appeared during temp promotion"
+                    ) from exc
+                os.unlink(temporary_name, dir_fd=journal_fd)
+                os.fsync(journal_fd)
+            elif temporary_metadata is not None:
+                os.unlink(temporary_name, dir_fd=journal_fd)
+                os.fsync(journal_fd)
+            return verified
+
+        custody_record = read("custody", None)
+        if custody_record is None:
+            custody_envelope = _p_only_recovery_envelope_v27(
+                kind="custody",
+                payload_name=payload_name,
+                payload_identity=payload_identity,
+                predecessor_sha256=None,
+                body={
+                    "schemaVersion": 27,
+                    "payloadIdentity": dict(payload_identity),
+                },
+                controller_key=controller_key,
+            )
+            native_boundary_v27._persist_atomic_retirement_artifact_v27(
+                journal_fd,
+                "controller-custody.json",
+                _canonical(custody_envelope),
+                owner_uid=os.geteuid(),
+                owner_gid=os.getegid(),
+                phase_hook=phase_hook,
+            )
+            custody_record = (
+                custody_envelope["artifact"]["body"],
+                _sha(_canonical(custody_envelope)),
+            )
+        custody_sha = custody_record[1]
+        intent_record = read("intent", custody_sha)
+        intent = None if intent_record is None else intent_record[0]
+        intent_sha = None if intent_record is None else intent_record[1]
+        receipt_record = read("receipt", intent_sha)
+        kill = os.open(
+            "cgroup.kill", os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=payload_fd,
+        )
+        events = os.open(
+            "cgroup.events", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=payload_fd,
+        )
+        native_boundary_v27._write_all_v27(kill, b"1\n")
+        if b"populated 0\n" not in os.pread(events, 4096, 0):
+            raise ControllerProtocolError("P-only recovery payload is populated")
+        if receipt_record is not None:
+            return receipt_record[0]
+
+        persisted_intent_sha = intent_sha
+        def persist_intent(value: Mapping[str, Any]) -> None:
+            nonlocal persisted_intent_sha
+            envelope = _p_only_recovery_envelope_v27(
+                kind="intent",
+                payload_name=payload_name,
+                payload_identity=payload_identity,
+                predecessor_sha256=custody_sha,
+                body=value,
+                controller_key=controller_key,
+            )
+            native_boundary_v27._persist_atomic_retirement_artifact_v27(
+                journal_fd,
+                "controller-retirement.intent.json",
+                _canonical(envelope),
+                owner_uid=os.geteuid(),
+                owner_gid=os.getegid(),
+                phase_hook=phase_hook,
+            )
+            persisted_intent_sha = _sha(_canonical(envelope))
+
+        retirement = _retire_lifecycle_cgroups_v27(
+            payload_fd,
+            controller_uid=controller_uid,
+            worker_uid=worker_uid,
+            worker_gid=worker_gid,
+            cgroup2_observer=cgroup2_observer,
+            cgroup_mode_observer=cgroup_mode_observer,
+            retirement_intent=intent,
+            persist_intent=persist_intent,
+            phase_hook=phase_hook,
+        )
+        if persisted_intent_sha is None:
+            raise ControllerProtocolError("P-only recovery intent was not durable")
+        receipt = {
+            **retirement,
+            "controllerTrackedPlacementMask": retirement["placementMask"],
+        }
+        envelope = _p_only_recovery_envelope_v27(
+            kind="receipt",
+            payload_name=payload_name,
+            payload_identity=payload_identity,
+            predecessor_sha256=persisted_intent_sha,
+            body=receipt,
+            controller_key=controller_key,
+        )
+        native_boundary_v27._persist_atomic_retirement_artifact_v27(
+            journal_fd,
+            "controller-retirement.json",
+            _canonical(envelope),
+            owner_uid=os.geteuid(),
+            owner_gid=os.getegid(),
+            phase_hook=phase_hook,
+        )
+        return receipt
+    finally:
+        for descriptor in (events, kill, journal_fd, root_fd):
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
+def _recover_controller_payload_cgroups_v27(
+    supervisor_fd: int,
+    *,
+    controller_uid: int,
+    worker_uid: int,
+    worker_gid: int,
+    cgroup2_observer: Any = None,
+    cgroup_mode_observer: Any = None,
+    result_runtime_root: Path | None = None,
+    controller_key: bytes | None = None,
+    recovery_journal_root: Path | None = None,
+    phase_hook: Any = None,
+) -> dict[str, dict[str, Any]]:
+    """Drain and retire only exact stale controller-owned payload children."""
+
+    _prove_cgroup2_supervisor_fd_v27(
+        supervisor_fd,
+        observer=cgroup2_observer,
+    )
+    if controller_key is None or not 32 <= len(controller_key) <= 4096:
+        raise ControllerProtocolError(
+            "cgroup recovery requires the controller-only authentication key"
+        )
+    try:
+        names = sorted(os.listdir(supervisor_fd), key=os.fsencode)
+    except OSError as exc:
+        raise ControllerProtocolError(
+            f"controller cannot enumerate cgroup recovery state: {exc}"
+        ) from exc
+    recovered: dict[str, dict[str, Any]] = {}
+    for name in names:
+        try:
+            metadata = os.stat(name, dir_fd=supervisor_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ControllerProtocolError(
+                f"controller cannot inspect cgroup recovery entry: {exc}"
+            ) from exc
+        if stat.S_ISREG(metadata.st_mode):
+            interface_fd = -1
+            try:
+                interface_fd = os.open(
+                    name,
+                    getattr(os, "O_PATH", os.O_RDONLY)
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=supervisor_fd,
+                )
+                rebound = os.fstat(interface_fd)
+                if (
+                    rebound.st_dev,
+                    rebound.st_ino,
+                    rebound.st_uid,
+                    rebound.st_gid,
+                    rebound.st_mode,
+                    rebound.st_nlink,
+                ) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_uid,
+                    metadata.st_gid,
+                    metadata.st_mode,
+                    metadata.st_nlink,
+                ):
+                    raise ControllerProtocolError(
+                        "controller cgroup interface changed before descriptor open"
+                    )
+            finally:
+                if interface_fd >= 0:
+                    os.close(interface_fd)
+            continue
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ControllerProtocolError(
+                "controller cgroup recovery found a symlink or special entry"
+            )
+        if name == "worker":
+            worker_fd = _open_recover_worker_cgroup_v27(
+                supervisor_fd,
+                metadata,
+                controller_uid=controller_uid,
+                worker_gid=worker_gid,
+                cgroup2_observer=cgroup2_observer,
+                cgroup_mode_observer=cgroup_mode_observer,
+            )
+            os.close(worker_fd)
+            continue
+        if (
+            not re.fullmatch(r"payload-[0-9a-f]{64}-s(?:[1-9]|[1-6][0-9]|7[0-7])-[0-9a-f]{16}", name)
+            or metadata.st_uid != controller_uid
+            or metadata.st_gid != worker_gid
+        ):
+            raise ControllerProtocolError(
+                "controller cgroup recovery found substituted payload state"
+            )
+        payload_fd = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=supervisor_fd,
+        )
+        kill = events = root_fd = result_fd = -1
+        try:
+            rebound = os.fstat(payload_fd)
+            if (
+                rebound.st_dev,
+                rebound.st_ino,
+                rebound.st_uid,
+                rebound.st_gid,
+                rebound.st_mode,
+            ) != (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_uid,
+                metadata.st_gid,
+                metadata.st_mode,
+            ):
+                raise ControllerProtocolError(
+                    "controller cgroup recovery payload changed before open"
+                )
+            payload_mode = _observed_cgroup_mode_v27(
+                payload_fd, cgroup_mode_observer
+            )
+            if payload_mode != _PAYLOAD_CGROUP_MODE_V27:
+                raise ControllerProtocolError(
+                    "controller cgroup recovery found substituted payload state"
+                )
+            payload_identity = {
+                "device": rebound.st_dev,
+                "gid": rebound.st_gid,
+                "inode": rebound.st_ino,
+                "mode": f"{payload_mode:04o}",
+                "uid": rebound.st_uid,
+            }
+            try:
+                root_fd, result_fd, stage_plan_sha256 = (
+                    _open_recovered_native_result_directory_v27(
+                        worker_uid=worker_uid,
+                        worker_gid=worker_gid,
+                        payload_name=name,
+                        runtime_root=result_runtime_root,
+                    )
+                )
+                arena, arena_record_sha256 = _read_recovered_result_arena_v27(
+                    result_fd,
+                    payload_name=name,
+                    stage_plan_sha256=stage_plan_sha256,
+                    worker_uid=worker_uid,
+                    worker_gid=worker_gid,
+                    controller_key=controller_key,
+                )
+            except ControllerProtocolError as exc:
+                if recovery_journal_root is None or not any(
+                    marker in str(exc)
+                    for marker in (
+                        "no durable native result root",
+                        "no durable native result candidate",
+                        "no controller-authenticated result arena",
+                    )
+                ):
+                    raise
+                for descriptor in (result_fd, root_fd):
+                    if descriptor >= 0:
+                        os.close(descriptor)
+                result_fd = root_fd = -1
+                retirement = _recover_p_only_payload_v27(
+                    payload_fd,
+                    payload_name=name,
+                    payload_identity=payload_identity,
+                    controller_uid=controller_uid,
+                    worker_uid=worker_uid,
+                    worker_gid=worker_gid,
+                    controller_key=controller_key,
+                    recovery_journal_root=recovery_journal_root,
+                    cgroup2_observer=cgroup2_observer,
+                    cgroup_mode_observer=cgroup_mode_observer,
+                    phase_hook=phase_hook,
+                )
+                for descriptor in (payload_fd,):
+                    if descriptor >= 0:
+                        os.close(descriptor)
+                payload_fd = -1
+                os.rmdir(name, dir_fd=supervisor_fd)
+                try:
+                    os.stat(name, dir_fd=supervisor_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise ControllerProtocolError(
+                        "P-only recovery payload still exists after retirement"
+                    )
+                if callable(phase_hook):
+                    phase_hook("p-only-retirement-payload-removed")
+                # P-only recovery cannot make a stage result eligible; retain
+                # its controller-authenticated journal solely as audit proof.
+                continue
+            plan_binding = arena["arena"]
+            intent_record = _read_recovered_retirement_artifact_v27(
+                result_fd,
+                "controller-retirement.intent.json",
+                "intent",
+                payload_name=name,
+                stage_plan_sha256=stage_plan_sha256,
+                worker_uid=worker_uid,
+                worker_gid=worker_gid,
+                controller_key=controller_key,
+                arena_record_sha256=arena_record_sha256,
+                predecessor_artifact_sha256=None,
+            )
+            intent = None if intent_record is None else intent_record[0]
+            intent_record_sha256 = (
+                None if intent_record is None else intent_record[1]
+            )
+            receipt_record = _read_recovered_retirement_artifact_v27(
+                result_fd,
+                "controller-retirement.json",
+                "receipt",
+                payload_name=name,
+                stage_plan_sha256=stage_plan_sha256,
+                worker_uid=worker_uid,
+                worker_gid=worker_gid,
+                controller_key=controller_key,
+                arena_record_sha256=arena_record_sha256,
+                predecessor_artifact_sha256=intent_record_sha256,
+            )
+            receipt = None if receipt_record is None else receipt_record[0]
+            kill = os.open(
+                "cgroup.kill",
+                os.O_WRONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=payload_fd,
+            )
+            events = os.open(
+                "cgroup.events",
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=payload_fd,
+            )
+            native_boundary_v27._write_all_v27(kill, b"1\n")
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if b"populated 0\n" in os.pread(events, 4096, 0):
+                    break
+                time.sleep(0.02)
+            else:
+                raise ControllerProtocolError(
+                    "controller cgroup recovery could not prove payload empty"
+                )
+            if receipt is not None:
+                if intent is None:
+                    raise ControllerProtocolError(
+                        "durable retirement receipt has no predecessor intent"
+                    )
+                if any(
+                    stat.S_ISDIR(
+                        os.stat(
+                            entry, dir_fd=payload_fd, follow_symlinks=False
+                        ).st_mode
+                    )
+                    for entry in os.listdir(payload_fd)
+                ) or _read_cgroup_stat_v27(payload_fd)["nr_descendants"] != 0:
+                    raise ControllerProtocolError(
+                        "durable retirement receipt precedes topology retirement"
+                    )
+                if (
+                    receipt["visibleDescendants"] != intent["visibleDescendants"]
+                    or receipt["placementMask"] != intent["placementMask"]
+                    or receipt["controllerTrackedPlacementMask"]
+                    != intent["placementMask"]
+                    or receipt["initControllers"] != intent["initControllers"]
+                    or receipt["preRemovalCgroupStat"]
+                    != intent["preRemovalCgroupStat"]
+                    or receipt["terminalCgroupStat"]["nr_descendants"] != 0
+                ):
+                    raise ControllerProtocolError(
+                        "durable retirement receipt differs from its intent"
+                    )
+                retirement = receipt
+            else:
+                persisted_intent_envelope: dict[str, Any] | None = None
+                persisted_intent_sha256 = intent_record_sha256
+
+                def persist_intent(value: Mapping[str, Any]) -> None:
+                    nonlocal persisted_intent_envelope, persisted_intent_sha256
+                    envelope = _controller_retirement_envelope_v27(
+                        kind="intent",
+                        plan=plan_binding,
+                        payload_name=name,
+                        payload_identity=value["payloadIdentity"],
+                        arena_record_sha256=arena_record_sha256,
+                        predecessor_artifact_sha256=None,
+                        body=value,
+                        controller_key=controller_key,
+                    )
+                    _persist_recovered_retirement_artifact_v27(
+                        result_fd,
+                        "controller-retirement.intent.json",
+                        envelope,
+                        payload_name=name,
+                        stage_plan_sha256=stage_plan_sha256,
+                        worker_uid=worker_uid,
+                        worker_gid=worker_gid,
+                        phase_hook=phase_hook,
+                    )
+                    persisted_intent_envelope = envelope
+                    persisted_intent_sha256 = _sha(_canonical(envelope))
+
+                retirement = _retire_lifecycle_cgroups_v27(
+                    payload_fd,
+                    controller_uid=controller_uid,
+                    worker_uid=worker_uid,
+                    worker_gid=worker_gid,
+                    cgroup2_observer=cgroup2_observer,
+                    cgroup_mode_observer=cgroup_mode_observer,
+                    retirement_intent=intent,
+                    persist_intent=persist_intent,
+                    phase_hook=phase_hook,
+                )
+                if persisted_intent_sha256 is None:
+                    raise ControllerProtocolError(
+                        "retirement receipt lacks a durable authenticated intent"
+                    )
+                receipt_body = {
+                    **retirement,
+                    "controllerTrackedPlacementMask": retirement["placementMask"],
+                }
+                receipt_envelope = _controller_retirement_envelope_v27(
+                    kind="receipt",
+                    plan=plan_binding,
+                    payload_name=name,
+                    payload_identity=persisted_intent_envelope[
+                        "artifact"
+                    ]["payloadIdentity"],
+                    arena_record_sha256=arena_record_sha256,
+                    predecessor_artifact_sha256=persisted_intent_sha256,
+                    body=receipt_body,
+                    controller_key=controller_key,
+                )
+                _persist_recovered_retirement_artifact_v27(
+                    result_fd,
+                    "controller-retirement.json",
+                    receipt_envelope,
+                    payload_name=name,
+                    stage_plan_sha256=stage_plan_sha256,
+                    worker_uid=worker_uid,
+                    worker_gid=worker_gid,
+                    phase_hook=phase_hook,
+                )
+                if callable(phase_hook):
+                    phase_hook("retirement-receipt-durable")
+                retirement = receipt_body
+        finally:
+            for descriptor in (kill, events, payload_fd, result_fd, root_fd):
+                if descriptor >= 0:
+                    os.close(descriptor)
+        try:
+            os.rmdir(name, dir_fd=supervisor_fd)
+        except OSError as exc:
+            raise ControllerProtocolError(
+                f"controller cannot retire recovered payload cgroup: {exc}"
+            ) from exc
+        if callable(phase_hook):
+            phase_hook("retirement-payload-removed")
+        try:
+            os.stat(name, dir_fd=supervisor_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ControllerProtocolError(
+                "controller payload cgroup still exists after retirement"
+            )
+        recovered[name] = retirement
+    return recovered
+
+
+def _open_recovered_native_result_directory_v27(
+    *,
+    worker_uid: int,
+    worker_gid: int,
+    payload_name: str,
+    runtime_root: Path | None = None,
+) -> tuple[int, int, str]:
+    """Root-open the unique worker result directory bound by the payload name."""
+
+    match = re.fullmatch(
+        r"payload-([0-9a-f]{64})-s([1-9]|[1-6][0-9]|7[0-7])-([0-9a-f]{16})",
+        payload_name,
+    )
+    if match is None:
+        raise ControllerProtocolError(
+            "recovered payload name cannot bind a durable retirement receipt"
+        )
+    root_path = runtime_root if runtime_root is not None else (
+        Path("/run/user") / str(worker_uid) / "startup-factory-beads-results"
+    )
+    try:
+        root_fd = os.open(
+            root_path,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except FileNotFoundError as exc:
+        raise ControllerProtocolError(
+            "recovered payload has no durable native result root"
+        ) from exc
+    result_fd = -1
+    try:
+        root = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(root.st_mode)
+            or root.st_uid != worker_uid
+            or root.st_gid != worker_gid
+            or stat.S_IMODE(root.st_mode) != 0o700
+        ):
+            raise ControllerProtocolError(
+                "recovered native result root identity changed"
+            )
+        prefix = f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+        candidates = [
+            name for name in os.listdir(root_fd)
+            if re.fullmatch(
+                re.escape(prefix) + r"[0-9a-f]{48}", name
+            )
+        ]
+        if len(candidates) > 1:
+            raise ControllerProtocolError(
+                "recovered payload has multiple durable native result candidates"
+            )
+        if not candidates:
+            raise ControllerProtocolError(
+                "recovered payload has no durable native result candidate"
+            )
+        result_fd = os.open(
+            candidates[0],
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_fd,
+        )
+        result = os.fstat(result_fd)
+        if (
+            not stat.S_ISDIR(result.st_mode)
+            or result.st_uid != worker_uid
+            or result.st_gid != worker_gid
+            or stat.S_IMODE(result.st_mode) != 0o700
+        ):
+            raise ControllerProtocolError(
+                "recovered native result directory identity changed"
+            )
+        stage_plan_sha256 = "sha256:" + candidates[0].rsplit("-", 1)[1]
+        return root_fd, result_fd, stage_plan_sha256
+    except BaseException:
+        if result_fd >= 0:
+            os.close(result_fd)
+        os.close(root_fd)
+        raise
+
+
+def _read_recovered_result_arena_v27(
+    result_fd: int,
+    *,
+    payload_name: str,
+    stage_plan_sha256: str,
+    worker_uid: int,
+    worker_gid: int,
+    controller_key: bytes,
+) -> tuple[dict[str, Any], str]:
+    descriptor = lock_fd = -1
+    try:
+        descriptor = os.open(
+            "arena.json",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=result_fd,
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != worker_uid
+            or metadata.st_gid != worker_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or not 1 <= metadata.st_size <= MAX_MESSAGE_BYTES
+        ):
+            raise ControllerProtocolError(
+                "controller-authenticated result arena identity changed"
+            )
+        raw = os.pread(descriptor, metadata.st_size + 1, 0)
+        if len(raw) != metadata.st_size:
+            raise ControllerProtocolError(
+                "controller-authenticated result arena is truncated"
+            )
+        value = json.loads(raw)
+        if _canonical(value) != raw:
+            raise ControllerProtocolError(
+                "controller-authenticated result arena is noncanonical"
+            )
+        verified = _verify_controller_result_arena_v27(
+            value,
+            controller_key,
+            payload_name=payload_name,
+            stage_plan_sha256=stage_plan_sha256,
+        )
+        arena = verified["arena"]
+        result_metadata = os.fstat(result_fd)
+        lock_fd = os.open(
+            "operation.lock",
+            os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=result_fd,
+        )
+        if (
+            arena["resultDirectory"]
+            != native_boundary_v27._retirement_payload_identity_v27(
+                {
+                    "device": result_metadata.st_dev,
+                    "gid": result_metadata.st_gid,
+                    "inode": result_metadata.st_ino,
+                    "mode": f"{stat.S_IMODE(result_metadata.st_mode):04o}",
+                    "uid": result_metadata.st_uid,
+                }
+            )
+            or arena["operationLock"]
+            != native_boundary_v27._operation_lock_projection_v27(
+                os.fstat(lock_fd)
+            )
+        ):
+            raise ControllerProtocolError(
+                "controller-authenticated result arena descriptor identity changed"
+            )
+        return verified, _sha(raw)
+    except FileNotFoundError as exc:
+        raise ControllerProtocolError(
+            "recovered payload has no controller-authenticated result arena"
+        ) from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ControllerProtocolError(
+            "controller-authenticated result arena is malformed"
+        ) from exc
+    finally:
+        for item in (lock_fd, descriptor):
+            if item >= 0:
+                os.close(item)
+
+
+def _read_recovered_retirement_artifact_v27(
+    result_fd: int,
+    filename: str,
+    kind: str,
+    *,
+    payload_name: str,
+    stage_plan_sha256: str,
+    worker_uid: int,
+    worker_gid: int,
+    controller_key: bytes,
+    arena_record_sha256: str,
+    predecessor_artifact_sha256: str | None,
+) -> tuple[dict[str, Any], str] | None:
+    descriptor = -1
+    try:
+        try:
+            descriptor = os.open(
+                filename,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=result_fd,
+            )
+        except FileNotFoundError:
+            return None
+        metadata = os.fstat(descriptor)
+        if metadata.st_nlink == 2:
+            temp_fd = -1
+            try:
+                temp_fd = os.open(
+                    "." + filename + ".tmp",
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=result_fd,
+                )
+                temporary = os.fstat(temp_fd)
+                if (
+                    temporary.st_dev,
+                    temporary.st_ino,
+                    temporary.st_nlink,
+                ) != (metadata.st_dev, metadata.st_ino, 2):
+                    raise ControllerProtocolError(
+                        "durable controller retirement install hardlink changed"
+                    )
+            finally:
+                if temp_fd >= 0:
+                    os.close(temp_fd)
+            os.unlink("." + filename + ".tmp", dir_fd=result_fd)
+            os.fsync(result_fd)
+            metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != worker_uid
+            or metadata.st_gid != worker_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or not 1 <= metadata.st_size <= MAX_MESSAGE_BYTES
+        ):
+            raise ControllerProtocolError(
+                "durable controller retirement artifact identity changed"
+            )
+        raw = os.pread(descriptor, metadata.st_size + 1, 0)
+        if len(raw) != metadata.st_size:
+            raise ControllerProtocolError(
+                "durable controller retirement artifact is truncated"
+            )
+        value = json.loads(raw)
+        if _canonical(value) != raw:
+            raise ControllerProtocolError(
+                "durable controller retirement artifact is noncanonical"
+            )
+        return _verify_controller_retirement_envelope_v27(
+            value,
+            kind=kind,
+            controller_key=controller_key,
+            payload_name=payload_name,
+            stage_plan_sha256=stage_plan_sha256,
+            arena_record_sha256=arena_record_sha256,
+            predecessor_artifact_sha256=predecessor_artifact_sha256,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ControllerProtocolError(
+            "durable controller retirement artifact is malformed"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _persist_recovered_retirement_artifact_v27(
+    result_fd: int,
+    filename: str,
+    raw_envelope: Mapping[str, Any],
+    *,
+    payload_name: str,
+    stage_plan_sha256: str,
+    worker_uid: int,
+    worker_gid: int,
+    phase_hook: Any = None,
+) -> None:
+    raw = _canonical(dict(raw_envelope))
+    try:
+        native_boundary_v27._persist_atomic_retirement_artifact_v27(
+            result_fd,
+            filename,
+            raw,
+            owner_uid=worker_uid,
+            owner_gid=worker_gid,
+            phase_hook=phase_hook,
+        )
+    except native_boundary_v27.NativeBoundaryV27Error as exc:
+        raise ControllerProtocolError(str(exc)) from exc
+
+
+def _normalize_worker_cgroup_owner_v27(
+    descriptor: int,
+    metadata: os.stat_result,
+    *,
+    controller_uid: int,
+    worker_gid: int,
+    cgroup_mode_observer: Any = None,
+) -> os.stat_result:
+    """Complete only the exact root-created W ownership crash prefix."""
+
+    mode = _observed_cgroup_mode_v27(descriptor, cgroup_mode_observer)
+    if metadata.st_gid != worker_gid or metadata.st_uid not in {0, controller_uid}:
+        raise ControllerProtocolError(
+            "controller cgroup recovery found substituted worker state"
+        )
+    if metadata.st_uid == 0:
+        if mode not in {
+            _WORKER_CGROUP_MODE_V27,
+            _WORKER_CGROUP_MODE_V27 | stat.S_ISGID,
+        } or os.geteuid() != 0:
+            raise ControllerProtocolError(
+                "controller root-created worker cgroup half-state is unsafe"
+            )
+        os.fchown(descriptor, controller_uid, worker_gid)
+        os.fchmod(descriptor, _WORKER_CGROUP_MODE_V27)
+    elif mode == _WORKER_CGROUP_MODE_V27 | stat.S_ISGID:
+        os.fchmod(descriptor, _WORKER_CGROUP_MODE_V27)
+    elif mode != _WORKER_CGROUP_MODE_V27:
+        raise ControllerProtocolError(
+            "controller cgroup recovery found substituted worker state"
+        )
+    final = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(final.st_mode)
+        or final.st_uid != controller_uid
+        or final.st_gid != worker_gid
+        or _observed_cgroup_mode_v27(descriptor, cgroup_mode_observer)
+        != _WORKER_CGROUP_MODE_V27
+    ):
+        raise ControllerProtocolError(
+            "controller worker cgroup ownership normalization failed"
+        )
+    return final
+
+
+def _open_recover_worker_cgroup_v27(
+    supervisor_fd: int,
+    before: os.stat_result,
+    *,
+    controller_uid: int,
+    worker_gid: int,
+    cgroup2_observer: Any = None,
+    cgroup_mode_observer: Any = None,
+) -> int:
+    """Open, empty-proof, and normalize the fixed W leaf without following."""
+
+    descriptor = -1
+    procs = -1
+    try:
+        if not stat.S_ISDIR(before.st_mode):
+            raise ControllerProtocolError(
+                "controller cgroup recovery found substituted worker state"
+            )
+        descriptor = os.open(
+            "worker",
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=supervisor_fd,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            stat.S_IFMT(opened.st_mode),
+        ) != (
+            before.st_dev,
+            before.st_ino,
+            stat.S_IFMT(before.st_mode),
+        ):
+            raise ControllerProtocolError(
+                "controller worker cgroup changed before descriptor open"
+            )
+        root = _prove_cgroup2_supervisor_fd_v27(
+            supervisor_fd, observer=cgroup2_observer
+        )
+        worker = _prove_cgroup2_supervisor_fd_v27(
+            descriptor, observer=cgroup2_observer
+        )
+        if worker["device"] != root["device"]:
+            raise ControllerProtocolError(
+                "controller worker cgroup filesystem changed"
+            )
+        for name in sorted(os.listdir(descriptor), key=os.fsencode):
+            entry = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISREG(entry.st_mode):
+                _open_rebound_cgroup_interface_v27(descriptor, name)
+                continue
+            raise ControllerProtocolError(
+                "controller worker cgroup contains a child or special entry"
+            )
+        procs = os.open(
+            "cgroup.procs",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=descriptor,
+        )
+        if os.pread(procs, 4096, 0).strip():
+            raise ControllerProtocolError(
+                "controller worker cgroup half-state is populated"
+            )
+        fields = _read_cgroup_stat_v27(descriptor)
+        if fields["nr_descendants"] != 0 or any(
+            value != 0
+            for name, value in fields.items()
+            if name == "nr_dying_descendants"
+            or name.startswith("nr_dying_subsys_")
+        ):
+            raise ControllerProtocolError(
+                "controller worker cgroup half-state has descendants"
+            )
+        final = _normalize_worker_cgroup_owner_v27(
+            descriptor,
+            opened,
+            controller_uid=controller_uid,
+            worker_gid=worker_gid,
+            cgroup_mode_observer=cgroup_mode_observer,
+        )
+        rebound = os.stat("worker", dir_fd=supervisor_fd, follow_symlinks=False)
+        if (
+            rebound.st_dev,
+            rebound.st_ino,
+            rebound.st_uid,
+            rebound.st_gid,
+            stat.S_IMODE(rebound.st_mode),
+        ) != (
+            final.st_dev,
+            final.st_ino,
+            final.st_uid,
+            final.st_gid,
+            stat.S_IMODE(final.st_mode),
+        ):
+            raise ControllerProtocolError(
+                "controller worker cgroup changed during ownership normalization"
+            )
+        os.close(procs)
+        procs = -1
+        return descriptor
+    except BaseException:
+        if procs >= 0:
+            os.close(procs)
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def _create_controller_cgroup_custody_v27(
+    supervisor_fd: int,
+    supervisor_process_fd: int,
+    worker_fd: int,
+    worker_relative: str,
+    plan: Mapping[str, Any],
+    *,
+    controller_uid: int,
+    worker_uid: int,
+    worker_gid: int,
+    worker_pid: int,
+    worker_session_nonce: str,
+    cgroup_mode_observer: Any = None,
+) -> _ControllerCgroupCustodyV27:
+    """Create one controller-owned payload cgroup and pin all control files."""
+
+    name = _payload_cgroup_name_v27(plan)
+    supervisor_metadata = os.fstat(supervisor_fd)
+    if (
+        not stat.S_ISDIR(supervisor_metadata.st_mode)
+        or supervisor_metadata.st_uid != controller_uid
+        or supervisor_metadata.st_gid != worker_gid
+        or _observed_cgroup_mode_v27(supervisor_fd, cgroup_mode_observer)
+        != _SUPERVISOR_CGROUP_MODE_V27
+    ):
+        raise ControllerProtocolError(
+            "controller supervisor cgroup owner/mode/type changed"
+        )
+    try:
+        # The setgid half-state is intentional write-ahead evidence: a crash
+        # after mkdir but before the final fchmod is recoverable only while the
+        # cgroup is still provably empty and has no descendants.
+        os.mkdir(name, _PAYLOAD_CGROUP_MODE_V27 | stat.S_ISGID, dir_fd=supervisor_fd)
+        payload_fd = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=supervisor_fd,
+        )
+    except OSError as exc:
+        raise ControllerProtocolError(
+            f"controller cannot create the exact payload cgroup: {exc}"
+        ) from exc
+    descriptors: list[int] = [payload_fd]
+    try:
+        payload_metadata = os.fstat(payload_fd)
+        os.fchmod(payload_fd, _PAYLOAD_CGROUP_MODE_V27)
+        payload_metadata = os.fstat(payload_fd)
+        if (
+            not stat.S_ISDIR(payload_metadata.st_mode)
+            or payload_metadata.st_uid != controller_uid
+            or payload_metadata.st_gid != worker_gid
+            or _observed_cgroup_mode_v27(payload_fd, cgroup_mode_observer)
+            != _PAYLOAD_CGROUP_MODE_V27
+            or payload_metadata.st_nlink < 2
+        ):
+            raise ControllerProtocolError(
+                "controller payload cgroup owner/mode/type changed"
+            )
+        _enable_exact_subtree_controllers_v27(payload_fd)
+        for control, flags, expected_mode in (
+            ("cgroup.procs", os.O_RDWR, 0o600),
+            ("cgroup.threads", os.O_RDONLY, 0o400),
+            ("cgroup.subtree_control", os.O_RDONLY, 0o400),
+            ("cgroup.events", os.O_RDONLY, 0o400),
+            ("cgroup.kill", os.O_WRONLY, 0o200),
+        ):
+            descriptor = os.open(
+                control,
+                flags
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=payload_fd,
+            )
+            os.fchmod(descriptor, expected_mode)
+            control_metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(control_metadata.st_mode)
+                or control_metadata.st_uid != controller_uid
+                or control_metadata.st_gid != worker_gid
+                or stat.S_IMODE(control_metadata.st_mode) != expected_mode
+                or control_metadata.st_nlink != 1
+            ):
+                os.close(descriptor)
+                raise ControllerProtocolError(
+                    f"controller payload {control} identity changed"
+                )
+            descriptors.append(descriptor)
+        transfer = (worker_fd, descriptors[0], descriptors[4], descriptors[5])
+        bindings = [
+            _cgroup_descriptor_binding_v27(role, descriptor)
+            for role, descriptor in zip(_WORKER_CGROUP_ROLES_V27, transfer)
+        ]
+        if [item["type"] for item in bindings] != [
+            "directory", "directory", "file", "file"
+        ] or len({(item["device"], item["inode"]) for item in bindings}) != 4:
+            raise ControllerProtocolError(
+                "controller payload cgroup descriptor topology changed"
+            )
+        binding = {
+            "schemaVersion": 27,
+            "workerSessionNonce": worker_session_nonce,
+            "workerPid": worker_pid,
+            "operationId": plan["operationId"],
+            "stageLocation": plan["stageLocation"],
+            "stagePlanSha256": plan["stagePlanSha256"],
+            "payloadName": name,
+            "transferNonce": secrets.token_hex(32),
+            "workerCgroupRelative": worker_relative,
+            "descriptors": bindings,
+        }
+        return _ControllerCgroupCustodyV27(
+            supervisor_fd,
+            supervisor_process_fd,
+            worker_fd,
+            worker_relative,
+            name,
+            binding,
+            (
+                descriptors[0], descriptors[1], descriptors[2],
+                descriptors[3], descriptors[4], descriptors[5],
+            ),
+            controller_uid,
+            worker_uid,
+            worker_gid,
+            None,
+            cgroup_mode_observer,
+        )
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            os.rmdir(name, dir_fd=supervisor_fd)
+        except OSError:
+            pass
+        raise
+
+
+def _validate_worker_cgroup_transfer_v27(
+    binding: Any,
+    descriptors: tuple[int, ...],
+    plan: Mapping[str, Any],
+    *,
+    worker_session_nonce: str,
+    consumed_nonces: set[str],
+    process_cgroup_reader: Any = None,
+    process_start_time_reader: Any = None,
+) -> dict[str, Any]:
+    fields = {
+        "schemaVersion", "workerSessionNonce", "workerPid", "operationId",
+        "stageLocation", "stagePlanSha256", "payloadName", "transferNonce",
+        "workerCgroupRelative", "descriptors",
+    }
+    if not isinstance(binding, dict) or set(binding) != fields:
+        raise ControllerProtocolError("native cgroup transfer binding is not closed")
+    if (
+        binding["schemaVersion"] != 27
+        or binding["workerSessionNonce"] != worker_session_nonce
+        or binding["workerPid"] != os.getpid()
+        or binding["operationId"] != plan["operationId"]
+        or binding["stageLocation"] != plan["stageLocation"]
+        or binding["stagePlanSha256"] != plan["stagePlanSha256"]
+        or binding["payloadName"] != _payload_cgroup_name_v27(plan)
+        or not isinstance(binding["workerCgroupRelative"], str)
+        or Path(binding["workerCgroupRelative"]).name != "worker"
+        or not isinstance(binding["transferNonce"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", binding["transferNonce"])
+        or binding["transferNonce"] in consumed_nonces
+        or len(descriptors) != len(_WORKER_CGROUP_ROLES_V27)
+        or not isinstance(binding["descriptors"], list)
+        or len(binding["descriptors"]) != len(descriptors)
+    ):
+        raise ControllerProtocolError("native cgroup transfer identity changed")
+    observed = [
+        _cgroup_descriptor_binding_v27(role, descriptor)
+        for role, descriptor in zip(_WORKER_CGROUP_ROLES_V27, descriptors)
+    ]
+    if observed != binding["descriptors"] or [item["type"] for item in observed] != [
+        "directory", "directory", "file", "file"
+    ]:
+        raise ControllerProtocolError("native cgroup transfer descriptors changed")
+    reader = (
+        (lambda: (Path("/proc") / str(os.getpid()) / "cgroup").read_bytes())
+        if process_cgroup_reader is None
+        else process_cgroup_reader
+    )
+    relative = native_boundary_v27._unified_cgroup_relative_v27(reader())
+    if relative != binding["workerCgroupRelative"]:
+        raise ControllerProtocolError(
+            "native worker is outside the exact controller-issued worker cgroup"
+        )
+    consumed_nonces.add(binding["transferNonce"])
+    return {"binding": dict(binding), "descriptors": tuple(descriptors)}
+
+
 def _set_worker_parent_death_v27(parent_pid: int) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
@@ -1204,16 +5001,246 @@ def _close_worker_inherited_descriptors_v27(retained: int) -> None:
                 pass
 
 
+def _decode_mountinfo_path_v27(value: str) -> str:
+    """Decode only the kernel mountinfo octal escape grammar."""
+
+    output: list[str] = []
+    index = 0
+    while index < len(value):
+        if value[index] != "\\":
+            output.append(value[index])
+            index += 1
+            continue
+        if index + 3 >= len(value) or not all(
+            "0" <= item <= "7" for item in value[index + 1:index + 4]
+        ):
+            raise ControllerProtocolError(
+                "native repository release mountinfo escape changed"
+            )
+        output.append(chr(int(value[index + 1:index + 4], 8)))
+        index += 4
+    decoded = "".join(output)
+    if "\0" in decoded:
+        raise ControllerProtocolError(
+            "native repository release mountinfo contains NUL"
+        )
+    return decoded
+
+
+def _parse_mountinfo_v27(raw: bytes) -> list[dict[str, Any]]:
+    if not raw or len(raw) > _WORKER_STATUS_MAX_BYTES_V27 * 16:
+        raise ControllerProtocolError(
+            "native repository release mountinfo is empty or oversized"
+        )
+    try:
+        text = raw.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        raise ControllerProtocolError(
+            "native repository release mountinfo is not UTF-8"
+        ) from exc
+    if not text.endswith("\n"):
+        raise ControllerProtocolError(
+            "native repository release mountinfo is truncated"
+        )
+    result: list[dict[str, Any]] = []
+    for line in text[:-1].split("\n"):
+        left, separator, right = line.partition(" - ")
+        left_fields = left.split(" ")
+        right_fields = right.split(" ")
+        if (
+            separator != " - "
+            or len(left_fields) < 6
+            or len(right_fields) != 3
+            or not left_fields[0].isdigit()
+            or not left_fields[1].isdigit()
+            or re.fullmatch(r"[0-9]+:[0-9]+", left_fields[2]) is None
+        ):
+            raise ControllerProtocolError(
+                "native repository release mountinfo grammar changed"
+            )
+        result.append(
+            {
+                "mountId": int(left_fields[0]),
+                "parentId": int(left_fields[1]),
+                "majorMinor": left_fields[2],
+                "root": _decode_mountinfo_path_v27(left_fields[3]),
+                "mountPoint": _decode_mountinfo_path_v27(left_fields[4]),
+                "mountOptions": left_fields[5],
+                "optionalFields": left_fields[6:],
+                "fsType": right_fields[0],
+                "mountSource": _decode_mountinfo_path_v27(right_fields[1]),
+                "superOptions": right_fields[2],
+            }
+        )
+        if len(result) > 8192:
+            raise ControllerProtocolError(
+                "native repository release mountinfo exceeds the fixed bound"
+            )
+    return result
+
+
+def _path_within_v27(candidate: str, root: str) -> bool:
+    if not candidate.startswith("/") or os.path.normpath(candidate) != candidate:
+        return False
+    try:
+        return os.path.commonpath((candidate, root)) == root
+    except ValueError:
+        return False
+
+
+def _worker_repository_release_probe_v27(
+    plan: Mapping[str, Any],
+    request_key: bytes,
+    *,
+    worker_session_nonce: str,
+    probe_nonce: str,
+    post_manifest: Mapping[str, Any],
+    consumed_nonces: set[str] | None = None,
+    descriptor_names: Any = None,
+    descriptor_stat: Any = None,
+    descriptor_target: Any = None,
+    mountinfo_reader: Any = None,
+) -> dict[str, Any]:
+    custody = native_boundary_v27.validate_repository_custody_binding_v27(
+        plan.get("repositoryCustody"),
+        repository_path=str(plan.get("repositoryPath")),
+    )
+    if (
+        not isinstance(worker_session_nonce, str)
+        or re.fullmatch(r"[0-9a-f]{64}", worker_session_nonce) is None
+        or not isinstance(probe_nonce, str)
+        or re.fullmatch(r"[0-9a-f]{64}", probe_nonce) is None
+        or len(request_key) != 32
+    ):
+        raise ControllerProtocolError(
+            "native repository release probe identity changed"
+        )
+    if consumed_nonces is not None:
+        if probe_nonce in consumed_nonces:
+            raise ControllerProtocolError(
+                "native repository release probe nonce was replayed"
+            )
+        consumed_nonces.add(probe_nonce)
+    post_candidate = dict(custody)
+    post_candidate["manifest"] = dict(post_manifest)
+    post_candidate["manifestSha256"] = post_manifest.get("manifestSha256")
+    post_candidate["bindingSha256"] = native_boundary_v27.sha256(
+        native_boundary_v27._REPOSITORY_CUSTODY_BINDING_DOMAIN_V27
+        + native_boundary_v27.canonical_bytes(
+            {
+                key: item
+                for key, item in post_candidate.items()
+                if key != "bindingSha256"
+            }
+        )
+    )
+    post = native_boundary_v27.validate_repository_custody_binding_v27(
+        post_candidate, repository_path=str(plan.get("repositoryPath"))
+    )
+    names_reader = (
+        (lambda: os.listdir("/proc/self/fd"))
+        if descriptor_names is None
+        else descriptor_names
+    )
+    stat_reader = os.fstat if descriptor_stat is None else descriptor_stat
+    target_reader = (
+        (lambda descriptor: os.readlink(f"/proc/self/fd/{descriptor}"))
+        if descriptor_target is None
+        else descriptor_target
+    )
+    identities: dict[tuple[int, int], list[str]] = {}
+    for source, manifest in (
+        ("pre", custody["manifest"]), ("post", post["manifest"])
+    ):
+        for item in manifest["entries"]:
+            identities.setdefault(
+                (int(item["device"]), int(item["inode"])), []
+            ).append(f"{source}:{item['relativePath']}")
+    inventory: list[dict[str, Any]] = []
+    matches: list[dict[str, Any]] = []
+    for name in sorted(names_reader(), key=lambda item: int(item)):
+        if not isinstance(name, str) or not name.isdigit():
+            raise ControllerProtocolError(
+                "native repository release fd inventory changed"
+            )
+        descriptor = int(name)
+        try:
+            observed = stat_reader(descriptor)
+            target = target_reader(descriptor)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            if exc.errno == errno.EBADF:
+                continue
+            raise ControllerProtocolError(
+                f"native repository release fd inspection failed: {exc}"
+            ) from exc
+        item = {
+            "fd": descriptor,
+            "device": observed.st_dev,
+            "inode": observed.st_ino,
+            "fileType": stat.S_IFMT(observed.st_mode),
+            "target": target,
+        }
+        inventory.append(item)
+        relative_paths = identities.get((observed.st_dev, observed.st_ino), [])
+        if relative_paths:
+            matches.append({**item, "relativePaths": relative_paths})
+    mount_reader = (
+        (lambda: Path("/proc/self/mountinfo").read_bytes())
+        if mountinfo_reader is None
+        else mountinfo_reader
+    )
+    mounts = _parse_mountinfo_v27(mount_reader())
+    leaf_path = str(custody["leafPath"])
+    mount_matches = [
+        item
+        for item in mounts
+        if any(
+            _path_within_v27(str(item[field]), leaf_path)
+            for field in ("root", "mountPoint", "mountSource")
+        )
+    ]
+    body = {
+        "schemaVersion": 27,
+        "operationId": plan["operationId"],
+        "stageLocation": plan["stageLocation"],
+        "stagePlanSha256": plan["stagePlanSha256"],
+        "workerSessionNonce": worker_session_nonce,
+        "grantWorkerSessionNonce": custody["workerSessionNonce"],
+        "probeNonce": probe_nonce,
+        "repositoryBindingSha256": custody["bindingSha256"],
+        "repositoryManifestSha256": custody["manifestSha256"],
+        "postRepositoryManifestSha256": post["manifestSha256"],
+        "descriptorCount": len(inventory),
+        "descriptorInventorySha256": _sha(_canonical(inventory)),
+        "descriptorMatches": matches,
+        "mountCount": len(mounts),
+        "mountInfoSha256": _sha(_canonical(mounts)),
+        "mountMatches": mount_matches,
+    }
+    body["releaseHmac"] = "hmac-sha256:" + hmac.new(
+        request_key,
+        _REPOSITORY_CUSTODY_RELEASE_DOMAIN_V27 + _canonical(body),
+        hashlib.sha256,
+    ).hexdigest()
+    return body
+
+
 def _worker_main_v27(
     channel: socket.socket,
     config: ControllerConfig,
     manifest: native_boundary_v27.NativeBoundaryManifestV27,
     parent_pid: int,
+    worker_session_nonce: str,
 ) -> None:
     os.setsid()
-    _set_worker_parent_death_v27(parent_pid)
     _close_worker_inherited_descriptors_v27(channel.fileno())
     _drop_to_worker_identity_v27(config)
+    # setuid clears PR_SET_PDEATHSIG.  Bind it only after final credentials,
+    # then close the parent-race by checking getppid immediately.
+    _set_worker_parent_death_v27(parent_pid)
+    _verify_worker_result_root_label_v27(config)
     _verify_native_platform_gate(
         manifest, expected_worker_uid=config.worker_uid
     )
@@ -1225,48 +5252,703 @@ def _worker_main_v27(
                 "status": "ready",
                 "workerPid": os.getpid(),
                 "workerUid": os.geteuid(),
+                "workerSessionNonce": worker_session_nonce,
             }
         )
     )
+    consumed_cgroup_nonces: set[str] = set()
+    consumed_repository_probe_nonces: set[str] = set()
     while True:
-        packet = channel.recv(MAX_MESSAGE_BYTES + 1)
-        if not packet or len(packet) > MAX_MESSAGE_BYTES:
-            raise ControllerProtocolError("native worker request is empty or oversized")
-        request = _worker_packet_v27(packet, "native worker request")
-        if set(request) != {"schemaVersion", "protocol", "action", "plan"} or (
-            request["schemaVersion"], request["protocol"]
-        ) != (27, _WORKER_PROTOCOL):
-            raise ControllerProtocolError("native worker request shape is invalid")
-        if request["action"] == "STOP" and request["plan"] is None:
-            return
-        if request["action"] != "EXECUTE":
-            raise ControllerProtocolError("native worker action is invalid")
-        _assert_worker_dac_isolation_v27(config)
-        _verify_native_platform_gate(
-            manifest, expected_worker_uid=config.worker_uid
+        packet, received_descriptors = _recv_worker_execute_packet_v27(
+            channel,
+            expected_pid=parent_pid,
+            expected_uid=config.controller_uid,
+            expected_gid=config.transport_gid,
         )
-        plan = native_boundary_v27.validate_supervised_effect_plan_v27(
-            request["plan"], manifest
+        try:
+            request = _worker_packet_v27(packet, "native worker request")
+            if set(request) != {
+                "schemaVersion", "protocol", "action", "plan", "cgroupBinding",
+                "retirementArtifact",
+            } or (request["schemaVersion"], request["protocol"]) != (
+                27, _WORKER_PROTOCOL
+            ):
+                raise ControllerProtocolError(
+                    "native worker request shape is invalid"
+                )
+            if (
+                request["action"] == "STOP"
+                and request["plan"] is None
+                and request["cgroupBinding"] is None
+                and request["retirementArtifact"] is None
+                and not received_descriptors
+            ):
+                return
+            if request["action"] != "EXECUTE":
+                if request["action"] not in {
+                    "PREPARE", "ACK-ARENA", "RECOVER", "PERSIST-RETIREMENT",
+                    "PROBE-REPOSITORY-RELEASE",
+                }:
+                    raise ControllerProtocolError("native worker action is invalid")
+            _assert_worker_dac_isolation_v27(config)
+            _verify_worker_result_root_label_v27(config)
+            _verify_native_platform_gate(
+                manifest, expected_worker_uid=config.worker_uid
+            )
+            plan = native_boundary_v27.validate_native_stage_action_plan_v27(
+                request["plan"], manifest
+            )
+            if request["action"] == "PROBE-REPOSITORY-RELEASE":
+                artifact = request["retirementArtifact"]
+                probe_nonce = (
+                    artifact.get("value", {}).get("probeNonce")
+                    if isinstance(artifact, Mapping)
+                    and isinstance(artifact.get("value"), Mapping)
+                    else None
+                )
+                if (
+                    request["cgroupBinding"] is not None
+                    or len(received_descriptors) != 1
+                    or not isinstance(artifact, Mapping)
+                    or set(artifact) != {"kind", "value"}
+                    or artifact["kind"] != "repository-release-probe"
+                    or not isinstance(artifact["value"], Mapping)
+                    or set(artifact["value"]) != {"probeNonce", "postManifest"}
+                    or not isinstance(artifact["value"].get("postManifest"), Mapping)
+                    or probe_nonce in consumed_repository_probe_nonces
+                ):
+                    raise ControllerProtocolError(
+                        "native repository release probe custody changed"
+                    )
+                request_key = (
+                    native_boundary_v27.consume_sealed_request_key_descriptor_v27(
+                        received_descriptors[0], plan["requestKeyId"]
+                    )
+                )
+                receipt = _worker_repository_release_probe_v27(
+                    plan,
+                    request_key,
+                    worker_session_nonce=worker_session_nonce,
+                    probe_nonce=str(artifact["value"]["probeNonce"]),
+                    post_manifest=artifact["value"]["postManifest"],
+                    consumed_nonces=consumed_repository_probe_nonces,
+                )
+                channel.sendall(
+                    _canonical(
+                        {
+                            "schemaVersion": 27,
+                            "protocol": _WORKER_PROTOCOL,
+                            "status": "repository-release-proved",
+                            "stagePlanSha256": plan["stagePlanSha256"],
+                            "releaseReceipt": receipt,
+                        }
+                    )
+                )
+                continue
+            if request["action"] == "PREPARE":
+                if (
+                    request["cgroupBinding"] is not None
+                    or request["retirementArtifact"] is not None
+                    or len(received_descriptors) != 1
+                ):
+                    raise ControllerProtocolError(
+                        "native result-arena preparation custody changed"
+                    )
+                request_key = native_boundary_v27.consume_sealed_request_key_descriptor_v27(
+                    received_descriptors[0], plan["requestKeyId"]
+                )
+                preparation = native_boundary_v27.prepare_native_stage_result_arena_v27(
+                    manifest, plan, request_key
+                )
+                channel.sendall(
+                    _canonical(
+                        {
+                            "schemaVersion": 27,
+                            "protocol": _WORKER_PROTOCOL,
+                            "status": "result-arena-prepared",
+                            "stagePlanSha256": plan["stagePlanSha256"],
+                            "arenaPreparation": preparation,
+                        }
+                    )
+                )
+                continue
+            if request["action"] == "ACK-ARENA":
+                if (
+                    request["cgroupBinding"] is not None
+                    or len(received_descriptors) != 0
+                    or not isinstance(request["retirementArtifact"], Mapping)
+                    or set(request["retirementArtifact"]) != {"kind", "value"}
+                    or request["retirementArtifact"]["kind"] != "arena"
+                ):
+                    raise ControllerProtocolError(
+                        "native result-arena ACK custody changed"
+                    )
+                arena_sha256 = native_boundary_v27.persist_controller_result_arena_v27(
+                    manifest, plan, request["retirementArtifact"]["value"]
+                )
+                channel.sendall(
+                    _canonical(
+                        {
+                            "schemaVersion": 27,
+                            "protocol": _WORKER_PROTOCOL,
+                            "status": "result-arena-durable",
+                            "stagePlanSha256": plan["stagePlanSha256"],
+                            "arenaRecordSha256": arena_sha256,
+                        }
+                    )
+                )
+                continue
+            if request["action"] == "PERSIST-RETIREMENT":
+                if request["cgroupBinding"] is not None or received_descriptors:
+                    raise ControllerProtocolError(
+                        "native retirement persistence descriptor custody changed"
+                    )
+                artifact = request["retirementArtifact"]
+                if not isinstance(artifact, Mapping) or set(artifact) != {
+                    "kind", "value"
+                }:
+                    raise ControllerProtocolError(
+                        "native retirement artifact request changed"
+                    )
+                native_boundary_v27.persist_controller_retirement_artifact_v27(
+                    manifest, plan, artifact["kind"], artifact["value"]
+                )
+                artifact_sha256 = native_boundary_v27.sha256(
+                    native_boundary_v27.canonical_bytes(dict(artifact))
+                )
+                channel.sendall(
+                    _canonical(
+                        {
+                            "schemaVersion": 27,
+                            "protocol": _WORKER_PROTOCOL,
+                            "status": "retirement-artifact-durable",
+                            "stagePlanSha256": plan["stagePlanSha256"],
+                            "artifactKind": artifact["kind"],
+                            "artifactSha256": artifact_sha256,
+                        }
+                    )
+                )
+                continue
+            if request["action"] == "RECOVER":
+                if (
+                    request["cgroupBinding"] is not None
+                    or request["retirementArtifact"] is not None
+                    or len(received_descriptors) != 1
+                ):
+                    raise ControllerProtocolError(
+                        "native worker recovery descriptor custody changed"
+                    )
+                request_key = native_boundary_v27.consume_sealed_request_key_descriptor_v27(
+                    received_descriptors[0], plan["requestKeyId"]
+                )
+                result = native_boundary_v27.recover_durable_native_stage_result_v27(
+                    manifest, plan, request_key
+                )
+                channel.sendall(
+                    _worker_recovery_packet_v27(
+                        plan["stagePlanSha256"], result
+                    )
+                )
+                continue
+            if len(received_descriptors) != len(_WORKER_CGROUP_ROLES_V27) + 1:
+                raise ControllerProtocolError(
+                    "native worker execution descriptor custody changed"
+                )
+            if request["retirementArtifact"] is not None:
+                raise ControllerProtocolError(
+                    "native worker execution carried a retirement artifact"
+                )
+            request_key = native_boundary_v27.consume_sealed_request_key_descriptor_v27(
+                received_descriptors[-1], plan["requestKeyId"]
+            )
+            custody = _validate_worker_cgroup_transfer_v27(
+                request["cgroupBinding"],
+                received_descriptors[:-1],
+                plan,
+                worker_session_nonce=worker_session_nonce,
+                consumed_nonces=consumed_cgroup_nonces,
+            )
+            def placement_mediator(request_value: Mapping[str, Any]) -> Mapping[str, Any]:
+                request_fields = {
+                    "supervisorPid", "childPid", "childStartTime", "ordinal",
+                    "placementNonce",
+                }
+                if not isinstance(request_value, Mapping) or set(request_value) != request_fields:
+                    raise ControllerProtocolError(
+                        "native supervisor placement request shape changed"
+                    )
+                packet_value = {
+                    "schemaVersion": 27,
+                    "protocol": _WORKER_PROTOCOL,
+                    "status": "placement-request",
+                    "stagePlanSha256": plan["stagePlanSha256"],
+                    **dict(request_value),
+                }
+                encoded = _canonical(packet_value)
+                if channel.send(encoded) != len(encoded):
+                    raise ControllerProtocolError(
+                        "native placement request forwarding was truncated"
+                    )
+                response_packet = _recv_credentialed_packet_v27(
+                    channel,
+                    expected_pid=parent_pid,
+                    expected_uid=config.controller_uid,
+                    expected_gid=config.transport_gid,
+                    label="native lifecycle placement authorization",
+                )
+                response = _worker_packet_v27(
+                    response_packet, "native lifecycle placement authorization"
+                )
+                if set(response) != {
+                    "schemaVersion", "protocol", "status", "stagePlanSha256",
+                    "placement",
+                } or (
+                    response["schemaVersion"], response["protocol"],
+                    response["status"], response["stagePlanSha256"],
+                ) != (
+                    27, _WORKER_PROTOCOL, "placement-authorized",
+                    plan["stagePlanSha256"],
+                ) or not isinstance(response["placement"], Mapping):
+                    raise ControllerProtocolError(
+                        "native lifecycle placement authorization identity changed"
+                    )
+                return response["placement"]
+            native_result_offer: dict[str, Any] | None = None
+
+            def result_offer_mediator(
+                request_value: Mapping[str, Any]
+            ) -> Mapping[str, Any]:
+                nonlocal native_result_offer
+                fields = {
+                    "schemaVersion", "protocol", "status",
+                    "stagePlanSha256", "nativeResultSha256", "resultKind",
+                    "resultPredecessorKind", "failureEvidenceSha256",
+                    "placementMask",
+                }
+                if (
+                    native_result_offer is not None
+                    or not isinstance(request_value, Mapping)
+                    or set(request_value) != fields
+                    or request_value.get("schemaVersion") != 27
+                    or request_value.get("protocol") != _WORKER_PROTOCOL
+                    or request_value.get("status") != "result-offer"
+                    or request_value.get("stagePlanSha256")
+                    != plan["stagePlanSha256"]
+                ):
+                    raise ControllerProtocolError(
+                        "native result offer request identity changed"
+                    )
+                packet_value = dict(request_value)
+                packet_value["offerHmac"] = "hmac-sha256:" + hmac.new(
+                    request_key,
+                    _WORKER_RESULT_OFFER_DOMAIN_V27
+                    + _canonical(dict(request_value)),
+                    hashlib.sha256,
+                ).hexdigest()
+                encoded = _canonical(packet_value)
+                if channel.send(encoded) != len(encoded):
+                    raise ControllerProtocolError(
+                        "native result offer forwarding was truncated"
+                    )
+                response = _worker_packet_v27(
+                    _recv_credentialed_packet_v27(
+                        channel,
+                        expected_pid=parent_pid,
+                        expected_uid=config.controller_uid,
+                        expected_gid=config.transport_gid,
+                        label="native result-offer authorization",
+                    ),
+                    "native result-offer authorization",
+                )
+                expected_fields = {
+                    "schemaVersion", "protocol", "action", "stagePlanSha256",
+                    "nativeResultSha256", "authorizationRecordSha256", "ackHmac",
+                }
+                ack_body = {
+                    key: response.get(key)
+                    for key in expected_fields
+                    if key != "ackHmac"
+                }
+                expected_ack = "hmac-sha256:" + hmac.new(
+                    request_key,
+                    _WORKER_RESULT_OFFER_ACK_DOMAIN_V27 + _canonical(ack_body),
+                    hashlib.sha256,
+                ).hexdigest()
+                if (
+                    set(response) != expected_fields
+                    or response.get("schemaVersion") != 27
+                    or response.get("protocol") != _WORKER_PROTOCOL
+                    or response.get("action") != "ACK-RESULT-OFFER"
+                    or response.get("stagePlanSha256")
+                    != plan["stagePlanSha256"]
+                    or response.get("nativeResultSha256")
+                    != request_value["nativeResultSha256"]
+                    or not isinstance(
+                        response.get("authorizationRecordSha256"), str
+                    )
+                    or not _DIGEST.fullmatch(
+                        response["authorizationRecordSha256"]
+                    )
+                    or not hmac.compare_digest(
+                        str(response.get("ackHmac")), expected_ack
+                    )
+                ):
+                    raise ControllerProtocolError(
+                        "native result offer authorization changed"
+                    )
+                native_result_offer = dict(request_value)
+                return response
+
+            def event_mediator(request_value: Mapping[str, Any]) -> Mapping[str, Any]:
+                event_fields = {
+                    "schemaVersion", "stagePlanSha256", "sequence", "event",
+                    "phase", "eventObservation", "eventEvidenceSha256",
+                }
+                if (
+                    not isinstance(request_value, Mapping)
+                    or set(request_value) != event_fields
+                    or request_value.get("schemaVersion") != 27
+                    or request_value.get("stagePlanSha256")
+                    != plan["stagePlanSha256"]
+                ):
+                    raise ControllerProtocolError(
+                        "native supervisor event request shape changed"
+                    )
+                try:
+                    event_observation = (
+                        native_boundary_v27._validate_native_event_observation_v27(
+                            request_value["event"],
+                            request_value["phase"],
+                            request_value["eventObservation"],
+                        )
+                    )
+                except native_boundary_v27.NativeBoundaryV27Error as exc:
+                    raise ControllerProtocolError(str(exc)) from exc
+                if request_value["eventEvidenceSha256"] != (
+                    native_boundary_v27._native_event_evidence_v27(
+                        stage_plan_sha256=plan["stagePlanSha256"],
+                        sequence=request_value["sequence"],
+                        event=request_value["event"],
+                        phase=request_value["phase"],
+                        observation=event_observation,
+                    )
+                ):
+                    raise ControllerProtocolError(
+                        "native event evidence does not bind its closed observation"
+                    )
+                event_body = dict(request_value)
+                packet_value = {
+                    **event_body,
+                    "protocol": _WORKER_PROTOCOL,
+                    "status": "native-event",
+                    "eventHmac": native_boundary_v27._native_event_hmac_v27(
+                        request_key, event_body
+                    ),
+                }
+                encoded = _canonical(packet_value)
+                if channel.send(encoded) != len(encoded):
+                    raise ControllerProtocolError(
+                        "native event forwarding was truncated"
+                    )
+                response_packet = _recv_credentialed_packet_v27(
+                    channel,
+                    expected_pid=parent_pid,
+                    expected_uid=config.controller_uid,
+                    expected_gid=config.transport_gid,
+                    label="native event authorization",
+                )
+                response = _worker_packet_v27(
+                    response_packet, "native event authorization"
+                )
+                response_fields = {
+                    "schemaVersion", "protocol", "status",
+                    "stagePlanSha256", "sequence", "event", "phase",
+                    "authorityRecordSha256", "controlAction",
+                    "controlAuthorityRecordSha256", "creatorCaptureBinding",
+                    "ackHmac",
+                }
+                if set(response) != response_fields or (
+                    response["schemaVersion"], response["protocol"],
+                    response["status"], response["stagePlanSha256"],
+                    response["sequence"], response["event"],
+                    response["phase"],
+                ) != (
+                    27, _WORKER_PROTOCOL, "native-event-authorized",
+                    plan["stagePlanSha256"], event_body["sequence"],
+                    event_body["event"], event_body["phase"],
+                ):
+                    raise ControllerProtocolError(
+                        "native event authorization identity changed"
+                    )
+                ack_body = {
+                    key: response[key]
+                    for key in (
+                        "schemaVersion", "stagePlanSha256", "sequence",
+                        "event", "phase", "authorityRecordSha256",
+                        "controlAction", "controlAuthorityRecordSha256",
+                        "creatorCaptureBinding",
+                    )
+                }
+                capture_binding = response["creatorCaptureBinding"]
+                expected_capture_binding = (
+                    request_value["event"] == "creator-return-ready"
+                    and request_value["phase"] == "before"
+                )
+                if expected_capture_binding:
+                    if (
+                        not isinstance(capture_binding, Mapping)
+                        or set(capture_binding) != {
+                            "capturePreparationRecordSha256",
+                            "returnAuthorizationRecordSha256",
+                            "creatorReturnCurrentRecordSha256",
+                        }
+                        or not all(
+                            isinstance(item, str) and _DIGEST.fullmatch(item)
+                            for item in capture_binding.values()
+                        )
+                    ):
+                        raise ControllerProtocolError(
+                            "native creator capture authority changed"
+                        )
+                elif capture_binding is not None:
+                    raise ControllerProtocolError(
+                        "native event carried unexpected creator capture authority"
+                    )
+                if (
+                    response["controlAction"] not in {"continue", "revoke"}
+                    or (
+                        response["controlAction"] == "continue"
+                        and response["controlAuthorityRecordSha256"] is not None
+                    )
+                    or (
+                        response["controlAction"] == "revoke"
+                        and (
+                            not isinstance(
+                                response["controlAuthorityRecordSha256"], str
+                            )
+                            or not native_boundary_v27._DIGEST.fullmatch(
+                                response["controlAuthorityRecordSha256"]
+                            )
+                        )
+                    )
+                ):
+                    raise ControllerProtocolError(
+                        "native event control authorization changed"
+                    )
+                if not hmac.compare_digest(
+                    response["ackHmac"],
+                    native_boundary_v27._native_event_ack_hmac_v27(
+                        request_key, ack_body
+                    ),
+                ):
+                    raise ControllerProtocolError(
+                        "native event authorization HMAC changed"
+                    )
+                return response
+            token = native_boundary_v27._NATIVE_REQUEST_KEY_V27.set(request_key)
+            try:
+                try:
+                    result = native_boundary_v27.run_native_stage_action_v27(
+                        manifest,
+                        plan,
+                        cgroup_custody=custody,
+                        placement_mediator=placement_mediator,
+                        event_mediator=event_mediator,
+                        result_offer_mediator=result_offer_mediator,
+                    )
+                except native_boundary_v27._NativeLaunchPreEffectFailedV27 as exc:
+                    if exc.classification is None:
+                        raise ControllerProtocolError(
+                            "native launch pre-effect failure lacks Popen classification"
+                        ) from exc
+                    channel.sendall(
+                        _worker_pre_effect_failure_packet_v27(
+                            plan["stagePlanSha256"],
+                            evidence_sha256=exc.evidence_sha256,
+                            classification=exc.classification,
+                            request_key=request_key,
+                        )
+                    )
+                    continue
+                except native_boundary_v27._NativeLaunchUnresolvedV27 as exc:
+                    channel.sendall(
+                        _worker_launch_unresolved_packet_v27(
+                            plan["stagePlanSha256"],
+                            exc.recovered,
+                            request_key,
+                        )
+                    )
+                    continue
+            finally:
+                native_boundary_v27._NATIVE_REQUEST_KEY_V27.reset(token)
+            observation = native_boundary_v27._decode_native_stage_result_v27(
+                result, require_discriminants=True
+            )
+            if (
+                native_result_offer is None
+                or _sha(_canonical(observation))
+                != native_result_offer["nativeResultSha256"]
+                or result["resultKind"] != native_result_offer["resultKind"]
+                or result["resultPredecessorKind"]
+                != native_result_offer["resultPredecessorKind"]
+                or result["failureEvidenceSha256"]
+                != native_result_offer["failureEvidenceSha256"]
+                or result["placementMask"]
+                != native_result_offer["placementMask"]
+            ):
+                raise ControllerProtocolError(
+                    "native result differs from its supervisor-authorized offer"
+                )
+            channel.sendall(
+                _worker_result_packet_v27(plan["stagePlanSha256"], result)
+            )
+        finally:
+            for descriptor in received_descriptors:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def _mediate_native_event_authority_v27(
+    candidate: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    event_handler: Any,
+    *,
+    revocation_observation: Mapping[str, Any] | None,
+    revoke_delivered: bool,
+) -> tuple[str, str, str | None, bool]:
+    """Authorize one genuine supervisor event and an optional pre-effect revoke.
+
+    A disable may branch only after the creator-created receipt or in place of
+    the release-consumed `before` event.  The RevokeDecision CAS is therefore
+    installed before the authenticated command reaches the supervisor.  Once
+    the signal-attempt gate is reached, no verified-no-effect result is legal.
+    """
+
+    if not callable(event_handler):
+        raise ControllerProtocolError(
+            "native event arrived without a current authority handler"
         )
-        result = native_boundary_v27.run_native_supervisor_v27(manifest, plan)
-        channel.sendall(_worker_result_packet_v27(plan["planSha256"], result))
+    event = candidate["event"]
+    phase = candidate["phase"]
+    denied_pre_release = (
+        revocation_observation is not None
+        and not revoke_delivered
+        and phase == "before"
+        and event == "release-consumed-current"
+    )
+    if (
+        revocation_observation is not None
+        and not revoke_delivered
+        and event in {
+            "signal-attempt-consumed",
+            "release-issued",
+            "release-known-live",
+            "release-terminal",
+            "creator-return-ready",
+            "creator-lifetime-closed",
+        }
+    ):
+        raise ControllerProtocolError(
+            "operator disable crossed the no-effect revoke cutoff"
+        )
+    authority_record = None if denied_pre_release else event_handler(
+        event,
+        phase,
+        candidate["eventEvidenceSha256"],
+        candidate["eventObservation"],
+    )
+    control_action = "continue"
+    control_authority = None
+    completed_creator_gate = (
+        event == "native-creator-created" and phase == "after"
+    )
+    if (
+        revocation_observation is not None
+        and not revoke_delivered
+        and (completed_creator_gate or denied_pre_release)
+    ):
+        revoke_evidence = native_boundary_v27.sha256(
+            b"startup-factory/beads/v27/operator-revoke-decision\0"
+            + native_boundary_v27.canonical_bytes(
+                {
+                    "stagePlanSha256": plan["stagePlanSha256"],
+                    "triggerSequence": candidate["sequence"],
+                    "triggerEvent": event,
+                    "triggerPhase": phase,
+                    "triggerAuthorityRecordSha256": authority_record,
+                    "operatorLifecycle": dict(revocation_observation),
+                }
+            )
+        )
+        control_authority = event_handler(
+            "revoke-decision",
+            "before",
+            revoke_evidence,
+            {"revokeAuthorized": True, "releaseNotIssued": True},
+        )
+        control_action = "revoke"
+        revoke_delivered = True
+        if authority_record is None:
+            authority_record = control_authority
+    if not isinstance(authority_record, str) or not _DIGEST.fullmatch(
+        authority_record
+    ):
+        raise ControllerProtocolError(
+            "native event has no exact current authority"
+        )
+    if control_authority is not None and not _DIGEST.fullmatch(
+        control_authority
+    ):
+        raise ControllerProtocolError(
+            "native revoke command has no exact current authority"
+        )
+    return authority_record, control_action, control_authority, revoke_delivered
 
 
 @dataclasses.dataclass(slots=True)
 class _WorkerChannelV27:
     channel: socket.socket
     pid: int
+    pidfd: int
     worker_uid: int
+    worker_gid: int
+    controller_uid: int
+    cgroup_worker_gid: int
+    supervisor_cgroup_fd: int
+    supervisor_procs_fd: int
+    worker_cgroup_fd: int
+    worker_procs_fd: int
+    worker_cgroup_relative: str
+    worker_start_time: str
+    worker_session_nonce: str
+    retirement_receipts: dict[str, dict[str, Any]] = dataclasses.field(
+        default_factory=dict
+    )
+    arena_records: dict[str, str] = dataclasses.field(default_factory=dict)
+    retirement_intents: dict[str, tuple[dict[str, Any], str]] = (
+        dataclasses.field(default_factory=dict)
+    )
+    repository_release_receipts: dict[str, dict[str, Any]] = (
+        dataclasses.field(default_factory=dict)
+    )
 
     def _assert_peer(self) -> None:
-        _pid, uid, _gid = _peer_credentials(self.channel)
-        if uid != self.worker_uid:
-            raise ControllerProtocolError("native worker peer UID changed")
+        readable, _, _ = select.select([self.pidfd], [], [], 0)
+        if readable:
+            raise ControllerProtocolError("native worker pidfd is terminal")
 
     def await_ready(self) -> None:
         self.channel.settimeout(CONNECTION_DEADLINE_SECONDS * 6)
         self._assert_peer()
-        packet = self.channel.recv(MAX_MESSAGE_BYTES + 1)
+        packet = _recv_credentialed_packet_v27(
+            self.channel,
+            expected_pid=self.pid,
+            expected_uid=self.worker_uid,
+            expected_gid=self.worker_gid,
+            label="native worker readiness",
+        )
         value = _worker_packet_v27(packet, "native worker readiness")
         if set(value) != {
             "schemaVersion",
@@ -1274,13 +5956,22 @@ class _WorkerChannelV27:
             "status",
             "workerPid",
             "workerUid",
+            "workerSessionNonce",
         } or (
             value["schemaVersion"],
             value["protocol"],
             value["status"],
             value["workerPid"],
             value["workerUid"],
-        ) != (27, _WORKER_PROTOCOL, "ready", self.pid, self.worker_uid):
+            value["workerSessionNonce"],
+        ) != (
+            27,
+            _WORKER_PROTOCOL,
+            "ready",
+            self.pid,
+            self.worker_uid,
+            self.worker_session_nonce,
+        ):
             raise ControllerProtocolError("native worker readiness identity is invalid")
         self.channel.settimeout(None)
 
@@ -1290,58 +5981,1216 @@ class _WorkerChannelV27:
         value: Any,
         *,
         lifecycle_check: Any,
+        controller_key: bytes,
+        event_handler: Any = None,
     ) -> dict[str, Any]:
-        plan = native_boundary_v27.validate_supervised_effect_plan_v27(
+        def lifecycle_observation(*, require_active: bool) -> Mapping[str, Any] | None:
+            observed = lifecycle_check()
+            if observed is None:
+                return None
+            if not isinstance(observed, Mapping):
+                raise ControllerProtocolError(
+                    "native execution lifecycle observation changed"
+                )
+            state = observed.get("operatorState")
+            if state not in {"active", "disabled"} or type(
+                observed.get("generation")
+            ) is not int:
+                raise ControllerProtocolError(
+                    "native execution lifecycle observation is malformed"
+                )
+            if require_active and state != "active":
+                raise ControllerProtocolError(
+                    "local operator state is not active"
+                )
+            return dict(observed)
+
+        lifecycle_observation(require_active=True)
+        plan = native_boundary_v27.validate_native_stage_action_plan_v27(
             value, manifest
         )
+        request_key = native_boundary_v27._NATIVE_REQUEST_KEY_V27.get()
+        if request_key is None or native_boundary_v27.sha256(request_key) != plan["requestKeyId"]:
+            raise ControllerProtocolError(
+                "native worker execution lacks the exact derived request key"
+            )
         self._assert_peer()
-        self.channel.sendall(
-            _canonical(
+        arena_record_sha256 = self._prepare_result_arena(
+            manifest,
+            plan,
+            request_key=request_key,
+            controller_key=controller_key,
+            lifecycle_check=lambda: lifecycle_observation(require_active=True),
+        )
+        lifecycle_observation(require_active=True)
+        custody = _create_controller_cgroup_custody_v27(
+            self.supervisor_cgroup_fd,
+            self.supervisor_procs_fd,
+            self.worker_cgroup_fd,
+            self.worker_cgroup_relative,
+            plan,
+            controller_uid=self.controller_uid,
+            worker_uid=self.worker_uid,
+            worker_gid=self.cgroup_worker_gid,
+            worker_pid=self.pid,
+            worker_session_nonce=self.worker_session_nonce,
+        )
+        retirement_done = False
+        completed_result: dict[str, Any] | None = None
+        completed_retirement: dict[str, Any] | None = None
+        request_key_fd = -1
+        try:
+            request_key_fd, request_key_copy = (
+                native_boundary_v27._sealed_request_key_descriptor_v27(request_key)
+            )
+            for index in range(len(request_key_copy)):
+                request_key_copy[index] = 0
+            request = _canonical(
                 {
                     "schemaVersion": 27,
                     "protocol": _WORKER_PROTOCOL,
                     "action": "EXECUTE",
                     "plan": plan,
+                    "cgroupBinding": custody.binding,
+                    "retirementArtifact": None,
                 }
             )
-        )
-        deadline = time.monotonic() + _WORKER_WAIT_SECONDS
-        while True:
-            lifecycle_check()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self.terminate()
-                raise ControllerProtocolError(
-                    "native worker timed out and its delegated process group was drained"
-                )
-            readable, _, _ = select.select(
-                [self.channel], [], [], min(0.25, remaining)
+            rights = array.array(
+                "i", (*custody.transfer_descriptors, request_key_fd)
             )
-            if readable:
-                break
-        packet = self.channel.recv(MAX_MESSAGE_BYTES + 1)
-        response = _worker_packet_v27(packet, "native worker result")
-        expected_fields = {
-            "schemaVersion",
-            "protocol",
-            "status",
-            "planSha256",
-            "nativeObservation",
-        }
-        if set(response) != expected_fields or (
+            try:
+                sent = self.channel.sendmsg(
+                    [request],
+                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+                )
+            finally:
+                os.close(request_key_fd)
+                request_key_fd = -1
+            if sent != len(request):
+                raise ControllerProtocolError(
+                    "native worker cgroup transfer packet was truncated"
+                )
+            deadline = time.monotonic() + _WORKER_WAIT_SECONDS
+            packet = b""
+            expected_native_event_sequence = 1
+            revocation_observation: Mapping[str, Any] | None = None
+            revoke_delivered = False
+            pending_result_offer: dict[str, Any] | None = None
+            while True:
+                while True:
+                    observed_lifecycle = lifecycle_observation(
+                        require_active=False
+                    )
+                    if (
+                        observed_lifecycle is not None
+                        and observed_lifecycle["operatorState"] == "disabled"
+                    ):
+                        revocation_observation = observed_lifecycle
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self.terminate()
+                        raise ControllerProtocolError(
+                            "native worker timed out and its payload cgroup was drained"
+                        )
+                    readable, _, _ = select.select(
+                        [self.channel], [], [], min(0.25, remaining)
+                    )
+                    if readable:
+                        break
+                packet = _recv_credentialed_packet_v27(
+                    self.channel,
+                    expected_pid=self.pid,
+                    expected_uid=self.worker_uid,
+                    expected_gid=self.worker_gid,
+                    label="native worker result or placement request",
+                )
+                candidate = _worker_packet_v27(
+                    packet, "native worker result or placement request"
+                )
+                if candidate.get("status") == "result-offer":
+                    fields = {
+                        "schemaVersion", "protocol", "status",
+                        "stagePlanSha256", "nativeResultSha256", "resultKind",
+                        "resultPredecessorKind", "failureEvidenceSha256",
+                        "placementMask", "offerHmac",
+                    }
+                    offer_body = {
+                        key: candidate.get(key)
+                        for key in fields
+                        if key != "offerHmac"
+                    }
+                    expected_offer_hmac = "hmac-sha256:" + hmac.new(
+                        request_key,
+                        _WORKER_RESULT_OFFER_DOMAIN_V27
+                        + _canonical(offer_body),
+                        hashlib.sha256,
+                    ).hexdigest()
+                    if (
+                        pending_result_offer is not None
+                        or set(candidate) != fields
+                        or candidate.get("schemaVersion") != 27
+                        or candidate.get("protocol") != _WORKER_PROTOCOL
+                        or candidate.get("stagePlanSha256")
+                        != plan["stagePlanSha256"]
+                        or not isinstance(candidate.get("nativeResultSha256"), str)
+                        or not _DIGEST.fullmatch(candidate["nativeResultSha256"])
+                        or not hmac.compare_digest(
+                            str(candidate.get("offerHmac")), expected_offer_hmac
+                        )
+                        or not callable(
+                            getattr(event_handler, "authorize_result_offer", None)
+                        )
+                    ):
+                        raise ControllerProtocolError(
+                            "native result offer authentication changed"
+                        )
+                    native_boundary_v27.validate_result_envelope_v4(
+                        {
+                            "resultKind": candidate["resultKind"],
+                            "predecessorKind": candidate[
+                                "resultPredecessorKind"
+                            ],
+                            "failureEvidenceSha256": candidate[
+                                "failureEvidenceSha256"
+                            ],
+                        }
+                    )
+                    if not native_boundary_v27._placement_mask_matches_result_v27(
+                        candidate["placementMask"], candidate["resultKind"]
+                    ):
+                        raise ControllerProtocolError(
+                            "native result offer placement mask changed"
+                        )
+                    authorization_record = event_handler.authorize_result_offer(
+                        candidate
+                    )
+                    acknowledgement = _worker_result_offer_ack_v27(
+                        plan_sha256=plan["stagePlanSha256"],
+                        native_result_sha256=candidate["nativeResultSha256"],
+                        authorization_record_sha256=authorization_record,
+                        request_key=request_key,
+                    )
+                    if self.channel.send(acknowledgement) != len(acknowledgement):
+                        raise ControllerProtocolError(
+                            "native result-offer authorization was truncated"
+                        )
+                    pending_result_offer = dict(candidate)
+                    continue
+                if candidate.get("status") == "native-event":
+                    if not callable(event_handler):
+                        raise ControllerProtocolError(
+                            "native event arrived without a current authority handler"
+                        )
+                    required_event = {
+                        "schemaVersion", "protocol", "status",
+                        "stagePlanSha256", "sequence", "event", "phase",
+                        "eventObservation", "eventEvidenceSha256", "eventHmac",
+                    }
+                    if set(candidate) != required_event or (
+                        candidate["schemaVersion"],
+                        candidate["protocol"],
+                        candidate["stagePlanSha256"],
+                    ) != (27, _WORKER_PROTOCOL, plan["stagePlanSha256"]):
+                        raise ControllerProtocolError(
+                            "native event identity changed"
+                        )
+                    if candidate["sequence"] != expected_native_event_sequence:
+                        raise ControllerProtocolError(
+                            "native event sequence was skipped, replayed, or reordered"
+                        )
+                    try:
+                        event_observation = (
+                            native_boundary_v27._validate_native_event_observation_v27(
+                                candidate["event"],
+                                candidate["phase"],
+                                candidate["eventObservation"],
+                            )
+                        )
+                    except native_boundary_v27.NativeBoundaryV27Error as exc:
+                        raise ControllerProtocolError(str(exc)) from exc
+                    event_body = {
+                        key: candidate[key]
+                        for key in (
+                            "schemaVersion", "stagePlanSha256", "sequence",
+                            "event", "phase", "eventObservation",
+                            "eventEvidenceSha256",
+                        )
+                    }
+                    expected_event_hmac = native_boundary_v27._native_event_hmac_v27(
+                        request_key, event_body
+                    )
+                    if not hmac.compare_digest(
+                        candidate["eventHmac"], expected_event_hmac
+                    ):
+                        raise ControllerProtocolError(
+                            "native event authentication changed"
+                        )
+                    if candidate["eventEvidenceSha256"] != (
+                        native_boundary_v27._native_event_evidence_v27(
+                            stage_plan_sha256=plan["stagePlanSha256"],
+                            sequence=candidate["sequence"],
+                            event=candidate["event"],
+                            phase=candidate["phase"],
+                            observation=event_observation,
+                        )
+                    ):
+                        raise ControllerProtocolError(
+                            "native event observation digest changed"
+                        )
+                    observed_lifecycle = lifecycle_observation(
+                        require_active=False
+                    )
+                    if (
+                        observed_lifecycle is not None
+                        and observed_lifecycle["operatorState"] == "disabled"
+                    ):
+                        revocation_observation = observed_lifecycle
+                    try:
+                        (
+                            authority_record,
+                            control_action,
+                            control_authority,
+                            revoke_delivered,
+                        ) = _mediate_native_event_authority_v27(
+                            candidate,
+                            plan,
+                            event_handler,
+                            revocation_observation=revocation_observation,
+                            revoke_delivered=revoke_delivered,
+                        )
+                    except ControllerProtocolError as exc:
+                        if "crossed the no-effect revoke cutoff" in str(exc):
+                            self.terminate()
+                            raise ControllerProtocolError(
+                                f"{exc}; the worker was fenced for "
+                                "authenticated loss recovery"
+                            ) from exc
+                        raise
+                    acknowledgement = {
+                        "schemaVersion": 27,
+                        "protocol": _WORKER_PROTOCOL,
+                        "status": "native-event-authorized",
+                        "stagePlanSha256": plan["stagePlanSha256"],
+                        "sequence": candidate["sequence"],
+                        "event": candidate["event"],
+                        "phase": candidate["phase"],
+                        "authorityRecordSha256": authority_record,
+                        "controlAction": control_action,
+                        "controlAuthorityRecordSha256": control_authority,
+                        "creatorCaptureBinding": (
+                            event_handler.creator_capture_binding_v27()
+                            if (
+                                candidate["event"] == "creator-return-ready"
+                                and candidate["phase"] == "before"
+                                and callable(getattr(
+                                    event_handler,
+                                    "creator_capture_binding_v27",
+                                    None,
+                                ))
+                            )
+                            else None
+                        ),
+                    }
+                    acknowledgement["ackHmac"] = (
+                        native_boundary_v27._native_event_ack_hmac_v27(
+                            request_key,
+                            {
+                                key: acknowledgement[key]
+                                for key in (
+                                    "schemaVersion", "stagePlanSha256",
+                                    "sequence", "event", "phase",
+                                    "authorityRecordSha256", "controlAction",
+                                    "controlAuthorityRecordSha256",
+                                    "creatorCaptureBinding",
+                                )
+                            },
+                        )
+                    )
+                    encoded_ack = _canonical(acknowledgement)
+                    if self.channel.send(encoded_ack) != len(encoded_ack):
+                        raise ControllerProtocolError(
+                            "native event authorization was truncated"
+                        )
+                    expected_native_event_sequence += 1
+                    continue
+                if candidate.get("status") == "launch-unresolved":
+                    recovered = _validate_worker_launch_unresolved_v27(
+                        candidate,
+                        plan=plan,
+                        request_key=request_key,
+                    )
+                    retirement = custody.drain(
+                        persist_intent=lambda intent: self._persist_retirement_artifact(
+                            manifest,
+                            plan,
+                            "intent",
+                            intent,
+                            arena_record_sha256=arena_record_sha256,
+                            controller_key=controller_key,
+                            lifecycle_check=lambda: lifecycle_observation(
+                                require_active=False
+                            ),
+                        )
+                    )
+                    retirement_receipt = {
+                        **retirement,
+                        "controllerTrackedPlacementMask": retirement[
+                            "placementMask"
+                        ],
+                    }
+                    self._persist_retirement_artifact(
+                        manifest,
+                        plan,
+                        "receipt",
+                        retirement_receipt,
+                        arena_record_sha256=arena_record_sha256,
+                        controller_key=controller_key,
+                        lifecycle_check=lambda: lifecycle_observation(
+                            require_active=False
+                        ),
+                    )
+                    retirement_done = True
+                    recovered["controllerRetirement"] = retirement_receipt
+                    raise native_boundary_v27._NativeLaunchUnresolvedV27(
+                        recovered
+                    )
+                if candidate.get("status") == "launch-pre-effect-failed":
+                    failure = _validate_worker_pre_effect_failure_v27(
+                        candidate,
+                        plan=plan,
+                        manifest=manifest,
+                        request_key=request_key,
+                    )
+                    proof_error: ControllerProtocolError | None = None
+                    first_empty: dict[str, Any] | None = None
+                    second_empty: dict[str, Any] | None = None
+                    try:
+                        if (
+                            expected_native_event_sequence != 1
+                            or pending_result_offer is not None
+                        ):
+                            raise ControllerProtocolError(
+                                "pre-effect failure crossed native authority"
+                            )
+                        first_empty = _controller_pre_effect_empty_observation_v27(
+                            custody
+                        )
+                        second_empty = _controller_pre_effect_empty_observation_v27(
+                            custody
+                        )
+                        if first_empty != second_empty:
+                            raise ControllerProtocolError(
+                                "pre-effect S/P/O empty observations changed"
+                            )
+                    except ControllerProtocolError as exc:
+                        proof_error = exc
+                    retirement = custody.drain(
+                        persist_intent=lambda intent: self._persist_retirement_artifact(
+                            manifest,
+                            plan,
+                            "intent",
+                            intent,
+                            arena_record_sha256=arena_record_sha256,
+                            controller_key=controller_key,
+                            lifecycle_check=lambda: lifecycle_observation(
+                                require_active=False
+                            ),
+                        )
+                    )
+                    retirement_receipt = {
+                        **retirement,
+                        "controllerTrackedPlacementMask": 0,
+                    }
+                    if retirement.get("placementMask") != 0:
+                        raise ControllerProtocolError(
+                            "pre-effect retirement observed a lifecycle child"
+                        )
+                    self._persist_retirement_artifact(
+                        manifest,
+                        plan,
+                        "receipt",
+                        retirement_receipt,
+                        arena_record_sha256=arena_record_sha256,
+                        controller_key=controller_key,
+                        lifecycle_check=lambda: lifecycle_observation(
+                            require_active=False
+                        ),
+                    )
+                    retirement_done = True
+                    if proof_error is not None:
+                        unresolved_evidence = native_boundary_v27.sha256(
+                            b"startup-factory/beads/v27/pre-effect-proof-unresolved\0"
+                            + _canonical(
+                                {
+                                    "stagePlanSha256": plan["stagePlanSha256"],
+                                    "workerFailureEvidenceSha256": failure[
+                                        "evidenceSha256"
+                                    ],
+                                    "retirement": retirement_receipt,
+                                }
+                            )
+                        )
+                        recovered = native_boundary_v27._native_supervisor_loss_v27(
+                            reason="dead-holder-without-terminal",
+                            evidence_sha256=unresolved_evidence,
+                        )
+                        recovered["controllerRetirement"] = retirement_receipt
+                        raise native_boundary_v27._NativeLaunchUnresolvedV27(
+                            recovered
+                        ) from proof_error
+                    assert first_empty is not None and second_empty is not None
+                    consumed_current = getattr(event_handler, "current", None)
+                    if (
+                        not isinstance(consumed_current, Mapping)
+                        or consumed_current.get("kind")
+                        != "SupervisorLaunchSlotConsumedCurrentV1"
+                        or not _DIGEST.fullmatch(
+                            str(consumed_current.get("recordSha256"))
+                        )
+                    ):
+                        raise ControllerProtocolError(
+                            "pre-effect proof lost its consumed-current identity"
+                        )
+                    proof_envelope = _controller_pre_effect_proof_envelope_v27(
+                        plan=plan,
+                        payload_name=custody.payload_name,
+                        arena_record_sha256=arena_record_sha256,
+                        consumed_current_record_sha256=str(
+                            consumed_current["recordSha256"]
+                        ),
+                        worker_failure=failure,
+                        first_empty_observation=first_empty,
+                        second_empty_observation=second_empty,
+                        controller_retirement=retirement_receipt,
+                        controller_key=controller_key,
+                    )
+                    self._persist_retirement_artifact(
+                        manifest,
+                        plan,
+                        "pre-effect-proof",
+                        proof_envelope,
+                        arena_record_sha256=arena_record_sha256,
+                        controller_key=controller_key,
+                        lifecycle_check=lambda: lifecycle_observation(
+                            require_active=False
+                        ),
+                    )
+                    proved_evidence = _sha(_canonical(proof_envelope))
+                    raise native_boundary_v27._NativeLaunchPreEffectFailedV27(
+                        proved_evidence,
+                        failure["classification"],
+                        proof_envelope,
+                    )
+                if candidate.get("status") != "placement-request":
+                    break
+                required = {
+                    "schemaVersion", "protocol", "status", "stagePlanSha256",
+                    "supervisorPid", "childPid", "childStartTime", "ordinal",
+                    "placementNonce",
+                }
+                if set(candidate) != required or (
+                    candidate["schemaVersion"],
+                    candidate["protocol"],
+                    candidate["stagePlanSha256"],
+                ) != (27, _WORKER_PROTOCOL, plan["stagePlanSha256"]):
+                    raise ControllerProtocolError(
+                        "native lifecycle placement request identity changed"
+                    )
+                placement = custody.place_lifecycle_child(
+                    child_pid=candidate["childPid"],
+                    child_start_time=candidate["childStartTime"],
+                    supervisor_pid=candidate["supervisorPid"],
+                    ordinal=candidate["ordinal"],
+                    placement_nonce=candidate["placementNonce"],
+                )
+                response = _canonical(
+                    {
+                        "schemaVersion": 27,
+                        "protocol": _WORKER_PROTOCOL,
+                        "status": "placement-authorized",
+                        "stagePlanSha256": plan["stagePlanSha256"],
+                        "placement": placement,
+                    }
+                )
+                if self.channel.send(response) != len(response):
+                    raise ControllerProtocolError(
+                        "native lifecycle placement authorization was truncated"
+                    )
+            terminal_lifecycle = lifecycle_observation(require_active=False)
+            response = _worker_packet_v27(packet, "native worker result")
+            expected_fields = {
+                "schemaVersion",
+                "protocol",
+                "status",
+                "stagePlanSha256",
+                "nativeStageObservation",
+            }
+            if set(response) != expected_fields or (
+                response["schemaVersion"],
+                response["protocol"],
+                response["status"],
+                response["stagePlanSha256"],
+            ) != (27, _WORKER_PROTOCOL, "completed", plan["stagePlanSha256"]):
+                raise ControllerProtocolError(
+                    "native worker result identity is invalid"
+                )
+            observation = response["nativeStageObservation"]
+            if not isinstance(observation, dict):
+                raise ControllerProtocolError(
+                    "native worker stage observation is invalid"
+                )
+            try:
+                result = {
+                    "exitCode": observation["exitCode"],
+                    "placementMask": observation["placementMask"],
+                    "stdout": base64.b64decode(
+                        observation["stdoutBase64"], validate=True
+                    ),
+                    "stderr": base64.b64decode(
+                        observation["stderrBase64"], validate=True
+                    ),
+                    "lifecycle": observation["lifecycle"],
+                    "resultKind": observation["resultKind"],
+                    "resultPredecessorKind": observation[
+                        "resultPredecessorKind"
+                    ],
+                    "failureEvidenceSha256": observation[
+                        "failureEvidenceSha256"
+                    ],
+                }
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ControllerProtocolError(
+                    "native worker stage observation encoding is invalid"
+                ) from exc
+            native_boundary_v27._decode_native_stage_result_v27(
+                result, require_discriminants=True
+            )
+            if (
+                pending_result_offer is None
+                or _sha(_canonical(observation))
+                != pending_result_offer["nativeResultSha256"]
+                or result["resultKind"] != pending_result_offer["resultKind"]
+                or result["resultPredecessorKind"]
+                != pending_result_offer["resultPredecessorKind"]
+                or result["failureEvidenceSha256"]
+                != pending_result_offer["failureEvidenceSha256"]
+                or result["placementMask"]
+                != pending_result_offer["placementMask"]
+                or not callable(
+                    getattr(event_handler, "receipt_result_handoff", None)
+                )
+            ):
+                raise ControllerProtocolError(
+                    "native result handoff differs from its authorized offer"
+                )
+            event_handler.receipt_result_handoff(observation)
+            if (
+                terminal_lifecycle is not None
+                and terminal_lifecycle["operatorState"] == "disabled"
+                and result["resultKind"] == "success"
+            ):
+                raise ControllerProtocolError(
+                    "operator disable fenced a native success result"
+                )
+            native_mask = result["placementMask"]
+            tracked_mask = sum(1 << ordinal for ordinal in custody.lifecycle_leaves)
+            if native_mask != tracked_mask:
+                raise ControllerProtocolError(
+                    "native and controller-tracked placement masks differ"
+                )
+            retirement = custody.drain(
+                persist_intent=lambda intent: self._persist_retirement_artifact(
+                    manifest,
+                    plan,
+                    "intent",
+                    intent,
+                    arena_record_sha256=arena_record_sha256,
+                    controller_key=controller_key,
+                    lifecycle_check=lambda: lifecycle_observation(
+                        require_active=False
+                    ),
+                )
+            )
+            retirement_receipt = {
+                **retirement,
+                "controllerTrackedPlacementMask": tracked_mask,
+            }
+            if retirement.get("placementMask") != tracked_mask:
+                raise ControllerProtocolError(
+                    "controller-tracked and retirement placement masks differ"
+                )
+            self._persist_retirement_artifact(
+                manifest,
+                plan,
+                "receipt",
+                retirement_receipt,
+                arena_record_sha256=arena_record_sha256,
+                controller_key=controller_key,
+                lifecycle_check=lambda: lifecycle_observation(
+                    require_active=False
+                ),
+            )
+            retirement_done = True
+            result["controllerRetirement"] = retirement_receipt
+            if not callable(
+                getattr(event_handler, "terminalize_result_handoff", None)
+            ):
+                raise ControllerProtocolError(
+                    "native result handoff lacks terminal receipt authority"
+                )
+            event_handler.terminalize_result_handoff(retirement_receipt)
+            native_boundary_v27._decode_native_stage_result_v27(
+                result, require_discriminants=True
+            )
+            completed_result = result
+            completed_retirement = dict(retirement)
+        finally:
+            try:
+                if not retirement_done:
+                    custody.kill_and_wait()
+            finally:
+                try:
+                    if request_key_fd >= 0:
+                        os.close(request_key_fd)
+                finally:
+                    custody.close(retire=retirement_done)
+            if plan.get("repositoryCustody") is not None:
+                try:
+                    os.stat(
+                        custody.payload_name,
+                        dir_fd=self.supervisor_cgroup_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    self.repository_release_receipts[
+                        plan["stagePlanSha256"]
+                    ] = self._probe_repository_release(
+                        manifest,
+                        plan,
+                        request_key=request_key,
+                        lifecycle_check=lambda: lifecycle_observation(
+                            require_active=False
+                        ),
+                    )
+        if completed_result is None or completed_retirement is None:
+            raise ControllerProtocolError(
+                "native worker completed without a retirement result"
+            )
+        try:
+            os.stat(
+                custody.payload_name,
+                dir_fd=self.supervisor_cgroup_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise ControllerProtocolError(
+                "native worker success preceded payload cgroup removal"
+            )
+        self.retirement_receipts[custody.payload_name] = completed_retirement
+        return completed_result
+
+    def _probe_repository_release(
+        self,
+        manifest: native_boundary_v27.NativeBoundaryManifestV27,
+        plan: Mapping[str, Any],
+        *,
+        request_key: bytes,
+        lifecycle_check: Any,
+    ) -> dict[str, Any]:
+        """Ask the persistent UID993 worker to prove it retained no custody."""
+
+        del manifest  # The worker revalidates the protected installed manifest.
+        self._assert_peer()
+        probe_nonce = secrets.token_hex(32)
+        custody = native_boundary_v27.validate_repository_custody_binding_v27(
+            plan.get("repositoryCustody"),
+            repository_path=str(plan["repositoryPath"]),
+        )
+        post_manifest = native_boundary_v27._repository_custody_manifest_v27(
+            Path(str(plan["repositoryPath"])),
+            controller_uid=self.controller_uid,
+            worker_gid=self.cgroup_worker_gid,
+            directory_mode=(
+                0o550 if custody["accessMode"] == "read-only" else 0o770
+            ),
+            file_mode=(
+                0o440 if custody["accessMode"] == "read-only" else 0o660
+            ),
+        )
+        request_key_fd, key_copy = (
+            native_boundary_v27._sealed_request_key_descriptor_v27(request_key)
+        )
+        for index in range(len(key_copy)):
+            key_copy[index] = 0
+        request = _canonical(
+            {
+                "schemaVersion": 27,
+                "protocol": _WORKER_PROTOCOL,
+                "action": "PROBE-REPOSITORY-RELEASE",
+                "plan": dict(plan),
+                "cgroupBinding": None,
+                "retirementArtifact": {
+                    "kind": "repository-release-probe",
+                    "value": {
+                        "probeNonce": probe_nonce,
+                        "postManifest": post_manifest,
+                    },
+                },
+            }
+        )
+        try:
+            rights = array.array("i", (request_key_fd,))
+            if self.channel.sendmsg(
+                [request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)]
+            ) != len(request):
+                raise ControllerProtocolError(
+                    "native repository release probe packet was truncated"
+                )
+        finally:
+            os.close(request_key_fd)
+        lifecycle_check()
+        self._assert_peer()
+        response = _worker_packet_v27(
+            _recv_credentialed_packet_v27(
+                self.channel,
+                expected_pid=self.pid,
+                expected_uid=self.worker_uid,
+                expected_gid=self.worker_gid,
+                label="native repository release probe",
+            ),
+            "native repository release probe",
+        )
+        if set(response) != {
+            "schemaVersion", "protocol", "status", "stagePlanSha256",
+            "releaseReceipt",
+        } or (
             response["schemaVersion"],
             response["protocol"],
             response["status"],
-            response["planSha256"],
-        ) != (27, _WORKER_PROTOCOL, "completed", plan["planSha256"]):
-            raise ControllerProtocolError("native worker result identity is invalid")
-        result = {"nativeObservation": response["nativeObservation"]}
-        native_boundary_v27._decode_supervisor_result(result)
+            response["stagePlanSha256"],
+        ) != (
+            27,
+            _WORKER_PROTOCOL,
+            "repository-release-proved",
+            plan["stagePlanSha256"],
+        ):
+            raise ControllerProtocolError(
+                "native repository release probe identity changed"
+            )
+        receipt = response["releaseReceipt"]
+        if not isinstance(receipt, Mapping):
+            raise ControllerProtocolError(
+                "native repository release receipt is malformed"
+            )
+        fields = {
+            "schemaVersion", "operationId", "stageLocation",
+            "stagePlanSha256", "workerSessionNonce", "grantWorkerSessionNonce", "probeNonce",
+            "repositoryBindingSha256", "repositoryManifestSha256",
+            "postRepositoryManifestSha256",
+            "descriptorCount", "descriptorInventorySha256",
+            "descriptorMatches", "mountCount", "mountInfoSha256",
+            "mountMatches", "releaseHmac",
+        }
+        body = {key: receipt.get(key) for key in fields if key != "releaseHmac"}
+        expected_hmac = "hmac-sha256:" + hmac.new(
+            request_key,
+            _REPOSITORY_CUSTODY_RELEASE_DOMAIN_V27 + _canonical(body),
+            hashlib.sha256,
+        ).hexdigest()
+        if (
+            set(receipt) != fields
+            or receipt.get("schemaVersion") != 27
+            or receipt.get("operationId") != plan["operationId"]
+            or receipt.get("stageLocation") != plan["stageLocation"]
+            or receipt.get("stagePlanSha256") != plan["stagePlanSha256"]
+            or receipt.get("workerSessionNonce") != self.worker_session_nonce
+            or receipt.get("grantWorkerSessionNonce")
+            != custody["workerSessionNonce"]
+            or receipt.get("probeNonce") != probe_nonce
+            or receipt.get("repositoryBindingSha256")
+            != custody["bindingSha256"]
+            or receipt.get("repositoryManifestSha256")
+            != custody["manifestSha256"]
+            or receipt.get("postRepositoryManifestSha256")
+            != post_manifest["manifestSha256"]
+            or receipt.get("descriptorMatches") != []
+            or receipt.get("mountMatches") != []
+            or type(receipt.get("descriptorCount")) is not int
+            or type(receipt.get("mountCount")) is not int
+            or not hmac.compare_digest(
+                str(receipt.get("releaseHmac")), expected_hmac
+            )
+        ):
+            raise ControllerProtocolError(
+                "native repository release receipt changed or retained access"
+            )
+        return dict(receipt)
+
+    def _persist_retirement_artifact(
+        self,
+        manifest: native_boundary_v27.NativeBoundaryManifestV27,
+        plan: Mapping[str, Any],
+        artifact_kind: str,
+        value: Mapping[str, Any],
+        *,
+        arena_record_sha256: str,
+        controller_key: bytes,
+        lifecycle_check: Any,
+    ) -> None:
+        self._assert_peer()
+        payload_name = _payload_cgroup_name_v27(plan)
+        if artifact_kind == "intent":
+            decoded = native_boundary_v27._decode_controller_retirement_intent_v27(
+                value
+            )
+            payload_identity = decoded["payloadIdentity"]
+            predecessor = None
+        elif artifact_kind == "receipt":
+            decoded = native_boundary_v27._decode_controller_retirement_v27(
+                value, value.get("placementMask")
+            )
+            prior = self.retirement_intents.get(payload_name)
+            if prior is None:
+                raise ControllerProtocolError(
+                    "native retirement receipt lacks its authenticated intent"
+                )
+            payload_identity = prior[0]["payloadIdentity"]
+            predecessor = prior[1]
+        elif artifact_kind == "pre-effect-proof":
+            if (
+                not isinstance(value, Mapping)
+                or set(value) != {"proof", "controllerHmac"}
+            ):
+                raise ControllerProtocolError(
+                    "native pre-effect proof persistence envelope changed"
+                )
+            decoded = dict(value)
+            envelope = dict(value)
+            payload_identity = {}
+            predecessor = None
+        else:
+            raise ControllerProtocolError(
+                "native retirement artifact kind changed"
+            )
+        if artifact_kind != "pre-effect-proof":
+            envelope = _controller_retirement_envelope_v27(
+                kind=artifact_kind,
+                plan=plan,
+                payload_name=payload_name,
+                payload_identity=payload_identity,
+                arena_record_sha256=arena_record_sha256,
+                predecessor_artifact_sha256=predecessor,
+                body=decoded,
+                controller_key=controller_key,
+            )
+        artifact = {"kind": artifact_kind, "value": envelope}
+        artifact_sha256 = native_boundary_v27.sha256(
+            native_boundary_v27.canonical_bytes(artifact)
+        )
+        request = _canonical(
+            {
+                "schemaVersion": 27,
+                "protocol": _WORKER_PROTOCOL,
+                "action": "PERSIST-RETIREMENT",
+                "plan": dict(plan),
+                "cgroupBinding": None,
+                "retirementArtifact": artifact,
+            }
+        )
+        if self.channel.send(request) != len(request):
+            raise ControllerProtocolError(
+                "native retirement persistence packet was truncated"
+            )
+        lifecycle_check()
+        self._assert_peer()
+        packet = _recv_credentialed_packet_v27(
+            self.channel,
+            expected_pid=self.pid,
+            expected_uid=self.worker_uid,
+            expected_gid=self.worker_gid,
+            label="native retirement persistence acknowledgement",
+        )
+        response = _worker_packet_v27(
+            packet, "native retirement persistence acknowledgement"
+        )
+        if set(response) != {
+            "schemaVersion", "protocol", "status", "stagePlanSha256",
+            "artifactKind", "artifactSha256",
+        } or (
+            response["schemaVersion"], response["protocol"],
+            response["status"], response["stagePlanSha256"],
+            response["artifactKind"], response["artifactSha256"],
+        ) != (
+            27, _WORKER_PROTOCOL, "retirement-artifact-durable",
+            plan["stagePlanSha256"], artifact_kind, artifact_sha256,
+        ):
+            raise ControllerProtocolError(
+                "native retirement persistence acknowledgement changed"
+            )
+        envelope_sha256 = _sha(_canonical(envelope))
+        if artifact_kind == "intent":
+            self.retirement_intents[payload_name] = (
+                dict(decoded), envelope_sha256
+            )
+
+    def _prepare_result_arena(
+        self,
+        manifest: native_boundary_v27.NativeBoundaryManifestV27,
+        plan: Mapping[str, Any],
+        *,
+        request_key: bytes,
+        controller_key: bytes,
+        lifecycle_check: Any,
+    ) -> str:
+        """Complete worker PREPARE and controller-authenticated durable ACK."""
+
+        request_key_fd, request_key_copy = (
+            native_boundary_v27._sealed_request_key_descriptor_v27(request_key)
+        )
+        for index in range(len(request_key_copy)):
+            request_key_copy[index] = 0
+        request = _canonical(
+            {
+                "schemaVersion": 27,
+                "protocol": _WORKER_PROTOCOL,
+                "action": "PREPARE",
+                "plan": dict(plan),
+                "cgroupBinding": None,
+                "retirementArtifact": None,
+            }
+        )
+        try:
+            rights = array.array("i", (request_key_fd,))
+            if self.channel.sendmsg(
+                [request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)]
+            ) != len(request):
+                raise ControllerProtocolError(
+                    "native result-arena PREPARE packet was truncated"
+                )
+        finally:
+            os.close(request_key_fd)
+        lifecycle_check()
+        self._assert_peer()
+        prepared = _worker_packet_v27(
+            _recv_credentialed_packet_v27(
+                self.channel,
+                expected_pid=self.pid,
+                expected_uid=self.worker_uid,
+                expected_gid=self.worker_gid,
+                label="native result-arena PREPARE acknowledgement",
+            ),
+            "native result-arena PREPARE acknowledgement",
+        )
+        if set(prepared) != {
+            "schemaVersion", "protocol", "status", "stagePlanSha256",
+            "arenaPreparation",
+        } or (
+            prepared["schemaVersion"], prepared["protocol"],
+            prepared["status"], prepared["stagePlanSha256"],
+        ) != (
+            27, _WORKER_PROTOCOL, "result-arena-prepared",
+            plan["stagePlanSha256"],
+        ):
+            raise ControllerProtocolError(
+                "native result-arena PREPARE acknowledgement changed"
+            )
+        envelope = _controller_result_arena_envelope_v27(
+            prepared["arenaPreparation"], plan, request_key, controller_key
+        )
+        ack = _canonical(
+            {
+                "schemaVersion": 27,
+                "protocol": _WORKER_PROTOCOL,
+                "action": "ACK-ARENA",
+                "plan": dict(plan),
+                "cgroupBinding": None,
+                "retirementArtifact": {"kind": "arena", "value": envelope},
+            }
+        )
+        if self.channel.send(ack) != len(ack):
+            raise ControllerProtocolError(
+                "native result-arena ACK packet was truncated"
+            )
+        lifecycle_check()
+        self._assert_peer()
+        durable = _worker_packet_v27(
+            _recv_credentialed_packet_v27(
+                self.channel,
+                expected_pid=self.pid,
+                expected_uid=self.worker_uid,
+                expected_gid=self.worker_gid,
+                label="native result-arena durable acknowledgement",
+            ),
+            "native result-arena durable acknowledgement",
+        )
+        expected_sha256 = _sha(_canonical(envelope))
+        if set(durable) != {
+            "schemaVersion", "protocol", "status", "stagePlanSha256",
+            "arenaRecordSha256",
+        } or (
+            durable["schemaVersion"], durable["protocol"], durable["status"],
+            durable["stagePlanSha256"], durable["arenaRecordSha256"],
+        ) != (
+            27, _WORKER_PROTOCOL, "result-arena-durable",
+            plan["stagePlanSha256"], expected_sha256,
+        ):
+            raise ControllerProtocolError(
+                "native result-arena durable acknowledgement changed"
+            )
+        self.arena_records[_payload_cgroup_name_v27(plan)] = expected_sha256
+        return expected_sha256
+
+    def recover(
+        self,
+        manifest: native_boundary_v27.NativeBoundaryManifestV27,
+        value: Any,
+        *,
+        lifecycle_check: Any,
+    ) -> dict[str, Any]:
+        """Recover a durable FD10 result through the worker; never relaunch."""
+
+        plan = native_boundary_v27.validate_native_stage_action_plan_v27(
+            value, manifest
+        )
+        self._assert_peer()
+        payload_name = _payload_cgroup_name_v27(plan)
+        try:
+            os.stat(
+                payload_name,
+                dir_fd=self.supervisor_cgroup_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise ControllerProtocolError(
+                "native result is ineligible while its payload cgroup exists"
+            )
+        request_key = native_boundary_v27._NATIVE_REQUEST_KEY_V27.get()
+        if request_key is None or native_boundary_v27.sha256(request_key) != plan["requestKeyId"]:
+            raise ControllerProtocolError(
+                "native worker recovery lacks the exact derived request key"
+            )
+        request_key_fd, request_key_copy = (
+            native_boundary_v27._sealed_request_key_descriptor_v27(request_key)
+        )
+        for index in range(len(request_key_copy)):
+            request_key_copy[index] = 0
+        request = _canonical(
+            {
+                "schemaVersion": 27,
+                "protocol": _WORKER_PROTOCOL,
+                "action": "RECOVER",
+                "plan": plan,
+                "cgroupBinding": None,
+                "retirementArtifact": None,
+            }
+        )
+        try:
+            rights = array.array("i", (request_key_fd,))
+            if self.channel.sendmsg(
+                [request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)]
+            ) != len(request):
+                raise ControllerProtocolError(
+                    "native worker recovery packet was truncated"
+                )
+        finally:
+            os.close(request_key_fd)
+        lifecycle_check()
+        self._assert_peer()
+        packet = _recv_credentialed_packet_v27(
+            self.channel,
+            expected_pid=self.pid,
+            expected_uid=self.worker_uid,
+            expected_gid=self.worker_gid,
+            label="native worker recovered result",
+        )
+        response = _worker_packet_v27(packet, "native worker recovered result")
+        if set(response) == {
+            "schemaVersion", "protocol", "status", "stagePlanSha256",
+            "nativeLaunchPreEffectProof", "controllerRetirementChain",
+        } and (
+            response["schemaVersion"], response["protocol"],
+            response["status"], response["stagePlanSha256"],
+        ) == (
+            27, _WORKER_PROTOCOL, "launch-pre-effect-proved",
+            plan["stagePlanSha256"],
+        ):
+            return {
+                "nativeLaunchPreEffectProof": response[
+                    "nativeLaunchPreEffectProof"
+                ],
+                "_controllerRetirementChain": response[
+                    "controllerRetirementChain"
+                ],
+            }
+        if set(response) == {
+            "schemaVersion", "protocol", "status", "stagePlanSha256",
+            "nativeSupervisorLoss", "controllerRetirementChain",
+        } and (
+            response["schemaVersion"], response["protocol"],
+            response["status"], response["stagePlanSha256"],
+        ) == (27, _WORKER_PROTOCOL, "loss", plan["stagePlanSha256"]):
+            loss = {
+                "nativeSupervisorLoss": response["nativeSupervisorLoss"],
+                "_controllerRetirementChain": response[
+                    "controllerRetirementChain"
+                ],
+            }
+            if not native_boundary_v27._is_native_supervisor_loss_v27(loss):
+                raise ControllerProtocolError(
+                    "native worker recovered loss binding changed"
+                )
+            return loss
+        if set(response) != {
+            "schemaVersion", "protocol", "status", "stagePlanSha256",
+            "nativeStageObservation", "controllerRetirementChain",
+            "nativeCreatorArtifactBinding",
+        } or (
+            response["schemaVersion"], response["protocol"], response["status"],
+            response["stagePlanSha256"],
+        ) != (27, _WORKER_PROTOCOL, "completed", plan["stagePlanSha256"]):
+            raise ControllerProtocolError(
+                "native worker recovered result identity changed"
+            )
+        observation = response["nativeStageObservation"]
+        try:
+            result = {
+                "exitCode": observation["exitCode"],
+                "placementMask": observation["placementMask"],
+                "stdout": base64.b64decode(observation["stdoutBase64"], validate=True),
+                "stderr": base64.b64decode(observation["stderrBase64"], validate=True),
+                "lifecycle": observation["lifecycle"],
+                "resultKind": observation["resultKind"],
+                "resultPredecessorKind": observation[
+                    "resultPredecessorKind"
+                ],
+                "failureEvidenceSha256": observation[
+                    "failureEvidenceSha256"
+                ],
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ControllerProtocolError(
+                "native worker recovered result encoding changed"
+            ) from exc
+        native_boundary_v27._decode_native_stage_result_v27(result)
+        result["_controllerRetirementChain"] = response[
+            "controllerRetirementChain"
+        ]
+        if response["nativeCreatorArtifactBinding"] is not None:
+            result["_nativeCreatorArtifactBinding"] = response[
+                "nativeCreatorArtifactBinding"
+            ]
         return result
 
     def terminate(self) -> None:
         try:
-            os.killpg(self.pid, signal.SIGKILL)
+            if hasattr(signal, "pidfd_send_signal"):
+                signal.pidfd_send_signal(self.pidfd, signal.SIGKILL, None, 0)
+            else:
+                os.kill(self.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
         try:
@@ -1358,6 +7207,8 @@ class _WorkerChannelV27:
                         "protocol": _WORKER_PROTOCOL,
                         "action": "STOP",
                         "plan": None,
+                        "cgroupBinding": None,
+                        "retirementArtifact": None,
                     }
                 )
             )
@@ -1367,9 +7218,407 @@ class _WorkerChannelV27:
         try:
             waited, _status = os.waitpid(self.pid, os.WNOHANG)
         except ChildProcessError:
-            return
-        if waited == 0:
-            self.terminate()
+            waited = self.pid
+        try:
+            if waited == 0:
+                self.terminate()
+        finally:
+            try:
+                os.close(self.pidfd)
+            except OSError:
+                pass
+            try:
+                os.close(self.supervisor_cgroup_fd)
+            except OSError:
+                pass
+            try:
+                os.close(self.supervisor_procs_fd)
+            except OSError:
+                pass
+            try:
+                os.close(self.worker_procs_fd)
+            except OSError:
+                pass
+            try:
+                os.close(self.worker_cgroup_fd)
+            except OSError:
+                pass
+
+
+@dataclasses.dataclass(slots=True)
+class _WorkerStageRunnerV27:
+    worker: _WorkerChannelV27
+    lifecycle_check: Any
+    controller_key: bytes
+
+    def repository_custody_profile_v27(
+        self, _plan: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "rootPath": str(REPOSITORY_HANDOFF_ROOT_V27),
+            "controllerUid": self.worker.controller_uid,
+            "workerGid": self.worker.cgroup_worker_gid,
+            "workerSessionNonce": self.worker.worker_session_nonce,
+        }
+
+    def repository_custody_release_receipt_v27(
+        self, plan: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        receipt = self.worker.repository_release_receipts.pop(
+            str(plan["stagePlanSha256"]), None
+        )
+        if receipt is None:
+            raise ControllerProtocolError(
+                "native repository custody was not proved released"
+            )
+        return receipt
+
+    def __call__(
+        self,
+        manifest: native_boundary_v27.NativeBoundaryManifestV27,
+        plan: Any,
+    ) -> dict[str, Any]:
+        validated_plan = native_boundary_v27.validate_native_stage_action_plan_v27(
+            plan, manifest
+        )
+        event_handler = native_boundary_v27._NATIVE_OUTER_EVENT_HANDLER_V27.get()
+        if not callable(getattr(
+            event_handler, "bind_native_stage_authority_v27", None
+        )):
+            raise ControllerProtocolError(
+                "native stage execution lacks outer-current authority"
+            )
+        event_handler.bind_native_stage_authority_v27(validated_plan)
+        return self.worker.execute(
+            manifest,
+            validated_plan,
+            lifecycle_check=self.lifecycle_check,
+            controller_key=self.controller_key,
+            event_handler=event_handler,
+        )
+
+    def recover(
+        self,
+        manifest: native_boundary_v27.NativeBoundaryManifestV27,
+        plan: Any,
+    ) -> dict[str, Any]:
+        result = self.worker.recover(
+            manifest, plan, lifecycle_check=self.lifecycle_check
+        )
+        validated_plan = native_boundary_v27.validate_native_stage_action_plan_v27(
+            plan, manifest
+        )
+        event_handler = native_boundary_v27._NATIVE_OUTER_EVENT_HANDLER_V27.get()
+        if callable(getattr(
+            event_handler, "bind_native_stage_authority_v27", None
+        )):
+            event_handler.bind_native_stage_authority_v27(validated_plan)
+        request_key = native_boundary_v27._NATIVE_REQUEST_KEY_V27.get()
+        if (
+            request_key is None
+            or native_boundary_v27.sha256(request_key)
+            != validated_plan["requestKeyId"]
+        ):
+            raise ControllerProtocolError(
+                "native result recovery lacks the exact derived request key"
+            )
+        if isinstance(result, Mapping) and set(result) == {
+            "nativeLaunchPreEffectProof", "_controllerRetirementChain"
+        }:
+            retirement = _verify_controller_retirement_chain_v27(
+                result["_controllerRetirementChain"],
+                plan=validated_plan,
+                request_key=request_key,
+                controller_key=self.controller_key,
+                expected_placement_mask=0,
+            )
+            try:
+                proof = _verify_controller_pre_effect_proof_v27(
+                    result["nativeLaunchPreEffectProof"],
+                    plan=validated_plan,
+                    controller_key=self.controller_key,
+                    arena_record_sha256=_sha(
+                        _canonical(result["_controllerRetirementChain"]["arena"])
+                    ),
+                    retirement=retirement,
+                )
+            except ControllerProtocolError:
+                # Worker-readable proof bytes are relay data only.  Once the
+                # consumed holder is dead, an absent, forged, rebound, or
+                # swapped controller proof cannot establish never-created.
+                # The controller's verified arena/retirement custody turns
+                # that ambiguity into the closed non-public loss branch.
+                return {
+                    "nativeSupervisorLoss": (
+                        native_boundary_v27._native_supervisor_loss_v27(
+                            reason="dead-holder-without-terminal",
+                            evidence_sha256=native_boundary_v27.sha256(
+                                b"startup-factory/beads/v27/invalid-pre-effect-proof\0"
+                                + _canonical(
+                                    {
+                                        "operationId": validated_plan["operationId"],
+                                        "stageLocation": validated_plan["stageLocation"],
+                                        "stagePlanSha256": validated_plan[
+                                            "stagePlanSha256"
+                                        ],
+                                        "arenaRecordSha256": _sha(
+                                            _canonical(
+                                                result[
+                                                    "_controllerRetirementChain"
+                                                ]["arena"]
+                                            )
+                                        ),
+                                        "proofRelaySha256": _sha(
+                                            _canonical(
+                                                result[
+                                                    "nativeLaunchPreEffectProof"
+                                                ]
+                                            )
+                                        ),
+                                    }
+                                ),
+                            ),
+                        )["nativeSupervisorLoss"]
+                    ),
+                    "controllerRetirement": retirement,
+                }
+            raise native_boundary_v27._NativeLaunchPreEffectFailedV27(
+                _sha(_canonical(result["nativeLaunchPreEffectProof"])),
+                proof["workerFailure"]["classification"],
+                result["nativeLaunchPreEffectProof"],
+            )
+        if native_boundary_v27._is_native_supervisor_loss_v27(result):
+            if set(result) != {
+                "nativeSupervisorLoss", "_controllerRetirementChain"
+            }:
+                raise ControllerProtocolError(
+                    "native loss recovery lacks the full retirement chain"
+                )
+            retirement = _verify_controller_retirement_chain_v27(
+                result["_controllerRetirementChain"],
+                plan=validated_plan,
+                request_key=request_key,
+                controller_key=self.controller_key,
+                expected_placement_mask=None,
+            )
+            return {
+                "nativeSupervisorLoss": dict(result["nativeSupervisorLoss"]),
+                "controllerRetirement": retirement,
+            }
+        if not isinstance(result, Mapping) or set(result) not in ({
+            "exitCode", "placementMask", "stdout", "stderr", "lifecycle",
+            "resultKind", "resultPredecessorKind", "failureEvidenceSha256",
+            "_controllerRetirementChain",
+        }, {
+            "exitCode", "placementMask", "stdout", "stderr", "lifecycle",
+            "resultKind", "resultPredecessorKind", "failureEvidenceSha256",
+            "_controllerRetirementChain", "_nativeCreatorArtifactBinding",
+        }):
+            raise ControllerProtocolError(
+                "native result recovery lacks the full retirement chain"
+            )
+        retirement = _verify_controller_retirement_chain_v27(
+            result["_controllerRetirementChain"],
+            plan=validated_plan,
+            request_key=request_key,
+            controller_key=self.controller_key,
+            expected_placement_mask=result["placementMask"],
+        )
+        recovered = {
+            key: value
+            for key, value in result.items()
+            if key not in {
+                "_controllerRetirementChain", "_nativeCreatorArtifactBinding"
+            }
+        }
+        artifact_binding = result.get("_nativeCreatorArtifactBinding")
+        if recovered["resultKind"] in {
+            "success", "revoke-verified-no-effect"
+        }:
+            if not callable(getattr(
+                event_handler, "verify_creator_artifact_binding_v27", None
+            )):
+                raise ControllerProtocolError(
+                    "native creator artifact recovery lacks controller authority"
+                )
+            event_handler.verify_creator_artifact_binding_v27(
+                artifact_binding, recovered["resultKind"]
+            )
+        elif artifact_binding is not None:
+            raise ControllerProtocolError(
+                "non-creator result carried a creator artifact binding"
+            )
+        recovered["controllerRetirement"] = retirement
+        native_boundary_v27._decode_native_stage_result_v27(recovered)
+        cached = self.worker.retirement_receipts.get(
+            _payload_cgroup_name_v27(validated_plan)
+        )
+        if cached is not None and {
+            **cached,
+            "controllerTrackedPlacementMask": cached.get("placementMask"),
+        } != retirement:
+            raise ControllerProtocolError(
+                "cached and authenticated retirement receipts differ"
+            )
+        return recovered
+
+
+def _move_worker_to_supervisor_cgroup_v27(
+    worker_pid: int,
+    *,
+    worker_pidfd: int,
+    worker_start_time: str,
+    controller_uid: int,
+    worker_uid: int,
+    worker_gid: int,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    proc_root: Path = Path("/proc"),
+    cgroup2_observer: Any = None,
+    cgroup_mode_observer: Any = None,
+) -> tuple[int, int, int, int, str, dict[str, dict[str, Any]]]:
+    """Place a paused worker in W, leaving S empty for controller enablement."""
+
+    if type(worker_pid) is not int or worker_pid <= 1:
+        raise ControllerProtocolError("native worker PID is invalid")
+    try:
+        relative = native_boundary_v27._unified_cgroup_relative_v27(
+            (proc_root / "self/cgroup").read_bytes()
+        )
+        if Path(relative).name != "controller":
+            raise ControllerProtocolError(
+                "controller is not in the exact delegated controller subgroup"
+            )
+        supervisor = native_boundary_v27._delegated_supervisor_path_v27(
+            relative, cgroup_root=cgroup_root
+        )
+        try:
+            os.mkdir(supervisor, _SUPERVISOR_CGROUP_MODE_V27)
+        except FileExistsError:
+            pass
+        os.chown(
+            supervisor,
+            controller_uid,
+            worker_gid,
+            follow_symlinks=False,
+        )
+        os.chmod(
+            supervisor,
+            _SUPERVISOR_CGROUP_MODE_V27,
+            follow_symlinks=False,
+        )
+        descriptor = os.open(
+            supervisor,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != controller_uid
+            or metadata.st_gid != worker_gid
+            or _observed_cgroup_mode_v27(descriptor, cgroup_mode_observer)
+            != _SUPERVISOR_CGROUP_MODE_V27
+        ):
+            raise ControllerProtocolError(
+                "delegated supervisor cgroup owner/mode/type changed"
+            )
+        supervisor_process_file = _prepare_supervisor_process_control_v27(
+            descriptor,
+            controller_uid=controller_uid,
+            worker_uid=worker_uid,
+            worker_gid=worker_gid,
+            cgroup2_observer=cgroup2_observer,
+        )
+        # Stale payloads are recovered only after the worker has forked and
+        # the parent has loaded the controller-only HMAC key.  This preserves
+        # the worker key-denial invariant while allowing authenticated arena
+        # and retirement journals to be verified before service readiness.
+        recovered_retirements: dict[str, dict[str, Any]] = {}
+        try:
+            os.mkdir("worker", _WORKER_CGROUP_MODE_V27, dir_fd=descriptor)
+        except FileExistsError:
+            pass
+        worker_before = os.stat(
+            "worker", dir_fd=descriptor, follow_symlinks=False
+        )
+        worker_descriptor = _open_recover_worker_cgroup_v27(
+            descriptor,
+            worker_before,
+            controller_uid=controller_uid,
+            worker_gid=worker_gid,
+            cgroup2_observer=cgroup2_observer,
+            cgroup_mode_observer=cgroup_mode_observer,
+        )
+        worker_metadata = os.fstat(worker_descriptor)
+        if (
+            not stat.S_ISDIR(worker_metadata.st_mode)
+            or worker_metadata.st_uid != controller_uid
+            or worker_metadata.st_gid != worker_gid
+            or stat.S_IMODE(worker_metadata.st_mode) != _WORKER_CGROUP_MODE_V27
+        ):
+            raise ControllerProtocolError(
+                "delegated worker cgroup owner/mode/type changed"
+            )
+        worker_process_file = os.open(
+            "cgroup.procs",
+            os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=worker_descriptor,
+        )
+        _validate_supervisor_process_control_v27(
+            worker_process_file, worker_uid=worker_uid
+        )
+        relative_supervisor = "/" + "/".join(
+            supervisor.relative_to(cgroup_root).parts
+        )
+        relative_worker = relative_supervisor + "/worker"
+        _place_persistent_worker_v27(
+            worker_process_file,
+            worker_pid=worker_pid,
+            pidfd=worker_pidfd,
+            start_time=worker_start_time,
+            expected_relative=relative_worker,
+            proc_root=proc_root,
+        )
+        _enable_exact_subtree_controllers_v27(descriptor)
+        return (
+            descriptor,
+            supervisor_process_file,
+            worker_descriptor,
+            worker_process_file,
+            relative_worker,
+            recovered_retirements,
+        )
+    except (
+        OSError,
+        native_boundary_v27.NativeBoundaryV27Error,
+        ControllerProtocolError,
+    ) as exc:
+        if "descriptor" in locals():
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if "worker_process_file" in locals():
+            try:
+                os.close(worker_process_file)
+            except OSError:
+                pass
+        if "supervisor_process_file" in locals():
+            try:
+                os.close(supervisor_process_file)
+            except OSError:
+                pass
+        if "worker_descriptor" in locals():
+            try:
+                os.close(worker_descriptor)
+            except OSError:
+                pass
+        if isinstance(exc, ControllerProtocolError):
+            raise
+        raise ControllerProtocolError(
+            f"cannot place native worker in delegated supervisor cgroup: {exc}"
+        ) from exc
 
 
 def _spawn_worker_channel_v27(
@@ -1380,17 +7629,104 @@ def _spawn_worker_channel_v27(
         socket.AF_UNIX,
         socket.SOCK_SEQPACKET | getattr(socket, "SOCK_CLOEXEC", 0),
     )
+    parent.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    child.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    try:
+        worker_gid = pwd.getpwuid(config.worker_uid).pw_gid
+    except KeyError as exc:
+        parent.close()
+        child.close()
+        raise ControllerProtocolError("configured worker UID has no local account") from exc
     parent_pid = os.getpid()
+    worker_session_nonce = secrets.token_hex(32)
+    release_read, release_write = os.pipe2(os.O_CLOEXEC)
     pid = os.fork()
     if pid == 0:
         parent.close()
+        os.close(release_write)
         try:
-            _worker_main_v27(child, config, manifest, parent_pid)
+            if os.read(release_read, 1) != b"R":
+                raise ControllerProtocolError(
+                    "native worker cgroup release gate was not satisfied"
+                )
+            os.close(release_read)
+            _worker_main_v27(
+                child,
+                config,
+                manifest,
+                parent_pid,
+                worker_session_nonce,
+            )
         except BaseException:
             os._exit(125)
         os._exit(0)
     child.close()
-    return _WorkerChannelV27(parent, pid, config.worker_uid)
+    os.close(release_read)
+    if not hasattr(os, "pidfd_open"):
+        parent.close()
+        os.close(release_write)
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        raise ControllerProtocolError("native worker custody requires pidfd_open")
+    try:
+        pidfd = os.pidfd_open(pid, 0)
+        worker_start_time = _process_start_time_v27(pid)
+        (
+            supervisor_cgroup_fd,
+            supervisor_procs_fd,
+            worker_cgroup_fd,
+            worker_procs_fd,
+            worker_cgroup_relative,
+            recovered_retirements,
+        ) = _move_worker_to_supervisor_cgroup_v27(
+            pid,
+            worker_pidfd=pidfd,
+            worker_start_time=worker_start_time,
+            controller_uid=config.controller_uid,
+            worker_uid=config.worker_uid,
+            worker_gid=worker_gid,
+        )
+        native_boundary_v27._write_all_v27(release_write, b"R")
+        os.close(release_write)
+        return _WorkerChannelV27(
+            parent,
+            pid,
+            pidfd,
+            config.worker_uid,
+            worker_gid,
+            config.controller_uid,
+            worker_gid,
+            supervisor_cgroup_fd,
+            supervisor_procs_fd,
+            worker_cgroup_fd,
+            worker_procs_fd,
+            worker_cgroup_relative,
+            worker_start_time,
+            worker_session_nonce,
+            recovered_retirements,
+        )
+    except Exception:
+        os.close(release_write)
+        parent.close()
+        try:
+            if "pidfd" in locals() and hasattr(signal, "pidfd_send_signal"):
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL, None, 0)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        os.waitpid(pid, 0)
+        if "pidfd" in locals():
+            os.close(pidfd)
+        if "supervisor_cgroup_fd" in locals():
+            os.close(supervisor_cgroup_fd)
+        if "supervisor_procs_fd" in locals():
+            os.close(supervisor_procs_fd)
+        if "worker_procs_fd" in locals():
+            os.close(worker_procs_fd)
+        if "worker_cgroup_fd" in locals():
+            os.close(worker_cgroup_fd)
+        raise
 
 
 def _validate_endpoint_parent(config: ControllerConfig) -> None:
@@ -1607,14 +7943,14 @@ def step_operation(config: ControllerConfig, session: Mapping[str, Any], target_
 def execute_native_effect_v27(
     config: ControllerConfig,
     session: Mapping[str, Any],
-    plan: Mapping[str, Any],
+    authorization_record_sha256: str,
 ) -> dict[str, Any]:
     request = {
         "operationId": session["operationId"],
         "sessionNonce": session["sessionNonce"],
         "executionNonce": secrets.token_hex(32),
         "predecessorReceiptSha256": session["receiptSha256"],
-        "plan": dict(plan),
+        "authorizationRecordSha256": authorization_record_sha256,
     }
     response = _request("EXECUTE", request, config)
     if (
@@ -1809,6 +8145,10 @@ def _load_state(
     fields = {
         "openBindingSha256",
         "expiresAtUnix",
+        "operation",
+        "repositoryLocatorSha256",
+        "requestSha256",
+        "operatorGeneration",
         "state",
         "usedNonces",
         "response",
@@ -1824,12 +8164,24 @@ def _load_state(
     }:
         fields.add("effectAuthorizationReceiptSha256")
         fields.update(
-            {"nativeEffectPlanSha256", "nativeEffectResultSha256"}
+            {
+                "nativeEffectAuthorizationRecordSha256",
+                "nativeEffectPlanSha256",
+                "nativeEffectOperatorGeneration",
+                "nativeEffectResultSha256",
+                "nativeEffectResult",
+            }
         )
     if state in _RECOVERY_STATES:
         fields.add("recoveryPublicationIntentSha256")
     data = _closed_mapping(value, fields, "controller durable state")
     _digest(data["openBindingSha256"], "state openBindingSha256")
+    if data["operation"] not in ALLOWED_OPERATIONS:
+        raise ControllerProtocolError("controller durable operation is invalid")
+    _digest(data["repositoryLocatorSha256"], "state repositoryLocatorSha256")
+    _digest(data["requestSha256"], "state requestSha256")
+    if type(data["operatorGeneration"]) is not int or data["operatorGeneration"] < 0:
+        raise ControllerProtocolError("controller durable operator generation is invalid")
     _positive_int(data["expiresAtUnix"], "state expiresAtUnix")
     if state not in _STATES:
         raise ControllerProtocolError("controller durable state has an unknown state")
@@ -1841,6 +8193,11 @@ def _load_state(
             "state effectAuthorizationReceiptSha256",
         )
         _digest(
+            data["nativeEffectAuthorizationRecordSha256"],
+            "state nativeEffectAuthorizationRecordSha256",
+            nullable=True,
+        )
+        _digest(
             data["nativeEffectPlanSha256"],
             "state nativeEffectPlanSha256",
             nullable=True,
@@ -1850,12 +8207,27 @@ def _load_state(
             "state nativeEffectResultSha256",
             nullable=True,
         )
+        native_generation = data["nativeEffectOperatorGeneration"]
+        if native_generation is not None and (
+            type(native_generation) is not int or native_generation < 0
+        ):
+            raise ControllerProtocolError("native effect operator generation is invalid")
         if (data["nativeEffectPlanSha256"] is None) != (
-            data["nativeEffectResultSha256"] is None
+            data["nativeEffectAuthorizationRecordSha256"] is None
+        ) or (data["nativeEffectPlanSha256"] is None) != (
+            native_generation is None
         ):
             raise ControllerProtocolError(
-                "controller native effect plan/result binding is incomplete"
+                "controller native effect authorization binding is incomplete"
             )
+        native_result = data["nativeEffectResult"]
+        if (native_result is None) != (data["nativeEffectResultSha256"] is None):
+            raise ControllerProtocolError("controller native effect result binding is incomplete")
+        if native_result is not None and (
+            not isinstance(native_result, dict)
+            or _sha(_canonical(native_result)) != data["nativeEffectResultSha256"]
+        ):
+            raise ControllerProtocolError("controller native effect result digest changed")
     if state in _RECOVERY_STATES:
         _digest(
             data["recoveryPublicationIntentSha256"],
@@ -1964,6 +8336,717 @@ def _write_state(path: Path, value: Mapping[str, Any], expected: bytes | None) -
         os.close(directory)
 
 
+def _protected_record_v27(
+    config: ControllerConfig,
+    repository_locator_sha256: str,
+    relative: tuple[str, ...],
+    *,
+    kind: str,
+    expected_record_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Reopen and authenticate one broker-published protected record.
+
+    This is controller-side validation, not caller attestation.  The worker
+    never receives the protected root or record HMAC key.
+    """
+
+    repository = _digest(repository_locator_sha256, "protected repository")
+    key = _read_root_owned(
+        config.record_hmac_key_path,
+        "protected runtime record HMAC key",
+        max_bytes=4096,
+    )
+    if not 32 <= len(key) <= 4096:
+        raise ControllerProtocolError("protected runtime record HMAC key is invalid")
+    if any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", item) is None for item in relative):
+        raise ControllerProtocolError("protected record path component is invalid")
+    path = (
+        config.protected_root
+        / "beads-authority-v1"
+        / repository.removeprefix("sha256:")
+    ).joinpath(*relative)
+    raw = _read_root_owned(
+        path,
+        f"protected {kind} record",
+        max_bytes=MAX_MESSAGE_BYTES,
+    )
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ControllerProtocolError(f"protected {kind} record is malformed") from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"payload", "auth"}
+        or not isinstance(value["payload"], dict)
+        or _canonical(value) != raw
+    ):
+        raise ControllerProtocolError(f"protected {kind} record is not canonical")
+    body = value["payload"]
+    if body.get("kind") != kind or body.get("schemaVersion") != 1:
+        raise ControllerProtocolError(f"protected {kind} record kind changed")
+    body_raw = _canonical(body)
+    record_sha256 = _sha(body_raw)
+    if expected_record_sha256 is not None and record_sha256 != expected_record_sha256:
+        raise ControllerProtocolError(f"protected {kind} record digest changed")
+    expected_auth = "hmac-sha256:" + hmac.new(
+        key,
+        f"startup-factory/{kind}/v1\0".encode("ascii") + body_raw,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(str(value["auth"]), expected_auth):
+        raise ControllerProtocolError(f"protected {kind} record authentication failed")
+    if body.get("repositoryLocatorSha256") != repository:
+        raise ControllerProtocolError(f"protected {kind} repository binding changed")
+    return {"payload": body, "recordSha256": record_sha256, "rawSha256": _sha(raw)}
+
+
+def _closed_effect_text_v27(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > 4096
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        raise ControllerProtocolError(f"protected {label} is not a safe fixed argv value")
+    return value
+
+
+def _prepared_expected_bindings_v27(evidence: Mapping[str, Any]) -> Any:
+    """Decode the separately authenticated typed expected-binding evidence.
+
+    The candidate prepared payload is deliberately not an input.  In
+    particular, ``payload_sha256`` must already be present in the protected
+    finish evidence and cannot be minted by hashing the candidate here.
+    """
+
+    try:
+        from bin.beads_contract import PreparedBeadsStoreExpectedBindingsV1
+
+        return PreparedBeadsStoreExpectedBindingsV1(
+            **dict(evidence),
+        )
+    except (ImportError, KeyError, TypeError, ValueError) as exc:
+        raise ControllerProtocolError(
+            "protected typed prepared expected bindings are invalid"
+        ) from exc
+
+
+def _derive_protected_read_back_plan_v27(
+    config: ControllerConfig,
+    repository: str,
+    candidate: Mapping[str, Any],
+    target_id: str,
+) -> dict[str, Any]:
+    pointer_digest = _digest(
+        candidate.get("preparationPointerRecordSha256"),
+        "protected preparation pointer",
+    )
+    pointer = _protected_record_v27(
+        config,
+        repository,
+        (
+            "preparation-current",
+            "history",
+            pointer_digest.removeprefix("sha256:") + ".json",
+        ),
+        kind="beads-preparation-current",
+        expected_record_sha256=pointer_digest,
+    )
+    result_digest = _digest(
+        pointer["payload"].get("resultRecordSha256"),
+        "protected preparation result",
+    )
+    result = _protected_record_v27(
+        config,
+        repository,
+        (
+            "preparation-results",
+            "history",
+            result_digest.removeprefix("sha256:") + ".json",
+        ),
+        kind="beads-preparation-result",
+        expected_record_sha256=result_digest,
+    )
+    if pointer["payload"].get("leaseRecordSha256") != result["payload"].get(
+        "leaseRecordSha256"
+    ):
+        raise ControllerProtocolError("protected preparation pointer/result lease changed")
+    lease_digest = _digest(
+        result["payload"].get("leaseRecordSha256"), "protected preparation lease"
+    )
+    lease = _protected_record_v27(
+        config,
+        repository,
+        (
+            "preparation-leases",
+            "history",
+            lease_digest.removeprefix("sha256:") + ".json",
+        ),
+        kind="beads-preparation-lease",
+        expected_record_sha256=lease_digest,
+    )
+    canonical_text = result["payload"].get("preparedPayloadCanonicalJson")
+    if not isinstance(canonical_text, str):
+        raise ControllerProtocolError("protected prepared payload text is absent")
+    canonical = canonical_text.encode("utf-8")
+    if (
+        _sha(canonical)
+        != result["payload"].get("preparedPayloadCanonicalSha256")
+    ):
+        raise ControllerProtocolError("protected prepared payload raw digest changed")
+    try:
+        payload = json.loads(canonical)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ControllerProtocolError("protected prepared payload is malformed") from exc
+    if not isinstance(payload, dict) or _canonical(payload) != canonical:
+        raise ControllerProtocolError("protected prepared payload is noncanonical")
+    if (
+        payload.get("repositoryLocatorSha256") != repository
+        or payload.get("databaseName") != candidate.get("databaseName")
+        or payload.get("preparationMode") != lease["payload"].get("preparationMode")
+        or payload.get("executable", {}).get("sha256")
+        != lease["payload"].get("executableSha256")
+    ):
+        raise ControllerProtocolError(
+            "protected prepared payload differs from authority/lease bindings"
+        )
+    expected_text = result["payload"].get(
+        "preparedExpectedBindingsCanonicalJson"
+    )
+    expected_raw_digest = result["payload"].get(
+        "preparedExpectedBindingsCanonicalSha256"
+    )
+    if not isinstance(expected_text, str):
+        raise ControllerProtocolError(
+            "protected typed prepared expected bindings are absent"
+        )
+    expected_raw = expected_text.encode("utf-8")
+    if _sha(expected_raw) != expected_raw_digest:
+        raise ControllerProtocolError(
+            "protected typed prepared expected-binding bytes changed"
+        )
+    try:
+        expected_value = json.loads(expected_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ControllerProtocolError(
+            "protected typed prepared expected bindings are malformed"
+        ) from exc
+    if not isinstance(expected_value, dict) or _canonical(expected_value) != expected_raw:
+        raise ControllerProtocolError(
+            "protected typed prepared expected bindings are noncanonical"
+        )
+    expected = _prepared_expected_bindings_v27(expected_value)
+    try:
+        verified = native_boundary_v27.verify_protected_read_back_candidate_v27(
+            canonical,
+            protected_raw_sha256=str(
+                result["payload"]["preparedPayloadCanonicalSha256"]
+            ),
+            protected_expected_bindings=expected,
+        )
+    except native_boundary_v27.NativeBoundaryV27Error as exc:
+        raise ControllerProtocolError(
+            f"protected read-back candidate verification failed: {exc}"
+        ) from exc
+    executable_path = Path(
+        _closed_effect_text_v27(lease["payload"].get("executablePath"), "executable path")
+    )
+    repository_path = Path(
+        _closed_effect_text_v27(candidate.get("repositoryPath"), "repository path")
+    )
+    database_relative = payload.get("databaseRootRelative")
+    if not isinstance(database_relative, str) or Path(database_relative).is_absolute():
+        raise ControllerProtocolError("protected database relative path is invalid")
+    database_path = repository_path / database_relative
+    target_path = STATE_ROOT / f".read-back-target-{os.getpid()}-{secrets.token_hex(8)}"
+    descriptors: list[int] = []
+    try:
+        descriptors.append(
+            os.open(executable_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        )
+        descriptors.append(
+            os.open(
+                database_path,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+        )
+        target_fd = os.open(
+            target_path,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        descriptors.append(target_fd)
+        native_boundary_v27._write_all_v27(target_fd, (target_id + "\n").encode())
+        os.fsync(target_fd)
+        os.lseek(target_fd, 0, os.SEEK_SET)
+        derived = native_boundary_v27.derive_descriptor_pinned_read_back_plan_v27(
+            verified,
+            binary_fd=descriptors[0],
+            database_fd=descriptors[1],
+            target_id_fd=target_fd,
+        )
+        return native_boundary_v27.descriptor_pinned_read_back_plan_payload_v27(
+            derived
+        )
+    except (OSError, native_boundary_v27.NativeBoundaryV27Error) as exc:
+        raise ControllerProtocolError(
+            f"cannot derive descriptor-pinned protected read-back plan: {exc}"
+        ) from exc
+    finally:
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            os.unlink(target_path)
+        except FileNotFoundError:
+            pass
+
+
+def _derive_protected_effect_authority_v27(
+    config: ControllerConfig,
+    prior: Mapping[str, Any],
+    authorization_record_sha256: str,
+    manifest: native_boundary_v27.NativeBoundaryManifestV27,
+    operation_id: str,
+    *,
+    controller_key: bytes | None = None,
+    operator_generation: int = 0,
+) -> tuple[dict[str, Any], int, int | None]:
+    """Derive the only native plan from authenticated protected current state."""
+
+    authorization_digest = _digest(
+        authorization_record_sha256, "EXECUTE authorizationRecordSha256"
+    )
+    repository = _digest(
+        prior.get("repositoryLocatorSha256"), "controller repository binding"
+    )
+    operation = prior.get("operation")
+    authority = _protected_record_v27(
+        config,
+        repository,
+        ("authority", "current.json"),
+        kind="beads-authority-epoch-state",
+    )
+    authority_body = authority["payload"]
+    candidate = authority_body.get("candidate")
+
+    operation_class: str
+    argv: list[str]
+    repository_path: str
+    read_back_target_id: str | None = None
+    preparation_commands: list[list[str]] | None = None
+    stage_start = 1
+    stage_end: int | None = None
+    if operation in {"advance_atomic_claim_v1", "record_atomic_claim_receipt_v1"}:
+        if not isinstance(candidate, dict):
+            raise ControllerProtocolError("protected authority has no repository candidate")
+        lease = _protected_record_v27(
+            config,
+            repository,
+            (
+                "claims",
+                "history",
+                authorization_digest.removeprefix("sha256:") + ".json",
+            ),
+            kind="atomic-claim-lease",
+            expected_record_sha256=authorization_digest,
+        )["payload"]
+        if lease.get("activeAuthorityRecordSha256") != authority["recordSha256"]:
+            raise ControllerProtocolError("claim authority is not the authenticated current")
+        if authority_body.get("authorityState") != "active":
+            raise ControllerProtocolError("claim authority is not active")
+        task_id = _closed_effect_text_v27(lease.get("taskId"), "task id")
+        read_back_target_id = task_id
+        repository_path = _closed_effect_text_v27(
+            candidate.get("repositoryPath"), "repository path"
+        )
+        if operation == "advance_atomic_claim_v1":
+            if lease.get("claimState") != "prepared":
+                raise ControllerProtocolError("claim CAS requires a prepared lease")
+            expected_revision = _closed_effect_text_v27(
+                lease.get("expectedRevision"), "expected revision"
+            )
+            operation_class = "claim-cas"
+            argv = [
+                "/usr/local/bin/bd",
+                "update",
+                task_id,
+                "--claim",
+                "--expected-revision",
+                expected_revision,
+                "--json",
+            ]
+        else:
+            if lease.get("claimState") != "claimed":
+                raise ControllerProtocolError("claim receipt comment requires a claimed lease")
+            receipt_body = _canonical(
+                {
+                    "claimLeaseRecordSha256": authorization_digest,
+                    "taskId": task_id,
+                }
+            ).decode("utf-8")
+            operation_class = "receipt-comment"
+            argv = [
+                "/usr/local/bin/bd",
+                "comments",
+                "add",
+                task_id,
+                "--body",
+                receipt_body,
+                "--json",
+            ]
+    elif operation in {"finish_beads_mutation_v1", "advance_beads_preparation_v1"}:
+        intent = _protected_record_v27(
+            config,
+            repository,
+            (
+                "mutation-intents",
+                "history",
+                authorization_digest.removeprefix("sha256:") + ".json",
+            ),
+            kind="beads-mutation-intent",
+            expected_record_sha256=authorization_digest,
+        )["payload"]
+        raw_argv = intent.get("argv")
+        if (
+            not isinstance(raw_argv, list)
+            or not raw_argv
+            or any(not isinstance(item, str) for item in raw_argv)
+        ):
+            raise ControllerProtocolError("protected mutation intent argv is invalid")
+        argv = ["/usr/local/bin/bd", *[
+            _closed_effect_text_v27(item, "mutation argv") for item in raw_argv[1:]
+        ]]
+        if intent.get("mutationClass") == "ordinary":
+            if not isinstance(candidate, dict):
+                raise ControllerProtocolError(
+                    "protected authority has no repository candidate"
+                )
+            if (
+                authority_body.get("authorityState") != "active"
+                or intent.get("activeAuthorityRecordSha256")
+                != authority["recordSha256"]
+            ):
+                raise ControllerProtocolError("ordinary mutation authority is stale")
+            operation_class = "ordinary"
+            repository_path = _closed_effect_text_v27(
+                candidate.get("repositoryPath"), "repository path"
+            )
+            if len(argv) >= 3 and argv[1] == "update":
+                read_back_target_id = _closed_effect_text_v27(
+                    argv[2], "ordinary mutation target id"
+                )
+            elif len(argv) >= 4 and argv[1:3] == ["comments", "add"]:
+                read_back_target_id = _closed_effect_text_v27(
+                    argv[3], "ordinary mutation target id"
+                )
+            else:
+                raise ControllerProtocolError(
+                    "ordinary mutation has no pre-authorized exact read-back target"
+                )
+        elif intent.get("mutationClass") == "preparation":
+            lease_digest = _digest(
+                intent.get("preparationLeaseRecordSha256"),
+                "preparation lease record",
+            )
+            lease = _protected_record_v27(
+                config,
+                repository,
+                (
+                    "preparation-leases",
+                    "history",
+                    lease_digest.removeprefix("sha256:") + ".json",
+                ),
+                kind="beads-preparation-lease",
+                expected_record_sha256=lease_digest,
+            )["payload"]
+            if authority_body.get("authorityState") != "revoked":
+                raise ControllerProtocolError("preparation requires revoked authority")
+            if controller_key is None or not 32 <= len(controller_key) <= 4096:
+                raise ControllerProtocolError(
+                    "preparation sequence operation requires the controller HMAC key"
+                )
+            command_digest = _digest(
+                intent.get("preparationCommandIntentRecordSha256"),
+                "preparation command intent",
+            )
+            command = _protected_record_v27(
+                config,
+                repository,
+                (
+                    "preparation-commands",
+                    "history",
+                    command_digest.removeprefix("sha256:") + ".json",
+                ),
+                kind="beads-preparation-command-intent",
+                expected_record_sha256=command_digest,
+            )["payload"]
+            if command.get("leaseRecordSha256") != lease_digest:
+                raise ControllerProtocolError(
+                    "preparation command does not bind its exact lease"
+                )
+            sequence_fields = {
+                "repositoryLocatorSha256": repository,
+                "preparationSequenceSha256": _digest(
+                    lease.get("preparationSequenceSha256"),
+                    "preparation sequence",
+                ),
+                "authorizationRecordSha256": _digest(
+                    lease.get("authorizationRecordSha256"),
+                    "preparation authorization",
+                ),
+                "leaseTransactionIntentSha256": _digest(
+                    lease.get("transactionIntentSha256"),
+                    "preparation lease transaction",
+                ),
+                "revokedAuthorityRecordSha256": _digest(
+                    lease.get("revokedAuthorityRecordSha256"),
+                    "preparation revoked current",
+                ),
+                "operatorGeneration": operator_generation,
+            }
+            operation_id = hmac.new(
+                controller_key,
+                b"startup-factory/beads/v27/preparation-sequence-operation\0"
+                + _canonical(sequence_fields),
+                hashlib.sha256,
+            ).hexdigest()
+            mode = lease.get("preparationMode")
+            if mode == "create":
+                operation_class = "create-preparation"
+                stage_path = Path(
+                    _closed_effect_text_v27(
+                        lease.get("createStageDatabasePath"), "create-stage path"
+                    )
+                )
+                repository_path = str(stage_path.parent)
+                database = f"/workspace/{stage_path.name}"
+                config_value = _closed_effect_text_v27(
+                    lease.get("statusConfigValue"), "status config value"
+                )
+                executable = _closed_effect_text_v27(
+                    lease.get("executablePath"), "preparation executable path"
+                )
+                protected_commands = [
+                    [executable, "version", "--json"],
+                    [executable, "--db", str(stage_path), "--json", "--sandbox", "init"],
+                    [
+                        executable, "--db", str(stage_path), "--json", "--sandbox",
+                        "config", "set", "status.custom", config_value,
+                    ],
+                    [
+                        executable, "--db", str(stage_path), "--json", "--sandbox",
+                        "config", "list",
+                    ],
+                ]
+                preparation_commands = [
+                    ["/usr/local/bin/bd", "version", "--json"],
+                    [
+                        "/usr/local/bin/bd", "--db", database, "--json",
+                        "--sandbox", "init",
+                    ],
+                    [
+                        "/usr/local/bin/bd", "--db", database, "--json",
+                        "--sandbox", "config", "set", "status.custom",
+                        config_value,
+                    ],
+                    [
+                        "/usr/local/bin/bd", "--db", database, "--json",
+                        "--sandbox", "config", "list",
+                    ],
+                ]
+                ordinal = command.get("commandOrdinal")
+                if type(ordinal) is not int or not 0 <= ordinal <= 3:
+                    raise ControllerProtocolError(
+                        "create preparation command ordinal is invalid"
+                    )
+                stage_start = ordinal * 13 + 1
+                stage_end = stage_start + 12
+                expected_kind = (
+                    "binary-proof", "initialize", "status-config-write",
+                    "status-config-readback",
+                )[ordinal]
+            elif mode == "reattest":
+                operation_class = "reattest-preparation"
+                repository_path = _closed_effect_text_v27(
+                    lease.get("repositoryPath"), "repository path"
+                )
+                selector = Path(
+                    _closed_effect_text_v27(
+                        lease.get("installedSelectorPath"), "installed selector"
+                    )
+                )
+                try:
+                    relative_selector = selector.relative_to(Path(repository_path))
+                except ValueError as exc:
+                    raise ControllerProtocolError(
+                        "reattest selector is outside its protected repository"
+                    ) from exc
+                preparation_commands = [[
+                    "/usr/local/bin/bd", "--db",
+                    "/workspace/" + relative_selector.as_posix(), "--json",
+                    "--sandbox", "config", "list",
+                ]]
+                protected_commands = [[
+                    _closed_effect_text_v27(
+                        lease.get("executablePath"), "preparation executable path"
+                    ),
+                    "--db", str(selector), "--json", "--sandbox", "config", "list",
+                ]]
+                if command.get("commandOrdinal") != 0:
+                    raise ControllerProtocolError(
+                        "reattest preparation command ordinal is invalid"
+                    )
+                stage_start, stage_end = 1, 13
+                expected_kind = "status-config-readback"
+            else:
+                raise ControllerProtocolError("preparation mode is invalid")
+            ordinal = int(command["commandOrdinal"])
+            command_argv = command.get("argv")
+            if (
+                command.get("commandKind") != expected_kind
+                or command_argv != protected_commands[ordinal]
+                or intent.get("argv") != command_argv
+                or command.get("argvSha256") != _sha(_canonical(command_argv))
+                or intent.get("argvSha256") != command.get("argvSha256")
+            ):
+                raise ControllerProtocolError(
+                    "preparation command differs from its exact protected sequence row"
+                )
+            argv = list(preparation_commands[0])
+        else:
+            raise ControllerProtocolError("protected mutation class is invalid")
+    elif operation == "finish_beads_preparation_v1":
+        lease = _protected_record_v27(
+            config,
+            repository,
+            (
+                "preparation-leases",
+                "history",
+                authorization_digest.removeprefix("sha256:") + ".json",
+            ),
+            kind="beads-preparation-lease",
+            expected_record_sha256=authorization_digest,
+        )["payload"]
+        if (
+            authority_body.get("authorityState") != "revoked"
+            or lease.get("preparationState") != "commands-complete"
+            or controller_key is None
+            or not 32 <= len(controller_key) <= 4096
+        ):
+            raise ControllerProtocolError(
+                "preparation finish does not bind a completed revoked sequence"
+            )
+        sequence_fields = {
+            "repositoryLocatorSha256": repository,
+            "preparationSequenceSha256": _digest(
+                lease.get("preparationSequenceSha256"), "preparation sequence"
+            ),
+            "authorizationRecordSha256": _digest(
+                lease.get("authorizationRecordSha256"), "preparation authorization"
+            ),
+            "leaseTransactionIntentSha256": _digest(
+                lease.get("transactionIntentSha256"), "preparation lease transaction"
+            ),
+            "revokedAuthorityRecordSha256": _digest(
+                lease.get("revokedAuthorityRecordSha256"),
+                "preparation revoked current",
+            ),
+            "operatorGeneration": operator_generation,
+        }
+        operation_id = hmac.new(
+            controller_key,
+            b"startup-factory/beads/v27/preparation-sequence-operation\0"
+            + _canonical(sequence_fields),
+            hashlib.sha256,
+        ).hexdigest()
+        mode = lease.get("preparationMode")
+        executable = _closed_effect_text_v27(
+            lease.get("executablePath"), "preparation executable path"
+        )
+        if mode == "create":
+            operation_class = "create-preparation"
+            stage_path = Path(
+                _closed_effect_text_v27(
+                    lease.get("createStageDatabasePath"), "create-stage path"
+                )
+            )
+            repository_path = str(stage_path.parent)
+            database = f"/workspace/{stage_path.name}"
+            config_value = _closed_effect_text_v27(
+                lease.get("statusConfigValue"), "status config value"
+            )
+            preparation_commands = [
+                ["/usr/local/bin/bd", "version", "--json"],
+                [
+                    "/usr/local/bin/bd", "--db", database, "--json",
+                    "--sandbox", "init",
+                ],
+                [
+                    "/usr/local/bin/bd", "--db", database, "--json",
+                    "--sandbox", "config", "set", "status.custom", config_value,
+                ],
+                [
+                    "/usr/local/bin/bd", "--db", database, "--json",
+                    "--sandbox", "config", "list",
+                ],
+            ]
+            stage_start, stage_end = 53, 63
+        elif mode == "reattest":
+            operation_class = "reattest-preparation"
+            repository_path = _closed_effect_text_v27(
+                lease.get("repositoryPath"), "repository path"
+            )
+            selector = Path(
+                _closed_effect_text_v27(
+                    lease.get("installedSelectorPath"), "installed selector"
+                )
+            )
+            try:
+                relative_selector = selector.relative_to(Path(repository_path))
+            except ValueError as exc:
+                raise ControllerProtocolError(
+                    "reattest selector is outside its protected repository"
+                ) from exc
+            preparation_commands = [[
+                "/usr/local/bin/bd", "--db",
+                "/workspace/" + relative_selector.as_posix(), "--json",
+                "--sandbox", "config", "list",
+            ]]
+            stage_start, stage_end = 14, 24
+        else:
+            raise ControllerProtocolError("preparation finish mode is invalid")
+        argv = list(preparation_commands[0])
+    else:
+        raise ControllerProtocolError("operation has no native EXECUTE authority")
+    read_back_plan = None
+    if read_back_target_id is not None:
+        assert isinstance(candidate, dict)
+        read_back_plan = _derive_protected_read_back_plan_v27(
+            config, repository, candidate, read_back_target_id
+        )
+    plan = native_boundary_v27.reference_supervised_effect_plan_v27(
+        manifest,
+        operation_id=operation_id,
+        operation_class=operation_class,
+        argv=argv,
+        repository_path=repository_path,
+        read_back_plan=read_back_plan,
+        preparation_commands=preparation_commands,
+        launch_core_sha256=_digest(
+            prior.get("openBindingSha256"), "controller LaunchCore"
+        ),
+        operator_generation=operator_generation,
+        config_epoch=config.config_epoch,
+        key_epoch=config.key_epoch,
+    )
+    return plan, stage_start, stage_end
+
+
 def _serve_packet(
     packet: bytes,
     peer_uid: int,
@@ -1973,16 +9056,19 @@ def _serve_packet(
     operator_key: bytes | None = None,
     operator_state_path: Path = OPERATOR_STATE_PATH,
     supervisor_runner: Any = None,
+    authority_loader: Any = None,
 ) -> bytes:
     if not config.beads_enabled:
         raise ControllerProtocolError("protected Beads boundary is disabled")
+    operator_generation = 0
     if operator_key is not None:
-        verify_operator_lifecycle_v1(
+        operator_state = verify_operator_lifecycle_v1(
             config,
             operator_key,
             state_path=operator_state_path,
             require_active=True,
         )
+        operator_generation = int(operator_state["generation"])
     try:
         value = json.loads(packet)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -2086,6 +9172,10 @@ def _serve_packet(
         _write_state(path, {
             "openBindingSha256": open_binding_sha256,
             "expiresAtUnix": opened["expiresAtUnix"],
+            "operation": operation,
+            "repositoryLocatorSha256": opened["repositoryLocatorSha256"],
+            "requestSha256": opened["requestSha256"],
+            "operatorGeneration": operator_generation,
             "state": "accepted",
             "usedNonces": [opened["clientNonce"]],
             "response": response,
@@ -2151,8 +9241,11 @@ def _serve_packet(
             successor["effectAuthorizationReceiptSha256"] = response[
                 "receiptSha256"
             ]
+            successor["nativeEffectAuthorizationRecordSha256"] = None
             successor["nativeEffectPlanSha256"] = None
+            successor["nativeEffectOperatorGeneration"] = None
             successor["nativeEffectResultSha256"] = None
+            successor["nativeEffectResult"] = None
         _write_state(path, successor, prior_bytes)
         return _canonical(response)
     if action == "VALIDATE":
@@ -2192,6 +9285,10 @@ def _serve_packet(
             execution["predecessorReceiptSha256"],
             "EXECUTE predecessorReceiptSha256",
         )
+        authorization_digest = _digest(
+            execution["authorizationRecordSha256"],
+            "EXECUTE authorizationRecordSha256",
+        )
         path = _state_file(operation_id)
         loaded = _load_state(path, key)
         assert loaded is not None
@@ -2202,6 +9299,7 @@ def _serve_packet(
             or execution["predecessorReceiptSha256"]
             != prior["response"]["receiptSha256"]
             or int(prior.get("expiresAtUnix", 0)) <= int(time.time())
+            or int(prior.get("operatorGeneration", -1)) != operator_generation
         ):
             raise ControllerProtocolError(
                 "EXECUTE does not bind the live effect-authorized predecessor"
@@ -2210,10 +9308,40 @@ def _serve_packet(
             raise ControllerProtocolError("EXECUTE nonce was already consumed")
         manifest = _verify_installed_artifacts(config)
         _verify_native_platform_gate(manifest, run_probe=False)
-        plan = native_boundary_v27.validate_supervised_effect_plan_v27(
-            execution["plan"], manifest
+        derive = (
+            _derive_protected_effect_authority_v27
+            if authority_loader is None
+            else authority_loader
         )
-        if plan["operationId"] != operation_id:
+        if authority_loader is None:
+            derived_value = derive(
+                config,
+                prior,
+                authorization_digest,
+                manifest,
+                operation_id,
+                controller_key=key,
+                operator_generation=operator_generation,
+            )
+        else:
+            derived_value = derive(
+                config, prior, authorization_digest, manifest, operation_id
+            )
+        if (
+            isinstance(derived_value, tuple)
+            and len(derived_value) == 3
+        ):
+            raw_plan, stage_start, stage_end = derived_value
+        else:
+            raw_plan, stage_start, stage_end = derived_value, 1, None
+        plan = native_boundary_v27.validate_supervised_effect_plan_v27(
+            raw_plan, manifest
+        )
+        if (
+            plan["operationClass"]
+            not in {"create-preparation", "reattest-preparation"}
+            and plan["operationId"] != operation_id
+        ):
             raise ControllerProtocolError(
                 "EXECUTE plan operationId differs from the controller lineage"
             )
@@ -2222,6 +9350,51 @@ def _serve_packet(
             raise ControllerProtocolError(
                 "EXECUTE attempted to rebind a consumed native effect plan"
             )
+        stored_authorization = prior.get("nativeEffectAuthorizationRecordSha256")
+        if stored_authorization is not None and stored_authorization != authorization_digest:
+            raise ControllerProtocolError(
+                "EXECUTE attempted to rebind a consumed protected authorization"
+            )
+        if prior.get("nativeEffectResult") is not None:
+            stored_native_result = prior["nativeEffectResult"]
+            if (
+                not isinstance(stored_native_result, dict)
+                or _sha(_canonical(stored_native_result))
+                != prior.get("nativeEffectResultSha256")
+            ):
+                raise ControllerProtocolError("stored native result authentication changed")
+            response = _sign_response(
+                key,
+                action,
+                {
+                    "status": "executed",
+                    "state": "effect-authorized",
+                    "requestSha256": request_sha,
+                    "operationId": operation_id,
+                    "sessionNonce": execution["sessionNonce"],
+                    "resultSha256": prior["nativeEffectResultSha256"],
+                    "nativeResult": stored_native_result,
+                },
+            )
+            _write_state(
+                path,
+                {
+                    **prior,
+                    "usedNonces": [*prior["usedNonces"], execution["executionNonce"]],
+                },
+                prior_bytes,
+            )
+            return _canonical(response)
+        consumed = {
+            **prior,
+            "usedNonces": [*prior["usedNonces"], execution["executionNonce"]],
+            "nativeEffectAuthorizationRecordSha256": authorization_digest,
+            "nativeEffectPlanSha256": plan["planSha256"],
+            "nativeEffectOperatorGeneration": operator_generation,
+        }
+        _write_state(path, consumed, prior_bytes)
+        prior_bytes = _canonical(consumed)
+        prior = consumed
         try:
             native_result = native_boundary_v27.execute_supervised_effect_v27(
                 STATE_ROOT,
@@ -2229,10 +9402,12 @@ def _serve_packet(
                 manifest,
                 plan,
                 runner=(
-                    native_boundary_v27.run_native_supervisor_v27
+                    native_boundary_v27.run_native_stage_action_v27
                     if supervisor_runner is None
                     else supervisor_runner
                 ),
+                start_location=stage_start,
+                end_location=stage_end,
             )
         except native_boundary_v27.NativeBoundaryV27Error as exc:
             raise ControllerProtocolError(
@@ -2261,9 +9436,9 @@ def _serve_packet(
             path,
             {
                 **prior,
-                "usedNonces": [*prior["usedNonces"], execution["executionNonce"]],
                 "nativeEffectPlanSha256": plan["planSha256"],
                 "nativeEffectResultSha256": result_digest,
+                "nativeEffectResult": native_result,
             },
             prior_bytes,
         )
@@ -2588,10 +9763,6 @@ def serve_forever() -> None:
         # the forked worker cannot inherit either secret.  The worker drops to
         # workerUid, closes every inherited descriptor, proves DAC denial, and
         # performs all Podman/supervisor probes under that identity.
-        operator_key = _read_operator_key()
-        verify_operator_lifecycle_v1(config, operator_key, require_active=True)
-        listener = _create_listener(config)
-        worker.await_ready()
         try:
             key_info = os.lstat(CONTROLLER_KEY_PATH)
             if (
@@ -2624,16 +9795,73 @@ def serve_forever() -> None:
         if len(key) < 32 or len(key) > 4096:
             raise ControllerProtocolError("controller HMAC key must contain 32..4096 bytes")
         _validate_controller_directory(STATE_ROOT, config, "controller state root")
+        recovered = _recover_controller_payload_cgroups_v27(
+            worker.supervisor_cgroup_fd,
+            controller_uid=config.controller_uid,
+            worker_uid=config.worker_uid,
+            worker_gid=worker.cgroup_worker_gid,
+            controller_key=key,
+            recovery_journal_root=STATE_ROOT / "cgroup-recovery-v27",
+        )
+        worker.retirement_receipts.update(recovered)
+        operator_key = _read_operator_key()
+        verify_operator_lifecycle_v1(config, operator_key, require_active=True)
+        # Bind/chown the endpoint and irreversibly drop to controllerUid before
+        # mutating controller-owned handoff journals or leaf modes.
+        listener = _create_listener(config)
+        worker.await_ready()
+        native_boundary_v27.recover_repository_custody_v27(
+            STATE_ROOT,
+            key,
+            native_manifest,
+            {
+                "rootPath": str(REPOSITORY_HANDOFF_ROOT_V27),
+                "controllerUid": config.controller_uid,
+                "workerGid": worker.cgroup_worker_gid,
+                "workerSessionNonce": worker.worker_session_nonce,
+            },
+            release_probe=lambda plan, request_key: worker._probe_repository_release(
+                native_manifest,
+                plan,
+                request_key=request_key,
+                lifecycle_check=lambda: None,
+            ),
+        )
         listener.listen(LISTEN_BACKLOG)
         listener.settimeout(1.0)
+
+        def live_execution_lifecycle() -> dict[str, Any]:
+            live_config = load_controller_config()
+            fixed_live = dataclasses.replace(
+                live_config, beads_enabled=config.beads_enabled
+            )
+            if fixed_live != config:
+                raise ControllerProtocolError(
+                    "live Beads controller configuration identity changed"
+                )
+            operator = verify_operator_lifecycle_v1(
+                live_config, operator_key, require_active=False
+            )
+            return {
+                **operator,
+                "authenticatedOperatorState": operator["operatorState"],
+                "configEnabled": live_config.beads_enabled,
+                "operatorState": (
+                    operator["operatorState"]
+                    if live_config.beads_enabled
+                    else "disabled"
+                ),
+            }
+
         while True:
             # A root operator disable replaces authenticated state in /etc.
             # Re-read it before every accept and request.  A disabled state
             # fences new work and closes the listener so systemd can drain the
             # complete delegated service cgroup.
-            verify_operator_lifecycle_v1(
-                config, operator_key, require_active=True
-            )
+            if live_execution_lifecycle()["operatorState"] != "active":
+                raise ControllerProtocolError(
+                    "local operator state is not active"
+                )
             try:
                 connection, _ = listener.accept()
             except socket.timeout:
@@ -2643,12 +9871,10 @@ def serve_forever() -> None:
                 config,
                 key,
                 operator_key,
-                supervisor_runner=lambda manifest, plan: worker.execute(
-                    manifest,
-                    plan,
-                    lifecycle_check=lambda: verify_operator_lifecycle_v1(
-                        config, operator_key, require_active=True
-                    ),
+                supervisor_runner=_WorkerStageRunnerV27(
+                    worker,
+                    live_execution_lifecycle,
+                    key,
                 ),
             )
     finally:

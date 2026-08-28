@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Opt-in genuine Linux proof for the protected Beads V27 native boundary.
+"""External installed-service proof for the protected Beads V27 boundary.
 
-The offline suite runs this file only to observe its explicit SKIP. Operators
-run it on the exact disposable systemd-254/SELinux host after installing the
-root-owned controller, V27 manifest, native supervisor, Podman and conmon.
-Passing is external evidence; it never promotes Startup Factory readiness.
+This is intentionally skipped by the offline suite.  It runs only on the
+operator-provisioned disposable systemd-254/SELinux/Podman-5.4.1 fixture.  The
+fixture manifest names already-authorized public API requests; it contains no
+credentials and grants no authority.  Passing remains evidence, not readiness.
 """
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import pwd
-import re
 import socket
+import stat
 import subprocess
 import sys
-import tempfile
+import time
+import hashlib
 from pathlib import Path
 
 
@@ -28,309 +28,385 @@ if os.environ.get("STARTUP_FACTORY_REAL_BEADS_NATIVE_V27_PROBE") != "1":
         "operator-provisioned disposable Linux fixture"
     )
     raise SystemExit(0)
-
 if not sys.platform.startswith("linux") or os.geteuid() != 0:
     raise SystemExit("V27 proof requires an operator-provisioned Linux root harness")
 
-from startup_factory_cli import beads_boundary_controller as controller  # noqa: E402
-from startup_factory_cli import beads_native_boundary_v27 as boundary  # noqa: E402
+import startup_factory_cli.beads_boundary_controller as controller  # noqa: E402
+import startup_factory_cli.beads_protected_runtime as runtime  # noqa: E402
 
 
-def strict_json(raw: bytes, label: str) -> object:
-    if not raw or len(raw) > boundary.MAX_CANONICAL_BYTES:
-        raise SystemExit(f"{label} returned empty or oversized JSON")
-
-    def pairs(items):
-        result = {}
-        for key, value in items:
-            if key in result:
-                raise ValueError("duplicate key")
-            result[key] = value
-        return result
-
-    try:
-        value = json.loads(raw, object_pairs_hook=pairs)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise SystemExit(f"{label} returned malformed/duplicate JSON: {exc}") from exc
-    if not isinstance(value, (dict, list)):
-        raise SystemExit(f"{label} did not return one JSON object or array")
-    return value
+UNIT = "startup-factory-beads-controller.service"
+MANIFEST_ENV = "STARTUP_FACTORY_REAL_BEADS_PUBLIC_FIXTURE"
 
 
-def fixed_run(argv: list[str], *, as_uid: int | None = None) -> bytes:
-    if not argv or any(type(item) is not str or not item or "\0" in item for item in argv):
-        raise SystemExit("probe constructed invalid argv")
-    environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
-    before = None
-    if as_uid is not None:
-        account = pwd.getpwuid(as_uid)
-        environment["HOME"] = account.pw_dir
-        environment["USER"] = account.pw_name
-        environment["LOGNAME"] = account.pw_name
-        environment["XDG_RUNTIME_DIR"] = f"/run/user/{as_uid}"
-
-        def before() -> None:
-            os.setgroups([])
-            os.setgid(account.pw_gid)
-            os.setuid(account.pw_uid)
-
+def fixed_run(argv: list[str], *, timeout: int = 30) -> bytes:
     completed = subprocess.run(
         argv,
         shell=False,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env=environment,
-        timeout=30,
+        cwd="/",
+        env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        timeout=timeout,
         check=False,
-        preexec_fn=before,
     )
     if completed.returncode != 0:
         raise SystemExit(
-            f"fixed probe argv {argv!r} failed rc={completed.returncode}: "
-            f"{completed.stderr[:512]!r}"
+            f"fixed fixture argv failed rc={completed.returncode}: {completed.stderr[:512]!r}"
         )
     return completed.stdout
 
 
+def policy_search(*arguments: str) -> bytes:
+    return fixed_run(["/usr/bin/sesearch", *arguments])
+
+
+def require_policy_rule(label: str, *arguments: str) -> None:
+    observed = policy_search(*arguments)
+    if not observed.strip():
+        raise SystemExit(f"loaded SELinux policy lacks {label}")
+
+
+def require_policy_absence(label: str, *arguments: str) -> None:
+    observed = policy_search(*arguments)
+    if observed.strip():
+        raise SystemExit(f"loaded SELinux policy unexpectedly grants {label}")
+
+
+def verify_loaded_selinux_policy(manifest) -> None:
+    if fixed_run(["/usr/sbin/getenforce"]) != b"Enforcing\n":
+        raise SystemExit("external V27 policy probe requires enforcing SELinux")
+    capability = Path(
+        "/sys/fs/selinux/policy_capabilities/nnp_nosuid_transition"
+    ).read_bytes()
+    if capability not in {b"1", b"1\n"}:
+        raise SystemExit("loaded policy lacks nnp_nosuid_transition policycap")
+    loaded = controller.native_boundary_v27._selinux_policy_bytes()
+    if "sha256:" + hashlib.sha256(loaded).hexdigest() != manifest.selinux_policy_sha256:
+        raise SystemExit("loaded SELinux binary differs from the pinned manifest")
+    modules = fixed_run(["/usr/sbin/semodule", "-lfull"]).decode("utf-8").splitlines()
+    matching = [
+        line for line in modules
+        if "startup_factory_beads_v27" in line.split()
+    ]
+    if len(matching) != 1:
+        raise SystemExit("installed V27 SELinux module identity is absent or duplicated")
+
+    result_root = Path("/run/user/993/startup-factory-beads-results")
+    result_metadata = os.lstat(result_root)
+    if (
+        stat.S_ISLNK(result_metadata.st_mode)
+        or not stat.S_ISDIR(result_metadata.st_mode)
+        or result_metadata.st_uid != 993
+        or stat.S_IMODE(result_metadata.st_mode) != 0o700
+    ):
+        raise SystemExit("UID 993 result root type/owner/mode is not exact")
+    expected_result_context = b"system_u:object_r:beads_runtime_result_t:s0"
+    if fixed_run(["/usr/bin/matchpathcon", "-n", str(result_root)]).strip() != expected_result_context:
+        raise SystemExit("installed file-context policy does not map the UID 993 result root")
+    if fixed_run(["/usr/bin/stat", "-c", "%C", str(result_root)]).strip() != expected_result_context:
+        raise SystemExit("UID 993 result root was not actually restored to the pinned label")
+
+    for controller_type in (
+        "beads_controller_t",
+        "startup_factory_beads_controller_t",
+    ):
+        for permission in (
+            "add_name", "create", "getattr", "open", "read", "remove_name",
+            "rmdir", "search", "write",
+        ):
+            require_policy_rule(
+                f"{controller_type} delegated cgroup directory {permission}",
+                "--allow", "-s", controller_type, "-t", "cgroup_t",
+                "-c", "dir", "-p", permission,
+            )
+        for permission in ("getattr", "open", "read", "write"):
+            require_policy_rule(
+                f"{controller_type} delegated cgroup control file {permission}",
+                "--allow", "-s", controller_type, "-t", "cgroup_t",
+                "-c", "file", "-p", permission,
+            )
+        for permission in ("mount", "remount", "unmount"):
+            require_policy_absence(
+                f"{controller_type} cgroup filesystem {permission}",
+                "--allow", "-s", controller_type, "-t", "cgroup_t",
+                "-c", "filesystem", "-p", permission,
+            )
+        for object_class in ("dir", "file"):
+            for permission in ("relabelfrom", "relabelto"):
+                require_policy_absence(
+                    f"{controller_type} cgroup {object_class} {permission}",
+                    "--allow", "-s", controller_type, "-t", "cgroup_t",
+                    "-c", object_class, "-p", permission,
+                )
+
+    automatic_edges = (
+        (
+            "startup_factory_beads_controller_t",
+            "startup_factory_beads_conmon_exec_t",
+            "startup_factory_beads_conmon_t",
+        ),
+        (
+            "startup_factory_beads_controller_t",
+            "startup_factory_beads_runtime_exec_t",
+            "startup_factory_beads_runtime_t",
+        ),
+        (
+            "startup_factory_beads_conmon_t",
+            "startup_factory_beads_runtime_exec_t",
+            "startup_factory_beads_runtime_t",
+        ),
+    )
+    for source, executable, target in automatic_edges:
+        for permission in ("getattr", "read", "open", "map", "execute"):
+            require_policy_rule(
+                f"{source} executable {permission}",
+                "--allow", "-s", source, "-t", executable,
+                "-c", "file", "-p", permission,
+            )
+        require_policy_rule(
+            f"{target} executable entrypoint",
+            "--allow", "-s", target, "-t", executable,
+            "-c", "file", "-p", "entrypoint",
+        )
+        require_policy_rule(
+            f"{source}->{target} process transition",
+            "--allow", "-s", source, "-t", target,
+            "-c", "process", "-p", "transition",
+        )
+        require_policy_rule(
+            f"{source}->{target} NNP transition",
+            "--allow", "-s", source, "-t", target,
+            "-c", "process2", "-p", "nnp_transition",
+        )
+        require_policy_rule(
+            f"{source}->{target} automatic type transition",
+            "--type_trans", "-s", source, "-t", executable,
+            "-c", "process",
+        )
+
+    runtime_type = "startup_factory_beads_runtime_t"
+    payload_type = "startup_factory_beads_payload_t"
+    payload_exec = "startup_factory_beads_payload_exec_t"
+    for permission in ("getattr", "read", "open", "map", "execute"):
+        require_policy_rule(
+            f"runtime payload executable {permission}",
+            "--allow", "-s", runtime_type, "-t", payload_exec,
+            "-c", "file", "-p", permission,
+        )
+    require_policy_rule(
+        "payload executable entrypoint",
+        "--allow", "-s", payload_type, "-t", payload_exec,
+        "-c", "file", "-p", "entrypoint",
+    )
+    require_policy_rule(
+        "runtime payload process transition",
+        "--allow", "-s", runtime_type, "-t", payload_type,
+        "-c", "process", "-p", "transition",
+    )
+    for permission in ("nnp_transition", "nosuid_transition"):
+        require_policy_rule(
+            f"runtime payload {permission}",
+            "--allow", "-s", runtime_type, "-t", payload_type,
+            "-c", "process2", "-p", permission,
+        )
+    require_policy_rule(
+        "runtime self setexec",
+        "--allow", "-s", runtime_type, "-t", runtime_type,
+        "-c", "process", "-p", "setexec",
+    )
+    require_policy_absence(
+        "runtime payload automatic transition",
+        "--type_trans", "-s", runtime_type, "-t", payload_exec,
+        "-c", "process",
+    )
+
+    conmon_type = "startup_factory_beads_conmon_t"
+    podman_exec = "startup_factory_beads_podman_exec_t"
+    for permission in ("execute", "execute_no_trans"):
+        require_policy_absence(
+            f"conmon Podman {permission}",
+            "--allow", "-s", conmon_type, "-t", podman_exec,
+            "-c", "file", "-p", permission,
+        )
+    require_policy_absence(
+        "conmon Podman automatic transition",
+        "--type_trans", "-s", conmon_type, "-t", podman_exec,
+        "-c", "process",
+    )
+    require_policy_absence(
+        "conmon self setexec",
+        "--allow", "-s", conmon_type, "-t", conmon_type,
+        "-c", "process", "-p", "setexec",
+    )
+
+
+def strict_manifest(path: Path) -> dict:
+    raw = path.read_bytes()
+    duplicate = False
+
+    def pairs(items):
+        nonlocal duplicate
+        value = {}
+        for key, item in items:
+            if key in value:
+                duplicate = True
+            value[key] = item
+        return value
+
+    value = json.loads(raw, object_pairs_hook=pairs)
+    if duplicate or not isinstance(value, dict) or runtime.canonical_bytes(value) + b"\n" != raw:
+        raise SystemExit("external V27 public fixture manifest is not canonical closed JSON")
+    if set(value) != {"prepare", "advance", "receipt", "expected"}:
+        raise SystemExit("external V27 public fixture manifest shape changed")
+    return value
+
+
+def public_cycle_as_broker(config, fixture: dict) -> dict:
+    """Use only installed public APIs after entering the configured broker UID."""
+
+    account = pwd.getpwuid(config.broker_uid)
+    read_fd, write_fd = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(read_fd)
+        try:
+            os.environ.clear()
+            os.environ.update(
+                {
+                    "HOME": account.pw_dir,
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "LOGNAME": account.pw_name,
+                    "PATH": "/usr/bin:/bin",
+                    "USER": account.pw_name,
+                }
+            )
+            os.setgroups([])
+            os.setgid(account.pw_gid)
+            os.setuid(account.pw_uid)
+            prepared = runtime.prepare_atomic_claim_v1(
+                runtime.PrepareAtomicClaimRequestV1(**fixture["prepare"])
+            )
+            advanced_request = dict(fixture["advance"])
+            advanced_request["leaseRecordSha256"] = prepared.record_sha256
+            # Hostile caller observations are deliberately bogus. Production
+            # derives success/revision/status from four native read containers.
+            advanced_request.update(
+                {"claimSucceeded": False, "observedRevision": None, "observedStatus": None}
+            )
+            claimed = runtime.advance_atomic_claim_v1(
+                runtime.AdvanceAtomicClaimRequestV1(**advanced_request)
+            )
+            receipt_request = dict(fixture["receipt"])
+            receipt_request["leaseRecordSha256"] = claimed.record_sha256
+            receipt_request.update(
+                {
+                    "readBackRevision": "caller-forgery",
+                    "readBackStatus": "caller-forgery",
+                    "claimIdentitySha256": "sha256:" + "0" * 64,
+                }
+            )
+            receipt = runtime.record_atomic_claim_receipt_v1(
+                runtime.RecordAtomicClaimReceiptRequestV1(**receipt_request)
+            )
+            result = {
+                "claimState": claimed.payload["claimState"],
+                "revision": receipt.payload["revision"],
+                "status": receipt.payload["status"],
+                "taskId": receipt.payload["taskId"],
+            }
+            os.write(write_fd, runtime.canonical_bytes(result))
+            os._exit(0)
+        except BaseException as exc:
+            os.write(write_fd, str(exc).encode("utf-8")[:4096])
+            os._exit(91)
+    os.close(write_fd)
+    raw = os.read(read_fd, runtime.MAX_CANONICAL_BYTES + 1)
+    os.close(read_fd)
+    _pid, status = os.waitpid(child, 0)
+    if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+        raise SystemExit(f"installed public V27 cycle failed: {raw!r}")
+    return json.loads(raw)
+
+
+fixture_path = os.environ.get(MANIFEST_ENV)
+if not fixture_path:
+    raise SystemExit(f"set {MANIFEST_ENV} to the root-owned canonical fixture manifest")
+fixture = strict_manifest(Path(fixture_path))
 config = controller.load_controller_config()
 if not config.beads_enabled:
-    raise SystemExit("beadsEnabled is false; the operator has not enabled this gate")
-operator_key = controller._read_operator_key()
-controller.verify_operator_lifecycle_v1(config, operator_key, require_active=True)
-controller._verify_installed_artifacts(config)
-manifest_raw = controller._read_root_owned(
-    config.native_boundary_manifest_path, "installed V27 manifest"
+    raise SystemExit("beadsEnabled is false; external gate remains non-green")
+controller.verify_operator_lifecycle_v1(
+    config, controller._read_operator_key(), require_active=True
 )
-manifest = boundary.parse_native_boundary_manifest_v27(json.loads(manifest_raw))
+installed_manifest = controller._verify_installed_artifacts(config)
+verify_loaded_selinux_policy(installed_manifest)
 
-for path, expected, label in (
-    (manifest.supervisor_path, manifest.supervisor_sha256, "native supervisor"),
-    (manifest.podman_path, manifest.podman_sha256, "Podman"),
-    (manifest.conmon_path, manifest.conmon_sha256, "conmon"),
-):
-    if controller._sha(controller._read_root_owned(path, label, executable=True)) != expected:
-        raise SystemExit(f"{label} digest differs from the V27 manifest")
-policy_path = Path("/sys/fs/selinux/policy")
-if controller._sha(
-    controller._read_root_owned(
-        policy_path, "SELinux policy", max_bytes=64 * 1024 * 1024
-    )
-) != manifest.selinux_policy_sha256:
-    raise SystemExit("loaded SELinux policy digest differs from the V27 manifest")
+# Start the packaged unit and prove the installed controller domain, rather
+# than calling a Python/native helper directly.
+fixed_run(["/usr/bin/systemctl", "start", UNIT])
+fixed_run(["/usr/bin/systemctl", "is-active", "--quiet", UNIT])
+properties = fixed_run(
+    ["/usr/bin/systemctl", "show", UNIT, "--property=Delegate", "--property=DelegateSubgroup"]
+)
+if properties != b"Delegate=yes\nDelegateSubgroup=controller\n":
+    raise SystemExit("packaged unit delegation differs from the closed topology")
 
-# A non-broker/non-controller/non-worker account must not even connect to the
-# protected endpoint or read any protected authority/key root.
+# Independent agent denial: no protected roots, endpoint, lifecycle or worker
+# handoff may become readable merely because the service is active.
 agent = pwd.getpwnam("nobody")
-if agent.pw_uid in {0, config.controller_uid, config.broker_uid, config.worker_uid}:
-    raise SystemExit("nobody is not a distinct agent denial identity")
 agent_pid = os.fork()
 if agent_pid == 0:
-    try:
-        os.setgroups([])
-        os.setgid(agent.pw_gid)
-        os.setuid(agent.pw_uid)
-        for forbidden in (
-            config.protected_root,
-            config.record_hmac_key_path,
-            controller.CONTROLLER_KEY_PATH,
-            controller.OPERATOR_KEY_PATH,
-        ):
-            try:
-                descriptor = os.open(forbidden, os.O_RDONLY | os.O_NOFOLLOW)
-            except PermissionError:
-                continue
-            else:
-                os.close(descriptor)
-                os._exit(91)
-        denied = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    os.setgroups([])
+    os.setgid(agent.pw_gid)
+    os.setuid(agent.pw_uid)
+    for forbidden in (
+        config.protected_root,
+        config.record_hmac_key_path,
+        controller.CONTROLLER_KEY_PATH,
+        controller.OPERATOR_KEY_PATH,
+        Path("/var/lib/startup-factory/beads-worker"),
+        Path("/var/lib/startup-factory/beads-handoff"),
+    ):
         try:
-            denied.connect(str(controller.ENDPOINT_PATH))
+            descriptor = os.open(forbidden, os.O_RDONLY | os.O_NOFOLLOW)
         except PermissionError:
-            os._exit(0)
-        os._exit(92)
-    except BaseException:
-        os._exit(93)
-_, agent_status = os.waitpid(agent_pid, 0)
-if not os.WIFEXITED(agent_status) or os.WEXITSTATUS(agent_status) != 0:
-    raise SystemExit("unprivileged agent denial fixture failed")
-
-fixture_root = Path(tempfile.mkdtemp(prefix="startup-factory-beads-v27-"))
-workspace = fixture_root / "workspace"
-state_root = fixture_root / "state"
-workspace.mkdir(mode=0o700)
-state_root.mkdir(mode=0o700)
-account = pwd.getpwuid(config.worker_uid)
-for path in (fixture_root, workspace, state_root):
-    os.chown(path, account.pw_uid, account.pw_gid)
-    os.chmod(path, 0o700)
-
-# Permanently enter the production worker identity. All probes and every real
-# Podman/bd lifecycle below run after this point and cannot regain root.
-os.environ.clear()
-os.environ.update(
-    {
-        "HOME": account.pw_dir,
-        "LANG": "C",
-        "LC_ALL": "C",
-        "LOGNAME": account.pw_name,
-        "PATH": "/usr/bin:/bin",
-        "USER": account.pw_name,
-        "XDG_RUNTIME_DIR": f"/run/user/{config.worker_uid}",
-    }
-)
-os.setgroups([])
-os.setgid(account.pw_gid)
-os.setuid(account.pw_uid)
-controller._assert_worker_dac_isolation_v27(config)
-
-supervisor_observation = boundary.verify_local_platform_gate_v27(
-    manifest, expected_worker_uid=config.worker_uid
-)
-boundary.validate_native_supervisor_probe_v27(supervisor_observation, manifest)
-
-left, right = socket.socketpair(
-    socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC, 0
-)
-try:
-    left.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
-    right.send(b"x" * 128)
-    data, ancillary, flags, _ = left.recvmsg(128, socket.CMSG_SPACE(12))
-    credentials = sum(
-        level == socket.SOL_SOCKET and kind == socket.SCM_CREDENTIALS
-        for level, kind, _payload in ancillary
-    )
-    boundary.validate_seqpacket_observation_v27(
-        {
-            "packetLength": len(data),
-            "msgTrunc": bool(flags & socket.MSG_TRUNC),
-            "msgCtrunc": bool(flags & socket.MSG_CTRUNC),
-            "zeroLengthRecord": len(data) == 0,
-            "credentialsCount": credentials,
-            "rightsCount": sum(kind == socket.SCM_RIGHTS for _level, kind, _ in ancillary),
-            "extraQueuedRecord": False,
-            "peerEof": False,
-        },
-        expected_length=128,
-    )
-finally:
-    left.close()
-    right.close()
-
-memfd = os.memfd_create("startup-factory-v27-key", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
-try:
-    key = os.urandom(32)
-    os.write(memfd, key)
-    fcntl.fcntl(
-        memfd,
-        fcntl.F_ADD_SEALS,
-        fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL,
-    )
-    os.lseek(memfd, 0, os.SEEK_SET)
-    boundary.verify_live_sealed_key_material_v27(
-        memfd, expected_sha256=boundary.sha256(key)
-    )
-finally:
-    os.close(memfd)
-
-with tempfile.NamedTemporaryFile() as operation_lock:
-    result, captured_errno = boundary.try_operation_lock_v27(operation_lock.fileno())
-    if (result, captured_errno) != ("acquired", 0):
-        raise SystemExit("the genuine OFD operation-lock fixture did not acquire exactly once")
-
-# Run four genuine bd invocations. Each one traverses sealed-plan FD3 and the
-# exact Podman create -> init -> start/attach -> terminal -> cleanup -> rm path.
-commands = (
-    ["/usr/local/bin/bd", "version", "--json"],
-    [
-        "/usr/local/bin/bd",
-        "--db",
-        "/workspace/db",
-        "--json",
-        "--sandbox",
-        "init",
-    ],
-    [
-        "/usr/local/bin/bd",
-        "--db",
-        "/workspace/db",
-        "--json",
-        "--sandbox",
-        "config",
-        "set",
-        "status.custom",
-        "open,closed",
-    ],
-    [
-        "/usr/local/bin/bd",
-        "--db",
-        "/workspace/db",
-        "--json",
-        "--sandbox",
-        "config",
-        "list",
-    ],
-)
-fixture_key = os.urandom(32)
-for ordinal, argv in enumerate(commands, 1):
-    operation_id = f"{ordinal:064x}"
-    plan = boundary.reference_supervised_effect_plan_v27(
-        manifest,
-        operation_id=operation_id,
-        operation_class="create-preparation",
-        argv=argv,
-        repository_path=str(workspace),
-    )
-    captured = []
-
-    def genuine_runner(observed_manifest, observed_plan):
-        raw = boundary.run_native_supervisor_v27(observed_manifest, observed_plan)
-        captured.append(raw)
-        return raw
-
-    result = boundary.execute_supervised_effect_v27(
-        state_root, fixture_key, manifest, plan, runner=genuine_runner
-    )
-    if result["exitCode"] != 0 or len(captured) != 1:
-        raise SystemExit(f"genuine bd lifecycle {ordinal} did not complete exactly once")
-    strict_json(captured[0]["stdout"], f"genuine bd lifecycle {ordinal}")
-
-# A real child death after the authenticated result object is fsynced must
-# recover only the durable suffix and must never relaunch Podman.
-crash_plan = boundary.reference_supervised_effect_plan_v27(
-    manifest,
-    operation_id="f" * 64,
-    operation_class="ordinary",
-    argv=["/usr/local/bin/bd", "version", "--json"],
-    repository_path=str(workspace),
-)
-crash_pid = os.fork()
-if crash_pid == 0:
+            continue
+        else:
+            os.close(descriptor)
+            os._exit(92)
+    denied = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     try:
-        with boundary.inject_native_effect_fault_v27("result-object-written"):
-            boundary.execute_supervised_effect_v27(
-                state_root, fixture_key, manifest, crash_plan
-            )
-    except SystemExit:
-        os._exit(91)
-    except BaseException:
-        os._exit(93)
-    os._exit(92)
-_, crash_status = os.waitpid(crash_pid, 0)
-if not os.WIFEXITED(crash_status) or os.WEXITSTATUS(crash_status) != 91:
-    raise SystemExit("real V27 process-death fixture did not stop at the bound phase")
+        denied.connect(str(controller.ENDPOINT_PATH))
+    except PermissionError:
+        os._exit(0)
+    os._exit(93)
+_, denial_status = os.waitpid(agent_pid, 0)
+if not os.WIFEXITED(denial_status) or os.WEXITSTATUS(denial_status) != 0:
+    raise SystemExit("external agent-denial proof failed")
 
-def forbidden_replay(_manifest, _plan):
-    raise SystemExit("stored-result recovery attempted to replay Podman")
+observed = public_cycle_as_broker(config, fixture)
+if observed != fixture["expected"]:
+    raise SystemExit(
+        "installed public V27 cycle did not derive exact task/labels/comment/dependency projection"
+    )
 
-recovered = boundary.execute_supervised_effect_v27(
-    state_root, fixture_key, manifest, crash_plan, runner=forbidden_replay
-)
-if recovered["exitCode"] != 0:
-    raise SystemExit("stored-result suffix recovery did not preserve the terminal result")
+# Controller death must drain the complete delegated subtree. A disposable
+# fixture may kill the packaged unit only after one successful public cycle.
+fixed_run(["/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=KILL", UNIT])
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    if fixed_run(["/usr/bin/systemctl", "show", UNIT, "--property=ActiveState"]).strip() != b"ActiveState=active":
+        break
+    time.sleep(0.05)
+fixed_run(["/usr/bin/systemctl", "start", UNIT])
+fixed_run(["/usr/bin/systemctl", "is-active", "--quiet", UNIT])
 
 print(
-    "external protected Beads V27 Linux full lifecycle: PASS "
-    "(worker UID, agent denial, four real bd/Podman lifecycles, process death and "
-    "no-replay recovery; evidence only, readiness is not promoted)"
+    "external protected Beads V27 Linux installed lifecycle: PASS "
+    "(packaged systemd controller domain, public API, derived authority, "
+    "create/init/start-attach/terminal/cleanup/rm, four reads, agent denial, "
+    "controller death/restart; evidence only, readiness is not promoted)"
 )

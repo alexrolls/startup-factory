@@ -9,6 +9,7 @@ domain when its production provenance requirement is restored.
 from __future__ import annotations
 
 import contextlib
+import json
 import time
 from pathlib import Path
 from types import MappingProxyType
@@ -172,42 +173,114 @@ class LogicHarness:
             session.completed = True
 
         def execute_supervised_effect(
-            *, operation_class: str, argv: Any, repository_path: Path
+            *, authorization_record_sha256: str
         ) -> MappingProxyType:
-            if operation_class not in {
-                "ordinary",
-                "create-preparation",
-                "reattest-preparation",
-            }:
+            if not isinstance(authorization_record_sha256, str):
                 raise runtime.BeadsProtectedRuntimeError(
-                    "test harness received an unknown native effect class"
+                    "test harness received an invalid protected authorization"
                 )
+            records = []
+            for path in self.protected_root.rglob("*.json"):
+                try:
+                    candidate = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                payload = candidate.get("payload")
+                if (
+                    isinstance(payload, dict)
+                    and runtime.sha256(runtime.canonical_bytes(payload))
+                    == authorization_record_sha256
+                ):
+                    records.append(payload)
+            if len(records) != 1:
+                raise runtime.BeadsProtectedRuntimeError(
+                    "test harness cannot resolve one protected authorization record"
+                )
+            authority = records[0]
+            session = runtime._BOUNDARY_SESSION_CONTEXT.get()
             if (
-                not isinstance(argv, list)
-                or not argv
-                or not isinstance(repository_path, Path)
-                or not repository_path.is_absolute()
+                isinstance(session, runtime._ControllerBoundarySessionV1)
+                and session.operation == "finish_beads_preparation_v1"
             ):
-                raise runtime.BeadsProtectedRuntimeError(
-                    "test harness received an invalid native effect plan"
+                mode = authority.get("preparationMode")
+                stages = (
+                    [
+                        "binary-proof-payload-terminal",
+                        "initialize-payload-terminal",
+                        "status-write-payload-terminal",
+                        "status-read-payload-terminal",
+                    ]
+                    if mode == "create"
+                    else ["status-read-payload-terminal"]
                 )
+                return MappingProxyType(
+                    {
+                        "schemaVersion": 27,
+                        "profile": "startup-factory/beads-native-boundary/v27",
+                        "preparationState": "sequence-completed",
+                        "operationClass": (
+                            "create-preparation"
+                            if mode == "create"
+                            else "reattest-preparation"
+                        ),
+                        "commandCount": len(stages),
+                        "commandStages": stages,
+                        "commandResultsSha256": [
+                            runtime.sha256(stage.encode("utf-8")) for stage in stages
+                        ],
+                        "observedByNativeSupervisor": True,
+                    }
+                )
+            argv = authority.get("argv", ["fixture-native-effect"])
             if "init" in argv and "--db" in argv:
                 database_path = Path(argv[argv.index("--db") + 1])
                 database_path.mkdir(mode=0o700, parents=False, exist_ok=False)
                 (database_path / ".dolt").mkdir(mode=0o700)
+                manifest = database_path / "manifest.json"
+                manifest.write_bytes(b'{"database":"dolt","schemaVersion":1}\n')
+                manifest.chmod(0o600)
+            task_id = authority.get("taskId", "fixture-task")
+            revision = authority.get("observedRevision")
+            if revision is None:
+                expected = authority.get("expectedRevision")
+                revision = "r2" if expected == "r1" else "fixture-revision"
+            projection = {
+                "comments": [],
+                "dependencies": [],
+                "id": task_id,
+                "labels": [],
+                "revision": revision,
+                "status": authority.get("observedStatus") or "active",
+            }
             observation = runtime.canonical_bytes(
                 {
-                    "argv": argv,
-                    "operationClass": operation_class,
-                    "repositoryPath": str(repository_path),
+                    "authorizationRecordSha256": authorization_record_sha256,
+                    "projection": projection,
                 }
             )
+            read_back_digest = runtime.sha256(runtime.canonical_bytes(projection))
             return MappingProxyType(
                 {
                     "exitCode": 0,
                     "stdoutSha256": runtime.sha256(observation),
                     "stderrSha256": runtime.sha256(b""),
-                    "readBackSha256": runtime.sha256(observation),
+                    "readBackSha256": read_back_digest,
+                    "readBackProjection": projection,
+                    "readBacksSha256": [read_back_digest] * 4,
+                    "physicalEqualityPasses": [True, True],
+                    "repeatabilityPasses": [True] * 6,
+                    "repeatabilityEvidenceSha256": runtime.sha256(
+                        b"harness-repeatability"
+                    ),
+                    "rollingJoinPasses": [True] * 5,
+                    "rollingJoinEvidenceSha256": runtime.sha256(
+                        b"harness-rolling-joins"
+                    ),
+                    "crossWindowNoEffect": True,
+                    "crossWindowNoEffectEvidenceSha256": runtime.sha256(
+                        b"harness-cross-window"
+                    ),
+                    "independentReadCount": 4,
                     "lifecycle": [
                         "create",
                         "init",

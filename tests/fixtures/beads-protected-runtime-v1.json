@@ -1,1 +1,1 @@
-{"baselineCommit":"20e493e569c922d1253bdeff068c5e56c94957fb","reattestArgv":["B","--db","S","--json","--sandbox","config","list"],"schemaFixtureSha256":"sha256:243a5fe258034db00f872808b0cde7d6a75f6d6b9b04e50b35bf086fd4a71819","schemaVersion":1}
+{"baselineCommit":"20e493e569c922d1253bdeff068c5e56c94957fb","reattestArgv":["B","--db","S","--json","--sandbox","config","list"],"schemaFixtureSha256":"sha256:e05855572b4c91012daf79cd3e15944e75e0d5d48a8efd506ac2ef9e5ed60989","schemaVersion":1}

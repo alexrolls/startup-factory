@@ -1,1 +1,17 @@
 d /run/startup-factory 0750 root startup-factory-beads-transport -
+d /run/user/993 0700 startup-factory-beads-worker startup-factory-beads-worker -
+d /run/user/993/startup-factory-beads-results 0700 startup-factory-beads-worker startup-factory-beads-worker -
+# Recursively restore the installed file-context policy after creation. This is
+# an operational relabel action, not evidence that the policy was compiled or
+# loaded; the external Linux fixture must still prove the observed labels.
+Z /run/user/993/startup-factory-beads-results 0700 startup-factory-beads-worker startup-factory-beads-worker -
+d /run/user/991 0700 startup-factory-beads-controller startup-factory-beads-controller -
+d /run/user/991/startup-factory-beads-results 0700 startup-factory-beads-controller startup-factory-beads-controller -
+d /var/lib/startup-factory/beads-worker 0700 startup-factory-beads-worker startup-factory-beads-worker -
+d /var/lib/startup-factory/beads-worker/storage 0700 startup-factory-beads-worker startup-factory-beads-worker -
+d /var/lib/startup-factory/beads-worker/graphroot 0700 startup-factory-beads-worker startup-factory-beads-worker -
+# Root provisions only this non-enumerable setgid parent.  The controller owns
+# HMAC-named one-operation leaves; the worker group receives access only after
+# a consumed-current CAS, and every leaf is revoked after pidfd/cgroup/FD/mount
+# closure proof.  No ACL, world traversal, or shared writable repository exists.
+d /var/lib/startup-factory/beads-handoff 2710 startup-factory-beads-controller startup-factory-beads-worker -

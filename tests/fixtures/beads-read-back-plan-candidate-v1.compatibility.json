@@ -1,0 +1,111 @@
+{
+  "candidate": {
+    "aggregateDeadlineSeconds": 120,
+    "baselineVersion": "1.1.2",
+    "envelope": {
+      "noDuplicates": true,
+      "noExtras": true,
+      "noTrailingValue": true,
+      "outerKeys": [
+        "data",
+        "schema_version"
+      ],
+      "schemaVersion": 1
+    },
+    "environmentProfile": "beads-protected-readback-env-v1",
+    "kind": "beads-read-back-plan-candidate-v1",
+    "maxArgvBytes": 65536,
+    "maxRecordBytes": 262144,
+    "maxSpawnCount": 4,
+    "maxStringBytes": 65536,
+    "planSha256": "sha256:fe7dd91760b115a3c0b6dda7c191de272808606468fa9d38056456efa60847b8",
+    "schemaVersion": 1,
+    "sourceCommit": "20e493e569c922d1253bdeff068c5e56c94957fb",
+    "stderrLimitBytesPerChild": 1048576,
+    "stdoutLimitBytesPerChild": 1048576,
+    "steps": [
+      {
+        "argvShape": [
+          "$B",
+          "--db",
+          "$E",
+          "--json",
+          "--readonly",
+          "--sandbox",
+          "list",
+          "--id",
+          "$ID",
+          "--all",
+          "--limit",
+          "0"
+        ],
+        "dataShape": "exact-one-issue-with-counts-v112",
+        "ordinal": 0,
+        "requires": "terminal-mutation-process-group"
+      },
+      {
+        "argvShape": [
+          "$B",
+          "--db",
+          "$E",
+          "--json",
+          "--readonly",
+          "--sandbox",
+          "label",
+          "list",
+          "$ID"
+        ],
+        "dataShape": "complete-label-string-array-v112",
+        "ordinal": 1,
+        "requires": "usable-ordinal-0-and-physical-equality"
+      },
+      {
+        "argvShape": [
+          "$B",
+          "--db",
+          "$E",
+          "--json",
+          "--readonly",
+          "--sandbox",
+          "comments",
+          "$ID"
+        ],
+        "dataShape": "complete-comment-array-v112",
+        "ordinal": 2,
+        "requires": "usable-ordinal-1-and-physical-equality"
+      },
+      {
+        "argvShape": [
+          "$B",
+          "--db",
+          "$E",
+          "--json",
+          "--readonly",
+          "--sandbox",
+          "dep",
+          "list",
+          "$ID",
+          "--direction",
+          "down"
+        ],
+        "dataShape": "complete-one-id-dependency-projection-array-v112",
+        "ordinal": 3,
+        "requires": "usable-ordinal-2-and-physical-equality"
+      }
+    ]
+  },
+  "candidateCanonicalBytes": "{\"aggregateDeadlineSeconds\":120,\"baselineVersion\":\"1.1.2\",\"envelope\":{\"noDuplicates\":true,\"noExtras\":true,\"noTrailingValue\":true,\"outerKeys\":[\"data\",\"schema_version\"],\"schemaVersion\":1},\"environmentProfile\":\"beads-protected-readback-env-v1\",\"kind\":\"beads-read-back-plan-candidate-v1\",\"maxArgvBytes\":65536,\"maxRecordBytes\":262144,\"maxSpawnCount\":4,\"maxStringBytes\":65536,\"planSha256\":\"sha256:fe7dd91760b115a3c0b6dda7c191de272808606468fa9d38056456efa60847b8\",\"schemaVersion\":1,\"sourceCommit\":\"20e493e569c922d1253bdeff068c5e56c94957fb\",\"stderrLimitBytesPerChild\":1048576,\"stdoutLimitBytesPerChild\":1048576,\"steps\":[{\"argvShape\":[\"$B\",\"--db\",\"$E\",\"--json\",\"--readonly\",\"--sandbox\",\"list\",\"--id\",\"$ID\",\"--all\",\"--limit\",\"0\"],\"dataShape\":\"exact-one-issue-with-counts-v112\",\"ordinal\":0,\"requires\":\"terminal-mutation-process-group\"},{\"argvShape\":[\"$B\",\"--db\",\"$E\",\"--json\",\"--readonly\",\"--sandbox\",\"label\",\"list\",\"$ID\"],\"dataShape\":\"complete-label-string-array-v112\",\"ordinal\":1,\"requires\":\"usable-ordinal-0-and-physical-equality\"},{\"argvShape\":[\"$B\",\"--db\",\"$E\",\"--json\",\"--readonly\",\"--sandbox\",\"comments\",\"$ID\"],\"dataShape\":\"complete-comment-array-v112\",\"ordinal\":2,\"requires\":\"usable-ordinal-1-and-physical-equality\"},{\"argvShape\":[\"$B\",\"--db\",\"$E\",\"--json\",\"--readonly\",\"--sandbox\",\"dep\",\"list\",\"$ID\",\"--direction\",\"down\"],\"dataShape\":\"complete-one-id-dependency-projection-array-v112\",\"ordinal\":3,\"requires\":\"usable-ordinal-2-and-physical-equality\"}]}",
+  "candidateDomain": "startup-factory/beads-read-back-plan-candidate/v1\\0",
+  "carrierDigestMeaning": "nested-domain-separated-planSha256",
+  "carrierNames": [
+    "readBackPlanCandidate",
+    "readBackPlanCandidateSha256"
+  ],
+  "consumerTask": "task-3-independent-recompute",
+  "kind": "beads-read-back-plan-candidate-compatibility-v1",
+  "producerModule": "bin.beads_contract",
+  "projectedPlanSha256": "sha256:fe7dd91760b115a3c0b6dda7c191de272808606468fa9d38056456efa60847b8",
+  "rawCanonicalBytesSha256": "sha256:35cff7ab1355a978742deeae87740ae174372f0c3daa74420c780d189d8b813a",
+  "schemaVersion": 1,
+  "soleAbstractPrerequisite": "terminal-mutation-process-group"
+}

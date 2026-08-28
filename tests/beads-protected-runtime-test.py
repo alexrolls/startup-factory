@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import importlib
+import dataclasses
+import copy
+import hashlib
 import json
 import os
 import sys
@@ -13,15 +16,33 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "tests"))
 
 runtime = importlib.import_module("startup_factory_cli.beads_protected_runtime")
+from bin import beads_contract
 from support.beads_protected_runtime_harness import logic_harness
 
 
 def digest(label: str) -> str:
     return runtime.sha256(label.encode("utf-8"))
+
+
+def domain_digest(domain: bytes, raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(domain + raw).hexdigest()
+
+
+def stat_projection(path: Path) -> dict[str, object]:
+    observed = os.lstat(path)
+    return {
+        "device": observed.st_dev,
+        "inode": observed.st_ino,
+        "uid": observed.st_uid,
+        "mode": f"{observed.st_mode & 0o7777:04o}",
+        "linkCount": observed.st_nlink,
+        "size": observed.st_size,
+    }
 
 
 class ProtectedRuntimeTest(unittest.TestCase):
@@ -341,7 +362,7 @@ fi
 exit 64
 """
         executable_path.write_bytes(executable_bytes)
-        executable_path.chmod(0o700)
+        executable_path.chmod(0o500)
         install_path = repository_path / ".beads" / "embeddeddolt" / "sf"
         install_path.parent.mkdir(parents=True, mode=0o700)
         (repository_path / ".beads").chmod(0o700)
@@ -356,6 +377,21 @@ exit 64
         sequence["createStageDatabasePathLocatorSha256"] = runtime.sha256(
             runtime.canonical_bytes(runtime._observe_path_locator(stage_path, "test stage path"))
         )
+        static_raw = runtime.canonical_bytes(
+            {"kind": "beads-status-profile-static-bindings-v1", "schemaVersion": 1}
+        )
+        policy_raw = runtime.canonical_bytes(
+            {"kind": "beads-status-profile-derivation-policy-v1", "schemaVersion": 1}
+        )
+        static_digest = domain_digest(
+            b"startup-factory/beads-status-profile-static-bindings/v1\0",
+            static_raw,
+        )
+        policy_digest = domain_digest(
+            b"startup-factory/beads-status-profile-derivation-policy/v1\0",
+            policy_raw,
+        )
+        generic_config_digest = digest("generic-status-config")
         authorization = runtime.authorize_beads_preparation_v1(
             self.request(
                 "AuthorizeBeadsPreparationRequestV1",
@@ -368,6 +404,9 @@ exit 64
                 adapterReleaseManifestRecordSha256=release_manifest.record_sha256,
                 bootstrapRuntimeCoreSha256=core.payload["bootstrapRuntimeCoreSha256"],
                 adapterReleaseCoreSha256=core.payload["adapterReleaseCoreSha256"],
+                genericStatusConfigSha256=generic_config_digest,
+                statusProfileStaticBindingsSha256=static_digest,
+                statusProfileDerivationPolicySha256=policy_digest,
                 createStageDatabasePath=str(stage_path),
                 executablePath=str(executable_path),
                 repositoryPath=str(repository_path),
@@ -445,16 +484,294 @@ exit 64
         )
         with runtime.use_beads_protected_runtime_v1(str(self.root), str(self.key)):
             dynamic = runtime.derive_beads_status_profile_dynamic_bindings_v1(lease, pre, post, config_digest)
+        dynamic_raw = runtime.canonical_bytes(dynamic.payload)
+        dynamic_digest = runtime.sha256(dynamic_raw)
+        expected_status_raw = runtime.canonical_bytes(
+            {
+                "dynamic": dynamic.payload,
+                "kind": "beads-status-profile-expected-bindings-v1",
+                "schemaVersion": 1,
+                "static": json.loads(static_raw),
+            }
+        )
+        expected_status_digest = domain_digest(
+            b"startup-factory/beads-status-profile-expected-bindings/v1\0",
+            expected_status_raw,
+        )
+        status_raw = runtime.canonical_bytes(
+            {
+                "allowed": ["open", "closed"],
+                "dynamicBindingsSha256": dynamic_digest,
+                "expectedBindingsSha256": expected_status_digest,
+                "schemaVersion": 1,
+                "staticBindingsSha256": static_digest,
+            }
+        )
+        status_digest = domain_digest(
+            b"startup-factory/beads-status-profile-payload/v1\0", status_raw
+        )
+        cleanup_digest = runtime.sha256(
+            runtime.canonical_bytes(lease.payload["cleanupObservationA"])
+        )
+        prepared_database_evidence = pre.payload["preparedDatabaseEvidence"]
+        prepared_inputs = beads_contract.PreparedBeadsStorePayloadInputsV1(
+            preparation_mode="create",
+            repository_locator_sha256=self.repository,
+            project_root_locator_sha256=lease.payload["projectRootLocatorSha256"],
+            beads_root_locator_sha256=lease.payload["beadsRootLocatorSha256"],
+            beads_root_stat=json.loads(
+                runtime.canonical_bytes(lease.payload["beadsRootStat"])
+            ),
+            embedded_data_root_stat=json.loads(
+                runtime.canonical_bytes(lease.payload["embeddedDataRootStat"])
+            ),
+            database_name="sf",
+            database_root_stat=json.loads(runtime.canonical_bytes(
+                prepared_database_evidence["databaseRootStat"]
+            )),
+            database_dolt_root_stat=json.loads(runtime.canonical_bytes(
+                prepared_database_evidence["databaseDoltRootStat"]
+            )),
+            executable=json.loads(runtime.canonical_bytes(
+                lease.payload["preparedExecutable"]
+            )),
+            immutable_files=json.loads(runtime.canonical_bytes(
+                prepared_database_evidence["immutableFiles"]
+            )),
+            metadata=json.loads(runtime.canonical_bytes(
+                lease.payload["preparedStoreMetadata"]
+            )),
+            status_profile_payload_sha256=status_digest,
+            status_profile_static_bindings_sha256=static_digest,
+            status_profile_derivation_policy_sha256=policy_digest,
+            status_profile_dynamic_bindings_sha256=dynamic_digest,
+            status_profile_expected_bindings_sha256=expected_status_digest,
+            derivation_journal_head_sha256=dynamic.record_sha256,
+            runtime_api_manifest_sha256=runtime_manifest.record_sha256,
+            release_manifest_sha256=release_manifest.record_sha256,
+            generic_status_config_sha256=generic_config_digest,
+            pre_store_observation_sha256=pre.record_sha256,
+            post_store_observation_sha256=post.record_sha256,
+            store_state_sha256=pre.payload["storeStateSha256"],
+            config_envelope_canonical_sha256=config_digest,
+            cleanup_observation_sha256=cleanup_digest,
+            preparation_plan_sha256=lease.payload["planSha256"],
+            authority_epoch=lease.payload["authorityEpoch"],
+            predecessor_prepared_store_payload_sha256=None,
+        )
+        prepared_raw = beads_contract.build_prepared_beads_store_payload_v1(
+            prepared_inputs
+        )
+        prepared_digest = domain_digest(
+            b"startup-factory/prepared-beads-store-payload/v1\0", prepared_raw
+        )
+        prepared_expected = beads_contract.PreparedBeadsStoreExpectedBindingsV1(
+            preparation_mode="create",
+            repository_locator_sha256=self.repository,
+            project_root_locator_sha256=prepared_inputs.project_root_locator_sha256,
+            beads_root_locator_sha256=prepared_inputs.beads_root_locator_sha256,
+            database_name="sf",
+            metadata_sha256=prepared_inputs.metadata["sha256"],
+            status_profile_payload_sha256=status_digest,
+            status_profile_static_bindings_sha256=static_digest,
+            status_profile_derivation_policy_sha256=policy_digest,
+            status_profile_dynamic_bindings_sha256=dynamic_digest,
+            status_profile_expected_bindings_sha256=expected_status_digest,
+            derivation_journal_head_sha256=dynamic.record_sha256,
+            runtime_api_manifest_sha256=runtime_manifest.record_sha256,
+            release_manifest_sha256=release_manifest.record_sha256,
+            generic_status_config_sha256=generic_config_digest,
+            pre_store_observation_sha256=pre.record_sha256,
+            post_store_observation_sha256=post.record_sha256,
+            store_state_sha256=pre.payload["storeStateSha256"],
+            config_envelope_canonical_sha256=config_digest,
+            cleanup_observation_sha256=cleanup_digest,
+            preparation_plan_sha256=lease.payload["planSha256"],
+            authority_epoch=lease.payload["authorityEpoch"],
+            predecessor_prepared_store_payload_sha256=None,
+            read_back_plan_candidate_sha256=json.loads(prepared_raw)[
+                "readBackPlanCandidateSha256"
+            ],
+            payload_sha256=prepared_digest,
+        )
+        prepared_expected_raw = runtime.canonical_bytes(
+            dataclasses.asdict(prepared_expected)
+        )
         finish_request = self.request(
                 "FinishBeadsPreparationRequestV1",
                 leaseRecordSha256=lease.record_sha256,
                 preObservationRecordSha256=pre.record_sha256,
                 postObservationRecordSha256=post.record_sha256,
-                dynamicBindingsCanonicalJson=runtime.canonical_bytes(dynamic.payload).decode(),
-                statusProfilePayloadCanonicalJson='{"allowed":["open","closed"],"schemaVersion":1}',
-                preparedStorePayloadCanonicalJson='{"database":"sf","schemaVersion":1}',
+                preparationMode="create",
+                preparationPlanSha256=lease.payload["planSha256"],
+                preparationAuthorizationRecordSha256=lease.payload[
+                    "authorizationRecordSha256"
+                ],
+                authorityEpoch=lease.payload["authorityEpoch"],
+                runtimeApiManifestRecordSha256=runtime_manifest.record_sha256,
+                adapterReleaseManifestRecordSha256=release_manifest.record_sha256,
+                genericStatusConfigSha256=generic_config_digest,
+                cleanupObservationSha256=cleanup_digest,
+                storeStateSha256=pre.payload["storeStateSha256"],
+                configEnvelopeCanonicalSha256=config_digest,
+                statusProfileStaticBindingsCanonicalJson=static_raw.decode(),
+                statusProfileStaticBindingsSha256=static_digest,
+                statusProfileStaticBindingsSize=len(static_raw),
+                statusProfileDerivationPolicyCanonicalJson=policy_raw.decode(),
+                statusProfileDerivationPolicySha256=policy_digest,
+                statusProfileDerivationPolicySize=len(policy_raw),
+                dynamicBindingsCanonicalJson=dynamic_raw.decode(),
+                dynamicBindingsSha256=dynamic_digest,
+                dynamicBindingsSize=len(dynamic_raw),
+                statusProfileExpectedBindingsCanonicalJson=expected_status_raw.decode(),
+                statusProfileExpectedBindingsSha256=expected_status_digest,
+                statusProfileExpectedBindingsSize=len(expected_status_raw),
+                statusProfilePayloadCanonicalJson=status_raw.decode(),
+                statusProfilePayloadSha256=status_digest,
+                statusProfilePayloadSize=len(status_raw),
+                preparedStorePayloadCanonicalJson=prepared_raw.decode(),
+                preparedStorePayloadSha256=prepared_digest,
+                preparedStorePayloadSize=len(prepared_raw),
+                preparedStoreExpectedBindingsCanonicalJson=prepared_expected_raw.decode(),
+                preparedStoreExpectedBindingsSha256=runtime.sha256(prepared_expected_raw),
+                preparedStoreExpectedBindingsSize=len(prepared_expected_raw),
                 expectedCurrentPointerFullBytesSha256=None,
+                requestNonce="0123456789abcdef0123456789abcdef",
         )
+        product_namespaces = {
+            "preparation-finish-successors",
+            "preparation-results",
+            "preparation-current",
+            "status-profiles",
+        }
+        product_before = sorted(
+            str(path.relative_to(self.root))
+            for path in self.root.rglob("*.json")
+            if product_namespaces.intersection(path.parts)
+        )
+        expected_field_to_payload = {
+            "preparation_mode": "preparationMode",
+            "repository_locator_sha256": "repositoryLocatorSha256",
+            "project_root_locator_sha256": "projectRootLocatorSha256",
+            "beads_root_locator_sha256": "beadsRootLocatorSha256",
+            "database_name": "databaseName",
+            "metadata_sha256": "metadata.sha256",
+            "status_profile_payload_sha256": "statusProfilePayloadSha256",
+            "status_profile_static_bindings_sha256": "statusProfileStaticBindingsSha256",
+            "status_profile_derivation_policy_sha256": "statusProfileDerivationPolicySha256",
+            "status_profile_dynamic_bindings_sha256": "statusProfileDynamicBindingsSha256",
+            "status_profile_expected_bindings_sha256": "statusProfileExpectedBindingsSha256",
+            "derivation_journal_head_sha256": "derivationJournalHeadSha256",
+            "runtime_api_manifest_sha256": "runtimeApiManifestSha256",
+            "release_manifest_sha256": "releaseManifestSha256",
+            "generic_status_config_sha256": "genericStatusConfigSha256",
+            "pre_store_observation_sha256": "preStoreObservationSha256",
+            "post_store_observation_sha256": "postStoreObservationSha256",
+            "store_state_sha256": "storeStateSha256",
+            "config_envelope_canonical_sha256": "configEnvelopeCanonicalSha256",
+            "cleanup_observation_sha256": "cleanupObservationSha256",
+            "preparation_plan_sha256": "preparationPlanSha256",
+            "authority_epoch": "authorityEpoch",
+            "predecessor_prepared_store_payload_sha256": "predecessorPreparedStorePayloadSha256",
+            "read_back_plan_candidate_sha256": "readBackPlanCandidateSha256",
+        }
+        for expected_field, payload_field in (
+            *expected_field_to_payload.items(),
+            ("payload_sha256", None),
+        ):
+            hostile_candidate = copy.deepcopy(json.loads(prepared_raw))
+            hostile_expected = dataclasses.asdict(prepared_expected)
+            if expected_field == "payload_sha256":
+                hostile_expected[expected_field] = runtime.sha256(prepared_raw)
+            else:
+                replacement: object = digest("joint-" + expected_field)
+                if expected_field == "preparation_mode":
+                    replacement = "reattest"
+                elif expected_field == "database_name":
+                    replacement = "joint_mutation"
+                elif expected_field == "authority_epoch":
+                    replacement = "f" * 32
+                if payload_field == "metadata.sha256":
+                    hostile_candidate["metadata"]["sha256"] = replacement
+                else:
+                    assert payload_field is not None
+                    hostile_candidate[payload_field] = replacement
+                    if expected_field == "read_back_plan_candidate_sha256":
+                        hostile_candidate["readBackPlanCandidate"][
+                            "planSha256"
+                        ] = replacement
+                hostile_expected[expected_field] = replacement
+                hostile_candidate_raw = runtime.canonical_bytes(hostile_candidate)
+                hostile_expected["payload_sha256"] = domain_digest(
+                    b"startup-factory/prepared-beads-store-payload/v1\0",
+                    hostile_candidate_raw,
+                )
+            hostile_candidate_raw = runtime.canonical_bytes(hostile_candidate)
+            hostile_expected_raw = runtime.canonical_bytes(hostile_expected)
+            joint_payload = dict(finish_request.payload)
+            joint_payload.update(
+                {
+                    "preparedStorePayloadCanonicalJson": hostile_candidate_raw.decode(),
+                    "preparedStorePayloadSha256": domain_digest(
+                        b"startup-factory/prepared-beads-store-payload/v1\0",
+                        hostile_candidate_raw,
+                    ),
+                    "preparedStorePayloadSize": len(hostile_candidate_raw),
+                    "preparedStoreExpectedBindingsCanonicalJson": hostile_expected_raw.decode(),
+                    "preparedStoreExpectedBindingsSha256": runtime.sha256(
+                        hostile_expected_raw
+                    ),
+                    "preparedStoreExpectedBindingsSize": len(hostile_expected_raw),
+                }
+            )
+            with self.subTest(joint_mutation=expected_field):
+                with self.assertRaises(runtime.BeadsProtectedRuntimeError):
+                    runtime.finish_beads_preparation_v1(
+                        runtime.FinishBeadsPreparationRequestV1(
+                            payload=joint_payload
+                        )
+                    )
+                self.assertEqual(
+                    product_before,
+                    sorted(
+                        str(path.relative_to(self.root))
+                        for path in self.root.rglob("*.json")
+                        if product_namespaces.intersection(path.parts)
+                    ),
+                )
+                self.assertFalse(install_path.exists())
+        forged_expected = dataclasses.replace(
+            prepared_expected,
+            payload_sha256=runtime.sha256(prepared_raw),
+        )
+        forged_expected_raw = runtime.canonical_bytes(
+            dataclasses.asdict(forged_expected)
+        )
+        hostile_payload = dict(finish_request.payload)
+        hostile_payload.update(
+            {
+                "preparedStoreExpectedBindingsCanonicalJson": forged_expected_raw.decode(),
+                "preparedStoreExpectedBindingsSha256": runtime.sha256(
+                    forged_expected_raw
+                ),
+                "preparedStoreExpectedBindingsSize": len(forged_expected_raw),
+            }
+        )
+        with self.assertRaisesRegex(
+            runtime.BeadsProtectedRuntimeError, "expected bindings"
+        ):
+            runtime.finish_beads_preparation_v1(
+                runtime.FinishBeadsPreparationRequestV1(payload=hostile_payload)
+            )
+        self.assertEqual(
+            product_before,
+            sorted(
+                str(path.relative_to(self.root))
+                for path in self.root.rglob("*.json")
+                if product_namespaces.intersection(path.parts)
+            ),
+        )
+        self.assertFalse(install_path.exists())
         with runtime._inject_fault("preparation-install-quarantined"), self.assertRaises(SystemExit):
             runtime.finish_beads_preparation_v1(finish_request)
         self.assertFalse(install_path.exists())
@@ -569,8 +886,8 @@ exit 64
         self.assertNotEqual(digest("empty"), result.payload["stderrSha256"])
         self.assertNotEqual(digest("read-back"), result.payload["readBackSha256"])
         self.assertTrue(result.payload["observedByBroker"])
-        executable_path.write_bytes(executable_bytes + b"# changed after activation\n")
         executable_path.chmod(0o700)
+        executable_path.write_bytes(executable_bytes + b"# changed after activation\n")
         with runtime.use_beads_protected_runtime_v1(str(self.root), str(self.key)):
             with self.assertRaises(runtime.BeadsProtectedRuntimeError):
                 runtime.verify_active_beads_authority_v1(self.repository)
