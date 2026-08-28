@@ -175,6 +175,36 @@ class AgentHealthTest(unittest.TestCase):
         self.assertIsNone(row["progressSource"])
         self.assertIn("-", agent_health.render_table(snapshot))
 
+    def test_identity_mismatch_never_renders_time_in_progress(self):
+        snapshot = self.snapshot(lifecycle_record(state="identity-mismatch"))
+        row = snapshot["agents"][0]
+        self.assertEqual("identity-mismatch", row["verdict"])
+        self.assertIsNone(row["elapsedSeconds"])
+        self.assertIsNone(row["progressPercent"])
+        self.assertIn("identity-mismatch", agent_health.render_table(snapshot))
+
+    def test_symlinked_heartbeat_directory_fails_closed(self):
+        outside = self.repo / "outside-heartbeats"
+        outside.mkdir()
+        (outside / self.heartbeat.name).write_text(
+            "2026-08-24T18:10:00Z | TASK-1 | implementing; attempt=2; progress=90\n",
+            encoding="utf-8",
+        )
+        self.heartbeat.parent.rmdir()
+        self.heartbeat.parent.symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(agent_health.AgentHealthError):
+            self.snapshot()
+
+    def test_release_lifecycle_process_is_omitted_as_a_non_agent(self):
+        snapshot = self.snapshot(
+            lifecycle_record(category="release", instance="release-worker")
+        )
+        self.assertEqual([], snapshot["agents"])
+        self.assertEqual(1, snapshot["nonAgentProcessesOmitted"])
+        warning = " ".join(snapshot["warnings"]).casefold()
+        self.assertIn("non-agent release process", warning)
+        self.assertNotIn("release-worker", warning)
+
     def test_watch_emits_immediately_then_on_monotonic_deadlines(self):
         clock = [0.0]
         emitted = []
@@ -196,6 +226,30 @@ class AgentHealthTest(unittest.TestCase):
             maximum_snapshots=3,
         )
         self.assertEqual([0.0, 300.0, 600.0], emitted)
+
+    def test_watch_skips_missed_deadlines_after_collection_overrun(self):
+        clock = [0.0]
+        emitted = []
+
+        def monotonic():
+            return clock[0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        def emit():
+            emitted.append(clock[0])
+            if len(emitted) == 1:
+                clock[0] += 650
+
+        agent_health.watch(
+            emit,
+            interval_seconds=300,
+            monotonic=monotonic,
+            sleep=sleep,
+            maximum_snapshots=3,
+        )
+        self.assertEqual([0.0, 900.0, 1200.0], emitted)
 
     def test_unmanaged_snapshot_is_empty_and_explicit(self):
         snapshot = agent_health.unmanaged_snapshot(REPOSITORY_ID, NOW)

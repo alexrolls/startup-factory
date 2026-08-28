@@ -301,6 +301,7 @@ def classify(
         reported_progress is not None
         and expected_attempt is not None
         and heartbeat_attempt == expected_attempt
+        and observed_at >= created
         and 0 <= progress_age <= DEFAULT_PROGRESS_MAX_AGE_SECONDS
     ):
         progress = reported_progress

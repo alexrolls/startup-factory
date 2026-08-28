@@ -131,7 +131,8 @@ and then every 300 seconds from a monotonic observer; it does not wake an LLM.
 Percentages are optional, self-reported, current-attempt-bound, fresh for at most
 300 seconds, and presentation-only. Missing or ineligible percentages fall back to
 protected lifecycle elapsed time for live agents. Unmanaged agents are never inferred
-from workspace PID markers.
+from workspace PID markers. Deterministic release lifecycle processes are not agents;
+the health envelope omits them and reports only a non-identifying omission count.
 
 Review depth (`REVIEW_MODE=sequential|parallel|tiered`) is a **per-team** choice
 and lives in the team file (`teams/<preset>.md`, next to `ROSTER=`), not here —

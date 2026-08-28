@@ -242,13 +242,12 @@ def validate_envelope(envelope: dict[str, Any]) -> tuple[str, list[dict[str, Any
 
 def assessment_for(
     record: dict[str, Any],
-    workspace: Path,
+    heartbeat: Path,
     binding: dict[str, Any] | None,
     now: datetime,
     stuck_minutes: int,
     start_grace_seconds: int,
 ) -> dict[str, Any]:
-    heartbeat = workspace / "heartbeats" / str(record["instance"])
     state = record.get("state")
     if state in {"dead", "identity-mismatch"}:
         value = None
@@ -299,6 +298,7 @@ def build_snapshot(
     workspace_host = Path(teamwork_host or repository).resolve(strict=True)
     repository_id, records, warnings = validate_envelope(envelope)
     rows: list[dict[str, Any]] = []
+    non_agent_processes_omitted = 0
     for record in records:
         if "auth" in record or "launchToken" in record:
             raise AgentHealthError("lifecycle envelope exposed protected authentication material")
@@ -315,6 +315,9 @@ def build_snapshot(
             or category not in {"gate", "task", "release"}
         ):
             raise AgentHealthError("lifecycle record has an invalid presentation identity")
+        if category == "release":
+            non_agent_processes_omitted += 1
+            continue
         try:
             workspace = teamwork_path.workspace(str(workspace_host), teamwork_root, team)
         except (OSError, RuntimeError, SystemExit) as exc:
@@ -324,9 +327,17 @@ def build_snapshot(
             warnings.append(
                 f"Managed task agent {team}/{instance} has no unique current execution binding; assignment and percentage were omitted."
             )
+        try:
+            heartbeat = teamwork_path.child(
+                str(workspace_host), workspace, f"heartbeats/{instance}"
+            )
+        except (OSError, RuntimeError, SystemExit) as exc:
+            raise AgentHealthError(
+                f"cannot resolve managed heartbeat path for {team}/{instance}"
+            ) from exc
         assessment = assessment_for(
             record,
-            workspace,
+            heartbeat,
             binding,
             now,
             stuck_minutes,
@@ -375,6 +386,11 @@ def build_snapshot(
                 "nextActionBy": assessment["nextActionBy"],
             }
         )
+    if non_agent_processes_omitted:
+        warnings.append(
+            f"Omitted {non_agent_processes_omitted} managed non-agent release "
+            f"process{'es' if non_agent_processes_omitted != 1 else ''}."
+        )
     rows.sort(key=lambda row: (row["team"], row["category"], row["instance"]))
     return {
         "schemaVersion": SCHEMA,
@@ -382,6 +398,7 @@ def build_snapshot(
         "repositoryId": repository_id,
         "intervalSeconds": INTERVAL_SECONDS,
         "presentationOnly": True,
+        "nonAgentProcessesOmitted": non_agent_processes_omitted,
         "agents": rows,
         "warnings": warnings,
     }
@@ -394,6 +411,7 @@ def unmanaged_snapshot(repository_id: str, now: datetime) -> dict[str, Any]:
         "repositoryId": repository_id,
         "intervalSeconds": INTERVAL_SECONDS,
         "presentationOnly": True,
+        "nonAgentProcessesOmitted": 0,
         "agents": [],
         "warnings": [
             "Lifecycle supervision is unmanaged; agent health is unavailable and no workspace-authored rows were fabricated."
@@ -504,6 +522,9 @@ def watch(
         emit()
         emitted += 1
         deadline += interval_seconds
+        observed = monotonic()
+        while deadline <= observed:
+            deadline += interval_seconds
 
 
 def parser() -> argparse.ArgumentParser:

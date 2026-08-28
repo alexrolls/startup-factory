@@ -130,6 +130,17 @@ class HeartbeatStatusTest(unittest.TestCase):
         )
         self.assertEqual("stalled:replayed-heartbeat", result["verdict"])
 
+    def test_within_skew_pre_generation_progress_is_never_displayed(self):
+        result = self.classify(
+            "2026-08-24T17:59:30Z | TASK-1 | implementing; attempt=2; progress=40",
+            at(18, 0),
+            expected_task="TASK-1",
+            expected_role="backend",
+            expected_attempt=2,
+        )
+        self.assertEqual("active", result["verdict"])
+        self.assertIsNone(result["progressPercent"])
+
     def test_expected_task_binds_the_agent_written_target(self):
         heartbeat = "2026-08-24T18:10:00Z | TASK-1 | implementing"
         matching = self.classify(
