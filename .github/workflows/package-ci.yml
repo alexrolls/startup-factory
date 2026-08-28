@@ -48,9 +48,40 @@ jobs:
         id: package
         shell: bash
         run: |
+          set -euo pipefail
           version="$(python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
           test -n "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Require an unreleased version before merge
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          VERSION: ${{ steps.package.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_version="$(
+            git show "origin/$BASE_REF:pyproject.toml" |
+              python -c 'import sys,tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])'
+          )"
+          python - "$base_version" "$VERSION" <<'PY'
+          import re
+          import sys
+
+          base, proposed = sys.argv[1:]
+          stable = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+          if stable.fullmatch(base) is None or stable.fullmatch(proposed) is None:
+              raise SystemExit("release versions must use stable numeric SemVer")
+          if tuple(map(int, proposed.split("."))) <= tuple(map(int, base.split("."))):
+              raise SystemExit(
+                  f"project.version must increase before merge: {base} -> {proposed}"
+              )
+          PY
+          if git rev-parse -q --verify "refs/tags/v$VERSION^{commit}" >/dev/null; then
+            echo "v$VERSION is already published; bump project.version before merging" >&2
+            exit 1
+          fi
 
       - name: Build the source bundle twice
         env:
