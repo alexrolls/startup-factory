@@ -46,6 +46,8 @@ MAX_PROTECTED_HANDOFF_FILE_BYTES = 16 * 1024 * 1024
 MAX_HEALTH_STDOUT_BYTES = 16 * 1024 * 1024
 MAX_HEALTH_STDERR_BYTES = 256 * 1024
 HEALTH_COMMAND_TIMEOUT_SECONDS = 30
+HEALTH_CHILD_KILL_GRACE_SECONDS = 2
+HEALTH_CHILD_POLL_SECONDS = 0.02
 HEALTH_SNAPSHOT_SCHEMA = "agent-health-snapshot-v1"
 HEALTH_SNAPSHOT_KEYS = {
     "schemaVersion",
@@ -1288,7 +1290,15 @@ def health_publication_lock(primary: Path) -> Iterator[int]:
 
 
 def _read_cache_at(directory: int) -> bytes | None:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK makes the open itself bounded for attacker-planted FIFOs. The
+    # descriptor is still rejected after fstat unless it is a private regular
+    # file; regular-file reads are unaffected by this flag.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open("agent-health.json", flags, dir_fd=directory)
     except FileNotFoundError:
@@ -3736,21 +3746,64 @@ def one_pass(*, dry_run: bool) -> int:
         lease.release()
 
 
+def _health_group_alive(process: subprocess.Popen[bytes], process_group: int) -> bool:
+    process.poll()  # Reap the direct child without ever performing a blocking wait.
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Darwin can transiently report EPERM while a just-signalled session
+        # leader is crossing exec/exit. Treat it as conservatively live; the
+        # bounded poll will either observe ESRCH or escalate to a real signal,
+        # whose permission failure is reported explicitly.
+        return True
+    except OSError as exc:
+        raise MonitorError(f"cannot inspect health collector process group: {exc}") from exc
+    return True
+
+
+def _wait_for_health_group_exit(
+    process: subprocess.Popen[bytes], process_group: int, timeout_seconds: float
+) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        group_alive = _health_group_alive(process, process_group)
+        if not group_alive and process.poll() is not None:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(HEALTH_CHILD_POLL_SECONDS, remaining))
+
+
+def _signal_health_group(process_group: int, requested_signal: int) -> bool:
+    try:
+        os.killpg(process_group, requested_signal)
+    except ProcessLookupError:
+        return False
+    except PermissionError as exc:
+        raise MonitorError("cannot signal health collector process group") from exc
+    except OSError as exc:
+        raise MonitorError(f"cannot signal health collector process group: {exc}") from exc
+    return True
+
+
 def _stop_health_child(process: subprocess.Popen[bytes]) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=COMMAND_KILL_GRACE_SECONDS)
+    process_group = process.pid
+    if process_group <= 1 or process_group == os.getpgrp():
+        raise MonitorError("refusing unsafe health collector process group")
+    _signal_health_group(process_group, signal.SIGTERM)
+    if _wait_for_health_group_exit(
+        process, process_group, COMMAND_KILL_GRACE_SECONDS
+    ):
         return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
+
+    _signal_health_group(process_group, signal.SIGKILL)
+    if not _wait_for_health_group_exit(
+        process, process_group, HEALTH_CHILD_KILL_GRACE_SECONDS
+    ):
+        raise MonitorError("health collector process group survived SIGKILL")
 
 
 def run_bounded_health_child(

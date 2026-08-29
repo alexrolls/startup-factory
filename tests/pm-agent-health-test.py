@@ -10,10 +10,14 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -470,6 +474,64 @@ class HealthPublisherTest(unittest.TestCase):
                 pm_agent.atomic_health_snapshot(primary, snapshot())
             self.assertEqual("outside\n", outside.read_text(encoding="utf-8"))
 
+    def test_fifo_cache_is_rejected_promptly_and_does_not_delay_watch_scan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            primary = Path(temp).resolve()
+            cache = primary / ".teamwork" / "pm-agent" / "agent-health.json"
+            cache.parent.mkdir(parents=True)
+            os.mkfifo(cache, mode=0o600)
+            scans = []
+            errors = []
+            durations = []
+
+            def run_watch():
+                started = time.monotonic()
+                pm_agent.watch_supervisor(
+                    lambda: scans.append("scan"),
+                    lambda: pm_agent.atomic_health_snapshot(primary, snapshot()),
+                    scan_interval_seconds=180,
+                    health_interval_seconds=300,
+                    maximum_callbacks=2,
+                    on_error=lambda label, exc: errors.append((label, str(exc))),
+                )
+                durations.append(time.monotonic() - started)
+
+            thread = threading.Thread(target=run_watch, daemon=True)
+            thread.start()
+            thread.join(timeout=0.5)
+            completed_promptly = not thread.is_alive()
+            if thread.is_alive():
+                # Wake a blocking pre-fix FIFO open so the regression can fail
+                # without leaking a stuck test thread.
+                descriptor = os.open(cache, os.O_RDWR | os.O_NONBLOCK)
+                os.close(descriptor)
+                thread.join(timeout=2)
+            self.assertFalse(thread.is_alive(), "health publication stayed blocked on a FIFO")
+            self.assertTrue(completed_promptly, "health publication did not reject the FIFO promptly")
+            self.assertLess(durations[0], 0.5)
+            self.assertEqual(["scan"], scans)
+            self.assertEqual("health", errors[0][0])
+            self.assertIn("regular file", errors[0][1])
+            self.assertTrue(stat.S_ISFIFO(os.lstat(cache).st_mode))
+
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix sockets unavailable")
+    def test_socket_cache_is_rejected_without_target_mutation(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+            primary = Path(temp).resolve()
+            cache = primary / ".teamwork" / "pm-agent" / "agent-health.json"
+            cache.parent.mkdir(parents=True)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                try:
+                    listener.bind(os.path.relpath(cache, Path.cwd()))
+                except PermissionError as exc:
+                    self.skipTest(f"Unix socket bind denied by test sandbox: {exc}")
+                with self.assertRaises(pm_agent.MonitorError):
+                    pm_agent.atomic_health_snapshot(primary, snapshot())
+                self.assertTrue(stat.S_ISSOCK(os.lstat(cache).st_mode))
+            finally:
+                listener.close()
+
     def test_held_directory_descriptor_defeats_post_open_ancestor_swap(self):
         with tempfile.TemporaryDirectory() as temp:
             primary = Path(temp).resolve()
@@ -509,6 +571,71 @@ class HealthPublisherTest(unittest.TestCase):
                 env=pm_agent.health_child_environment({}),
                 timeout_seconds=0.05,
             )
+
+    def test_health_child_cleanup_kills_term_ignoring_group_descendant(self):
+        descendant_code = (
+            "import os,signal,time;"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+            "print(os.getpid(), flush=True);"
+            "time.sleep(60)"
+        )
+        leader_code = (
+            "import subprocess,sys,time;"
+            f"child=subprocess.Popen({[sys.executable, '-I', '-S', '-E', '-s', '-c', descendant_code]!r},"
+            "stdout=subprocess.PIPE,text=True);"
+            "print(child.stdout.readline().strip(), flush=True);"
+            "time.sleep(60)"
+        )
+        leader = subprocess.Popen(
+            [sys.executable, "-I", "-S", "-E", "-s", "-c", leader_code],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        assert leader.stdout is not None
+        descendant_pid = int(leader.stdout.readline().strip())
+
+        def pid_exists(pid):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            return True
+
+        started = time.monotonic()
+        try:
+            with (
+                mock.patch.object(pm_agent, "COMMAND_KILL_GRACE_SECONDS", 0.1),
+                mock.patch.object(
+                    pm_agent,
+                    "HEALTH_CHILD_KILL_GRACE_SECONDS",
+                    1.0,
+                    create=True,
+                ),
+            ):
+                pm_agent._stop_health_child(leader)
+            self.assertLess(time.monotonic() - started, 2)
+            deadline = time.monotonic() + 1
+            while pid_exists(descendant_pid) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(pid_exists(descendant_pid), "descendant survived group cleanup")
+            self.assertIsNotNone(leader.poll())
+        finally:
+            try:
+                os.killpg(leader.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                leader.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                leader.kill()
+                leader.wait(timeout=1)
+            if leader.stdout is not None:
+                leader.stdout.close()
+            if leader.stderr is not None:
+                leader.stderr.close()
 
     def test_protected_install_rejects_missing_symlinked_or_writable_helper(self):
         with tempfile.TemporaryDirectory() as temp:
