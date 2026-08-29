@@ -497,7 +497,13 @@ def build_snapshot(
                 "progressSource": "self-reported" if progress is not None else None,
                 "elapsedSeconds": elapsed,
                 "updatedAt": assessment.get("observedAt") or record["createdAt"],
-                "nextActionBy": assessment["nextActionBy"],
+                # The heartbeat classifier keeps "-" for existing human/status
+                # output. JSON uses null for the absence of an actionable deadline.
+                "nextActionBy": (
+                    None
+                    if assessment.get("nextActionBy") in {None, "-"}
+                    else assessment["nextActionBy"]
+                ),
             }
         )
     if non_agent_processes_omitted:

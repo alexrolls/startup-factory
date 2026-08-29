@@ -114,9 +114,12 @@ Successful collection atomically replaces
 `.teamwork/pm-agent/agent-health.json` in the canonical primary worktree. The
 snapshot is `agent-health-snapshot-v1`, is project-bound, records `generatedAt`,
 and remains presentation-only. It is never consumed as lifecycle or workflow
-authority. Failure preserves the prior complete bytes and generation time.
-Percentages remain optional, self-reported, exact-attempt-bound, and fresh only
-for the snapshot interval; otherwise a live managed row exposes elapsed time.
+authority. Any failure before the atomic rename commit point preserves the prior
+complete bytes and generation time. A directory durability error after rename
+emits a warning while the new complete snapshot remains published.
+Percentages remain optional, self-reported, exact-attempt-bound, and fresh for
+at most 300 seconds regardless of observer cadence; otherwise a live managed
+row exposes elapsed time.
 Other projects and legacy unbound records are omitted. An external runtime with
 insufficient protected attribution degrades to an explicit warning and no
 fabricated rows. The cadence is an observer guarantee and never wakes an LLM.

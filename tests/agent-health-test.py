@@ -174,6 +174,7 @@ class AgentHealthTest(unittest.TestCase):
         row = snapshot["agents"][0]
         self.assertIsNone(row["elapsedSeconds"])
         self.assertIsNone(row["progressSource"])
+        self.assertIsNone(row["nextActionBy"])
         self.assertIn("-", agent_health.render_table(snapshot))
 
     def test_identity_mismatch_never_renders_time_in_progress(self):
@@ -182,7 +183,15 @@ class AgentHealthTest(unittest.TestCase):
         self.assertEqual("identity-mismatch", row["verdict"])
         self.assertIsNone(row["elapsedSeconds"])
         self.assertIsNone(row["progressPercent"])
+        self.assertIsNone(row["nextActionBy"])
         self.assertIn("identity-mismatch", agent_health.render_table(snapshot))
+
+    def test_stalled_agent_json_uses_null_for_missing_deadline(self):
+        self.heartbeat.write_text("not-a-valid-heartbeat\n", encoding="utf-8")
+        snapshot = self.snapshot()
+        row = snapshot["agents"][0]
+        self.assertTrue(row["verdict"].startswith("stalled:"))
+        self.assertIsNone(row["nextActionBy"])
 
     def test_dead_agent_bypasses_hostile_team_workspace(self):
         outside = self.repo / "outside-dead-workspace"

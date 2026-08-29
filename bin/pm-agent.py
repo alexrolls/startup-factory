@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1378,7 +1379,18 @@ def _atomic_health_snapshot_at(directory: int, snapshot: dict) -> bool:
             src_dir_fd=directory,
             dst_dir_fd=directory,
         )
-        os.fsync(directory)
+        # Rename is the publication commit point: readers already see the new
+        # complete document. A later directory-fsync error is a durability
+        # warning, not a truthful basis for claiming the old bytes survived.
+        try:
+            os.fsync(directory)
+        except OSError as exc:
+            warnings.warn(
+                "health snapshot committed, but directory durability could not be confirmed: "
+                f"{exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return True
     except OSError as exc:
         raise MonitorError(f"cannot atomically publish health snapshot: {exc}") from exc

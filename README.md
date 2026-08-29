@@ -1711,8 +1711,10 @@ Choose exactly one mode. `--dry-run` combines only with `--once`.
 
 The health cache is an atomic, presentation-only latest view for an unattended
 operator/UI. It carries the canonical project id and generation time, is never
-read by scheduling, recovery, review, integration, or release code, and keeps
-the previous bytes and generation time when collection or publication fails.
+read by scheduling, recovery, review, integration, or release code. Any failure
+before the atomic rename commit point keeps the previous bytes and generation
+time. If directory durability confirmation fails after the rename, the command
+warns while the new complete snapshot remains published.
 Its optional percentages are fresh current-attempt self-reports, not computed
 completion; live agents without one show trusted elapsed time. Project binding
 excludes other repositories and legacy unbound records, while insufficient

@@ -139,7 +139,9 @@ semantics atomically at the canonical primary worktree's
 `.teamwork/pm-agent/agent-health.json`. Its default five-minute watch deadline is
 independent of the board scan clock. This cache is presentation-only and must
 never be read as lifecycle, scheduling, recovery, review, integration, or
-release authority; a failed refresh preserves its previous generation.
+release authority. A refresh failure before the atomic rename commit point
+preserves its previous generation. A post-rename directory durability error
+warns while the new complete generation remains published.
 
 Review depth (`REVIEW_MODE=sequential|parallel|tiered`) is a **per-team** choice
 and lives in the team file (`teams/<preset>.md`, next to `ROSTER=`), not here —

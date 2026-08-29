@@ -24,6 +24,13 @@ assert SPEC and SPEC.loader
 pm_agent = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pm_agent)
 
+AGENT_SPEC = importlib.util.spec_from_file_location(
+    "pm_agent_health_collector", ROOT / "bin" / "agent-health.py"
+)
+assert AGENT_SPEC and AGENT_SPEC.loader
+agent_health = importlib.util.module_from_spec(AGENT_SPEC)
+AGENT_SPEC.loader.exec_module(agent_health)
+
 NOW = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
 REPOSITORY_ID = "a" * 64
 
@@ -41,6 +48,27 @@ def snapshot(**changes):
     }
     value.update(changes)
     return value
+
+
+def managed_record(*, category, instance, state, pid):
+    return {
+        "schemaVersion": 3,
+        "repositoryId": REPOSITORY_ID,
+        "team": "feature-a",
+        "category": category,
+        "instance": instance,
+        "kind": "background",
+        "pid": pid,
+        "processIdentity": state,
+        "createdAt": "2026-08-29T11:50:00Z",
+        "tmuxSession": None,
+        "tmuxWindow": None,
+        "tmuxPane": None,
+        "processGroupId": pid,
+        "sessionId": pid,
+        "tmuxPanePid": None,
+        "state": state,
+    }
 
 
 class HealthPublisherTest(unittest.TestCase):
@@ -110,6 +138,61 @@ class HealthPublisherTest(unittest.TestCase):
                     finished_at=NOW + timedelta(seconds=1),
                 )
 
+    def test_actual_exited_and_stalled_rows_publish_end_to_end(self):
+        with tempfile.TemporaryDirectory() as temp:
+            primary = Path(temp).resolve()
+            heartbeat_dir = primary / ".teamwork" / "feature-a" / "heartbeats"
+            heartbeat_dir.mkdir(parents=True)
+            (heartbeat_dir / "team-lead").write_text(
+                "not-a-valid-heartbeat\n", encoding="utf-8"
+            )
+            envelope = {
+                "schemaVersion": "project-lifecycle-list-v1",
+                "repositoryId": REPOSITORY_ID,
+                "records": [
+                    managed_record(
+                        category="task",
+                        instance="backend--task-key--a1",
+                        state="dead",
+                        pid=100,
+                    ),
+                    managed_record(
+                        category="gate",
+                        instance="team-lead",
+                        state="live",
+                        pid=101,
+                    ),
+                ],
+                "legacyOmitted": 0,
+                "warnings": [],
+            }
+            collected = agent_health.build_snapshot(
+                envelope,
+                repo=primary,
+                teamwork_root=".teamwork",
+                now=NOW,
+                stuck_minutes=15,
+                start_grace_seconds=60,
+            )
+            self.assertEqual(
+                [None, None], [row["nextActionBy"] for row in collected["agents"]]
+            )
+            validated = pm_agent.validate_health_snapshot(
+                json.dumps(collected).encode(),
+                repository_id=REPOSITORY_ID,
+                interval_seconds=300,
+                started_at=NOW - timedelta(seconds=1),
+                finished_at=NOW + timedelta(seconds=1),
+            )
+            self.assertTrue(pm_agent.atomic_health_snapshot(primary, validated))
+            cached = json.loads(
+                (primary / ".teamwork" / "pm-agent" / "agent-health.json").read_bytes()
+            )
+            self.assertEqual(
+                {"exited", "stalled:malformed-heartbeat"},
+                {row["verdict"] for row in cached["agents"]},
+            )
+
     def test_atomic_publication_preserves_old_bytes_on_replace_failure(self):
         with tempfile.TemporaryDirectory() as temp:
             primary = Path(temp).resolve()
@@ -123,6 +206,27 @@ class HealthPublisherTest(unittest.TestCase):
                     pm_agent.atomic_health_snapshot(primary, snapshot())
             self.assertEqual(old, cache.read_bytes())
             self.assertEqual([], list(cache.parent.glob(".agent-health.json.tmp.*")))
+
+    def test_post_replace_directory_fsync_failure_is_committed_with_warning(self):
+        with tempfile.TemporaryDirectory() as temp:
+            primary = Path(temp).resolve()
+            real_fsync = pm_agent.os.fsync
+            calls = 0
+
+            def fsync(descriptor):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("directory durability unavailable")
+                return real_fsync(descriptor)
+
+            with (
+                mock.patch.object(pm_agent.os, "fsync", side_effect=fsync),
+                self.assertWarnsRegex(RuntimeWarning, "committed.*durability"),
+            ):
+                self.assertTrue(pm_agent.atomic_health_snapshot(primary, snapshot()))
+            cache = primary / ".teamwork" / "pm-agent" / "agent-health.json"
+            self.assertEqual(snapshot(), json.loads(cache.read_bytes()))
 
     def test_atomic_publication_rejects_symlinked_managed_parent(self):
         with tempfile.TemporaryDirectory() as temp:
