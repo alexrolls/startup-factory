@@ -36,7 +36,10 @@ def invoke(*arguments: str) -> tuple[int, str, str]:
 
 class GovernedRuntimeLauncherTest(unittest.TestCase):
     def test_gate_role_receives_only_isolated_clone_tools_and_scoped_outbox(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        # The governed runtime intentionally refuses lifecycle authority below
+        # world-writable ancestors such as Linux's /tmp.  Anchor this fixture in
+        # the user's protected home instead of the platform tempfile default.
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
             root = Path(temporary).resolve()
             project = root / "project"
             project.mkdir(mode=0o700)
