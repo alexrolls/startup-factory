@@ -44,6 +44,20 @@ licensed**
 
 ![Startup Factory demo](https://raw.githubusercontent.com/alexrolls/startup-factory/main/exports/execmatchai-issues-57s-70s.gif)
 
+## What's new in 0.1.16
+
+This release adds project-scoped agent health monitoring. Teams can use
+`launch-team.sh health [--json] [--watch]` to see typed agent status across the
+current Git project, including linked worktrees, without exposing agents from
+other projects. Fresh, self-reported implementation percentages are shown when
+available; otherwise the view reports trusted elapsed time.
+
+Watch mode observes immediately and then every five minutes without waking an
+LLM. For unattended operation, `pm-agent.py --healthcheck` atomically publishes
+the same presentation-only snapshot, while its health clock remains independent
+of portfolio scanning. Health data never controls lifecycle, scheduling,
+reviews, integration, or releases.
+
 ## Who it is for
 
 | You are | Startup Factory helps you |
