@@ -143,6 +143,30 @@ static long parse_stat_tid(const char *value) {
     return tid;
 }
 
+static int parse_stat_start_time(const char *raw, char output[32]) {
+    const char *closing = strrchr(raw, ')');
+    if (closing == NULL) return -1;
+    const char *cursor = closing + 1;
+    int field = 3;
+    while (*cursor != '\0' && field <= 22) {
+        while (*cursor == ' ') cursor++;
+        const char *start = cursor;
+        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\n') cursor++;
+        if (field == 22) {
+            size_t count = (size_t)(cursor - start);
+            if (count == 0U || count >= 32U) return -1;
+            memcpy(output, start, count);
+            output[count] = '\0';
+            for (size_t index = 0U; index < count; ++index)
+                if (output[index] < '0' || output[index] > '9') return -1;
+            return 0;
+        }
+        if (cursor == start) return -1;
+        field++;
+    }
+    return -1;
+}
+
 static void verify_launcher_proof(int proof_fd) {
     char path[128], observed[4096], reopened[4096];
     ssize_t count = pread(proof_fd, observed, sizeof(observed)-1U, 0);
@@ -155,8 +179,17 @@ static void verify_launcher_proof(int proof_fd) {
     if (second < 0) fail("V27 launcher cannot reopen launcher proof");
     struct stat left, right;
     ssize_t second_count = pread(second, reopened, sizeof(reopened)-1U, 0);
-    if (fstat(proof_fd,&left)!=0 || fstat(second,&right)!=0 || left.st_dev!=right.st_dev || left.st_ino!=right.st_ino ||
-        second_count!=count || memcmp(observed,reopened,(size_t)count)!=0) fail("V27 launcher FD11 identity changed");
+    if (second_count <= 0 || (size_t)second_count >= sizeof(reopened))
+        fail("V27 launcher reopened proof is unreadable");
+    reopened[second_count] = '\0';
+    char observed_start[32], reopened_start[32];
+    long reopened_tid = parse_stat_tid(reopened);
+    if (fstat(proof_fd,&left)!=0 || fstat(second,&right)!=0 ||
+        left.st_dev!=right.st_dev || left.st_ino!=right.st_ino ||
+        reopened_tid != tid || parse_stat_start_time(observed, observed_start) != 0 ||
+        parse_stat_start_time(reopened, reopened_start) != 0 ||
+        strcmp(observed_start, reopened_start) != 0)
+        fail("V27 launcher FD11 stable identity changed");
     close(second);
 }
 

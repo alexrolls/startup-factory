@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +85,48 @@ class OutboxIngressTest(unittest.TestCase):
         self.body.symlink_to(outside)
         with self.assertRaisesRegex(module.PromotionError, "unsafe"):
             module.promote(self.entry, self.ingress, self.pending, self.bodies, "feature-runtime", "F-1")
+
+    def test_retry_completes_a_durable_body_only_promotion(self) -> None:
+        original = module.exclusive
+        calls = 0
+
+        def fail_after_body(path: Path, content: bytes) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected crash before canonical entry")
+            original(path, content)
+
+        with mock.patch.object(module, "exclusive", side_effect=fail_after_body):
+            with self.assertRaisesRegex(OSError, "injected crash"):
+                module.promote(
+                    self.entry, self.ingress, self.pending, self.bodies,
+                    "feature-runtime", "F-1",
+                )
+        destination_body = self.bodies / f"{self.identifier}.md"
+        destination_entry = self.pending / f"{self.identifier}.json"
+        self.assertTrue(destination_body.is_file())
+        self.assertFalse(destination_entry.exists())
+        self.assertTrue(self.entry.is_file())
+
+        promoted = module.promote(
+            self.entry, self.ingress, self.pending, self.bodies, "feature-runtime", "F-1"
+        )
+        self.assertEqual(promoted, destination_entry)
+        self.assertTrue(destination_entry.is_file())
+        self.assertTrue(self.entry.with_suffix(".promoted").is_file())
+
+    def test_entry_without_body_is_rejected_and_preserved(self) -> None:
+        destination_entry = self.pending / f"{self.identifier}.json"
+        destination_entry.write_text("{}\n")
+        destination_entry.chmod(0o600)
+        with self.assertRaisesRegex(module.PromotionError, "entry without its body"):
+            module.promote(
+                self.entry, self.ingress, self.pending, self.bodies,
+                "feature-runtime", "F-1",
+            )
+        self.assertEqual(destination_entry.read_text(), "{}\n")
+        self.assertTrue(self.entry.is_file())
 
 
 if __name__ == "__main__":

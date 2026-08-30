@@ -20,6 +20,7 @@ from .project_config import (
     plan_changes,
     read_project_config,
 )
+from .runtime_proof import normalize_runtime_proofs
 
 
 SCHEMA_VERSION = 1
@@ -350,16 +351,16 @@ def _runtime_read(
 ) -> bytes:
     if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
         raise ValueError(f"{label} path is not canonical")
-    current = Path(path.anchor)
-    for part in path.parts[1:]:
-        current /= part
-        info = current.lstat()
-        if stat.S_ISLNK(info.st_mode):
-            raise ValueError(f"{label} path contains a symlink")
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    if not nofollow:
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory:
         raise ValueError("secure no-follow opens are unavailable")
-    descriptor = os.open(path, os.O_RDONLY | nofollow)
+    parent = _runtime_open_directory(path.parent, label=label)
+    try:
+        descriptor = os.open(path.name, os.O_RDONLY | nofollow, dir_fd=parent)
+    except OSError as exc:
+        os.close(parent)
+        raise ValueError(f"{label} is unavailable") from exc
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > maximum:
@@ -381,6 +382,7 @@ def _runtime_read(
         return bytes(content)
     finally:
         os.close(descriptor)
+        os.close(parent)
 
 
 def _runtime_json(content: bytes, *, label: str) -> dict[str, Any]:
@@ -398,16 +400,44 @@ def _runtime_json(content: bytes, *, label: str) -> dict[str, Any]:
     return value
 
 
-def _runtime_private_directory(path: Path, *, label: str) -> None:
+def _runtime_open_directory(path: Path, *, label: str, missing_ok: bool = False) -> int | None:
     if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
         raise ValueError(f"{label} path is not canonical")
-    current = Path(path.anchor)
-    for part in path.parts[1:]:
-        current /= part
-        info = current.lstat()
-        if stat.S_ISLNK(info.st_mode):
-            raise ValueError(f"{label} path contains a symlink")
-    info = path.lstat()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+    if not flags & getattr(os, "O_NOFOLLOW", 0) or not flags & getattr(os, "O_DIRECTORY", 0):
+        raise ValueError("secure descriptor-relative directory opens are unavailable")
+    descriptor = os.open(path.anchor, flags)
+    try:
+        for part in path.parts[1:]:
+            try:
+                child_info = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                if missing_ok:
+                    os.close(descriptor)
+                    return None
+                raise
+            if stat.S_ISLNK(child_info.st_mode) or not stat.S_ISDIR(child_info.st_mode):
+                raise ValueError(f"{label} path contains an unsafe component")
+            child = os.open(part, flags, dir_fd=descriptor)
+            opened_info = os.fstat(child)
+            if (child_info.st_dev, child_info.st_ino) != (opened_info.st_dev, opened_info.st_ino):
+                os.close(child)
+                raise ValueError(f"{label} path component identity changed")
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _runtime_private_directory(path: Path, *, label: str) -> None:
+    descriptor = _runtime_open_directory(path, label=label)
+    assert descriptor is not None
+    try:
+        info = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
     if (
         not stat.S_ISDIR(info.st_mode)
         or info.st_uid != os.geteuid()
@@ -420,21 +450,19 @@ def _runtime_private_directory(path: Path, *, label: str) -> None:
 def _runtime_path_present_nofollow(path: Path, *, label: str) -> bool:
     if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
         raise ValueError(f"{label} path is not canonical")
-    current = Path(path.anchor)
-    parts = path.parts[1:]
-    for index, part in enumerate(parts):
-        current /= part
+    parent = _runtime_open_directory(path.parent, label=label, missing_ok=True)
+    if parent is None:
+        return False
+    try:
         try:
-            info = current.lstat()
+            info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
         except FileNotFoundError:
             return False
-        except OSError as exc:
-            raise ValueError(f"{label} path is unavailable") from exc
         if stat.S_ISLNK(info.st_mode):
-            raise ValueError(f"{label} path contains a symlink: {current}")
-        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
-            raise ValueError(f"{label} path contains a non-directory ancestor: {current}")
-    return True
+            raise ValueError(f"{label} path is a symlink")
+        return True
+    finally:
+        os.close(parent)
 
 
 def _runtime_engine_json(engine: Path, arguments: list[str], *, label: str) -> Any:
@@ -467,64 +495,13 @@ def _runtime_engine_json(engine: Path, arguments: list[str], *, label: str) -> A
 
 def _runtime_proofs(engine: Path, image: str) -> tuple[dict[str, Any], dict[str, Any]]:
     info = _runtime_engine_json(engine, ["info", "--format", "json"], label="engine")
-    if not isinstance(info, dict):
-        raise ValueError("engine proof is not an object")
-    version = info.get("version")
-    host = info.get("host")
-    security = host.get("security") if isinstance(host, dict) else None
-    mappings = host.get("idMappings") if isinstance(host, dict) else None
-    version_text = version.get("Version") if isinstance(version, dict) else None
-
-    def valid_mapping(rows: Any) -> bool:
-        return bool(
-            isinstance(rows, list)
-            and rows
-            and all(
-                isinstance(row, dict)
-                and set(row) == {"container_id", "host_id", "size"}
-                and all(type(row[key]) is int and row[key] >= 0 for key in ("container_id", "host_id"))
-                and type(row["size"]) is int
-                and row["size"] > 0
-                for row in rows
-            )
-            and any(row["container_id"] == 0 for row in rows)
-        )
-
-    if (
-        not isinstance(version_text, str)
-        or version_text.split(".", 1)[0] != "5"
-        or not isinstance(security, dict)
-        or security.get("rootless") is not True
-        or not isinstance(mappings, dict)
-        or set(mappings) != {"uidmap", "gidmap"}
-        or not valid_mapping(mappings["uidmap"])
-        or not valid_mapping(mappings["gidmap"])
-    ):
-        raise ValueError("engine proof is not rootless Podman 5")
     inspected = _runtime_engine_json(
         engine, ["image", "inspect", "--format", "json", image], label="image"
     )
-    if not isinstance(inspected, list) or len(inspected) != 1 or not isinstance(inspected[0], dict):
-        raise ValueError("image proof cardinality changed")
-    repository_digests = inspected[0].get("RepoDigests")
-    image_id = inspected[0].get("Id")
-    if (
-        not isinstance(repository_digests, list)
-        or not all(isinstance(item, str) for item in repository_digests)
-        or image not in repository_digests
-        or not isinstance(image_id, str)
-        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
-    ):
-        raise ValueError("image proof identity changed")
-    return (
-        {
-            "version": version_text,
-            "rootless": True,
-            "uidmap": mappings["uidmap"],
-            "gidmap": mappings["gidmap"],
-        },
-        {"Id": image_id, "RepoDigests": sorted(set(repository_digests))},
-    )
+    def fail(message: str):
+        raise ValueError(message)
+
+    return normalize_runtime_proofs(info, inspected, image, fail)
 
 
 def _secure_runtime_configuration(target: Path) -> tuple[bool, str | None] | None:

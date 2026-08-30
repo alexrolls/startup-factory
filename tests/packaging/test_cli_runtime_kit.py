@@ -741,6 +741,50 @@ runtime_kit.apply_runtime_kit(plan, expected_plan_digest=expected)
         self.assertEqual(code, 1)
         self.assertIn("rootless Podman", error)
 
+    def test_apply_probe_conflict_is_rejected_before_planning(self) -> None:
+        with mock.patch.object(cli, "plan_runtime_kit") as planner:
+            code, _, error = self.runtime("--apply", "--probe")
+        self.assertEqual(code, 1)
+        self.assertIn("mutually exclusive", error)
+        planner.assert_not_called()
+
+    def test_runner_placeholders_are_replaced_once_from_the_original_template(self) -> None:
+        rendered = runtime_kit._render_runner(
+            b"engine=@@ENGINE@@\nimage=@@IMAGE@@\n",
+            {b"@@ENGINE@@": "@@IMAGE@@", b"@@IMAGE@@": "final-image"},
+        )
+        self.assertEqual(rendered, b"engine='@@IMAGE@@'\nimage='final-image'\n")
+        with self.assertRaisesRegex(runtime_kit.InstallerError, "placeholder inventory"):
+            runtime_kit._render_runner(
+                b"engine=@@ENGINE@@\n",
+                {b"@@ENGINE@@": "engine", b"@@IMAGE@@": "image"},
+            )
+
+    def test_regular_file_read_stays_bound_to_the_opened_parent(self) -> None:
+        parent = self.root / "read-parent"
+        parent.mkdir()
+        source = parent / "proof"
+        source.write_bytes(b"trusted\n")
+        replacement = self.root / "replacement-parent"
+        replacement.mkdir()
+        (replacement / "proof").write_bytes(b"substituted\n")
+        saved = self.root / "opened-parent"
+        original_open = runtime_kit.os.open
+        swapped = False
+
+        def swap_before_final_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if path == "proof" and kwargs.get("dir_fd") is not None and not swapped:
+                parent.rename(saved)
+                parent.symlink_to(replacement, target_is_directory=True)
+                swapped = True
+            return original_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(runtime_kit.os, "open", side_effect=swap_before_final_open):
+            content, _ = runtime_kit._read_regular(source, "proof")
+        self.assertTrue(swapped)
+        self.assertEqual(content, b"trusted\n")
+
     def test_symlink_and_stale_asset_are_refused(self) -> None:
         outside = self.root / "outside"
         outside.mkdir()

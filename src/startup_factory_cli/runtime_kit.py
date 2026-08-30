@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from typing import Any, Iterable, Mapping
 
 from .installer import InstallerError, verify_installation
 from .readiness import secure_runtime_checks
+from .runtime_proof import normalize_runtime_proofs
 
 
 SCHEMA_VERSION = 1
@@ -315,10 +317,12 @@ def _read_regular(path: Path, label: str, maximum: int = 2 * 1024 * 1024) -> tup
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not nofollow:
         raise InstallerError(f"{label} requires secure no-follow opens")
-    _validate_existing_components(path, label)
+    path = _normalized_absolute(path, label)
+    parent = _open_directory_nofollow(path.parent, label)
     try:
-        descriptor = os.open(path, os.O_RDONLY | nofollow)
+        descriptor = os.open(path.name, os.O_RDONLY | nofollow, dir_fd=parent)
     except OSError as exc:
+        os.close(parent)
         raise InstallerError(f"cannot open {label}: {exc}") from exc
     try:
         info = os.fstat(descriptor)
@@ -335,6 +339,7 @@ def _read_regular(path: Path, label: str, maximum: int = 2 * 1024 * 1024) -> tup
         return bytes(chunks), info
     finally:
         os.close(descriptor)
+        os.close(parent)
 
 
 def _state(path: Path, *, maximum: int = 2 * 1024 * 1024) -> FileState:
@@ -402,58 +407,11 @@ def _reject_duplicate_pairs(rows: Iterable[tuple[str, Any]]) -> dict[str, Any]:
 
 def _prove_engine(engine: Path, image: str) -> tuple[dict[str, Any], dict[str, Any]]:
     info = _engine_json(engine, ["info", "--format", "json"], "rootless engine")
-    if not isinstance(info, dict):
-        raise InstallerError("Podman info proof must be an object")
-    version = info.get("version")
-    host = info.get("host")
-    security = host.get("security") if isinstance(host, dict) else None
-    mappings = host.get("idMappings") if isinstance(host, dict) else None
-    version_text = version.get("Version") if isinstance(version, dict) else None
-    try:
-        major = int(str(version_text).split(".", 1)[0])
-    except (TypeError, ValueError):
-        major = 0
-    if major != 5 or not isinstance(security, dict) or security.get("rootless") is not True:
-        raise InstallerError("runtime-kit requires machine-proved rootless Podman major version 5")
-    def valid_mapping(rows: Any) -> bool:
-        return bool(
-            isinstance(rows, list)
-            and rows
-            and all(
-                isinstance(row, dict)
-                and set(row) == {"container_id", "host_id", "size"}
-                and all(type(row[key]) is int and row[key] >= 0 for key in ("container_id", "host_id"))
-                and type(row["size"]) is int
-                and row["size"] > 0
-                for row in rows
-            )
-            and any(row["container_id"] == 0 for row in rows)
-        )
-
-    if (
-        not isinstance(mappings, dict)
-        or set(mappings) != {"uidmap", "gidmap"}
-        or not valid_mapping(mappings.get("uidmap"))
-        or not valid_mapping(mappings.get("gidmap"))
-    ):
-        raise InstallerError("rootless Podman proof is missing UID/GID namespace mappings")
     inspected = _engine_json(engine, ["image", "inspect", "--format", "json", image], "local image")
-    if not isinstance(inspected, list) or len(inspected) != 1 or not isinstance(inspected[0], dict):
-        raise InstallerError("Podman image proof must contain exactly one local image")
-    repo_digests = inspected[0].get("RepoDigests")
-    if not isinstance(repo_digests, list) or image not in repo_digests:
-        raise InstallerError("local Podman image digest does not match the requested pinned image")
-    image_id = inspected[0].get("Id")
-    if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
-        raise InstallerError("local Podman image proof has an invalid image identity")
-    normalized_engine = {
-        "version": version_text,
-        "rootless": True,
-        "uidmap": mappings["uidmap"],
-        "gidmap": mappings["gidmap"],
-    }
-    normalized_image = {"Id": image_id, "RepoDigests": sorted(set(repo_digests))}
-    return normalized_engine, normalized_image
+    def fail(message: str):
+        raise InstallerError(message)
+
+    return normalize_runtime_proofs(info, inspected, image, fail)
 
 
 def _assignments(raw: bytes) -> tuple[str, dict[str, re.Match[str]], str]:
@@ -498,15 +456,25 @@ def _render_config(raw: bytes, updates: Mapping[str, str]) -> bytes:
 
 
 def _render_runner(template: bytes, values: Mapping[bytes, str]) -> bytes:
-    content = template
+    placeholder = re.compile(rb"@@[A-Z][A-Z0-9_]*@@")
+    found = placeholder.findall(template)
+    if set(found) != set(values) or any(found.count(token) != 1 for token in set(found)):
+        raise InstallerError("runtime runner template placeholder inventory changed")
+    rendered: dict[bytes, bytes] = {}
     for token, value in values.items():
         if any(ord(character) < 32 for character in value):
             raise InstallerError("runtime runner binding contains a control character")
         quoted = "'" + value.replace("'", "'\"'\"'") + "'"
-        content = content.replace(token, quoted.encode())
-    if b"@@" in content:
-        raise InstallerError("runtime runner template contains an unresolved placeholder")
-    return content
+        rendered[token] = quoted.encode()
+    return placeholder.sub(lambda match: rendered[match.group(0)], template)
+
+
+def _render_proof_helper(template: bytes) -> tuple[bytes, bytes]:
+    token = b"@@NORMALIZE_RUNTIME_PROOFS_PY@@"
+    if template.count(token) != 1:
+        raise InstallerError("runtime runner proof-helper placeholder inventory changed")
+    source = inspect.getsource(normalize_runtime_proofs).encode("utf-8")
+    return template.replace(token, source), source
 
 
 def _plan_material(plan: dict[str, Any]) -> str:
@@ -573,8 +541,11 @@ def plan_runtime_kit(
     policy_obj = _strict_object(policy, "container policy")
     if policy_obj.get("profile") != PROFILE or policy_obj.get("schemaVersion") != 1:
         raise InstallerError("installed container policy has an unsupported profile")
-    source_digest = _sha256(runner_template + policy + network_policy)
-    version_name = "v1-" + source_digest.split(":", 1)[1][:16]
+    runner_source = runner_template
+    runner_template, proof_helper = _render_proof_helper(runner_source)
+    source_digest = _sha256(runner_source + policy + network_policy)
+    implementation_digest = _sha256(runner_source + proof_helper + policy + network_policy)
+    version_name = "v1-" + implementation_digest.split(":", 1)[1][:16]
     asset_root = runtime_root / "assets" / version_name
     manifest_path = asset_root / "runtime-manifest.json"
     policy_path = asset_root / "container-policy.json"

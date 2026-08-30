@@ -47,14 +47,24 @@ def pairs(rows):
 def read(path_raw,label,maximum=134217728,mode=None,executable=False):
  path=Path(path_raw)
  if not path.is_absolute() or Path(os.path.normpath(str(path))) != path: fail(label+" path is not canonical")
- current=Path(path.anchor)
- for part in path.parts[1:]:
-  current/=part
-  try: info=current.lstat()
+ nofollow=getattr(os,"O_NOFOLLOW",0); directory=getattr(os,"O_DIRECTORY",0)
+ if not nofollow or not directory: fail("secure descriptor-relative opens unavailable")
+ flags=os.O_RDONLY|nofollow|directory
+ parent=os.open(path.anchor,flags)
+ try:
+  for part in path.parent.parts[1:]:
+   try: before=os.stat(part,dir_fd=parent,follow_symlinks=False)
+   except OSError: fail(label+" is unavailable")
+   if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode): fail(label+" contains an unsafe component")
+   try: child=os.open(part,flags,dir_fd=parent)
+   except OSError: fail(label+" contains an unsafe component")
+   after=os.fstat(child)
+   if (before.st_dev,before.st_ino)!=(after.st_dev,after.st_ino): os.close(child); fail(label+" component identity changed")
+   os.close(parent); parent=child
+  try: fd=os.open(path.name,os.O_RDONLY|nofollow,dir_fd=parent)
   except OSError: fail(label+" is unavailable")
-  if stat.S_ISLNK(info.st_mode): fail(label+" contains a symlink")
- if not getattr(os,"O_NOFOLLOW",0): fail("secure no-follow opens unavailable")
- fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+ finally:
+  os.close(parent)
  try:
   info=os.fstat(fd)
   if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size>maximum: fail(label+" is unsafe")
@@ -83,21 +93,11 @@ def engine_json(argv,label):
  if result.returncode or result.stderr or len(result.stdout)>262144: fail(label+" proof invalid")
  try: return json.loads(result.stdout,object_pairs_hook=pairs)
  except (UnicodeError,ValueError): fail(label+" proof malformed")
+@@NORMALIZE_RUNTIME_PROOFS_PY@@
 def normalize_proofs():
  info=engine_json(["info","--format","json"],"engine")
- version=info.get("version") if isinstance(info,dict) else None
- host=info.get("host") if isinstance(info,dict) else None
- security=host.get("security") if isinstance(host,dict) else None
- mappings=host.get("idMappings") if isinstance(host,dict) else None
- version_text=version.get("Version") if isinstance(version,dict) else None
- def valid(rows):
-  return isinstance(rows,list) and rows and all(isinstance(row,dict) and set(row)=={"container_id","host_id","size"} and all(type(row[k]) is int and row[k]>=0 for k in ("container_id","host_id")) and type(row["size"]) is int and row["size"]>0 for row in rows) and any(row["container_id"]==0 for row in rows)
- if not isinstance(version_text,str) or version_text.split(".",1)[0]!="5" or not isinstance(security,dict) or security.get("rootless") is not True or not isinstance(mappings,dict) or set(mappings)!={"uidmap","gidmap"} or not valid(mappings["uidmap"]) or not valid(mappings["gidmap"]): fail("engine proof no longer matches rootless Podman 5")
  inspected=engine_json(["image","inspect","--format","json",image],"image")
- if not isinstance(inspected,list) or len(inspected)!=1 or not isinstance(inspected[0],dict): fail("image proof cardinality changed")
- repo=inspected[0].get("RepoDigests"); ident=inspected[0].get("Id")
- if not isinstance(repo,list) or image not in repo or not isinstance(ident,str) or not re.fullmatch(r"sha256:[0-9a-f]{64}",ident): fail("image identity changed")
- return {"version":version_text,"rootless":True,"uidmap":mappings["uidmap"],"gidmap":mappings["gidmap"]},{"Id":ident,"RepoDigests":sorted(set(repo))}
+ return normalize_runtime_proofs(info,inspected,image,fail)
 
 runner=read(runner_raw,"runner",2097152,0o700,True)
 manifest_content=read(manifest_raw,"manifest",2097152,0o600)

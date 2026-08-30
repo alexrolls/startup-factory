@@ -17,6 +17,7 @@ from typing import Any
 
 
 SAFE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
+TEAM = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?\Z")
 ROLE = re.compile(r"[a-z0-9-]{2,80}\Z")
 COMMIT = re.compile(r"[0-9a-f]{40,64}\Z")
 ALLOWED_CONFIG = {
@@ -96,22 +97,68 @@ def protected_root(raw: str, repository: Path) -> Path:
 
 
 def attempt_path(root: Path, team: str, role: str, attempt: int, task_key: str) -> Path:
-    _safe(team, "team")
+    _safe(team, "team", TEAM)
     _safe(role, "role", ROLE)
     _safe(task_key, "task key")
     if attempt < 1:
         raise WorkspaceError("attempt must be positive")
-    return root / team / f"{role}#{attempt}-{task_key}"
+    destination = root / team / f"{role}#{attempt}-{task_key}"
+    try:
+        destination.relative_to(root)
+    except ValueError as exc:
+        raise WorkspaceError("attempt path escapes the clone root") from exc
+    return destination
 
 
-def _mkdir_private(path: Path) -> None:
-    missing: list[Path] = []
-    cursor = path
-    while not cursor.exists():
-        missing.append(cursor)
-        cursor = cursor.parent
-    for directory in reversed(missing):
-        directory.mkdir(mode=0o700)
+def _mkdir_private(path: Path, private_root: Path) -> None:
+    if (
+        not path.is_absolute()
+        or Path(os.path.normpath(str(path))) != path
+        or not private_root.is_absolute()
+        or Path(os.path.normpath(str(private_root))) != private_root
+    ):
+        raise WorkspaceError("private directory path must be absolute and normalized")
+    try:
+        path.relative_to(private_root)
+    except ValueError as exc:
+        raise WorkspaceError("private directory escapes the clone root") from exc
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory:
+        raise WorkspaceError("secure descriptor-relative directory operations are unavailable")
+    flags = os.O_RDONLY | nofollow | directory
+    descriptor = os.open(path.anchor, flags)
+    current = Path(path.anchor)
+    try:
+        for part in path.parts[1:]:
+            current /= part
+            try:
+                before = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                except FileExistsError:
+                    pass
+                before = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                raise WorkspaceError("private directory path contains an unsafe component")
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except OSError as exc:
+                raise WorkspaceError("private directory path contains an unsafe component") from exc
+            after = os.fstat(child)
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                os.close(child)
+                raise WorkspaceError("private directory component identity changed")
+            if current == private_root or private_root in current.parents:
+                if after.st_uid != os.geteuid() or stat.S_IMODE(after.st_mode) != 0o700:
+                    os.close(child)
+                    raise WorkspaceError("clone root and team directory must be caller-owned mode 0700")
+            os.close(descriptor)
+            descriptor = child
+    finally:
+        os.close(descriptor)
 
 
 def _install_private_excludes(clone: Path) -> None:
@@ -153,7 +200,7 @@ def create_attempt(
         validation = validate_attempt(destination, branch, base)
         _install_private_excludes(destination)
         return {**validation, "created": False}
-    _mkdir_private(destination.parent)
+    _mkdir_private(destination.parent, root)
     environment = {
         "PATH": "/usr/bin:/bin",
         "GIT_CONFIG_GLOBAL": "/dev/null",

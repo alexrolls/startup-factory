@@ -243,6 +243,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_doctor_report(report, as_json=json_output)
             return 0 if report.ready else 1
         elif args.command == "runtime-kit":
+            if args.apply and args.probe:
+                raise InstallerError("runtime-kit --apply and --probe are mutually exclusive")
             if args.probe and args.recover:
                 raise InstallerError("runtime-kit --probe and --recover are mutually exclusive")
             if args.recover:
@@ -268,8 +270,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 network=args.network,
                 host_platform=args.host_platform,
             )
-            if args.apply and args.probe:
-                raise InstallerError("runtime-kit --apply and --probe are mutually exclusive")
             if args.apply:
                 if not args.plan_digest:
                     raise InstallerError("runtime-kit --apply requires the exact --plan-digest from preview")

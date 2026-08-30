@@ -312,21 +312,50 @@ def sign_entry(
 
 
 def _read_protected(path: Path, label: str, maximum: int = 65536) -> bytes:
+    if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
+        raise CapabilityError("%s path must be absolute and normalized" % label)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or not directory:
+        raise CapabilityError("secure descriptor-relative opens are unavailable")
+    flags = os.O_RDONLY | nofollow | directory
+    parent = os.open(path.anchor, flags)
     try:
-        info = path.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            raise CapabilityError("%s must be a non-symlink regular file" % label)
-        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
-            raise CapabilityError("%s must be owner-only" % label)
-        if info.st_size <= 0 or info.st_size > maximum:
-            raise CapabilityError("invalid %s size" % label)
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        for part in path.parent.parts[1:]:
+            before = os.stat(part, dir_fd=parent, follow_symlinks=False)
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                raise CapabilityError("%s path contains an unsafe component" % label)
+            child = os.open(part, flags, dir_fd=parent)
+            after = os.fstat(child)
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                os.close(child)
+                raise CapabilityError("%s path component identity changed" % label)
+            os.close(parent)
+            parent = child
+        descriptor = os.open(path.name, os.O_RDONLY | nofollow, dir_fd=parent)
         try:
-            return os.read(descriptor, maximum + 1)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise CapabilityError("%s must be a non-symlink regular file" % label)
+            if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                raise CapabilityError("%s must be owner-only" % label)
+            if info.st_size <= 0 or info.st_size > maximum:
+                raise CapabilityError("invalid %s size" % label)
+            content = bytearray()
+            while len(content) <= maximum:
+                block = os.read(descriptor, min(65536, maximum + 1 - len(content)))
+                if not block:
+                    break
+                content.extend(block)
+            if len(content) > maximum or len(content) != info.st_size:
+                raise CapabilityError("invalid %s size" % label)
+            return bytes(content)
         finally:
             os.close(descriptor)
     except OSError as exc:
         raise CapabilityError("cannot read %s: %s" % (label, exc)) from exc
+    finally:
+        os.close(parent)
 
 
 def _verify_entry(

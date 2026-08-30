@@ -129,6 +129,18 @@ class StandaloneWorkspaceTest(unittest.TestCase):
         self.assertIn("unrecognized arguments", result.stderr)
         self.assertFalse(self.clone_root.exists())
 
+    def test_team_dot_segments_and_unsafe_existing_team_directory_are_rejected(self) -> None:
+        for team in (".", ".."):
+            with self.subTest(team=team), self.assertRaisesRegex(module.WorkspaceError, "unsafe team"):
+                module.attempt_path(self.clone_root, team, "backend", 1, "task-key")
+
+        self.clone_root.mkdir(mode=0o700)
+        team_root = self.clone_root / "feature-runtime"
+        team_root.mkdir(mode=0o755)
+        with self.assertRaisesRegex(module.WorkspaceError, "caller-owned mode 0700"):
+            self.create()
+        self.assertEqual(list(team_root.iterdir()), [])
+
     def test_dirty_extra_refs_and_unsafe_git_config_fail_closed(self) -> None:
         clone = self.create()
         (clone / "dirty").write_text("dirty\n")
