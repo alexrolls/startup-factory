@@ -3014,8 +3014,9 @@ def _split_cgroup_children_v27(
                 )
             descriptor = os.open(
                 name,
-                getattr(os, "O_PATH", os.O_RDONLY)
+                os.O_RDONLY
                 | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0)
                 | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=payload_fd,
             )

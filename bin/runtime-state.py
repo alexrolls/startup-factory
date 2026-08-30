@@ -17,6 +17,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.dont_write_bytecode = True
+# PYTHONSAFEPATH is required for release helpers, so explicitly bind sibling
+# imports to this captured script's trusted directory instead of cwd or ambient
+# Python path state.
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIRECTORY))
 from retrospective import read_project
 from task_metadata import (
     effective_review_gates,

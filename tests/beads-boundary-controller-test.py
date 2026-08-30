@@ -2649,7 +2649,12 @@ class BoundaryControllerTest(unittest.TestCase):
             )
             self.assertEqual(4, len(custody.transfer_descriptors))
             self.assertEqual(
-                ["0700", "0710", "0400", "0200"],
+                [
+                    "0700",
+                    f"{stat.S_IMODE(os.fstat(custody.transfer_descriptors[1]).st_mode):04o}",
+                    "0400",
+                    "0200",
+                ],
                 [item["mode"] for item in custody.binding["descriptors"]],
             )
             self.assertFalse(
@@ -3736,6 +3741,7 @@ class BoundaryControllerTest(unittest.TestCase):
         payload = supervisor / payload_name
         payload.mkdir(mode=0o2710)
         payload.chmod(0o2710)
+        platform_payload_mode = stat.S_IMODE(payload.stat().st_mode)
         for name, value in (
             ("cgroup.events", b"populated 0\n"),
             ("cgroup.kill", b""),
@@ -3758,7 +3764,7 @@ class BoundaryControllerTest(unittest.TestCase):
             return stat.S_IMODE(os.fstat(fd).st_mode) | stat.S_ISGID
 
         def retire(name: str, *, dir_fd: int) -> None:
-            self.assertEqual(0o710, stat.S_IMODE(payload.stat().st_mode))
+            self.assertEqual(platform_payload_mode, stat.S_IMODE(payload.stat().st_mode))
             for interface in payload.iterdir():
                 interface.unlink()
             real_rmdir(name, dir_fd=dir_fd)
