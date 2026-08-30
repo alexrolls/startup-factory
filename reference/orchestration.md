@@ -825,6 +825,7 @@ shared authority or source snapshot.
 | tmux | launcher niceness | background processes + authenticated external lifecycle records |
 | Long-running loop | nobody — the loop lives outside agents (`reference/dispatch.md`) | one-shot turns are the primary path: `bin/dispatch.sh --watch` (CLI) or the harness orchestrator converts events into launches; recovery makes restarts free |
 | Portfolio clock | deterministic `bin/pm-agent.py --once` | run one scheduler instance; multi-host needs a distributed lock/CAS |
+| Project health observer | deterministic `bin/pm-agent.py --healthcheck` or its independent `--watch` deadline | atomic presentation-only latest snapshot; never workflow authority and never an LLM wake |
 | Production credentials | deterministic release executor only | production delivery remains disabled/blocked; never pass them to an agent |
 
 A missing capability degrades **explicitly** — state what you could not do; never

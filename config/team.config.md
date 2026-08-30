@@ -125,6 +125,24 @@ BROKER_LIFECYCLE_ROOT=null       # Absolute pre-created mode-0700 directory, ext
                                  # Agent sandboxes must not be able to read or write this directory.
 ```
 
+`bin/launch-team.sh health [--json] [--watch]` renders only lifecycle-authenticated
+agents bound to the current canonical Git project. Watch mode publishes immediately
+and then every 300 seconds from a monotonic observer; it does not wake an LLM.
+Percentages are optional, self-reported, current-attempt-bound, fresh for at most
+300 seconds, and presentation-only. Missing or ineligible percentages fall back to
+protected lifecycle elapsed time for live agents. Unmanaged agents are never inferred
+from workspace PID markers. Deterministic release lifecycle processes are not agents;
+the health envelope omits them and reports only a non-identifying omission count.
+
+The external `bin/pm-agent.py --healthcheck` command publishes the same JSON
+semantics atomically at the canonical primary worktree's
+`.teamwork/pm-agent/agent-health.json`. Its default five-minute watch deadline is
+independent of the board scan clock. This cache is presentation-only and must
+never be read as lifecycle, scheduling, recovery, review, integration, or
+release authority. A refresh failure before the atomic rename commit point
+preserves its previous generation. A post-rename directory durability error
+warns while the new complete generation remains published.
+
 Review depth (`REVIEW_MODE=sequential|parallel|tiered`) is a **per-team** choice
 and lives in the team file (`teams/<preset>.md`, next to `ROSTER=`), not here —
 see `teams/_PLAYBOOK.md` → *Review modes*.

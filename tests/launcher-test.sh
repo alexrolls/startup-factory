@@ -1617,6 +1617,19 @@ rm -f "$stop_task_good_record" "$stop_task_bad_record"
 # Capture first (grep -q closes the pipe early → SIGPIPE on the writer under pipefail).
 status_out="$("$LAUNCH" status test-feature)"
 echo "$status_out" | grep -q backend && echo "ok: status lists role" || { echo "FAIL: status"; FAILURES=$((FAILURES+1)); }
+health_json="$("$LAUNCH" health --json)"
+check "health uses the project snapshot envelope through the real launcher" python3 -c \
+  'import json,sys; value=json.loads(sys.argv[1]); assert value["schemaVersion"] == "agent-health-snapshot-v1"; assert value["intervalSeconds"] == 300; assert any(row["team"] == "test-feature" and row["role"] == "backend" for row in value["agents"]); assert "launchToken" not in sys.argv[1] and "auth" not in sys.argv[1]' \
+  "$health_json"
+health_table="$("$LAUNCH" health)"
+echo "$health_table" | grep -q 'self-reported' \
+  && echo "ok: health table labels percentage provenance" \
+  || { echo "FAIL: health table omits percentage provenance"; FAILURES=$((FAILURES+1)); }
+canonical_launch="$PWD/$LAUNCH"
+linked_health_json="$(cd "$T42_WT" && "$canonical_launch" health --json)"
+check "linked-worktree health resolves the canonical project workspace" python3 -c \
+  'import json,sys; canonical=json.loads(sys.argv[1]); linked=json.loads(sys.argv[2]); assert linked["repositoryId"] == canonical["repositoryId"]; assert {(r["team"],r["category"],r["instance"]) for r in linked["agents"]} == {(r["team"],r["category"],r["instance"]) for r in canonical["agents"]}' \
+  "$health_json" "$linked_health_json"
 "$LAUNCH" stop test-feature
 echo "---"
 [ "$FAILURES" -eq 0 ] && echo "ALL PASS" || { echo "$FAILURES FAILURE(S)"; exit 1; }

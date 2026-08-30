@@ -3,6 +3,7 @@
   "enabled": false,
   "trustedPath": "/usr/bin:/bin",
   "scanIntervalMinutes": 3,
+  "healthcheckIntervalMinutes": 5,
   "leaseSeconds": 900,
   "operationTimeoutSeconds": 120,
   "releaseTimeoutSeconds": 7200,

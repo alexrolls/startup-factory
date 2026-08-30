@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
 import re
+import secrets
+import selectors
 import shlex
 import signal
 import socket
@@ -16,9 +20,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable, Iterator
 
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
@@ -37,6 +43,38 @@ ACTIVE_TRUSTED_PATH = "/usr/bin:/bin"
 TRUSTED_GIT = "/usr/bin/git"
 RELEASE_WORKER = Path(__file__).resolve().with_name("release-worker.py")
 MAX_PROTECTED_HANDOFF_FILE_BYTES = 16 * 1024 * 1024
+MAX_HEALTH_STDOUT_BYTES = 16 * 1024 * 1024
+MAX_HEALTH_STDERR_BYTES = 256 * 1024
+HEALTH_COMMAND_TIMEOUT_SECONDS = 30
+HEALTH_CHILD_KILL_GRACE_SECONDS = 2
+HEALTH_CHILD_POLL_SECONDS = 0.02
+HEALTH_SNAPSHOT_SCHEMA = "agent-health-snapshot-v1"
+HEALTH_SNAPSHOT_KEYS = {
+    "schemaVersion",
+    "generatedAt",
+    "repositoryId",
+    "intervalSeconds",
+    "presentationOnly",
+    "nonAgentProcessesOmitted",
+    "agents",
+    "warnings",
+}
+HEALTH_ROW_KEYS = {
+    "team",
+    "category",
+    "instance",
+    "role",
+    "taskId",
+    "attempt",
+    "lifecycleState",
+    "verdict",
+    "activity",
+    "progressPercent",
+    "progressSource",
+    "elapsedSeconds",
+    "updatedAt",
+    "nextActionBy",
+}
 RELEASE_SNAPSHOT_FILES = {
     "release-feature.py": Path("bin/release-feature.py"),
     "policy-check.py": Path("bin/policy-check.py"),
@@ -100,6 +138,20 @@ def supervisor_child_environment(source: dict[str, str] | None = None) -> dict[s
     child["PYTHONNOUSERSITE"] = "1"
     child["PYTHONSAFEPATH"] = "1"
     child["PATH"] = ACTIVE_TRUSTED_PATH
+    return child
+
+
+def health_child_environment(source: dict[str, str] | None = None) -> dict[str, str]:
+    """Build the credential-free environment used only by the health observer."""
+    source = dict(os.environ) if source is None else source
+    child = {
+        name: source[name]
+        for name in ("TMPDIR", "LANG", "LC_ALL")
+        if name in source
+    }
+    child["PATH"] = ACTIVE_TRUSTED_PATH
+    child["PYTHONNOUSERSITE"] = "1"
+    child["PYTHONSAFEPATH"] = "1"
     return child
 
 
@@ -531,6 +583,91 @@ def scan_interval_seconds(config: dict) -> int:
     return 3 * 60
 
 
+def healthcheck_interval_seconds(config: dict) -> int:
+    """Return the observer cadence without coupling it to portfolio scanning."""
+    return integer_setting(config, "healthcheckIntervalMinutes", 5, 1, 1440) * 60
+
+
+def parse_health_time(raw: object, label: str) -> datetime:
+    if not isinstance(raw, str) or not raw:
+        raise MonitorError(f"health snapshot {label} must be an ISO-8601 string")
+    try:
+        value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise MonitorError(f"health snapshot {label} is not valid ISO-8601") from exc
+    if value.tzinfo is None:
+        raise MonitorError(f"health snapshot {label} must include a timezone")
+    return value.astimezone(timezone.utc)
+
+
+def validate_health_snapshot(
+    raw: bytes,
+    *,
+    repository_id: str,
+    interval_seconds: int,
+    started_at: datetime,
+    finished_at: datetime,
+) -> dict:
+    """Validate the complete typed observer envelope before it can be published."""
+    if len(raw) > MAX_HEALTH_STDOUT_BYTES:
+        raise MonitorError("health snapshot exceeds the bounded output limit")
+    try:
+        text = raw.decode("utf-8")
+        value = strict_json(text)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise MonitorError(f"health collector returned invalid JSON: {exc}") from exc
+    if not isinstance(value, dict) or set(value) != HEALTH_SNAPSHOT_KEYS:
+        raise MonitorError("health collector returned an unsupported snapshot envelope")
+    if value.get("schemaVersion") != HEALTH_SNAPSHOT_SCHEMA:
+        raise MonitorError("health collector returned an unsupported snapshot schema")
+    if value.get("repositoryId") != repository_id:
+        raise MonitorError("health collector returned a snapshot for another project")
+    if value.get("intervalSeconds") != interval_seconds:
+        raise MonitorError("health collector returned the wrong observer interval")
+    if value.get("presentationOnly") is not True:
+        raise MonitorError("health snapshot must remain presentation-only")
+    omitted = value.get("nonAgentProcessesOmitted")
+    if type(omitted) is not int or omitted < 0:
+        raise MonitorError("health snapshot has an invalid non-agent omission count")
+    warnings = value.get("warnings")
+    if not isinstance(warnings, list) or any(not isinstance(item, str) for item in warnings):
+        raise MonitorError("health snapshot warnings must be a string list")
+    agents = value.get("agents")
+    if not isinstance(agents, list):
+        raise MonitorError("health snapshot agents must be a list")
+    for row in agents:
+        if not isinstance(row, dict) or set(row) != HEALTH_ROW_KEYS:
+            raise MonitorError("health snapshot contains an unsupported agent row")
+        for field in ("team", "category", "instance", "role", "lifecycleState", "verdict", "updatedAt"):
+            if not isinstance(row.get(field), str) or not row[field]:
+                raise MonitorError(f"health snapshot agent {field} must be a non-empty string")
+        for field in ("taskId", "activity", "progressSource", "nextActionBy"):
+            if row.get(field) is not None and not isinstance(row[field], str):
+                raise MonitorError(f"health snapshot agent {field} must be a string or null")
+        attempt = row.get("attempt")
+        if attempt is not None and (type(attempt) is not int or attempt < 1):
+            raise MonitorError("health snapshot agent attempt must be a positive integer or null")
+        progress = row.get("progressPercent")
+        if progress is not None and (type(progress) is not int or not 0 <= progress <= 100):
+            raise MonitorError("health snapshot agent progress must be 0..100 or null")
+        if (progress is None) != (row.get("progressSource") is None):
+            raise MonitorError("health snapshot agent progress source does not match progress")
+        if progress is not None and row.get("progressSource") != "self-reported":
+            raise MonitorError("health snapshot agent progress source is unsupported")
+        elapsed = row.get("elapsedSeconds")
+        if elapsed is not None and (type(elapsed) is not int or elapsed < 0):
+            raise MonitorError("health snapshot agent elapsed time must be non-negative or null")
+        parse_health_time(row["updatedAt"], "agent updatedAt")
+        if row.get("nextActionBy") is not None:
+            parse_health_time(row["nextActionBy"], "agent nextActionBy")
+    generated_at = parse_health_time(value.get("generatedAt"), "generatedAt")
+    earliest = started_at.astimezone(timezone.utc) - timedelta(seconds=1)
+    latest = finished_at.astimezone(timezone.utc) + timedelta(seconds=1)
+    if not earliest <= generated_at <= latest:
+        raise MonitorError("health collector returned a non-current generation time")
+    return value
+
+
 def validate_pm_automation(project: Path) -> None:
     path = Path(os.environ.get("STARTUP_FACTORY_PM_CONFIG") or SKILL_DIR / "config" / "project-management.config.md").expanduser()
     if not path.is_absolute() or path.is_symlink():
@@ -856,7 +993,14 @@ def minimal_release_environment(config: dict) -> dict[str, str]:
 
 
 def validate_supervisor_install(project: Path) -> Path:
-    supervisor = Path(__file__).resolve()
+    supervisor_candidate = Path(__file__)
+    supervisor_lexical = Path(os.path.abspath(supervisor_candidate))
+    if (
+        supervisor_candidate.is_symlink()
+        or supervisor_lexical != Path(os.path.realpath(supervisor_lexical))
+    ):
+        raise MonitorError("automation supervisor must not traverse symlinks")
+    supervisor = supervisor_candidate.resolve()
     try:
         supervisor.relative_to(project)
     except ValueError:
@@ -874,6 +1018,8 @@ def validate_supervisor_install(project: Path) -> Path:
     else:
         raise MonitorError("automation supervisor Python must live outside the agent repository")
     capture_protected_file(interpreter, "automation supervisor Python")
+    if RELEASE_WORKER.is_symlink():
+        raise MonitorError("detached release worker must not be a symlink")
     worker = RELEASE_WORKER.resolve()
     try:
         worker.relative_to(project)
@@ -884,16 +1030,25 @@ def validate_supervisor_install(project: Path) -> Path:
             "autonomous cron requires release-worker.py from a protected external installation"
         )
     capture_protected_file(worker, "detached release worker")
-    lifecycle_helper = worker.with_name("process-lifecycle.py").resolve()
-    try:
-        lifecycle_helper.relative_to(project)
-    except ValueError:
-        pass
-    else:
-        raise MonitorError(
-            "autonomous cron requires process-lifecycle.py from a protected external installation"
-        )
-    capture_protected_file(lifecycle_helper, "release lifecycle supervisor")
+    for filename, label in (
+        ("process-lifecycle.py", "release lifecycle supervisor"),
+        ("agent-health.py", "agent health collector"),
+        ("heartbeat-status.py", "agent heartbeat classifier"),
+        ("teamwork-path.py", "agent health path policy"),
+    ):
+        candidate = worker.with_name(filename)
+        if candidate.is_symlink():
+            raise MonitorError(f"protected external {filename} must not be a symlink")
+        helper = candidate.resolve()
+        try:
+            helper.relative_to(project)
+        except ValueError:
+            pass
+        else:
+            raise MonitorError(
+                f"autonomous health publication requires {filename} from a protected external installation"
+            )
+        capture_protected_file(helper, label)
     return interpreter
 
 
@@ -927,6 +1082,340 @@ def bootstrap_automation() -> tuple[dict, Path, Path, Path]:
     verify_project_checkout(project)
     interpreter = validate_supervisor_install(project)
     return config, config_path, project, interpreter
+
+
+def _git_value(project: Path, *arguments: str) -> str:
+    try:
+        result = subprocess.run(
+            git_argv(*arguments),
+            cwd=project,
+            capture_output=True,
+            text=True,
+            env=unprivileged_git_environment(),
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MonitorError(f"cannot inspect canonical Git project: {exc}") from exc
+    value = result.stdout.strip()
+    if result.returncode or not value:
+        raise MonitorError("cannot inspect canonical Git project")
+    return value
+
+
+def canonical_project_context(project: Path) -> tuple[Path, str]:
+    """Return the primary worktree and stable identity shared by linked worktrees."""
+    common_raw = _git_value(
+        project, "rev-parse", "--path-format=absolute", "--git-common-dir"
+    )
+    if "\n" in common_raw:
+        raise MonitorError("canonical Git common directory is ambiguous")
+    try:
+        common = Path(common_raw).resolve(strict=True)
+        common_info = common.stat()
+    except OSError as exc:
+        raise MonitorError(f"cannot inspect canonical Git common directory: {exc}") from exc
+    if not stat.S_ISDIR(common_info.st_mode):
+        raise MonitorError("canonical Git common directory must be a directory")
+    listing = _git_value(project, "worktree", "list", "--porcelain")
+    primary_raw = next(
+        (
+            line.removeprefix("worktree ")
+            for line in listing.splitlines()
+            if line.startswith("worktree ")
+        ),
+        None,
+    )
+    if primary_raw is None:
+        raise MonitorError("Git did not report a primary worktree")
+    primary_lexical = Path(os.path.abspath(primary_raw))
+    if primary_lexical != Path(os.path.realpath(primary_lexical)):
+        raise MonitorError("primary Git worktree must not traverse symlinks")
+    try:
+        primary = primary_lexical.resolve(strict=True)
+    except OSError as exc:
+        raise MonitorError(f"cannot inspect primary Git worktree: {exc}") from exc
+    if Path(_git_value(primary, "rev-parse", "--show-toplevel")).resolve() != primary:
+        raise MonitorError("Git primary worktree root is inconsistent")
+    primary_common = Path(
+        _git_value(primary, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    ).resolve(strict=True)
+    if primary_common != common:
+        raise MonitorError("primary worktree does not share the selected project identity")
+    material = (
+        os.fsencode(common)
+        + b"\0"
+        + str(common_info.st_dev).encode("ascii")
+        + b"\0"
+        + str(common_info.st_ino).encode("ascii")
+    )
+    return primary, hashlib.sha256(material).hexdigest()
+
+
+def _strict_config_integer(
+    values: dict[str, str | None], name: str, default: int, minimum: int, maximum: int
+) -> int:
+    raw = values.get(name)
+    if raw is None or raw == "":
+        return default
+    if not re.fullmatch(r"[0-9]+", raw):
+        raise MonitorError(f"{name} must be an integer from {minimum} to {maximum}")
+    value = int(raw)
+    if not minimum <= value <= maximum:
+        raise MonitorError(f"{name} must be an integer from {minimum} to {maximum}")
+    return value
+
+
+def health_runtime_context(project: Path) -> tuple[Path, Path, str, int, int]:
+    """Resolve health-only inputs without tracker, workflow, or release preflight."""
+    primary, _repository_id = canonical_project_context(project)
+    team_config = (SKILL_DIR / "config" / "team.config.md").resolve()
+    for boundary in (project, primary):
+        try:
+            team_config.relative_to(boundary)
+        except ValueError:
+            continue
+        raise MonitorError("health publication requires an external protected team config")
+    raw, _ = capture_protected_file(team_config, "team config")
+    try:
+        values = parse_key_values(raw.decode("utf-8"), team_config)
+    except UnicodeDecodeError as exc:
+        raise MonitorError("team config must be UTF-8 text") from exc
+    lifecycle_root = validate_lifecycle_state_root(primary, values)
+    teamwork_root = values.get("TEAMWORK_ROOT") or ".teamwork"
+    contained(primary, teamwork_root, "TEAMWORK_ROOT")
+    stuck_minutes = _strict_config_integer(
+        values, "STUCK_AFTER_MINUTES", 15, 1, 1440
+    )
+    start_grace_seconds = _strict_config_integer(
+        values, "START_GRACE_SECONDS", 60, 1, 86400
+    )
+    return primary, lifecycle_root, teamwork_root, stuck_minutes, start_grace_seconds
+
+
+def _directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _open_named_directory(parent_descriptor: int, name: str, *, create: bool) -> int:
+    try:
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        if not create:
+            raise
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+        except FileExistsError:
+            pass
+        try:
+            descriptor = os.open(name, _directory_flags(), dir_fd=parent_descriptor)
+        except OSError as exc:
+            raise MonitorError(f"cannot safely open health cache directory {name}: {exc}") from exc
+    except OSError as exc:
+        raise MonitorError(f"cannot safely open health cache directory {name}: {exc}") from exc
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid not in {0, os.geteuid()}
+            or stat.S_IMODE(info.st_mode) & 0o022
+        ):
+            raise MonitorError(
+                f"health cache directory {name} must be supervisor/root-owned and not group/world writable"
+            )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_health_cache_directory(primary: Path) -> int:
+    lexical = Path(os.path.abspath(primary))
+    if lexical != Path(os.path.realpath(lexical)):
+        raise MonitorError("health cache primary worktree must not traverse symlinks")
+    try:
+        named = primary.stat(follow_symlinks=False)
+        descriptor = os.open(primary, _directory_flags())
+    except OSError as exc:
+        raise MonitorError(f"cannot safely open health cache project root: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            raise MonitorError("health cache project root changed while being opened")
+        for name in (".teamwork", "pm-agent"):
+            child = _open_named_directory(descriptor, name, create=True)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+@contextmanager
+def health_publication_lock(primary: Path) -> Iterator[int]:
+    """Serialize health collect+commit independently of the board-scan lease."""
+    directory = _open_health_cache_directory(primary)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock = os.open("agent-health.lock", flags, 0o600, dir_fd=directory)
+    except OSError as exc:
+        os.close(directory)
+        raise MonitorError(f"cannot safely open health publication lock: {exc}") from exc
+    try:
+        info = os.fstat(lock)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid not in {0, os.geteuid()}
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            raise MonitorError("health publication lock must be a private regular file")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield directory
+    except OSError as exc:
+        raise MonitorError(f"health publication lock failed: {exc}") from exc
+    finally:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        finally:
+            os.close(lock)
+            os.close(directory)
+
+
+def _read_cache_at(directory: int) -> bytes | None:
+    # O_NONBLOCK makes the open itself bounded for attacker-planted FIFOs. The
+    # descriptor is still rejected after fstat unless it is a private regular
+    # file; regular-file reads are unaffected by this flag.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open("agent-health.json", flags, dir_fd=directory)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise MonitorError(f"cannot safely inspect existing health snapshot: {exc}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise MonitorError("existing health snapshot must be a regular file")
+        if (
+            before.st_uid not in {0, os.geteuid()}
+            or stat.S_IMODE(before.st_mode) & 0o077
+        ):
+            raise MonitorError("existing health snapshot must be a private supervisor-owned file")
+        if before.st_size > MAX_HEALTH_STDOUT_BYTES:
+            raise MonitorError("existing health snapshot exceeds the bounded cache limit")
+        chunks: list[bytes] = []
+        remaining = MAX_HEALTH_STDOUT_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        value = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise MonitorError("existing health snapshot changed while being read")
+        return value if len(value) <= MAX_HEALTH_STDOUT_BYTES else None
+    finally:
+        os.close(descriptor)
+
+
+def _existing_generation(raw: bytes | None, snapshot: dict) -> datetime | None:
+    if raw is None:
+        return None
+    try:
+        existing = strict_json(raw.decode("utf-8"))
+        if (
+            not isinstance(existing, dict)
+            or existing.get("schemaVersion") != HEALTH_SNAPSHOT_SCHEMA
+            or existing.get("repositoryId") != snapshot["repositoryId"]
+            or existing.get("presentationOnly") is not True
+        ):
+            return None
+        value = parse_health_time(existing.get("generatedAt"), "existing generatedAt")
+    except (UnicodeDecodeError, ValueError, MonitorError):
+        return None
+    candidate = parse_health_time(snapshot["generatedAt"], "generatedAt")
+    return value if value >= candidate else None
+
+
+def _atomic_health_snapshot_at(directory: int, snapshot: dict) -> bool:
+    if _existing_generation(_read_cache_at(directory), snapshot) is not None:
+        return False
+    value = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    if len(value) > MAX_HEALTH_STDOUT_BYTES:
+        raise MonitorError("health snapshot exceeds the bounded cache limit")
+    temp_name = f".agent-health.json.tmp.{os.getpid()}.{secrets.token_hex(8)}"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = None
+    try:
+        descriptor = os.open(temp_name, flags, 0o600, dir_fd=directory)
+        written = 0
+        while written < len(value):
+            count = os.write(descriptor, value[written:])
+            if count <= 0:
+                raise OSError("health snapshot write made no progress")
+            written += count
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temp_name,
+            "agent-health.json",
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        # Rename is the publication commit point: readers already see the new
+        # complete document. A later directory-fsync error is a durability
+        # warning, not a truthful basis for claiming the old bytes survived.
+        try:
+            os.fsync(directory)
+        except OSError as exc:
+            warnings.warn(
+                "health snapshot committed, but directory durability could not be confirmed: "
+                f"{exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return True
+    except OSError as exc:
+        raise MonitorError(f"cannot atomically publish health snapshot: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temp_name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+
+
+def atomic_health_snapshot(primary: Path, snapshot: dict) -> bool:
+    with health_publication_lock(primary) as directory:
+        return _atomic_health_snapshot_at(directory, snapshot)
 
 
 def validate_release_deadline(config: dict) -> None:
@@ -3257,6 +3746,290 @@ def one_pass(*, dry_run: bool) -> int:
         lease.release()
 
 
+def _health_group_alive(process: subprocess.Popen[bytes], process_group: int) -> bool:
+    process.poll()  # Reap the direct child without ever performing a blocking wait.
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Darwin can transiently report EPERM while a just-signalled session
+        # leader is crossing exec/exit. Treat it as conservatively live; the
+        # bounded poll will either observe ESRCH or escalate to a real signal,
+        # whose permission failure is reported explicitly.
+        return True
+    except OSError as exc:
+        raise MonitorError(f"cannot inspect health collector process group: {exc}") from exc
+    return True
+
+
+def _wait_for_health_group_exit(
+    process: subprocess.Popen[bytes], process_group: int, timeout_seconds: float
+) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        group_alive = _health_group_alive(process, process_group)
+        if not group_alive and process.poll() is not None:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(HEALTH_CHILD_POLL_SECONDS, remaining))
+
+
+def _signal_health_group(process_group: int, requested_signal: int) -> bool:
+    try:
+        os.killpg(process_group, requested_signal)
+    except ProcessLookupError:
+        return False
+    except PermissionError as exc:
+        raise MonitorError("cannot signal health collector process group") from exc
+    except OSError as exc:
+        raise MonitorError(f"cannot signal health collector process group: {exc}") from exc
+    return True
+
+
+def _stop_health_child(process: subprocess.Popen[bytes]) -> None:
+    process_group = process.pid
+    if process_group <= 1 or process_group == os.getpgrp():
+        raise MonitorError("refusing unsafe health collector process group")
+    _signal_health_group(process_group, signal.SIGTERM)
+    if _wait_for_health_group_exit(
+        process, process_group, COMMAND_KILL_GRACE_SECONDS
+    ):
+        return
+
+    _signal_health_group(process_group, signal.SIGKILL)
+    if not _wait_for_health_group_exit(
+        process, process_group, HEALTH_CHILD_KILL_GRACE_SECONDS
+    ):
+        raise MonitorError("health collector process group survived SIGKILL")
+
+
+def run_bounded_health_child(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_seconds: int = HEALTH_COMMAND_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[bytes]:
+    """Capture collector output incrementally and kill its group at hard bounds."""
+    try:
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise MonitorError(f"health collector could not start: {exc}") from exc
+    assert process.stdout is not None and process.stderr is not None
+    selector = selectors.DefaultSelector()
+    streams = {
+        process.stdout.fileno(): ("stdout", process.stdout, MAX_HEALTH_STDOUT_BYTES),
+        process.stderr.fileno(): ("stderr", process.stderr, MAX_HEALTH_STDERR_BYTES),
+    }
+    output = {"stdout": bytearray(), "stderr": bytearray()}
+    for descriptor, (_name, stream, _limit) in streams.items():
+        os.set_blocking(descriptor, False)
+        selector.register(stream, selectors.EVENT_READ)
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while streams:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _stop_health_child(process)
+                raise MonitorError(
+                    f"health collector exceeded the {timeout_seconds}s operation deadline"
+                )
+            for key, _events in selector.select(min(remaining, 0.1)):
+                descriptor = key.fileobj.fileno()
+                name, stream, limit = streams[descriptor]
+                try:
+                    chunk = os.read(descriptor, 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    stream.close()
+                    streams.pop(descriptor)
+                    continue
+                output[name].extend(chunk)
+                if len(output[name]) > limit:
+                    _stop_health_child(process)
+                    raise MonitorError(f"health collector {name} exceeded its bounded output limit")
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            _stop_health_child(process)
+            raise MonitorError(
+                f"health collector exceeded the {timeout_seconds}s operation deadline"
+            ) from exc
+    finally:
+        selector.close()
+        for _name, stream, _limit in list(streams.values()):
+            stream.close()
+        if process.poll() is None:
+            _stop_health_child(process)
+    return subprocess.CompletedProcess(
+        argv, returncode, bytes(output["stdout"]), bytes(output["stderr"])
+    )
+
+
+def collect_health_snapshot(
+    *,
+    primary: Path,
+    lifecycle_root: Path,
+    teamwork_root: str,
+    stuck_minutes: int,
+    start_grace_seconds: int,
+    repository_id: str,
+    interval_seconds: int,
+) -> dict:
+    helper_candidate = RELEASE_WORKER.with_name("agent-health.py")
+    if helper_candidate.is_symlink():
+        raise MonitorError("protected external agent-health.py must not be a symlink")
+    helper = helper_candidate.resolve()
+    capture_protected_file(helper, "agent health collector")
+    argv = [
+        str(Path(sys.executable).resolve()),
+        "-I",
+        "-S",
+        "-E",
+        "-s",
+        str(helper),
+        "--repo",
+        str(primary),
+        "--teamwork-root",
+        teamwork_root,
+        "--lifecycle-root",
+        str(lifecycle_root),
+        "--stuck-minutes",
+        str(stuck_minutes),
+        "--start-grace-seconds",
+        str(start_grace_seconds),
+        "--interval-seconds",
+        str(interval_seconds),
+        "--json",
+    ]
+    started_at = utc_now()
+    result = run_bounded_health_child(
+        argv,
+        cwd=primary,
+        env=health_child_environment(),
+    )
+    finished_at = utc_now()
+    if result.returncode:
+        try:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+        except AttributeError:
+            detail = ""
+        raise MonitorError(
+            f"health collector failed with exit {result.returncode}"
+            + (f": {detail}" if detail else "")
+        )
+    return validate_health_snapshot(
+        result.stdout,
+        repository_id=repository_id,
+        interval_seconds=interval_seconds,
+        started_at=started_at,
+        finished_at=finished_at,
+    )
+
+
+def collect_and_publish_health(
+    config: dict,
+    project: Path,
+    runtime_context: tuple[Path, Path, str, int, int] | None = None,
+) -> bool:
+    interval_seconds = healthcheck_interval_seconds(config)
+    primary, lifecycle_root, teamwork_root, stuck_minutes, start_grace_seconds = (
+        runtime_context or health_runtime_context(project)
+    )
+    verified_primary, repository_id = canonical_project_context(primary)
+    if verified_primary != primary:
+        raise MonitorError("health publication target is not the canonical primary worktree")
+    with health_publication_lock(primary) as directory:
+        snapshot = collect_health_snapshot(
+            primary=primary,
+            lifecycle_root=lifecycle_root,
+            teamwork_root=teamwork_root,
+            stuck_minutes=stuck_minutes,
+            start_grace_seconds=start_grace_seconds,
+            repository_id=repository_id,
+            interval_seconds=interval_seconds,
+        )
+        replaced = _atomic_health_snapshot_at(directory, snapshot)
+    cache = primary / ".teamwork/pm-agent/agent-health.json"
+    if replaced:
+        print(f"pm-agent: published project health snapshot at {cache}")
+    else:
+        print(f"pm-agent: retained newer or equal project health snapshot at {cache}")
+    return replaced
+
+
+def one_healthcheck() -> int:
+    config, _config_path, project, _interpreter = bootstrap_automation()
+    healthcheck_interval_seconds(config)
+    context = health_runtime_context(project)
+    collect_and_publish_health(config, project, context)
+    return 0
+
+
+def watch_supervisor(
+    scan: Callable[[], object],
+    health: Callable[[], object],
+    *,
+    scan_interval_seconds: int,
+    health_interval_seconds: int,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    maximum_callbacks: int | None = None,
+    on_error: Callable[[str, Exception], None] | None = None,
+) -> None:
+    """Run independent monotonic scan and health deadlines without catch-up bursts."""
+    if scan_interval_seconds <= 0 or health_interval_seconds <= 0:
+        raise MonitorError("watch intervals must be positive")
+    started = monotonic()
+    scan_deadline = started
+    health_deadline = started
+    callbacks = 0
+    while maximum_callbacks is None or callbacks < maximum_callbacks:
+        observed = monotonic()
+        remaining = min(scan_deadline, health_deadline) - observed
+        if remaining > 0:
+            sleep(remaining)
+            observed = monotonic()
+        due_health = health_deadline <= observed
+        due_scan = scan_deadline <= observed
+        for label, callback in (("health", health), ("scan", scan)):
+            if maximum_callbacks is not None and callbacks >= maximum_callbacks:
+                return
+            if (label == "health" and not due_health) or (label == "scan" and not due_scan):
+                continue
+            try:
+                callback()
+            except Exception as exc:
+                if on_error is not None:
+                    on_error(label, exc)
+                else:
+                    print(f"pm-agent: {label} pass failed: {exc}", file=sys.stderr)
+            callbacks += 1
+        observed = monotonic()
+        if due_health:
+            health_deadline += health_interval_seconds
+            while health_deadline <= observed:
+                health_deadline += health_interval_seconds
+        if due_scan:
+            scan_deadline += scan_interval_seconds
+            while scan_deadline <= observed:
+                scan_deadline += scan_interval_seconds
+
+
 def print_cron() -> int:
     config, config_path, project, interpreter = bootstrap_automation()
     lifecycle_root = validate_team_safety(config, project)
@@ -3306,6 +4079,7 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true")
     mode.add_argument("--watch", action="store_true")
+    mode.add_argument("--healthcheck", action="store_true")
     mode.add_argument("--print-cron", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -3313,6 +4087,10 @@ def main() -> int:
         if args.dry_run:
             raise MonitorError("--dry-run does not combine with --print-cron")
         return print_cron()
+    if args.healthcheck:
+        if args.dry_run:
+            raise MonitorError("--dry-run does not combine with --healthcheck")
+        return one_healthcheck()
     if args.once:
         return one_pass(dry_run=args.dry_run)
     if args.dry_run:
@@ -3320,14 +4098,20 @@ def main() -> int:
     config, _config_path, _project, _interpreter = bootstrap_automation()
     if type(config.get("enabled")) is not bool:
         raise MonitorError("enabled must be true or false")
-    interval = scan_interval_seconds(config)
-    print(f"pm-agent: watching every {interval}s; this process is the clock owner")
-    while True:
-        try:
-            one_pass(dry_run=False)
-        except MonitorError as exc:
-            print(f"pm-agent: pass failed: {exc}", file=sys.stderr)
-        time.sleep(interval)
+    scan_interval = scan_interval_seconds(config)
+    health_interval = healthcheck_interval_seconds(config)
+    print(
+        "pm-agent: watching with independent "
+        f"scan={scan_interval}s and health={health_interval}s clocks; "
+        "this process is the clock owner"
+    )
+    watch_supervisor(
+        lambda: one_pass(dry_run=False),
+        one_healthcheck,
+        scan_interval_seconds=scan_interval,
+        health_interval_seconds=health_interval,
+    )
+    return 0
 
 
 if __name__ == "__main__":

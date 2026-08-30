@@ -294,7 +294,8 @@ Run the adapter-neutral supervisor from one scheduler:
 3. Set the absolute target checkout and protected config environment variables,
    then use protected Python with `-I -S -E -s` to run the external
    `pm-agent.py --once --dry-run`; inspect every route.
-4. Set `scanIntervalMinutes` (default `3`), set `enabled: true`, and use that same protected invocation for
+4. Set `scanIntervalMinutes` (default `3`) and the independent
+   `healthcheckIntervalMinutes` (default `5`), set `enabled: true`, and use that same protected invocation for
    `pm-agent.py --print-cron`, and install its output in
    one scheduler, and configure overlap prevention there too.
 5. Each pass observes exactly semantic `queued` and `blocked` status kinds, but
@@ -321,6 +322,15 @@ Run the adapter-neutral supervisor from one scheduler:
    conflicting routing, orphaned [tasks], adapter errors, stale claims, or unsafe
    identifiers fail closed and receive an idempotent escalation when appropriate.
    They never become paths or commands.
+
+The protected supervisor may also run `pm-agent.py --healthcheck` as a bounded
+one-shot, including while portfolio automation is disabled. It publishes the
+same current-project presentation semantics as `launch-team.sh health --json`
+to the primary worktree's atomic `.teamwork/pm-agent/agent-health.json` cache.
+Neither this file nor its optional self-reported percentages participate in
+lifecycle, scheduling, recovery, review, integration, or release decisions.
+`--watch` publishes it immediately and then on an independent monotonic cadence;
+scan overruns and failures do not reset that deadline.
 
 The PM supervisor is deterministic. A team-lead agent handles the judgment its
 snapshot exposes; no agent sleeps or owns a polling loop.
