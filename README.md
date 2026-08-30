@@ -44,6 +44,20 @@ licensed**
 
 ![Startup Factory demo](https://raw.githubusercontent.com/alexrolls/startup-factory/main/exports/execmatchai-issues-57s-70s.gif)
 
+## What's new in 0.1.16
+
+This release adds project-scoped agent health monitoring. Teams can use
+`launch-team.sh health [--json] [--watch]` to see typed agent status across the
+current Git project, including linked worktrees, without exposing agents from
+other projects. Fresh, self-reported implementation percentages are shown when
+available; otherwise the view reports trusted elapsed time.
+
+Watch mode observes immediately and then every five minutes without waking an
+LLM. For unattended operation, `pm-agent.py --healthcheck` atomically publishes
+the same presentation-only snapshot, while its health clock remains independent
+of portfolio scanning. Health data never controls lifecycle, scheduling,
+reviews, integration, or releases.
+
 ## Who it is for
 
 | You are | Startup Factory helps you |
@@ -68,7 +82,7 @@ account, API key, application server, or coordinator database.
    ```
 
    For Claude Code, use `--agent claude-code`. Pin a release in controlled
-   environments, for example `startup-factory@0.1.15`. For a Git checkout or an
+   environments, for example `startup-factory@0.1.16`. For a Git checkout or an
    offline installation, use the
    [auditable shell compatibility path](#shell-compatibility-path).
 
@@ -1331,6 +1345,7 @@ protected external storage before enabling it. The scheduler reads these keys:
 | `enabled` | `false` | Master switch. A disabled pass launches nothing. |
 | `trustedPath` | `/usr/bin:/bin` | Absolute protected command-search directories used by the scheduler. |
 | `scanIntervalMinutes` | `3` | Board scan interval, from 1 through 1440 minutes. Omit it to retain the three-minute default. Legacy `pollSeconds` is accepted only when this key is absent. |
+| `healthcheckIntervalMinutes` | `5` | Independent current-project health publication interval, from 1 through 1440 minutes. It does not change or reset board scans. |
 | `leaseSeconds` | `900` | Single-host pass lease and bounded stale-recovery window; integer 5–86400. |
 | `operationTimeoutSeconds` | `120` | Outer deadline for each adapter, launcher, and dispatcher child process; integer 5–3600. |
 | `releaseTimeoutSeconds` | `7200` | Separate outer deadline for the complete release transaction; integer 60–86400 and at least the conservative full hook-path bound. |
@@ -1750,10 +1765,25 @@ service.
 | Command | Use |
 |---|---|
 | `pm-agent.py --once [--dry-run]` | Run one bounded scan/reconcile pass; this is the scheduler primitive. Dry-run performs preflight and planning without launches or tracker mutations. |
-| `pm-agent.py --watch` | Keep one dedicated foreground process as the clock owner, sleeping for `scanIntervalMinutes` between bounded passes. |
+| `pm-agent.py --healthcheck` | Publish one complete current-project JSON snapshot to `.teamwork/pm-agent/agent-health.json` and exit, without tracker, workflow, release, or process-control actions. |
+| `pm-agent.py --watch` | Keep one foreground clock owner with independent monotonic scan and health deadlines. Health publishes immediately; missed slots are skipped without catch-up bursts. |
 | `pm-agent.py --print-cron` | Print one credential-free cron line with protected paths, isolated Python flags, lifecycle root, lease, and logging. |
 
 Choose exactly one mode. `--dry-run` combines only with `--once`.
+
+The health cache is an atomic, presentation-only latest view for an unattended
+operator/UI. It carries the canonical project id and generation time, is never
+read by scheduling, recovery, review, integration, or release code. Any failure
+before the atomic rename commit point keeps the previous bytes and generation
+time. If directory durability confirmation fails after the rename, the command
+warns while the new complete snapshot remains published.
+Its optional percentages are fresh current-attempt self-reports, not computed
+completion; live agents without one show trusted elapsed time. Project binding
+excludes other repositories and legacy unbound records, while insufficient
+external-runtime attribution is reported without fabricating agent rows. A
+five-minute cadence guarantees observation, not an LLM wake or semantic update.
+For interactive operation use `--watch`. An external scheduler may run
+`--healthcheck` every five minutes; that scheduler still owns job overlap.
 
 On every pass the supervisor:
 

@@ -16,13 +16,39 @@ read_key() {
   printf '%s' "$value"
 }
 
-[ $# -ge 7 ] && [ $# -le 9 ] || {
-  echo "usage: runtime-event.sh <team> <featureId> <taskId|-> <attempt> <actor> <type> <stage> [summary] [artifact]" >&2
+[ $# -ge 7 ] || {
+  echo "usage: runtime-event.sh <team> <featureId> <taskId|-> <attempt> <actor> <type> <stage> [summary] [artifact] [--progress-percent 0..100]" >&2
   exit 2
 }
 
 team="$1"; feature="$2"; task="$3"; attempt="$4"; actor="$5"; type="$6"; stage="$7"
-summary="${8:-}"; artifact="${9:-}"
+shift 7
+progress_percent=""
+progress_seen=false
+positionals=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --progress-percent)
+      [ "$progress_seen" = false ] && [ $# -ge 2 ] \
+        || { echo "runtime-event: progress percent must be an integer from 0 to 100" >&2; exit 2; }
+      progress_seen=true
+      progress_percent="$2"
+      shift 2
+      ;;
+    *) positionals+=("$1"); shift ;;
+  esac
+done
+[ "${#positionals[@]}" -le 2 ] || {
+  echo "usage: runtime-event.sh <team> <featureId> <taskId|-> <attempt> <actor> <type> <stage> [summary] [artifact] [--progress-percent 0..100]" >&2
+  exit 2
+}
+if [ "$progress_seen" = true ]; then
+  case "$progress_percent" in
+    0|[1-9]|[1-9][0-9]|100) ;;
+    *) echo "runtime-event: progress percent must be an integer from 0 to 100" >&2; exit 2 ;;
+  esac
+fi
+summary="${positionals[0]:-}"; artifact="${positionals[1]:-}"
 
 # A launched role receives an immutable runtime identity and canonical routing
 # context from launch-team.sh.  Bind caller-supplied event identity to that
@@ -133,10 +159,10 @@ if [ "$launched" = yes ]; then
   # post-append writer below can then fail only on an actual filesystem error,
   # rather than accepting a journal entry whose supplied state cannot refresh
   # the heartbeat.
-  heartbeat_state="$(python3 - "$STARTUP_FACTORY_TASK_ID" "$STARTUP_FACTORY_ATTEMPT" "$stage" <<'PY'
+  heartbeat_state="$(python3 - "$STARTUP_FACTORY_TASK_ID" "$STARTUP_FACTORY_ATTEMPT" "$stage" "$progress_percent" <<'PY'
 import sys
 
-task, attempt, stage = sys.argv[1:]
+task, attempt, stage, progress = sys.argv[1:]
 if not task or len(task) > 1024 or any(char in task for char in "\r\n|"):
     raise SystemExit("runtime-event: fixed task identity is unsafe for heartbeat transport")
 if not attempt.isdigit() or len(attempt) > 12:
@@ -144,7 +170,15 @@ if not attempt.isdigit() or len(attempt) > 12:
 state = " ".join(stage.split())
 if not state:
     raise SystemExit("runtime-event: heartbeat state must not be empty")
-print(state[:160])
+for item in state.split(";")[1:]:
+    name = item.split("=", 1)[0].strip().casefold()
+    if name in {"attempt", "progress"}:
+        raise SystemExit("runtime-event: heartbeat state contains reserved semantic metadata")
+state = state[:160]
+if progress:
+    if not progress.isdigit() or not 0 <= int(progress) <= 100:
+        raise SystemExit("runtime-event: progress percent must be an integer from 0 to 100")
+print(state)
 PY
 )"
 fi
@@ -154,16 +188,17 @@ args=(emit --workspace "$workspace" --team "$team" --feature "$feature" --task "
       --summary "$summary")
 [ "$(read_key TRACKER_WRITERS)" != "all" ] || args+=(--tracker-ops "$SKILL_DIR/bin/tracker-ops.sh")
 [ -z "$artifact" ] || args+=(--artifact "$artifact")
+[ "$progress_seen" != true ] || args+=(--progress-percent "$progress_percent")
 python3 "$SKILL_DIR/bin/runtime-state.py" "${args[@]}"
 if [ -n "$heartbeat" ]; then
-  python3 - "$heartbeat" "$STARTUP_FACTORY_TASK_ID" "$STARTUP_FACTORY_ATTEMPT" "$heartbeat_state" <<'PY'
+  python3 - "$heartbeat" "$STARTUP_FACTORY_TASK_ID" "$STARTUP_FACTORY_ATTEMPT" "$heartbeat_state" "$progress_percent" <<'PY'
 from datetime import datetime, timezone
 import os
 from pathlib import Path
 import sys
 
 path = Path(sys.argv[1])
-task, attempt, stage = sys.argv[2:]
+task, attempt, stage, progress = sys.argv[2:]
 
 if not task or len(task) > 1024 or any(char in task for char in "\r\n|"):
     raise SystemExit("runtime-event: fixed task identity is unsafe for heartbeat transport")
@@ -171,7 +206,10 @@ if not attempt.isdigit() or len(attempt) > 12:
     raise SystemExit("runtime-event: fixed attempt identity is unsafe for heartbeat transport")
 state = stage
 timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-body = f"{timestamp} | {task} | {state}; attempt={attempt}\n"
+metadata = f"; attempt={attempt}"
+if progress:
+    metadata += f"; progress={int(progress)}"
+body = f"{timestamp} | {task} | {state}{metadata}\n"
 if len(body.encode("utf-8")) > 2048:
     raise SystemExit("runtime-event: heartbeat exceeds the 2 KiB transport limit")
 

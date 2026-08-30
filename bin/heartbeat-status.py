@@ -16,6 +16,7 @@ from typing import Any
 
 MAX_HEARTBEAT_BYTES = 4096
 DEFAULT_MAX_CLOCK_SKEW_SECONDS = 60
+DEFAULT_PROGRESS_MAX_AGE_SECONDS = 300
 TASK_INSTANCE_RE = re.compile(
     r"^(?P<role>[a-z0-9-]+)--(?P<task_key>.+)--a(?P<attempt>[1-9][0-9]*)$"
 )
@@ -46,6 +47,75 @@ def iso(value: datetime) -> str:
     )
 
 
+def _read_open_heartbeat(
+    descriptor: int, expected_identity: tuple[int, int] | None = None
+) -> str:
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode):
+        raise HeartbeatError("heartbeat must be a non-symlink regular file")
+    if expected_identity is not None and (opened.st_dev, opened.st_ino) != expected_identity:
+        raise HeartbeatError("heartbeat changed identity while being read")
+    if opened.st_size > MAX_HEARTBEAT_BYTES:
+        raise HeartbeatError("heartbeat exceeds the 4096-byte limit")
+    chunks: list[bytes] = []
+    remaining = MAX_HEARTBEAT_BYTES + 1
+    while remaining:
+        chunk = os.read(descriptor, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    raw = b"".join(chunks)
+    if len(raw) > MAX_HEARTBEAT_BYTES:
+        raise HeartbeatError("heartbeat exceeds the 4096-byte limit")
+    if len(raw) != opened.st_size:
+        raise HeartbeatError("heartbeat changed size while being read")
+    after = os.fstat(descriptor)
+    if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise HeartbeatError("heartbeat changed identity or contents while being read")
+    try:
+        text = raw.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise HeartbeatError("heartbeat is not UTF-8") from exc
+    if any(ord(char) < 32 for char in text):
+        raise HeartbeatError("heartbeat must be exactly one printable line")
+    return text
+
+
+def read_heartbeat_at(parent_descriptor: int, name: str) -> str | None:
+    """Read a heartbeat leaf relative to an already-verified directory."""
+
+    if (
+        not isinstance(name, str)
+        or name in {"", ".", ".."}
+        or os.path.basename(name) != name
+        or "/" in name
+        or "\\" in name
+    ):
+        raise HeartbeatError("heartbeat name must be one safe path component")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise HeartbeatError(f"cannot open heartbeat safely: {exc}") from exc
+    try:
+        return _read_open_heartbeat(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def read_heartbeat(path: Path) -> str | None:
     try:
         info = path.lstat()
@@ -63,41 +133,65 @@ def read_heartbeat(path: Path) -> str | None:
     except OSError as exc:
         raise HeartbeatError(f"cannot open heartbeat safely: {exc}") from exc
     try:
-        current = os.fstat(descriptor)
-        if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
-            info.st_dev,
-            info.st_ino,
-        ):
-            raise HeartbeatError("heartbeat changed identity while being read")
-        chunks: list[bytes] = []
-        remaining = MAX_HEARTBEAT_BYTES + 1
-        while remaining:
-            chunk = os.read(descriptor, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        raw = b"".join(chunks)
-        if len(raw) > MAX_HEARTBEAT_BYTES:
-            raise HeartbeatError("heartbeat exceeds the 4096-byte limit")
-        try:
-            text = raw.decode("utf-8").strip()
-        except UnicodeDecodeError as exc:
-            raise HeartbeatError("heartbeat is not UTF-8") from exc
-        if any(ord(char) < 32 for char in text):
-            raise HeartbeatError("heartbeat must be exactly one printable line")
-        return text
+        return _read_open_heartbeat(descriptor, (info.st_dev, info.st_ino))
     finally:
         os.close(descriptor)
 
 
-def stalled(verdict: str, heartbeat: str | None, detail: str) -> dict[str, str]:
+def stalled(verdict: str, heartbeat: str | None, detail: str) -> dict[str, Any]:
     return {
         "verdict": verdict,
         "nextActionBy": "-",
         "heartbeat": heartbeat or "-",
         "detail": detail,
+        "activity": None,
+        "observedAt": None,
+        "progressPercent": None,
     }
+
+
+def semantic_state(raw: str) -> tuple[str, int | None, int | None]:
+    """Parse bounded presentation metadata from the heartbeat state field.
+
+    Unknown metadata remains part of the human-readable state contract and is
+    ignored. Known metadata is fail-closed independently: malformed or repeated
+    attempt/progress values suppress progress without changing liveness.
+    """
+
+    parts = [part.strip() for part in raw.split(";")]
+    activity = parts[0]
+    attempt: int | None = None
+    progress: int | None = None
+    invalid: set[str] = set()
+    seen: set[str] = set()
+    for item in parts[1:]:
+        if "=" not in item:
+            continue
+        name, value = (piece.strip() for piece in item.split("=", 1))
+        if name not in {"attempt", "progress"}:
+            continue
+        if name in seen:
+            invalid.add(name)
+            continue
+        seen.add(name)
+        if not re.fullmatch(r"0|[1-9][0-9]*", value):
+            invalid.add(name)
+            continue
+        parsed = int(value)
+        if name == "attempt":
+            if parsed < 1:
+                invalid.add(name)
+            else:
+                attempt = parsed
+        elif parsed > 100:
+            invalid.add(name)
+        else:
+            progress = parsed
+    if "attempt" in invalid:
+        attempt = None
+    if "progress" in invalid:
+        progress = None
+    return activity, attempt, progress
 
 
 def record_binding_error(
@@ -156,7 +250,7 @@ def classify(
     expected_instance: str | None = None,
     start_grace: timedelta | None = None,
     max_clock_skew: timedelta = timedelta(seconds=DEFAULT_MAX_CLOCK_SKEW_SECONDS),
-) -> dict[str, str]:
+) -> dict[str, Any]:
     if max_clock_skew < timedelta(0):
         raise HeartbeatError("maximum clock skew must not be negative")
     if expected_attempt is not None and expected_attempt < 1:
@@ -168,12 +262,18 @@ def classify(
             "verdict": "exited",
             "nextActionBy": "-",
             "heartbeat": heartbeat or "-",
+            "activity": None,
+            "observedAt": None,
+            "progressPercent": None,
         }
     if state == "identity-mismatch":
         return {
             "verdict": "identity-mismatch",
             "nextActionBy": "-",
             "heartbeat": heartbeat or "-",
+            "activity": None,
+            "observedAt": None,
+            "progressPercent": None,
         }
     if state != "live":
         raise HeartbeatError(f"unsupported lifecycle state {state!r}")
@@ -195,6 +295,9 @@ def classify(
             "verdict": verdict,
             "nextActionBy": iso(deadline),
             "heartbeat": "-",
+            "activity": None,
+            "observedAt": None,
+            "progressPercent": None,
         }
 
     parts = [part.strip() for part in heartbeat.split("|")]
@@ -213,6 +316,7 @@ def classify(
 
     try:
         observed_at = parse_time(parts[0], "heartbeat timestamp")
+        activity, heartbeat_attempt, reported_progress = semantic_state(parts[2])
         ttl_deadline = observed_at + ttl
         if len(parts) == 4:
             requested_deadline = parse_time(parts[3], "heartbeat next-action-by")
@@ -237,18 +341,29 @@ def classify(
             "heartbeat timestamp predates the protected lifecycle instance",
         )
 
-    if parts[2].casefold() == "starting":
+    progress_age = (now - observed_at).total_seconds()
+    progress = None
+    if (
+        reported_progress is not None
+        and expected_attempt is not None
+        and heartbeat_attempt == expected_attempt
+        and observed_at >= created
+        and 0 <= progress_age <= DEFAULT_PROGRESS_MAX_AGE_SECONDS
+    ):
+        progress = reported_progress
+
+    if activity.casefold() == "starting":
         verdict = "starting" if now <= deadline else "stalled:no-heartbeat"
     elif now <= deadline:
         verdict = "active"
     else:
         target = parts[1]
-        activity = parts[2].casefold()
+        normalized_activity = activity.casefold()
         idle_words = ("idle", "unassigned", "no assignment", "awaiting assignment", "ready")
         gate_words = ("gate", "review", "approval", "blocked", "waiting")
-        if target == "-" and any(word in activity for word in idle_words):
+        if target == "-" and any(word in normalized_activity for word in idle_words):
             verdict = "stalled:idle-no-assignment"
-        elif any(word in activity for word in gate_words):
+        elif any(word in normalized_activity for word in gate_words):
             verdict = "stalled:waiting-on-gate"
         else:
             verdict = "stalled:no-progress"
@@ -256,6 +371,9 @@ def classify(
         "verdict": verdict,
         "nextActionBy": iso(deadline),
         "heartbeat": heartbeat,
+        "activity": activity,
+        "observedAt": iso(observed_at),
+        "progressPercent": progress,
     }
 
 
