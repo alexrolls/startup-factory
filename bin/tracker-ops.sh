@@ -1015,9 +1015,34 @@ class Jira:
                 break
             elif not page:
                 die("Jira comments for %s stalled during pagination — andon" % task_id)
+        return self.sort_comments(rows)
+
+    @staticmethod
+    def sort_comments(rows):
         rows.sort(key=lambda c: (c.get('updated') or c.get('created') or '',
                                  str(c.get('id') or '')))
         return rows
+
+    def inline_comments(self, task_id, fields):
+        # Search can return the comment field inline, which removes one request
+        # per [task] from an exhaustive read. Jira truncates that inline block to
+        # maxResults, so it is usable only when it demonstrably holds every
+        # comment; anything else falls back to the exhaustive paginated read.
+        # A malformed or unbounded block is never treated as complete.
+        block = fields.get('comment')
+        if not isinstance(block, dict):
+            return self.comments(task_id)
+        rows = block.get('comments')
+        total = block.get('total')
+        if not isinstance(rows, list) or total is None:
+            return self.comments(task_id)
+        try:
+            total = int(total)
+        except (TypeError, ValueError):
+            die("Jira comments for %s returned an invalid total — andon" % task_id)
+        if len(rows) < total:
+            return self.comments(task_id)
+        return self.sort_comments(list(rows))
 
     def search_all(self, jql, fields):
         # Jira's enhanced search is a scrolling/token API. The legacy
@@ -1147,14 +1172,14 @@ class Jira:
         tasks = []
         issues = self.search_all(
             jql,
-            'summary,description,status,assignee,issuelinks,labels,updated,project,issuetype')
+            'summary,description,status,assignee,issuelinks,labels,updated,project,issuetype,comment')
         for i in issues:
             f = self.scoped_issue_fields(
                 i, project_key, task_issue_type, "Jira feature export")
             raw = f['status']['name']
             blocked_by = [l['inwardIssue']['key'] for l in f.get('issuelinks', [])
                           if l.get('type', {}).get('name') == 'Blocks' and l.get('inwardIssue')]
-            comments = self.comments(i['key'])
+            comments = self.inline_comments(i['key'], f)
             tasks.append({'taskId': i['key'], 'title': f['summary'],
                           'status': generic_of(raw), 'statusRaw': raw,
                           'assignee': (f.get('assignee') or {}).get('displayName'),
@@ -1180,7 +1205,7 @@ class Jira:
         jql = ' AND '.join(clauses)
         items = []
         rows = self.search_all(jql,
-                               'summary,description,status,assignee,issuelinks,parent,labels,updated,project,issuetype')
+                               'summary,description,status,assignee,issuelinks,parent,labels,updated,project,issuetype,comment')
         for i in rows:
             f = self.scoped_issue_fields(
                 i, project_key, task_issue_type, "Jira board scan")
@@ -1191,7 +1216,7 @@ class Jira:
             parent = f.get('parent') or {}
             blocked_by = [l['inwardIssue']['key'] for l in f.get('issuelinks', [])
                           if l.get('type', {}).get('name') == 'Blocks' and l.get('inwardIssue')]
-            comments = self.comments(i['key'])
+            comments = self.inline_comments(i['key'], f)
             items.append({
                 'featureId': parent.get('key'),
                 'featureTitle': ((parent.get('fields') or {}).get('summary') if isinstance(parent.get('fields'), dict) else None),

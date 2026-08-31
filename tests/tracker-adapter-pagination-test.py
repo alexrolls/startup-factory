@@ -365,7 +365,8 @@ class JiraPaginationTest(unittest.TestCase):
                 self.assertEqual(100, payload["maxResults"])
                 self.assertEqual(
                     ["summary", "description", "status", "assignee",
-                     "issuelinks", "labels", "updated", "project", "issuetype"],
+                     "issuelinks", "labels", "updated", "project", "issuetype",
+                     "comment"],
                     payload["fields"])
                 search_payloads.append(dict(payload))
                 if payload.get("nextPageToken") is None:
@@ -397,6 +398,67 @@ class JiraPaginationTest(unittest.TestCase):
         self.assertEqual(tasks[0]["comments"][0]["updatedAt"],
                          tasks[0]["comments"][0]["revision"])
 
+    def _export_with_inline_comment(self, block):
+        """Export one issue whose search result carries the given comment block."""
+        comment_paths = []
+
+        def api(path, payload=None, method=None):
+            parsed = urlparse(path)
+            if parsed.path == "/rest/api/3/project/PROJ":
+                return {"id": "10000", "key": "PROJ", "name": "Project"}
+            if parsed.path.endswith("/search/jql"):
+                issue = self.issue("PROJ-1")
+                if block is not None:
+                    issue["fields"]["comment"] = block
+                return {"issues": [issue], "isLast": True}
+            if parsed.path.endswith("/comment"):
+                comment_paths.append(parsed.path)
+                return {"comments": [
+                    {"id": "paged", "body": "from the paginated read",
+                     "created": "2026-05-01T00:00:00Z",
+                     "updated": "2026-05-01T00:00:00Z",
+                     "author": {"accountId": "bot"}}], "total": 1}
+            self.fail("unexpected Jira path: %s" % path)
+
+        self.jira.api = api
+        return self.jira.export("EPIC-1"), comment_paths
+
+    def test_export_uses_a_complete_inline_comment_block(self):
+        # A complete inline block must remove the per-[task] comment request:
+        # that saving is the whole point of asking search for the field.
+        tasks, comment_paths = self._export_with_inline_comment({
+            "total": 2,
+            "comments": [
+                {"id": "c2", "body": "second", "created": "2026-05-02T00:00:00Z",
+                 "updated": "2026-05-02T00:00:00Z", "author": {"accountId": "bot"}},
+                {"id": "c1", "body": "first", "created": "2026-05-01T00:00:00Z",
+                 "updated": "2026-05-01T00:00:00Z", "author": {"accountId": "bot"}},
+            ],
+        })
+        self.assertEqual([], comment_paths)
+        self.assertEqual(["c1", "c2"], [c["id"] for c in tasks[0]["comments"]])
+
+    def test_export_falls_back_when_the_inline_comment_block_is_unusable(self):
+        # Truncated, malformed, unbounded or absent blocks must all fall back to
+        # the exhaustive paginated read. Trusting a truncated block would drop
+        # comments silently, which is the evidence gate decisions rest on.
+        for label, block in [
+            ("truncated", {"total": 5, "comments": [
+                {"id": "only", "body": "one of five",
+                 "created": "2026-05-01T00:00:00Z",
+                 "updated": "2026-05-01T00:00:00Z",
+                 "author": {"accountId": "bot"}}]}),
+            ("no total", {"comments": []}),
+            ("malformed comments", {"total": 0, "comments": "not-a-list"}),
+            ("not a dict", "not-a-block"),
+            ("absent", None),
+        ]:
+            with self.subTest(block=label):
+                tasks, comment_paths = self._export_with_inline_comment(block)
+                self.assertEqual(1, len(comment_paths), label)
+                self.assertEqual(["paged"],
+                                 [c["id"] for c in tasks[0]["comments"]], label)
+
     def test_scan_resolves_exact_scope_and_filters_child_issue_type(self):
         calls = []
 
@@ -411,7 +473,8 @@ class JiraPaginationTest(unittest.TestCase):
                     payload["jql"])
                 self.assertEqual(
                     ["summary", "description", "status", "assignee", "issuelinks",
-                     "parent", "labels", "updated", "project", "issuetype"],
+                     "parent", "labels", "updated", "project", "issuetype",
+                     "comment"],
                     payload["fields"])
                 return {"issues": [self.issue("PROJ-1", parent="PROJ-EPIC")],
                         "isLast": True}
