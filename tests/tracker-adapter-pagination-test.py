@@ -155,15 +155,29 @@ class LinearPaginationTest(unittest.TestCase):
             if "project(id:" in query and "issues(first:" in query:
                 top_queries.append(query)
                 self.assertIn("includeArchived: true", query)
-                self.assertNotIn("comments(first:", query)
-                self.assertNotIn("labels(first:", query)
-                self.assertNotIn("inverseRelations(first:", query)
+                # The export hydrates connections inline to stay inside a
+                # tracker's request budget on a large [feature].
+                self.assertIn("comments(first:", query)
+                self.assertIn("labels(first:", query)
+                self.assertIn("inverseRelations(first:", query)
                 if variables.get("after") is None:
                     return {"project": {"issues": connection([{
                         "id": "issue-id", "identifier": "ENG-1", "title": "Ship it",
                         "description": "body", "updatedAt": "2026-04-01T00:00:00Z",
                         "state": {"name": "ToDo"}, "assignee": {"name": "Ada"},
                         "team": {"id": "team-id", "key": "ENG", "name": "Engineering"},
+                        # Every inline connection reports more pages, so the
+                        # exhaustive per-issue fallback must run for all three.
+                        # Truncating to these first pages would drop "c1",
+                        # "team-preset:deep" and the ENG-9 blocker below.
+                        "comments": connection([
+                            {"id": "c2", "body": "later",
+                             "createdAt": "2026-02-02T00:00:00Z",
+                             "updatedAt": "2026-02-02T00:00:00Z",
+                             "user": {"name": "Later", "email": None}},
+                        ], True, "comments-2"),
+                        "labels": connection([{"name": "automation"}], True, "labels-2"),
+                        "inverseRelations": connection([], True, "relations-2"),
                     }], True, "issues-2")}}
                 return {"project": {"issues": connection([])}}
             if "comments(first:" in query:

@@ -610,15 +610,37 @@ class Linear:
         comments = self.issue_connection(issue_id, 'comments')
         labels = self.issue_connection(issue_id, 'labels')
         relations = self.issue_connection(issue_id, 'inverseRelations')
+        return self.build_hydrated(comments, labels, relations)
+
+    @staticmethod
+    def build_hydrated(comments, labels, relations):
         return {
-            'comments': self.normalize_comments(comments),
+            'comments': Linear.normalize_comments(comments),
             'labels': [item['name'] for item in labels],
             'blockedBy': [item['issue']['identifier'] for item in relations
                           if item.get('type') == 'blocks' and item.get('issue')],
         }
 
+    def inline_connection(self, issue, connection):
+        # Exhaustiveness contract: use the nodes embedded in the bulk export
+        # query when the connection fit on one page, and fall back to the
+        # per-issue paginated read otherwise. A missing or malformed connection
+        # is an andon, never an empty list — silently dropping comments would
+        # corrupt the evidence that gate decisions are made from.
+        conn = issue.get(connection)
+        if not isinstance(conn, dict):
+            die("Linear issue %s returned no %s connection — andon"
+                % (issue.get('identifier'), connection))
+        nodes = conn.get('nodes')
+        if not isinstance(nodes, list):
+            die("Linear issue %s returned a malformed %s page — andon"
+                % (issue.get('identifier'), connection))
+        if (conn.get('pageInfo') or {}).get('hasNextPage'):
+            return self.issue_connection(issue['id'], connection)
+        return nodes
+
     def issue(self, task_id):
-        d = self.gql('query($id: String!) { issue(id: $id) { id identifier team { id } } }',
+        d = self.gql('query($id: String!) { issue(id: $id) { id identifier archivedAt team { id } } }',
                      {'id': task_id})
         if not d.get('issue'):
             die("no Linear issue '%s'" % task_id)
@@ -677,6 +699,19 @@ class Linear:
 
     def upsert_progress(self, task_id, body):
         issue = self.issue(task_id)
+        # An archived issue cannot accept a comment: Linear answers every
+        # commentCreate against it with "Could not find referenced Issue". The
+        # feature export deliberately passes includeArchived so an archived
+        # [task] cannot vanish from release-authorization evidence, which means
+        # the PM projection walks archived [tasks] too and used to abort the
+        # whole pass — and therefore the whole outbox drain — on the first one.
+        #
+        # The [progress] comment is a human-visibility projection for a board the
+        # archived issue has already left, so skipping it loses nothing. Say so
+        # out loud rather than silently, and never widen this skip to gate
+        # markers, approvals, or status writes: those must still fail loudly.
+        if issue.get('archivedAt'):
+            return 'skipped-archived'
         comments = self.issue_connection(issue['id'], 'comments')
         current = next((c for c in comments
                         if (c.get('body') or '').lstrip().startswith('[progress]')), None)
@@ -752,13 +787,40 @@ class Linear:
         team = self.resolve_team(team_scope) if team_scope else None
         # Read the entire project before enforcing team scope. Filtering here
         # would silently make a multi-team project look exhaustive.
+        #
+        # Comments, labels and relations are fetched INLINE rather than with a
+        # per-issue hydrate call. The per-issue shape cost three requests per
+        # issue, so a [feature] with a few hundred [tasks] spent well over a
+        # thousand requests on a single export — and a dispatch pass performs
+        # several exports. Against Linear's 2500 requests/hour budget that makes
+        # one pass unable to finish on a large [feature], which in turn prevents
+        # any durable state from being written, so the next pass repeats it.
+        #
+        # Page sizes are deliberately small: Linear rejects a query outright
+        # ("Query too complex") when the outer and nested page sizes multiply
+        # out too far, and complexity scales with their product rather than with
+        # the rows actually returned. Correctness does not depend on these
+        # numbers — anything that overflows a nested page falls back to the
+        # exhaustive per-issue read in inline_connection(). Only throughput does.
         query = '''query($id: String!, $after: String) {
           project(id: $id) {
-            issues(first: 100, after: $after, includeArchived: true) {
+            issues(first: 25, after: $after, includeArchived: true) {
               nodes {
                 id identifier title description updatedAt
                 state { name } assignee { name }
                 team { id key name }
+                comments(first: 25) {
+                  nodes { id body createdAt updatedAt user { name email } }
+                  pageInfo { hasNextPage }
+                }
+                labels(first: 10) {
+                  nodes { name }
+                  pageInfo { hasNextPage }
+                }
+                inverseRelations(first: 10) {
+                  nodes { type issue { identifier } }
+                  pageInfo { hasNextPage }
+                }
               }
               pageInfo { hasNextPage endCursor }
             }
@@ -780,7 +842,10 @@ class Linear:
             if team and issue_team.get('id') != team['id']:
                 die("Linear project export returned issue %s from outside configured team '%s' — andon"
                     % (issue.get('identifier'), team_scope))
-            hydrated = self.hydrate_issue(issue['id'])
+            hydrated = self.build_hydrated(
+                self.inline_connection(issue, 'comments'),
+                self.inline_connection(issue, 'labels'),
+                self.inline_connection(issue, 'inverseRelations'))
             tasks.append({'taskId': issue['identifier'], 'title': issue['title'],
                           'status': generic_of(raw), 'statusRaw': raw,
                           'assignee': (issue.get('assignee') or {}).get('name'),
@@ -2235,6 +2300,9 @@ def op_upsert_progress(args):
     body = protect_outbound_ticket_text(body, 'progress-body')
     fresh_task_status(args[0])
     cid = backend.upsert_progress(args[0], body)
+    if cid == 'skipped-archived':
+        print("progress skipped on %s — issue is archived and cannot accept comments" % args[0])
+        return
     print("progress updated on %s%s" % (args[0], " (id: %s)" % cid if cid else ""))
 
 def op_upsert_digest(args):
