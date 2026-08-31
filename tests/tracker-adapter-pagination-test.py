@@ -320,9 +320,13 @@ class LinearPaginationTest(unittest.TestCase):
 
         def gql(query, variables=None):
             variables = variables or {}
+            if "comments(first:" in query and "filter: {project:" in query:
+                return {"comments": connection([dict(c) for c in comments])}
             if "project(id:" in query and "comments(first:" in query:
-                return {"project": {"comments": connection(
-                    [dict(c) for c in comments])}}
+                # Linear's nested Project.comments connection returns nothing
+                # even when project comments exist. The adapter must not read
+                # it: doing so appends a duplicate projection every pass.
+                self.fail("read project comments through the nested connection")
             if "project(id:" in query and "projectUpdate" not in query:
                 return {"project": dict(state)}
             if "commentCreate" in query:
@@ -380,24 +384,29 @@ class LinearPaginationTest(unittest.TestCase):
         self.assertEqual("A teammate's note.",
                          next(c["body"] for c in out["comments"] if c["id"] == "human"))
 
-    def test_digest_retires_a_block_left_in_project_fields(self):
-        # A project written by an older version carries the block in a field;
-        # one upsert must retire it and preserve the human-authored text.
+    def test_digest_retires_a_block_left_in_the_short_description(self):
+        # A project written by an older version carries the block in
+        # `description`; one upsert must retire it and keep the operator's text.
         out = self._upsert_digest(
             "[digest]\nfresh",
             description=("Operator-authored summary.\n\n"
                          "<!-- agent-squad:digest:start -->\n[digest]\nstale\n"
-                         "<!-- agent-squad:digest:end -->\n"),
-            content=("# Notes\n\nKeep me.\n\n"
-                     "<!-- agent-squad:digest:start -->\n[digest]\nstale\n"
-                     "<!-- agent-squad:digest:end -->\n\nKeep me too."))
+                         "<!-- agent-squad:digest:end -->\n"))
         self.assertEqual(1, len(out["created"]))
         self.assertEqual(1, len(out["field_writes"]))
         self.assertEqual("Operator-authored summary.", out["state"]["description"])
         self.assertNotIn("agent-squad:digest", out["state"]["description"])
-        self.assertNotIn("agent-squad:digest", out["state"]["content"])
-        self.assertIn("Keep me.", out["state"]["content"])
-        self.assertIn("Keep me too.", out["state"]["content"])
+
+    def test_digest_never_writes_the_project_content_document(self):
+        # `content` is not a location any released version wrote a block to, and
+        # Linear silently ignores an empty-string content write — so the adapter
+        # must leave that document entirely alone rather than depend on a quirk.
+        content = ("# Notes\n\nKeep me.\n\n"
+                   "<!-- agent-squad:digest:start -->\n[digest]\nstale\n"
+                   "<!-- agent-squad:digest:end -->\n\nKeep me too.")
+        out = self._upsert_digest("[digest]\nfresh", content=content)
+        self.assertEqual([], out["field_writes"])
+        self.assertEqual(content, out["state"]["content"])
 
     def test_digest_does_not_write_project_fields_when_nothing_to_retire(self):
         out = self._upsert_digest("[digest]\nfresh",

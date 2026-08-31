@@ -742,22 +742,20 @@ class Linear:
         return self.comment(task_id, body)
 
     def project_comments(self, project_id):
-        query = '''query($id: String!, $after: String) {
-          project(id: $id) {
-            comments(first: 100, after: $after) {
-              nodes { id body }
-              pageInfo { hasNextPage endCursor }
-            }
+        # Read project comments through the root `comments` connection filtered
+        # by project, NOT through `Project.comments`. The nested connection
+        # returns an empty list even when project comments exist, so using it
+        # made every upsert believe there was nothing to update and append a
+        # duplicate projection on each pass.
+        query = '''query($id: ID!, $after: String) {
+          comments(first: 100, after: $after, filter: {project: {id: {eq: $id}}}) {
+            nodes { id body }
+            pageInfo { hasNextPage endCursor }
           }
         }'''
-
-        def fetch(after):
-            project = self.gql(query, {'id': project_id, 'after': after}).get('project')
-            if not project:
-                die("no Linear project '%s'" % project_id)
-            return project.get('comments')
-
-        return self.paginate(fetch, "project %s comments" % project_id)
+        return self.paginate(
+            lambda after: self.gql(query, {'id': project_id, 'after': after}).get('comments'),
+            "project %s comments" % project_id)
 
     def upsert_project_block(self, feature_id, key, body):
         # A managed [feature] projection is a project COMMENT, not part of the
@@ -798,29 +796,24 @@ class Linear:
         self.retire_legacy_project_block(pid, key)
 
     def retire_legacy_project_block(self, pid, key):
-        """Remove a managed block an older version wrote into a project field."""
-        d = self.gql('query($id: String!) { project(id: $id) { description content } }',
-                     {'id': pid})
-        project = d.get('project') or {}
-        description = project.get('description') or ''
-        content = project.get('content') or ''
-        cleaned_description = strip_managed_block(description, key)
-        cleaned_content = strip_managed_block(content, key)
-        updates = {}
-        if cleaned_description != description:
-            updates['description'] = cleaned_description
-        if cleaned_content != content:
-            updates['content'] = cleaned_content
-        if not updates:
+        """Remove a managed block an older version wrote into `description`.
+
+        Only `description` is considered: that is the single field a released
+        version ever wrote a managed block into. `content` is deliberately not
+        touched — nothing in the wild put a block there, and Linear silently
+        ignores an empty-string content write, so a speculative clean-up would
+        add a quirk-dependent write for a state that cannot occur.
+        """
+        d = self.gql('query($id: String!) { project(id: $id) { description } }', {'id': pid})
+        description = (d.get('project') or {}).get('description') or ''
+        cleaned = strip_managed_block(description, key)
+        if cleaned == description:
             return
-        fields = ', '.join('%s: $%s' % (name, name) for name in sorted(updates))
-        signature = ', '.join('$%s: String!' % name for name in sorted(updates))
-        mutation = ('mutation($id: String!, %s) { projectUpdate(id: $id, input: {%s}) '
-                    '{ success } }' % (signature, fields))
-        variables = {'id': pid}
-        variables.update(updates)
-        self.mutation_payload(self.gql(mutation, variables), 'projectUpdate',
-                              'retiring the legacy project %s block' % key)
+        self.mutation_payload(
+            self.gql('mutation($id: String!, $description: String!) '
+                     '{ projectUpdate(id: $id, input: {description: $description}) { success } }',
+                     {'id': pid, 'description': cleaned}),
+            'projectUpdate', 'retiring the legacy project %s block' % key)
 
     def upsert_digest(self, feature_id, body):
         self.upsert_project_block(feature_id, 'digest', body)
