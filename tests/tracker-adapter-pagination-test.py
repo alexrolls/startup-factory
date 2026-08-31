@@ -155,15 +155,29 @@ class LinearPaginationTest(unittest.TestCase):
             if "project(id:" in query and "issues(first:" in query:
                 top_queries.append(query)
                 self.assertIn("includeArchived: true", query)
-                self.assertNotIn("comments(first:", query)
-                self.assertNotIn("labels(first:", query)
-                self.assertNotIn("inverseRelations(first:", query)
+                # The export hydrates connections inline to stay inside a
+                # tracker's request budget on a large [feature].
+                self.assertIn("comments(first:", query)
+                self.assertIn("labels(first:", query)
+                self.assertIn("inverseRelations(first:", query)
                 if variables.get("after") is None:
                     return {"project": {"issues": connection([{
                         "id": "issue-id", "identifier": "ENG-1", "title": "Ship it",
                         "description": "body", "updatedAt": "2026-04-01T00:00:00Z",
                         "state": {"name": "ToDo"}, "assignee": {"name": "Ada"},
                         "team": {"id": "team-id", "key": "ENG", "name": "Engineering"},
+                        # Every inline connection reports more pages, so the
+                        # exhaustive per-issue fallback must run for all three.
+                        # Truncating to these first pages would drop "c1",
+                        # "team-preset:deep" and the ENG-9 blocker below.
+                        "comments": connection([
+                            {"id": "c2", "body": "later",
+                             "createdAt": "2026-02-02T00:00:00Z",
+                             "updatedAt": "2026-02-02T00:00:00Z",
+                             "user": {"name": "Later", "email": None}},
+                        ], True, "comments-2"),
+                        "labels": connection([{"name": "automation"}], True, "labels-2"),
+                        "inverseRelations": connection([], True, "relations-2"),
                     }], True, "issues-2")}}
                 return {"project": {"issues": connection([])}}
             if "comments(first:" in query:
@@ -296,6 +310,109 @@ class LinearPaginationTest(unittest.TestCase):
             project_id, self.ns["feature_status_by_name"]("Resolved"))
         self.assertEqual([None, "page-2"], cursors)
 
+    def _upsert_digest(self, body, description="Summary.", content="",
+                       existing_comments=()):
+        """Run a digest upsert against a project in the given state."""
+        project_id = "00000000-0000-0000-0000-000000000001"
+        state = {"description": description, "content": content}
+        comments = [dict(c) for c in existing_comments]
+        created, updated, field_writes = [], [], []
+
+        def gql(query, variables=None):
+            variables = variables or {}
+            if "comments(first:" in query and "filter: {project:" in query:
+                return {"comments": connection([dict(c) for c in comments])}
+            if "project(id:" in query and "comments(first:" in query:
+                # Linear's nested Project.comments connection returns nothing
+                # even when project comments exist. The adapter must not read
+                # it: doing so appends a duplicate projection every pass.
+                self.fail("read project comments through the nested connection")
+            if "project(id:" in query and "projectUpdate" not in query:
+                return {"project": dict(state)}
+            if "commentCreate" in query:
+                created.append(dict(variables))
+                comments.append({"id": "generated", "body": variables["body"]})
+                return {"commentCreate": {"success": True,
+                                          "comment": {"id": "generated",
+                                                      "body": variables["body"]}}}
+            if "commentUpdate" in query:
+                updated.append(dict(variables))
+                for c in comments:
+                    if c["id"] == variables["cid"]:
+                        c["body"] = variables["body"]
+                return {"commentUpdate": {"success": True,
+                                          "comment": {"id": variables["cid"],
+                                                      "body": variables["body"]}}}
+            if "projectUpdate" in query:
+                field_writes.append(dict(variables))
+                # A real tracker refuses an over-long short description; the
+                # adapter must never send one.
+                if "description" in variables and len(variables["description"]) > 255:
+                    self.fail("description exceeded the 255-character limit")
+                state.update({k: v for k, v in variables.items() if k != "id"})
+                return {"projectUpdate": {"success": True}}
+            self.fail("unexpected Linear query: %s" % query)
+
+        self.linear.gql = gql
+        self.linear.upsert_digest(project_id, body)
+        return {"state": state, "comments": comments, "created": created,
+                "updated": updated, "field_writes": field_writes}
+
+    def test_digest_is_a_project_comment_and_never_touches_project_fields(self):
+        # A real digest is far longer than a short description may be, and the
+        # content document is reformatted by the tracker, so the projection is a
+        # comment: stored as sent, and no operator-authored field is touched.
+        body = "[digest]\n" + "\n".join("task ENG-%d: integrated" % n for n in range(40))
+        self.assertGreater(len(body), 255)
+        out = self._upsert_digest(body, description="Operator-authored summary.")
+        self.assertEqual(1, len(out["created"]))
+        self.assertEqual(body, out["created"][0]["body"])
+        self.assertEqual([], out["updated"])
+        self.assertEqual([], out["field_writes"])
+        self.assertEqual("Operator-authored summary.", out["state"]["description"])
+
+    def test_digest_updates_its_own_comment_and_leaves_others_alone(self):
+        out = self._upsert_digest(
+            "[digest]\nfresh",
+            existing_comments=[
+                {"id": "human", "body": "A teammate's note."},
+                {"id": "managed", "body": "[digest]\nstale"},
+            ])
+        self.assertEqual([], out["created"])
+        self.assertEqual(1, len(out["updated"]))
+        self.assertEqual("managed", out["updated"][0]["cid"])
+        self.assertEqual("A teammate's note.",
+                         next(c["body"] for c in out["comments"] if c["id"] == "human"))
+
+    def test_digest_retires_a_block_left_in_the_short_description(self):
+        # A project written by an older version carries the block in
+        # `description`; one upsert must retire it and keep the operator's text.
+        out = self._upsert_digest(
+            "[digest]\nfresh",
+            description=("Operator-authored summary.\n\n"
+                         "<!-- agent-squad:digest:start -->\n[digest]\nstale\n"
+                         "<!-- agent-squad:digest:end -->\n"))
+        self.assertEqual(1, len(out["created"]))
+        self.assertEqual(1, len(out["field_writes"]))
+        self.assertEqual("Operator-authored summary.", out["state"]["description"])
+        self.assertNotIn("agent-squad:digest", out["state"]["description"])
+
+    def test_digest_never_writes_the_project_content_document(self):
+        # `content` is not a location any released version wrote a block to, and
+        # Linear silently ignores an empty-string content write — so the adapter
+        # must leave that document entirely alone rather than depend on a quirk.
+        content = ("# Notes\n\nKeep me.\n\n"
+                   "<!-- agent-squad:digest:start -->\n[digest]\nstale\n"
+                   "<!-- agent-squad:digest:end -->\n\nKeep me too.")
+        out = self._upsert_digest("[digest]\nfresh", content=content)
+        self.assertEqual([], out["field_writes"])
+        self.assertEqual(content, out["state"]["content"])
+
+    def test_digest_does_not_write_project_fields_when_nothing_to_retire(self):
+        out = self._upsert_digest("[digest]\nfresh",
+                                  description="Summary.", content="# Notes\n\nKeep me.")
+        self.assertEqual([], out["field_writes"])
+
     def test_probe_reads_only_the_feature_container(self):
         project_id = "00000000-0000-0000-0000-000000000001"
         calls = []
@@ -351,7 +468,8 @@ class JiraPaginationTest(unittest.TestCase):
                 self.assertEqual(100, payload["maxResults"])
                 self.assertEqual(
                     ["summary", "description", "status", "assignee",
-                     "issuelinks", "labels", "updated", "project", "issuetype"],
+                     "issuelinks", "labels", "updated", "project", "issuetype",
+                     "comment"],
                     payload["fields"])
                 search_payloads.append(dict(payload))
                 if payload.get("nextPageToken") is None:
@@ -383,6 +501,67 @@ class JiraPaginationTest(unittest.TestCase):
         self.assertEqual(tasks[0]["comments"][0]["updatedAt"],
                          tasks[0]["comments"][0]["revision"])
 
+    def _export_with_inline_comment(self, block):
+        """Export one issue whose search result carries the given comment block."""
+        comment_paths = []
+
+        def api(path, payload=None, method=None):
+            parsed = urlparse(path)
+            if parsed.path == "/rest/api/3/project/PROJ":
+                return {"id": "10000", "key": "PROJ", "name": "Project"}
+            if parsed.path.endswith("/search/jql"):
+                issue = self.issue("PROJ-1")
+                if block is not None:
+                    issue["fields"]["comment"] = block
+                return {"issues": [issue], "isLast": True}
+            if parsed.path.endswith("/comment"):
+                comment_paths.append(parsed.path)
+                return {"comments": [
+                    {"id": "paged", "body": "from the paginated read",
+                     "created": "2026-05-01T00:00:00Z",
+                     "updated": "2026-05-01T00:00:00Z",
+                     "author": {"accountId": "bot"}}], "total": 1}
+            self.fail("unexpected Jira path: %s" % path)
+
+        self.jira.api = api
+        return self.jira.export("EPIC-1"), comment_paths
+
+    def test_export_uses_a_complete_inline_comment_block(self):
+        # A complete inline block must remove the per-[task] comment request:
+        # that saving is the whole point of asking search for the field.
+        tasks, comment_paths = self._export_with_inline_comment({
+            "total": 2,
+            "comments": [
+                {"id": "c2", "body": "second", "created": "2026-05-02T00:00:00Z",
+                 "updated": "2026-05-02T00:00:00Z", "author": {"accountId": "bot"}},
+                {"id": "c1", "body": "first", "created": "2026-05-01T00:00:00Z",
+                 "updated": "2026-05-01T00:00:00Z", "author": {"accountId": "bot"}},
+            ],
+        })
+        self.assertEqual([], comment_paths)
+        self.assertEqual(["c1", "c2"], [c["id"] for c in tasks[0]["comments"]])
+
+    def test_export_falls_back_when_the_inline_comment_block_is_unusable(self):
+        # Truncated, malformed, unbounded or absent blocks must all fall back to
+        # the exhaustive paginated read. Trusting a truncated block would drop
+        # comments silently, which is the evidence gate decisions rest on.
+        for label, block in [
+            ("truncated", {"total": 5, "comments": [
+                {"id": "only", "body": "one of five",
+                 "created": "2026-05-01T00:00:00Z",
+                 "updated": "2026-05-01T00:00:00Z",
+                 "author": {"accountId": "bot"}}]}),
+            ("no total", {"comments": []}),
+            ("malformed comments", {"total": 0, "comments": "not-a-list"}),
+            ("not a dict", "not-a-block"),
+            ("absent", None),
+        ]:
+            with self.subTest(block=label):
+                tasks, comment_paths = self._export_with_inline_comment(block)
+                self.assertEqual(1, len(comment_paths), label)
+                self.assertEqual(["paged"],
+                                 [c["id"] for c in tasks[0]["comments"]], label)
+
     def test_scan_resolves_exact_scope_and_filters_child_issue_type(self):
         calls = []
 
@@ -397,7 +576,8 @@ class JiraPaginationTest(unittest.TestCase):
                     payload["jql"])
                 self.assertEqual(
                     ["summary", "description", "status", "assignee", "issuelinks",
-                     "parent", "labels", "updated", "project", "issuetype"],
+                     "parent", "labels", "updated", "project", "issuetype",
+                     "comment"],
                     payload["fields"])
                 return {"issues": [self.issue("PROJ-1", parent="PROJ-EPIC")],
                         "isLast": True}

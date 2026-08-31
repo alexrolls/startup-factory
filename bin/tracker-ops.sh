@@ -220,6 +220,27 @@ def replace_managed_block(text, key, body):
     text = text.rstrip()
     return (text + '\n\n' if text else '') + block + '\n'
 
+def strip_managed_block(text, key):
+    """Remove one generated block, preserving all user-authored text.
+
+    Used to retire a managed block from a field an older version wrote to. It
+    applies the same unmatched/duplicate-marker refusal as
+    replace_managed_block: an ambiguous block is an operator repair, never
+    something to guess at.
+    """
+    start = '<!-- agent-squad:%s:start -->' % key
+    end = '<!-- agent-squad:%s:end -->' % key
+    text = text or ''
+    if start not in text and end not in text:
+        return text
+    pattern = re.compile(r'\n*' + re.escape(start) + r'.*?' + re.escape(end) + r'\n*', re.S)
+    matches = list(pattern.finditer(text))
+    if text.count(start) != text.count(end) or len(matches) != text.count(start):
+        die("managed %s block has unmatched markers — andon" % key)
+    if len(matches) > 1:
+        die("managed %s block is duplicated — andon" % key)
+    return pattern.sub('', text, count=1).strip()
+
 def adf_text(value):
     if isinstance(value, str):
         return value
@@ -610,15 +631,37 @@ class Linear:
         comments = self.issue_connection(issue_id, 'comments')
         labels = self.issue_connection(issue_id, 'labels')
         relations = self.issue_connection(issue_id, 'inverseRelations')
+        return self.build_hydrated(comments, labels, relations)
+
+    @staticmethod
+    def build_hydrated(comments, labels, relations):
         return {
-            'comments': self.normalize_comments(comments),
+            'comments': Linear.normalize_comments(comments),
             'labels': [item['name'] for item in labels],
             'blockedBy': [item['issue']['identifier'] for item in relations
                           if item.get('type') == 'blocks' and item.get('issue')],
         }
 
+    def inline_connection(self, issue, connection):
+        # Exhaustiveness contract: use the nodes embedded in the bulk export
+        # query when the connection fit on one page, and fall back to the
+        # per-issue paginated read otherwise. A missing or malformed connection
+        # is an andon, never an empty list — silently dropping comments would
+        # corrupt the evidence that gate decisions are made from.
+        conn = issue.get(connection)
+        if not isinstance(conn, dict):
+            die("Linear issue %s returned no %s connection — andon"
+                % (issue.get('identifier'), connection))
+        nodes = conn.get('nodes')
+        if not isinstance(nodes, list):
+            die("Linear issue %s returned a malformed %s page — andon"
+                % (issue.get('identifier'), connection))
+        if (conn.get('pageInfo') or {}).get('hasNextPage'):
+            return self.issue_connection(issue['id'], connection)
+        return nodes
+
     def issue(self, task_id):
-        d = self.gql('query($id: String!) { issue(id: $id) { id identifier team { id } } }',
+        d = self.gql('query($id: String!) { issue(id: $id) { id identifier archivedAt team { id } } }',
                      {'id': task_id})
         if not d.get('issue'):
             die("no Linear issue '%s'" % task_id)
@@ -677,6 +720,19 @@ class Linear:
 
     def upsert_progress(self, task_id, body):
         issue = self.issue(task_id)
+        # An archived issue cannot accept a comment: Linear answers every
+        # commentCreate against it with "Could not find referenced Issue". The
+        # feature export deliberately passes includeArchived so an archived
+        # [task] cannot vanish from release-authorization evidence, which means
+        # the PM projection walks archived [tasks] too and used to abort the
+        # whole pass — and therefore the whole outbox drain — on the first one.
+        #
+        # The [progress] comment is a human-visibility projection for a board the
+        # archived issue has already left, so skipping it loses nothing. Say so
+        # out loud rather than silently, and never widen this skip to gate
+        # markers, approvals, or status writes: those must still fail loudly.
+        if issue.get('archivedAt'):
+            return 'skipped-archived'
         comments = self.issue_connection(issue['id'], 'comments')
         current = next((c for c in comments
                         if (c.get('body') or '').lstrip().startswith('[progress]')), None)
@@ -685,25 +741,85 @@ class Linear:
             return current['id']
         return self.comment(task_id, body)
 
-    def upsert_digest(self, feature_id, body):
+    def project_comments(self, project_id):
+        # Read project comments through the root `comments` connection filtered
+        # by project, NOT through `Project.comments`. The nested connection
+        # returns an empty list even when project comments exist, so using it
+        # made every upsert believe there was nothing to update and append a
+        # duplicate projection on each pass.
+        query = '''query($id: ID!, $after: String) {
+          comments(first: 100, after: $after, filter: {project: {id: {eq: $id}}}) {
+            nodes { id body }
+            pageInfo { hasNextPage endCursor }
+          }
+        }'''
+        return self.paginate(
+            lambda after: self.gql(query, {'id': project_id, 'after': after}).get('comments'),
+            "project %s comments" % project_id)
+
+    def upsert_project_block(self, feature_id, key, body):
+        # A managed [feature] projection is a project COMMENT, not part of the
+        # project's own fields. Both field candidates are unusable:
+        #
+        #   description — documented as "the short description of the project"
+        #     and capped at 255 characters, so a real digest is rejected
+        #     outright, and appending to it mixes generated text into a
+        #     human-authored summary while consuming its whole budget.
+        #   content — the markdown body, which Linear owns the canonical
+        #     formatting of. It rewrites table delimiters and inserts blank
+        #     lines on write, so a projection can never be verified as stored,
+        #     and every pass would fight the formatter.
+        #
+        # A comment has neither problem: it is stored as sent, so the read-back
+        # check stays exact, and it leaves the operator's description and
+        # content document untouched. This also makes the [feature] projection
+        # structurally identical to the [task] progress projection.
+        #
+        # Blocks written into description or content by an older version are
+        # removed once, so an existing project self-heals rather than showing
+        # two competing projections.
         pid = self.project_id(feature_id)
+        marker = '[%s]' % key
+        current = next((c for c in self.project_comments(pid)
+                        if (c.get('body') or '').lstrip().startswith(marker)), None)
+        if current:
+            self.update_comment(feature_id, current['id'], body)
+        else:
+            d = self.gql('mutation($id: String!, $body: String!) { commentCreate(input: {projectId: $id, body: $body}) { success comment { id body } } }',
+                         {'id': pid, 'body': body})
+            payload = self.mutation_payload(d, 'commentCreate', 'project %s comment' % key)
+            comment = payload.get('comment') or {}
+            if not comment.get('id'):
+                die("Linear project %s comment returned no comment id — andon" % key)
+            if comment.get('body') != body:
+                die("Linear project %s comment did not read back the requested body — andon" % key)
+        self.retire_legacy_project_block(pid, key)
+
+    def retire_legacy_project_block(self, pid, key):
+        """Remove a managed block an older version wrote into `description`.
+
+        Only `description` is considered: that is the single field a released
+        version ever wrote a managed block into. `content` is deliberately not
+        touched — nothing in the wild put a block there, and Linear silently
+        ignores an empty-string content write, so a speculative clean-up would
+        add a quirk-dependent write for a state that cannot occur.
+        """
         d = self.gql('query($id: String!) { project(id: $id) { description } }', {'id': pid})
-        description = replace_managed_block((d.get('project') or {}).get('description') or '', 'digest', body)
-        d = self.gql('mutation($id: String!, $description: String!) { projectUpdate(id: $id, input: {description: $description}) { success project { description } } }',
-                     {'id': pid, 'description': description})
-        payload = self.mutation_payload(d, 'projectUpdate', 'project digest update')
-        if (payload.get('project') or {}).get('description') != description:
-            die("Linear project digest update did not read back the requested description — andon")
+        description = (d.get('project') or {}).get('description') or ''
+        cleaned = strip_managed_block(description, key)
+        if cleaned == description:
+            return
+        self.mutation_payload(
+            self.gql('mutation($id: String!, $description: String!) '
+                     '{ projectUpdate(id: $id, input: {description: $description}) { success } }',
+                     {'id': pid, 'description': cleaned}),
+            'projectUpdate', 'retiring the legacy project %s block' % key)
+
+    def upsert_digest(self, feature_id, body):
+        self.upsert_project_block(feature_id, 'digest', body)
 
     def upsert_deployment(self, feature_id, body):
-        pid = self.project_id(feature_id)
-        d = self.gql('query($id: String!) { project(id: $id) { description } }', {'id': pid})
-        description = replace_managed_block((d.get('project') or {}).get('description') or '', 'deployment', body)
-        d = self.gql('mutation($id: String!, $description: String!) { projectUpdate(id: $id, input: {description: $description}) { success project { description } } }',
-                     {'id': pid, 'description': description})
-        payload = self.mutation_payload(d, 'projectUpdate', 'project deployment update')
-        if (payload.get('project') or {}).get('description') != description:
-            die("Linear project deployment update did not read back the requested description — andon")
+        self.upsert_project_block(feature_id, 'deployment', body)
 
     def current_feature_status(self, feature_id):
         d = self.gql('query($id: String!) { project(id: $id) { status { name } } }',
@@ -752,13 +868,40 @@ class Linear:
         team = self.resolve_team(team_scope) if team_scope else None
         # Read the entire project before enforcing team scope. Filtering here
         # would silently make a multi-team project look exhaustive.
+        #
+        # Comments, labels and relations are fetched INLINE rather than with a
+        # per-issue hydrate call. The per-issue shape cost three requests per
+        # issue, so a [feature] with a few hundred [tasks] spent well over a
+        # thousand requests on a single export — and a dispatch pass performs
+        # several exports. Against Linear's 2500 requests/hour budget that makes
+        # one pass unable to finish on a large [feature], which in turn prevents
+        # any durable state from being written, so the next pass repeats it.
+        #
+        # Page sizes are deliberately small: Linear rejects a query outright
+        # ("Query too complex") when the outer and nested page sizes multiply
+        # out too far, and complexity scales with their product rather than with
+        # the rows actually returned. Correctness does not depend on these
+        # numbers — anything that overflows a nested page falls back to the
+        # exhaustive per-issue read in inline_connection(). Only throughput does.
         query = '''query($id: String!, $after: String) {
           project(id: $id) {
-            issues(first: 100, after: $after, includeArchived: true) {
+            issues(first: 25, after: $after, includeArchived: true) {
               nodes {
                 id identifier title description updatedAt
                 state { name } assignee { name }
                 team { id key name }
+                comments(first: 25) {
+                  nodes { id body createdAt updatedAt user { name email } }
+                  pageInfo { hasNextPage }
+                }
+                labels(first: 10) {
+                  nodes { name }
+                  pageInfo { hasNextPage }
+                }
+                inverseRelations(first: 10) {
+                  nodes { type issue { identifier } }
+                  pageInfo { hasNextPage }
+                }
               }
               pageInfo { hasNextPage endCursor }
             }
@@ -780,7 +923,10 @@ class Linear:
             if team and issue_team.get('id') != team['id']:
                 die("Linear project export returned issue %s from outside configured team '%s' — andon"
                     % (issue.get('identifier'), team_scope))
-            hydrated = self.hydrate_issue(issue['id'])
+            hydrated = self.build_hydrated(
+                self.inline_connection(issue, 'comments'),
+                self.inline_connection(issue, 'labels'),
+                self.inline_connection(issue, 'inverseRelations'))
             tasks.append({'taskId': issue['identifier'], 'title': issue['title'],
                           'status': generic_of(raw), 'statusRaw': raw,
                           'assignee': (issue.get('assignee') or {}).get('name'),
@@ -950,9 +1096,34 @@ class Jira:
                 break
             elif not page:
                 die("Jira comments for %s stalled during pagination — andon" % task_id)
+        return self.sort_comments(rows)
+
+    @staticmethod
+    def sort_comments(rows):
         rows.sort(key=lambda c: (c.get('updated') or c.get('created') or '',
                                  str(c.get('id') or '')))
         return rows
+
+    def inline_comments(self, task_id, fields):
+        # Search can return the comment field inline, which removes one request
+        # per [task] from an exhaustive read. Jira truncates that inline block to
+        # maxResults, so it is usable only when it demonstrably holds every
+        # comment; anything else falls back to the exhaustive paginated read.
+        # A malformed or unbounded block is never treated as complete.
+        block = fields.get('comment')
+        if not isinstance(block, dict):
+            return self.comments(task_id)
+        rows = block.get('comments')
+        total = block.get('total')
+        if not isinstance(rows, list) or total is None:
+            return self.comments(task_id)
+        try:
+            total = int(total)
+        except (TypeError, ValueError):
+            die("Jira comments for %s returned an invalid total — andon" % task_id)
+        if len(rows) < total:
+            return self.comments(task_id)
+        return self.sort_comments(list(rows))
 
     def search_all(self, jql, fields):
         # Jira's enhanced search is a scrolling/token API. The legacy
@@ -1082,14 +1253,14 @@ class Jira:
         tasks = []
         issues = self.search_all(
             jql,
-            'summary,description,status,assignee,issuelinks,labels,updated,project,issuetype')
+            'summary,description,status,assignee,issuelinks,labels,updated,project,issuetype,comment')
         for i in issues:
             f = self.scoped_issue_fields(
                 i, project_key, task_issue_type, "Jira feature export")
             raw = f['status']['name']
             blocked_by = [l['inwardIssue']['key'] for l in f.get('issuelinks', [])
                           if l.get('type', {}).get('name') == 'Blocks' and l.get('inwardIssue')]
-            comments = self.comments(i['key'])
+            comments = self.inline_comments(i['key'], f)
             tasks.append({'taskId': i['key'], 'title': f['summary'],
                           'status': generic_of(raw), 'statusRaw': raw,
                           'assignee': (f.get('assignee') or {}).get('displayName'),
@@ -1115,7 +1286,7 @@ class Jira:
         jql = ' AND '.join(clauses)
         items = []
         rows = self.search_all(jql,
-                               'summary,description,status,assignee,issuelinks,parent,labels,updated,project,issuetype')
+                               'summary,description,status,assignee,issuelinks,parent,labels,updated,project,issuetype,comment')
         for i in rows:
             f = self.scoped_issue_fields(
                 i, project_key, task_issue_type, "Jira board scan")
@@ -1126,7 +1297,7 @@ class Jira:
             parent = f.get('parent') or {}
             blocked_by = [l['inwardIssue']['key'] for l in f.get('issuelinks', [])
                           if l.get('type', {}).get('name') == 'Blocks' and l.get('inwardIssue')]
-            comments = self.comments(i['key'])
+            comments = self.inline_comments(i['key'], f)
             items.append({
                 'featureId': parent.get('key'),
                 'featureTitle': ((parent.get('fields') or {}).get('summary') if isinstance(parent.get('fields'), dict) else None),
@@ -2235,6 +2406,9 @@ def op_upsert_progress(args):
     body = protect_outbound_ticket_text(body, 'progress-body')
     fresh_task_status(args[0])
     cid = backend.upsert_progress(args[0], body)
+    if cid == 'skipped-archived':
+        print("progress skipped on %s — issue is archived and cannot accept comments" % args[0])
+        return
     print("progress updated on %s%s" % (args[0], " (id: %s)" % cid if cid else ""))
 
 def op_upsert_digest(args):

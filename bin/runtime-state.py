@@ -375,6 +375,18 @@ def cmd_sync(args) -> None:
     for task in automated_tasks:
         task_id = str(task["taskId"])
         stage, summary = derive_stage(task, terminal, preset_text)
+        # Never back-fill a [progress] projection onto a terminal [task] this
+        # team never tracked. On a long-lived [feature] the overwhelming
+        # majority of [tasks] are completed history, and each projection write
+        # costs several tracker requests. Back-filling them can exhaust a
+        # tracker's hourly request budget part-way through this loop, so the
+        # pass aborts before persisting the projection — and the next pass then
+        # starts from a cold cache and repeats the same exhaustion.
+        #
+        # A [task] the team did track already has a cache entry, so it still
+        # receives its final terminal update. Only untracked history is skipped.
+        if task.get("status") in terminal and task_id not in projection.get("tasks", {}):
+            continue
         execution = execution_for(workspace, task_id)
         actor = task.get("assignee") or execution.get("role") or "unassigned"
         attempt = int(execution.get("attempt") or 1)
