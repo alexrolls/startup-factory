@@ -44,6 +44,28 @@ licensed**
 
 ![Startup Factory demo](https://raw.githubusercontent.com/alexrolls/startup-factory/main/exports/execmatchai-issues-57s-70s.gif)
 
+## What's new in 0.1.17
+
+This release keeps an exhaustive tracker read inside a hosted tracker's request
+budget, so a dispatch pass can complete on a [feature] with hundreds of [tasks].
+
+Previously the Linear project export hydrated comments, labels, and relations
+with one request per connection per issue, and the Jira export and board scan
+read comments once per [task]. On a large [feature] a single pass could exceed an
+hourly request budget before finishing, so it never persisted its projection and
+the next pass repeated the same work. Both adapters now hydrate from the
+paginated read they already perform, and any connection reporting a further page
+still falls back to the exhaustive per-item read — a truncated or malformed
+response is never treated as complete.
+
+Two projection defects are fixed alongside it. Managed `[feature]` projections
+are now tracker comments rather than project fields, because a short description
+is length-capped and a content document is reformatted by the tracker, so
+neither could hold a projection verifiable as stored; a block left in either
+field by an earlier version is retired on the next upsert. The `[task]`
+projection also no longer back-fills completed history it never tracked, and it
+skips archived items instead of failing the pass that met one.
+
 ## What's new in 0.1.16
 
 This release adds project-scoped agent health monitoring. Teams can use
@@ -82,7 +104,7 @@ account, API key, application server, or coordinator database.
    ```
 
    For Claude Code, use `--agent claude-code`. Pin a release in controlled
-   environments, for example `startup-factory@0.1.16`. For a Git checkout or an
+   environments, for example `startup-factory@0.1.17`. For a Git checkout or an
    offline installation, use the
    [auditable shell compatibility path](#shell-compatibility-path).
 

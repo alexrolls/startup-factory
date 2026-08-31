@@ -104,8 +104,8 @@ Completed (Linear project states).
 | Scan `[tasks]` across the configured board scope | `list_issues` per mapped state (harness only) | `bin/tracker-ops.sh scan <outfile> --status Planned --status Blocked` paginates issues; unattended automation requires an explicit exact `LINEAR_DEFAULT_TEAM` |
 | update comment | `update_comment` MCP tool | GraphQL `commentUpdate(id: $commentId, input: {body: $body})`; or `bin/tracker-ops.sh update-comment <taskId> <commentId> <bodyfile>` |
 | Upsert task runtime progress | update the existing managed progress comment or create it | `bin/tracker-ops.sh upsert-progress <taskId> <bodyfile>` |
-| Upsert feature runtime digest | update the existing managed digest comment or create it | `bin/tracker-ops.sh upsert-digest <featureId> <bodyfile>` |
-| Upsert feature deployment state | update the managed deployment block in the project's `content` | `bin/tracker-ops.sh upsert-deployment <featureId> <bodyfile>` |
+| Upsert feature runtime digest | update the managed `[digest]` project comment or create it | `bin/tracker-ops.sh upsert-digest <featureId> <bodyfile>` |
+| Upsert feature deployment state | update the managed `[deployment]` project comment | `bin/tracker-ops.sh upsert-deployment <featureId> <bodyfile>` |
 
 > **Helper script.** For the `rest` mechanism, `bin/tracker-ops.sh` wraps the recurring
 > operations — `claim`, `state`, `comment` (body from a file or stdin, so no shell-quoting
@@ -149,6 +149,11 @@ Completed (Linear project states).
   `LINEAR_DEFAULT_TEAM` key/name; workspace-wide inference is refused. Generic `[Planned]` maps
   to Linear `Todo` and `[Blocked]` maps to Linear `Blocked` through the board
   config; the supervisor never hardcodes tool-side names.
+- Managed `[feature]` projections are **project comments**, never project
+  fields. `description` is capped at 255 characters, and Linear owns the
+  canonical formatting of `content` (it rewrites table delimiters and inserts
+  blank lines), so neither can hold a projection that is verifiable as stored.
+  A block found in either field is retired on the next upsert.
 - Hold-control marker text is acted on only with the matching local published
   broker receipt. Linear authorship and a copied team-lead signature cannot
   impersonate `[dependency-hold]`, `[resume-review]`, or `[resume-plan]`.

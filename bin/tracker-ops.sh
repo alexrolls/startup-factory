@@ -741,41 +741,86 @@ class Linear:
             return current['id']
         return self.comment(task_id, body)
 
+    def project_comments(self, project_id):
+        query = '''query($id: String!, $after: String) {
+          project(id: $id) {
+            comments(first: 100, after: $after) {
+              nodes { id body }
+              pageInfo { hasNextPage endCursor }
+            }
+          }
+        }'''
+
+        def fetch(after):
+            project = self.gql(query, {'id': project_id, 'after': after}).get('project')
+            if not project:
+                die("no Linear project '%s'" % project_id)
+            return project.get('comments')
+
+        return self.paginate(fetch, "project %s comments" % project_id)
+
     def upsert_project_block(self, feature_id, key, body):
-        # Managed [feature] projections live in the project's long-form `content`
-        # field, never in `description`. Linear documents `description` as "the
-        # short description of the project" and caps it at 255 characters, so a
-        # real digest never fits: the mutation is rejected and the whole pass
-        # aborts. Worse, appending into `description` mixes a generated block
-        # into a human-authored summary and can consume its entire budget.
+        # A managed [feature] projection is a project COMMENT, not part of the
+        # project's own fields. Both field candidates are unusable:
         #
-        # `content` is the markdown body and has no comparable limit, so the
-        # projection goes there and the operator's short description is left
-        # alone. A block written into `description` by an older version is
-        # removed in the same mutation, so an existing project self-heals once.
+        #   description — documented as "the short description of the project"
+        #     and capped at 255 characters, so a real digest is rejected
+        #     outright, and appending to it mixes generated text into a
+        #     human-authored summary while consuming its whole budget.
+        #   content — the markdown body, which Linear owns the canonical
+        #     formatting of. It rewrites table delimiters and inserts blank
+        #     lines on write, so a projection can never be verified as stored,
+        #     and every pass would fight the formatter.
+        #
+        # A comment has neither problem: it is stored as sent, so the read-back
+        # check stays exact, and it leaves the operator's description and
+        # content document untouched. This also makes the [feature] projection
+        # structurally identical to the [task] progress projection.
+        #
+        # Blocks written into description or content by an older version are
+        # removed once, so an existing project self-heals rather than showing
+        # two competing projections.
         pid = self.project_id(feature_id)
+        marker = '[%s]' % key
+        current = next((c for c in self.project_comments(pid)
+                        if (c.get('body') or '').lstrip().startswith(marker)), None)
+        if current:
+            self.update_comment(feature_id, current['id'], body)
+        else:
+            d = self.gql('mutation($id: String!, $body: String!) { commentCreate(input: {projectId: $id, body: $body}) { success comment { id body } } }',
+                         {'id': pid, 'body': body})
+            payload = self.mutation_payload(d, 'commentCreate', 'project %s comment' % key)
+            comment = payload.get('comment') or {}
+            if not comment.get('id'):
+                die("Linear project %s comment returned no comment id — andon" % key)
+            if comment.get('body') != body:
+                die("Linear project %s comment did not read back the requested body — andon" % key)
+        self.retire_legacy_project_block(pid, key)
+
+    def retire_legacy_project_block(self, pid, key):
+        """Remove a managed block an older version wrote into a project field."""
         d = self.gql('query($id: String!) { project(id: $id) { description content } }',
                      {'id': pid})
         project = d.get('project') or {}
-        content = replace_managed_block(project.get('content') or '', key, body)
-        legacy = strip_managed_block(project.get('description') or '', key)
-        variables = {'id': pid, 'content': content}
-        if legacy != (project.get('description') or ''):
-            mutation = ('mutation($id: String!, $content: String!, $description: String!) '
-                        '{ projectUpdate(id: $id, input: {content: $content, description: $description}) '
-                        '{ success project { content description } } }')
-            variables['description'] = legacy
-        else:
-            mutation = ('mutation($id: String!, $content: String!) '
-                        '{ projectUpdate(id: $id, input: {content: $content}) '
-                        '{ success project { content } } }')
-        payload = self.mutation_payload(
-            self.gql(mutation, variables), 'projectUpdate', 'project %s update' % key)
-        observed = payload.get('project') or {}
-        if observed.get('content') != content:
-            die("Linear project %s update did not read back the requested content — andon" % key)
-        if 'description' in variables and observed.get('description') != legacy:
-            die("Linear project %s update did not read back the migrated description — andon" % key)
+        description = project.get('description') or ''
+        content = project.get('content') or ''
+        cleaned_description = strip_managed_block(description, key)
+        cleaned_content = strip_managed_block(content, key)
+        updates = {}
+        if cleaned_description != description:
+            updates['description'] = cleaned_description
+        if cleaned_content != content:
+            updates['content'] = cleaned_content
+        if not updates:
+            return
+        fields = ', '.join('%s: $%s' % (name, name) for name in sorted(updates))
+        signature = ', '.join('$%s: String!' % name for name in sorted(updates))
+        mutation = ('mutation($id: String!, %s) { projectUpdate(id: $id, input: {%s}) '
+                    '{ success } }' % (signature, fields))
+        variables = {'id': pid}
+        variables.update(updates)
+        self.mutation_payload(self.gql(mutation, variables), 'projectUpdate',
+                              'retiring the legacy project %s block' % key)
 
     def upsert_digest(self, feature_id, body):
         self.upsert_project_block(feature_id, 'digest', body)
