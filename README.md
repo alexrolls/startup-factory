@@ -44,6 +44,18 @@ licensed**
 
 ![Startup Factory demo](https://raw.githubusercontent.com/alexrolls/startup-factory/main/exports/execmatchai-issues-57s-70s.gif)
 
+## What's new in 0.1.18
+
+This release fixes the public installation check that gates a release. The step
+retries while a freshly published version propagates, but the version comparison
+ran inside the `if` body, so the first not-yet-propagated answer aborted the step
+instead of retrying — and because the GitHub release job depends on that check,
+a transient lag published to PyPI and then skipped the tag and release entirely.
+
+The comparison is now part of the retry condition, so propagation lag is retried
+as intended while a genuinely wrong published version still fails the release
+after the retry budget is exhausted.
+
 ## What's new in 0.1.17
 
 This release keeps an exhaustive tracker read inside a hosted tracker's request
@@ -104,7 +116,7 @@ account, API key, application server, or coordinator database.
    ```
 
    For Claude Code, use `--agent claude-code`. Pin a release in controlled
-   environments, for example `startup-factory@0.1.17`. For a Git checkout or an
+   environments, for example `startup-factory@0.1.18`. For a Git checkout or an
    offline installation, use the
    [auditable shell compatibility path](#shell-compatibility-path).
 
