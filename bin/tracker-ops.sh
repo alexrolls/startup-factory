@@ -220,6 +220,27 @@ def replace_managed_block(text, key, body):
     text = text.rstrip()
     return (text + '\n\n' if text else '') + block + '\n'
 
+def strip_managed_block(text, key):
+    """Remove one generated block, preserving all user-authored text.
+
+    Used to retire a managed block from a field an older version wrote to. It
+    applies the same unmatched/duplicate-marker refusal as
+    replace_managed_block: an ambiguous block is an operator repair, never
+    something to guess at.
+    """
+    start = '<!-- agent-squad:%s:start -->' % key
+    end = '<!-- agent-squad:%s:end -->' % key
+    text = text or ''
+    if start not in text and end not in text:
+        return text
+    pattern = re.compile(r'\n*' + re.escape(start) + r'.*?' + re.escape(end) + r'\n*', re.S)
+    matches = list(pattern.finditer(text))
+    if text.count(start) != text.count(end) or len(matches) != text.count(start):
+        die("managed %s block has unmatched markers — andon" % key)
+    if len(matches) > 1:
+        die("managed %s block is duplicated — andon" % key)
+    return pattern.sub('', text, count=1).strip()
+
 def adf_text(value):
     if isinstance(value, str):
         return value
@@ -720,25 +741,47 @@ class Linear:
             return current['id']
         return self.comment(task_id, body)
 
-    def upsert_digest(self, feature_id, body):
+    def upsert_project_block(self, feature_id, key, body):
+        # Managed [feature] projections live in the project's long-form `content`
+        # field, never in `description`. Linear documents `description` as "the
+        # short description of the project" and caps it at 255 characters, so a
+        # real digest never fits: the mutation is rejected and the whole pass
+        # aborts. Worse, appending into `description` mixes a generated block
+        # into a human-authored summary and can consume its entire budget.
+        #
+        # `content` is the markdown body and has no comparable limit, so the
+        # projection goes there and the operator's short description is left
+        # alone. A block written into `description` by an older version is
+        # removed in the same mutation, so an existing project self-heals once.
         pid = self.project_id(feature_id)
-        d = self.gql('query($id: String!) { project(id: $id) { description } }', {'id': pid})
-        description = replace_managed_block((d.get('project') or {}).get('description') or '', 'digest', body)
-        d = self.gql('mutation($id: String!, $description: String!) { projectUpdate(id: $id, input: {description: $description}) { success project { description } } }',
-                     {'id': pid, 'description': description})
-        payload = self.mutation_payload(d, 'projectUpdate', 'project digest update')
-        if (payload.get('project') or {}).get('description') != description:
-            die("Linear project digest update did not read back the requested description — andon")
+        d = self.gql('query($id: String!) { project(id: $id) { description content } }',
+                     {'id': pid})
+        project = d.get('project') or {}
+        content = replace_managed_block(project.get('content') or '', key, body)
+        legacy = strip_managed_block(project.get('description') or '', key)
+        variables = {'id': pid, 'content': content}
+        if legacy != (project.get('description') or ''):
+            mutation = ('mutation($id: String!, $content: String!, $description: String!) '
+                        '{ projectUpdate(id: $id, input: {content: $content, description: $description}) '
+                        '{ success project { content description } } }')
+            variables['description'] = legacy
+        else:
+            mutation = ('mutation($id: String!, $content: String!) '
+                        '{ projectUpdate(id: $id, input: {content: $content}) '
+                        '{ success project { content } } }')
+        payload = self.mutation_payload(
+            self.gql(mutation, variables), 'projectUpdate', 'project %s update' % key)
+        observed = payload.get('project') or {}
+        if observed.get('content') != content:
+            die("Linear project %s update did not read back the requested content — andon" % key)
+        if 'description' in variables and observed.get('description') != legacy:
+            die("Linear project %s update did not read back the migrated description — andon" % key)
+
+    def upsert_digest(self, feature_id, body):
+        self.upsert_project_block(feature_id, 'digest', body)
 
     def upsert_deployment(self, feature_id, body):
-        pid = self.project_id(feature_id)
-        d = self.gql('query($id: String!) { project(id: $id) { description } }', {'id': pid})
-        description = replace_managed_block((d.get('project') or {}).get('description') or '', 'deployment', body)
-        d = self.gql('mutation($id: String!, $description: String!) { projectUpdate(id: $id, input: {description: $description}) { success project { description } } }',
-                     {'id': pid, 'description': description})
-        payload = self.mutation_payload(d, 'projectUpdate', 'project deployment update')
-        if (payload.get('project') or {}).get('description') != description:
-            die("Linear project deployment update did not read back the requested description — andon")
+        self.upsert_project_block(feature_id, 'deployment', body)
 
     def current_feature_status(self, feature_id):
         d = self.gql('query($id: String!) { project(id: $id) { status { name } } }',

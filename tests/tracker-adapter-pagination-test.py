@@ -310,6 +310,66 @@ class LinearPaginationTest(unittest.TestCase):
             project_id, self.ns["feature_status_by_name"]("Resolved"))
         self.assertEqual([None, "page-2"], cursors)
 
+    def _upsert_digest(self, description, content, body):
+        """Run a digest upsert against a project with the given fields."""
+        project_id = "00000000-0000-0000-0000-000000000001"
+        state = {"description": description, "content": content}
+        writes = []
+
+        def gql(query, variables=None):
+            variables = variables or {}
+            if "project(id:" in query and "projectUpdate" not in query:
+                return {"project": dict(state)}
+            if "projectUpdate" in query:
+                writes.append(dict(variables))
+                # A real tracker refuses an over-long short description; the
+                # adapter must never send one.
+                if "description" in variables and len(variables["description"]) > 255:
+                    self.fail("description exceeded the 255-character limit")
+                state.update({k: v for k, v in variables.items() if k != "id"})
+                return {"projectUpdate": {"success": True, "project": dict(state)}}
+            self.fail("unexpected Linear query: %s" % query)
+
+        self.linear.gql = gql
+        self.linear.upsert_digest(project_id, body)
+        return state, writes
+
+    def test_digest_goes_to_content_and_leaves_the_short_description_alone(self):
+        # A real digest is far longer than a short description may be, so the
+        # projection must target the long-form field.
+        body = "[digest]\n" + "\n".join("task ENG-%d: integrated" % n for n in range(40))
+        self.assertGreater(len(body), 255)
+        summary = "Operator-authored summary of this feature."
+        state, writes = self._upsert_digest(summary, "", body)
+        self.assertEqual(summary, state["description"])
+        self.assertIn("[digest]", state["content"])
+        self.assertIn("agent-squad:digest:start", state["content"])
+        self.assertEqual(1, len(writes))
+        self.assertNotIn("description", writes[0])
+
+    def test_digest_migrates_a_block_left_in_the_short_description(self):
+        # A project written by an older version carries the block in the wrong
+        # field; one upsert must move it and preserve the human-authored text.
+        summary = ("Operator-authored summary.\n\n"
+                   "<!-- agent-squad:digest:start -->\n[digest]\nstale\n"
+                   "<!-- agent-squad:digest:end -->\n")
+        state, writes = self._upsert_digest(summary, "", "[digest]\nfresh")
+        self.assertEqual("Operator-authored summary.", state["description"])
+        self.assertNotIn("agent-squad:digest", state["description"])
+        self.assertIn("fresh", state["content"])
+        self.assertEqual(1, len(writes))
+        self.assertIn("description", writes[0])
+
+    def test_digest_preserves_user_authored_content_around_the_block(self):
+        content = ("# Notes\n\nKeep me.\n\n"
+                   "<!-- agent-squad:digest:start -->\n[digest]\nold\n"
+                   "<!-- agent-squad:digest:end -->\n\nKeep me too.")
+        state, _writes = self._upsert_digest("Summary.", content, "[digest]\nnew")
+        self.assertIn("Keep me.", state["content"])
+        self.assertIn("Keep me too.", state["content"])
+        self.assertIn("new", state["content"])
+        self.assertNotIn("old", state["content"])
+
     def test_probe_reads_only_the_feature_container(self):
         project_id = "00000000-0000-0000-0000-000000000001"
         calls = []

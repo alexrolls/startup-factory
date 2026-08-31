@@ -105,7 +105,7 @@ Completed (Linear project states).
 | update comment | `update_comment` MCP tool | GraphQL `commentUpdate(id: $commentId, input: {body: $body})`; or `bin/tracker-ops.sh update-comment <taskId> <commentId> <bodyfile>` |
 | Upsert task runtime progress | update the existing managed progress comment or create it | `bin/tracker-ops.sh upsert-progress <taskId> <bodyfile>` |
 | Upsert feature runtime digest | update the existing managed digest comment or create it | `bin/tracker-ops.sh upsert-digest <featureId> <bodyfile>` |
-| Upsert feature deployment state | update the managed project-description deployment block | `bin/tracker-ops.sh upsert-deployment <featureId> <bodyfile>` |
+| Upsert feature deployment state | update the managed deployment block in the project's `content` | `bin/tracker-ops.sh upsert-deployment <featureId> <bodyfile>` |
 
 > **Helper script.** For the `rest` mechanism, `bin/tracker-ops.sh` wraps the recurring
 > operations — `claim`, `state`, `comment` (body from a file or stdin, so no shell-quoting
