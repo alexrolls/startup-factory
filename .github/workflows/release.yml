@@ -331,19 +331,37 @@ jobs:
           set -euo pipefail
           exact_output=""
           latest_output=""
+          # The version check belongs in the `if` CONDITION, not its body. A
+          # freshly published version is not immediately visible to the index
+          # `uvx --refresh "…@latest"` resolves against, so the first attempts
+          # legitimately report the previous version. With the check inside the
+          # body, `set -e` aborted the whole step on that first stale answer:
+          # the retry budget below only ever covered `uvx` itself failing, never
+          # the propagation lag it exists for. A transient lag then skipped the
+          # github-release job, leaving the package on PyPI with no tag or
+          # release — a half-published release that reads as a failed one.
+          #
+          # As part of the condition, a stale answer makes the condition false,
+          # so the loop retries as intended. A genuinely wrong version still
+          # fails: it simply fails after the budget is exhausted rather than on
+          # the first attempt.
           for attempt in $(seq 1 18); do
             if exact_output="$(uvx --refresh "startup-factory@$VERSION" version --json 2>&1)" &&
-              latest_output="$(uvx --refresh "startup-factory@latest" version --json 2>&1)"; then
+              latest_output="$(uvx --refresh "startup-factory@latest" version --json 2>&1)" &&
               python - "$VERSION" "$exact_output" "$latest_output" <<'PY'
           import json
           import sys
 
           expected, *responses = sys.argv[1:]
           for raw in responses:
-              result = json.loads(raw.splitlines()[-1])
+              try:
+                  result = json.loads(raw.splitlines()[-1])
+              except (IndexError, ValueError):
+                  raise SystemExit("uvx did not return a JSON version response")
               if result != {"ok": True, "version": expected}:
                   raise SystemExit(f"unexpected uvx version response: {result!r}")
           PY
+            then
               printf '%s\n' "$exact_output" "$latest_output"
               exit 0
             fi

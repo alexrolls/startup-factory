@@ -151,7 +151,7 @@ class ProjectMetadataTests(unittest.TestCase):
     def test_public_package_metadata(self) -> None:
         project = self.config["project"]
         self.assertEqual(project["name"], "startup-factory")
-        self.assertEqual(project["version"], "0.1.17")
+        self.assertEqual(project["version"], "0.1.18")
         self.assertEqual(project["requires-python"], ">=3.10")
         self.assertEqual(project["license"], "MIT")
         self.assertEqual(project["license-files"], ["LICENSE"])
@@ -234,6 +234,31 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('uvx --refresh "startup-factory@latest" version --json', workflow)
         github_release = workflow.split("  github-release:\n", 1)[1]
         self.assertIn("      - verify-uvx", github_release.split("    runs-on:", 1)[0])
+
+    def test_uvx_version_check_is_part_of_the_retry_condition(self) -> None:
+        # A freshly published version is not immediately visible to the index
+        # `@latest` resolves against, so the first attempts legitimately report
+        # the previous version. The check must therefore be part of the `if`
+        # condition: inside the body, `set -e` aborts the step on the first
+        # stale answer and the retry budget never applies to the propagation lag
+        # it exists for — which skips github-release and half-publishes a release.
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        step = workflow.split("      - name: Resolve the published release through uvx", 1)[1]
+        step = step.split("\n  github-release:", 1)[0]
+        loop = step.split("for attempt in", 1)[1]
+        # The condition ends at a `then` on its own line. Requiring the split to
+        # actually find one matters: without it, a body-style `; then` leaves the
+        # whole loop as the "condition" and every assertion below passes
+        # vacuously — which is exactly the shape this test exists to reject.
+        head, sep, _tail = loop.partition("\n            then\n")
+        self.assertTrue(sep, "the uvx retry condition must end at a standalone `then`")
+        self.assertIn('uvx --refresh "startup-factory@$VERSION"', head)
+        self.assertIn('uvx --refresh "startup-factory@latest"', head)
+        self.assertIn('python - "$VERSION" "$exact_output" "$latest_output"', head)
+        # The retry must still exist, and the step must still fail closed.
+        self.assertIn("$(seq 1 18)", step)
+        self.assertIn("sleep 10", step)
+        self.assertIn("exit 1", step)
 
     def test_draft_release_target_is_verified_before_the_tag_exists(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
@@ -323,7 +348,7 @@ class BuiltDistributionIdentityTests(unittest.TestCase):
             license_bytes = archive.read(license_names[0])
 
         self.assertEqual(metadata["Name"], "startup-factory")
-        self.assertEqual(metadata["Version"], "0.1.17")
+        self.assertEqual(metadata["Version"], "0.1.18")
         self.assertEqual(metadata["Requires-Python"], ">=3.10")
         self.assertEqual(metadata["License-Expression"], "MIT")
         self.assertEqual(metadata.get_all("License-File", []), ["LICENSE"])
