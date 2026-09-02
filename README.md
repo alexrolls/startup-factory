@@ -28,6 +28,7 @@ Startup Factory does not replace your coding agent, repository, project-manageme
 
 - [Who it is for](#who-it-is-for)
 - [Quick start (two minutes, no accounts)](#quick-start-two-minutes-no-accounts)
+  - [Safe updates](#safe-updates)
 - [Ten easy prompts for startup delivery](#ten-easy-prompts-for-startup-delivery)
 - [See the factory work](#see-the-factory-work)
 - [This is not another coding copilot](#this-is-not-another-coding-copilot)
@@ -90,6 +91,102 @@ PLAN -> BUILD -> REVIEW -> VERIFY
 ```
 
 Run it on one small, real feature. You will know quickly whether the workflow fits.
+
+### Safe updates
+
+Preview and apply an update with the same release CLI. It recognizes the
+selected project installation and performs a complete preflight before any
+destination mutation:
+
+```bash
+uvx startup-factory@latest update --agent codex --dry-run
+uvx startup-factory@latest update --agent codex
+```
+
+For Claude Code, use `--agent claude-code`. You can also ask your agent:
+
+```text
+Fetch latest Startup Factory skill.
+```
+
+Existing project configuration remains byte-for-byte untouched by default,
+while newly introduced config files are installed. Destination-only files under
+the documented `adapters/`, `extensions/`, and `teams/` extension points are
+also preserved. A generated ownership manifest lets later updates delete an
+upstream extension that has been retired without mistaking project-owned files
+for upstream files. A legacy installation without a manifest is migrated
+conservatively: destination-only extension files are kept. If a later upstream
+release introduces a file at a project-owned extension path, the update fails
+before mutation instead of overwriting it:
+
+- [`config/project-management.config.md`](config/project-management.config.md)
+- [`config/planning.config.md`](config/planning.config.md)
+- [`config/team.config.md`](config/team.config.md)
+- [`config/statuses.config.json`](config/statuses.config.json)
+- [`config/automation.config.json`](config/automation.config.json)
+- [`config/deployment.config.json`](config/deployment.config.json)
+- [`config/guardrails.config.json`](config/guardrails.config.json)
+
+To intentionally replace those files with upstream defaults too:
+
+```bash
+uvx startup-factory@latest update --agent codex --overwrite-config
+```
+
+To verify the owned runtime independently of preserved configuration and custom
+extensions:
+
+```bash
+uvx startup-factory@latest verify --agent codex
+```
+
+The release CLI uses a sibling staging directory, an installation lock, and a
+backup swap with rollback. Interrupted copying cannot silently turn a valid
+installation into a partial one. Its main operator options are:
+
+| Option | Purpose |
+|---|---|
+| `--agent codex\|claude-code\|aider\|deepseek-harness` | Select the native project skill directory. |
+| `--project PATH` | Resolve the agent directory relative to another project. |
+| `--install-dir PATH` | Override the mapped installation directory. |
+| `--bundle PATH` | For install/update, use an explicitly supplied local canonical archive. |
+| `--overwrite-config` | For install/update, replace all seven preserved project configuration files. |
+| `--dry-run` | For install/update, print the plan without writing the destination or lock. |
+| `--mode solo\|team\|autonomous\|release` | Select the initialization/readiness profile; protected modes are inspection-only in phase one. |
+| `--apply` | For `init`, atomically apply a supported preview; without it initialization is read-only. |
+| `--product-management-tool ADAPTER` | For `init`, select an installed regular adapter without accepting credentials. |
+| `--json` | Emit machine-readable output for operator automation. |
+
+The `--mode` profiles are described in [Choose how much autonomy you want](#choose-how-much-autonomy-you-want), and `--product-management-tool` accepts any adapter listed in [Project-management tools](#project-management-tools).
+
+Legacy or source-installed copies can continue to use the shell compatibility
+updater from their installed bundle:
+
+```bash
+bash .agents/skills/startup-factory/bin/update-installed-skill.sh --dry-run
+bash .agents/skills/startup-factory/bin/update-installed-skill.sh
+bash .agents/skills/startup-factory/tests/run-all.sh --smoke
+```
+
+It requires `git`, `rsync`, and `python3`, accepts `--remote-url` and `--ref`,
+and defaults to `main`; prefer a reviewed tag or exact commit. The compatibility
+updater builds and validates a sibling staging tree under an installation lock,
+then uses a backup swap so a failed copy cannot partially replace the live
+skill. Before activation it verifies that the selected tracker adapter and
+configured `STATUS_CONFIG` both exist in the staged result. It also parses the
+retained board and checks its status names, transitions, initial/terminal
+states, and mappings for the selected project-management tool, returning a
+specific error before mutation if they are incompatible. Existing canonical
+config, the configured custom status board, and destination-only project files
+are preserved by default. Path plus Git-object ownership metadata lets a later
+update delete a retired upstream file only when its installed bytes still match
+the previously installed source; legacy path-only metadata is migrated
+conservatively.
+
+Each successful source-managed update records the exact fetched commit in
+`.startup-factory-source-install.json`. The console reports the planned or
+applied filesystem-entry count; when the install directory is Git-ignored it
+also explains why `git status` and `git diff` cannot display those changes.
 
 ## Ten easy prompts for startup delivery
 
@@ -337,7 +434,7 @@ Start small and add authority only when the environment is ready.
 | **Autonomous** | A deterministic supervisor scans the board, restores in-flight state, and launches only eligible bounded work | Carefully controlled unattended queues |
 | **Release** | A separate executor applies an exact, approved production plan and verifies the target | Governed production delivery |
 
-`init --apply` configures the safe `solo` and `team` starting modes. Autonomous board processing and production release are intentionally off by default and require external configuration, identities, sandboxes, hooks, and readiness checks. Read [Safety is part of the architecture](#safety-is-part-of-the-architecture) before turning either on.
+`init --apply` configures the safe `solo` and `team` starting modes; the full flag list is in [Safe updates](#safe-updates). Autonomous board processing and production release are intentionally off by default and require external configuration, identities, sandboxes, hooks, and readiness checks. Read [Safety is part of the architecture](#safety-is-part-of-the-architecture) before turning either on.
 
 ## Safety is part of the architecture
 
@@ -434,7 +531,7 @@ Claude Code users can optionally connect [`obra/superpowers`](https://github.com
 
 ## Project status
 
-Startup Factory is early-stage open-source software under active development. Start with Markdown and `solo` or `team` mode. Pin a reviewed package version in controlled environments, and do not enable autonomous or production operation until the documented readiness checks pass.
+Startup Factory is early-stage open-source software under active development. Start with Markdown and `solo` or `team` mode. Pin a reviewed package version in controlled environments and upgrade through [Safe updates](#safe-updates), and do not enable autonomous or production operation until the documented readiness checks pass.
 
 The framework is deliberately explicit. It would rather stop visibly than invent state, skip a gate, or pretend that work shipped.
 
