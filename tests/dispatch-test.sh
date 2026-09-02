@@ -292,6 +292,38 @@ check "PA queue in mailbox"          grep -rq "$FID#4" .teamwork/feat-team/mailb
 check "sceptical queue in mailbox"   grep -rq "$FID#4" .teamwork/feat-team/mailbox/sceptical-architect/
 check "security reviewer launched"   test -f .teamwork/feat-team/pids/senior-security-engineer.pid
 
+# -- idle passes reuse the cached export instead of re-reading the tracker -----
+# The export dominates a pass; re-reading an unchanged [feature] every cadence
+# is what exhausts a hosted tracker's request budget.
+check "first pass recorded a change token" test -s .teamwork/feat-team/dispatch.change-token
+check "first pass recorded a pass marker"  test -s .teamwork/feat-team/dispatch.last-pass
+# A pass that acts on the board also writes to it, so its own token is stale by
+# the time it is recorded. Settle first, then assert the next pass reuses.
+TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once >/dev/null 2>&1
+reuse_out="$(TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once 2>&1)"
+if echo "$reuse_out" | grep -q "tracker unchanged; reusing the cached feature export"; then
+  echo "ok: unchanged tracker reuses the cached export"
+else
+  echo "FAIL: unchanged tracker still paid for a full export"; FAILURES=$((FAILURES+1))
+fi
+# A real edit must defeat the cache: a missed change would strand the work.
+printf '\n## 9 Fresh work [Planned]\n' >> "$FID"
+change_out="$(TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once 2>&1)"
+if echo "$change_out" | grep -q "tracker unchanged; reusing the cached feature export"; then
+  echo "FAIL: an edited [feature] was skipped as unchanged"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: an edited [feature] forces a fresh export"
+fi
+check "edited task reached the snapshot" grep -q "Fresh work" .teamwork/feat-team/tasks.json
+# An elapsed reuse window forces a full export even when the token has not moved.
+echo 0 > .teamwork/feat-team/dispatch.export-at
+stale_out="$(TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once 2>&1)"
+if echo "$stale_out" | grep -q "tracker unchanged; reusing the cached feature export"; then
+  echo "FAIL: reuse was not bounded by EXPORT_MAX_REUSE_SECONDS"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: reuse is bounded even when the token has not moved"
+fi
+
 # -- agent-writable PID text is not a liveness authority -----------------------
 mkdir -p .teamwork/feat-team/pids
 echo $$ > .teamwork/feat-team/pids/senior-security-engineer.pid

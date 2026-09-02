@@ -19,6 +19,7 @@
 #                                                                            # idempotent [DENIED ACTION] audit comment
 #   tracker-ops.sh integrate      <taskId> <hash> [bodyfile]                # terminal move + completion comment citing <hash>
 #   tracker-ops.sh probe          <featureId>                               # minimal read proving access + feature scope
+#   tracker-ops.sh change-token   <featureId>                               # read-side: cheap token that moves when the [feature] changes
 #   tracker-ops.sh export         <featureId> <outfile>                     # read-side: dump the [feature]'s [tasks] as JSON
 #   tracker-ops.sh scan           <outfile> --status <Status>...            # board-wide normalized discovery
 #   tracker-ops.sh feature-state  <featureId> <Status>                      # set [feature] status (generic name)
@@ -526,6 +527,58 @@ class Linear:
         observed = (data.get('project') or {}).get('id')
         if observed != project_id:
             die("no Linear project '%s' — andon" % feature_id)
+
+    def change_token(self, feature_id):
+        # Two requests, independent of [task] count, versus the hundreds a full
+        # export costs. The token is a high-water mark over everything the
+        # export reads: the project itself, the most recently updated issue
+        # (archived included, so trashing one still moves the mark), and the
+        # most recently updated comment.
+        #
+        # A high-water mark cannot prove a hard delete, which removes a row
+        # without moving any surviving row's timestamp. That is why the caller
+        # must also refresh on a bounded interval: a token this misses delays
+        # an export, it does not cancel it. Anything unreadable returns None,
+        # which forces the exhaustive export rather than a false "nothing
+        # moved".
+        project_id = self.project_id(feature_id)
+        issues = self.gql('''query($id: String!) {
+          project(id: $id) {
+            updatedAt
+            issues(first: 1, orderBy: updatedAt, includeArchived: true) {
+              nodes { updatedAt }
+              pageInfo { hasNextPage }
+            }
+          }
+        }''', {'id': project_id})
+        project = (issues.get('project') or {}) if isinstance(issues, dict) else {}
+        connection = project.get('issues') or {}
+        nodes = connection.get('nodes')
+        if not isinstance(nodes, list):
+            return None
+        issue_mark = (nodes[0] or {}).get('updatedAt') if nodes else ''
+        comments = self.gql('''query($id: ID!) {
+          comments(
+            filter: { project: { id: { eq: $id } } }
+            orderBy: updatedAt
+            first: 1
+          ) {
+            nodes { updatedAt }
+          }
+        }''', {'id': project_id})
+        comment_nodes = ((comments.get('comments') or {}).get('nodes')
+                         if isinstance(comments, dict) else None)
+        if not isinstance(comment_nodes, list):
+            return None
+        comment_mark = (comment_nodes[0] or {}).get('updatedAt') if comment_nodes else ''
+        if not isinstance(issue_mark, (str, type(None))) or not isinstance(
+                comment_mark, (str, type(None))):
+            return None
+        return 'linear:' + hashlib.sha256(json.dumps({
+            'project': project.get('updatedAt') or '',
+            'issue': issue_mark or '',
+            'comment': comment_mark or '',
+        }, sort_keys=True).encode('utf-8')).hexdigest()
 
     @staticmethod
     def mutation_payload(data, key, action):
@@ -1851,6 +1904,12 @@ class Markdown:
         if not re.search(r'^# .*?\[[^\]]+\][ \t]*$', text, re.M):
             die("Markdown feature has no bracketed status: %s" % feature_id)
 
+    def change_token(self, feature_id):
+        # The whole board is one file, so the token is exact: any edit the
+        # export could observe changes the digest.
+        return 'sha256:' + hashlib.sha256(
+            self.load(feature_id).encode('utf-8')).hexdigest()
+
     def save(self, feature_id, text):
         directory_fd = temp_fd = None
         temp_name = None
@@ -2261,6 +2320,25 @@ def op_probe(args):
             die("adapter returned a malformed feature probe — andon")
     print("probe OK: %s" % feature_id)
 
+def op_change_token(args):
+    if len(args) != 1:
+        die("usage: change-token <featureId>")
+    feature_id = args[0]
+    resolver = getattr(backend, 'change_token', None)
+    if not callable(resolver):
+        # Adapters that cannot prove "nothing moved" simply do not offer a
+        # token, and every caller falls back to the exhaustive export.
+        print("")
+        return
+    token = resolver(feature_id)
+    if token is None:
+        print("")
+        return
+    if not isinstance(token, str) or not token or len(token) > 512 or any(
+            ord(character) < 32 for character in token):
+        die("adapter returned a malformed change token — andon")
+    print(token)
+
 def op_state(args):
     if len(args) != 2:
         die("usage: state <taskId> <Status>")
@@ -2659,13 +2737,13 @@ def op_scan(args):
         os.replace(temp, outfile)
         print("scanned %d [tasks] (%d orphaned) to %s" % (len(normalized), len(orphans), outfile))
 
-OPS = {'probe': op_probe, 'state': op_state, 'comment': op_comment, 'comment-once': op_comment_once, 'update-comment': op_update_comment,
+OPS = {'probe': op_probe, 'change-token': op_change_token, 'state': op_state, 'comment': op_comment, 'comment-once': op_comment_once, 'update-comment': op_update_comment,
        'upsert-progress': op_upsert_progress, 'upsert-digest': op_upsert_digest,
        'upsert-deployment': op_upsert_deployment, 'feature-state': op_feature_state,
        'feature-reopen': op_feature_reopen, 'task-reopen': op_task_reopen,
        'claim': op_claim, 'record-denial': op_record_denial, 'integrate': op_integrate,
        'export': op_export, 'scan': op_scan}
 if not ARGS or ARGS[0] not in OPS:
-    die("usage: tracker-ops.sh {probe|state|feature-state|feature-reopen|task-reopen|comment|comment-once|update-comment|upsert-progress|upsert-digest|upsert-deployment|claim|record-denial|integrate|export|scan} ...")
+    die("usage: tracker-ops.sh {probe|change-token|state|feature-state|feature-reopen|task-reopen|comment|comment-once|update-comment|upsert-progress|upsert-digest|upsert-deployment|claim|record-denial|integrate|export|scan} ...")
 OPS[ARGS[0]](ARGS[1:])
 PYEOF

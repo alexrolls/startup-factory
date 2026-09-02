@@ -23,6 +23,51 @@ before any status write, outbox processing, integration, or launch.
 owns that process**, explicitly. Hiding this ownership is how a pipeline
 silently stalls for hours.
 
+## What an idle pass costs
+
+The [feature] export dominates a pass. On a [feature] with hundreds of [tasks]
+it is hundreds of tracker requests, so a watch loop at the default cadence can
+exhaust an hourly hosted-tracker budget without any work having changed — which
+is how an affordable-looking mechanism becomes unusable and operators fall back
+to invisible manual dispatch.
+
+A pass therefore asks the adapter for a **change token** first
+(`tracker-ops.sh change-token <featureId>`) and reuses the cached export when
+the token has not moved. An idle pass costs a couple of requests instead of
+hundreds.
+
+The contract on that token is the important part:
+
+- It must move whenever anything the export reads moves. An adapter that cannot
+  promise this must not implement `change_token` at all; absence degrades to a
+  full export every pass, never to a false "nothing moved".
+- Reuse is bounded by `EXPORT_MAX_REUSE_SECONDS` (default 900). A full export
+  runs once that elapses regardless of the token, so a token that misses an edit
+  delays an export rather than cancelling one.
+- The token is recorded only after a successful export, so a failed export
+  cannot leave a token claiming the cached snapshot is current.
+
+Shipped support: Markdown (exact, a digest of the single board file) and Linear
+(a high-water mark over the project, its most recently updated issue including
+archived ones, and its most recently updated comment). Jira and GitHub Issues
+export every pass.
+
+## Seeing a stalled board
+
+Every role reaching `exited` is the normal end of a pass, so per-role health
+cannot distinguish a board that finished cleanly from one nobody is driving.
+`launch-team.sh health` adds one board-level line per team:
+
+```
+factory-one: STALLED — 2 queued tasks, 4 undrained artifacts, last pass 31m ago
+```
+
+`STALLED` means outstanding work, no live agent, and no dispatch pass in the
+last 15 minutes. `IDLE` is the same without the elapsed-time evidence,
+`WORKING` has live agents, and `DRAINED` is the quiet, healthy end of a run.
+Each completed non-dry pass records its time in `dispatch.last-pass`, which is
+the evidence the verdict rests on. All of it is presentation only.
+
 ## The event table
 
 One pass reads the [feature]'s task export, the team mailboxes, and the

@@ -345,8 +345,53 @@ dispatch_once() { # dispatch_once <team> <featureId> <dry:yes|no> [target-task]
 
   # Holds must observe the complete authoritative feature, including work that
   # is reserved from autonomous claiming with an ignored label.
-  env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
-    "$SKILL_DIR/bin/tracker-ops.sh" export "$fid" "$tasks_file" >/dev/null
+  #
+  # The export dominates the cost of a pass: on a [feature] with hundreds of
+  # [tasks] it is hundreds of requests, so a watch loop at the default cadence
+  # can exhaust an hourly tracker budget without any work having changed. Ask
+  # the adapter for a cheap change token first and reuse the previous snapshot
+  # when nothing moved.
+  #
+  # Reuse is bounded on purpose. A token is a high-water mark, and a
+  # sufficiently unusual tracker edit can fail to move one, so a full export
+  # runs at least every EXPORT_MAX_REUSE_SECONDS regardless. A missed change
+  # therefore delays an export; it can never cancel one.
+  # Declared then assigned: `local x="$(cmd)"` would return local's own status
+  # and hide a rejected path from set -e.
+  local token_file export_stamp max_reuse
+  token_file="$(team_path "$dir" dispatch.change-token)"
+  export_stamp="$(team_path "$dir" dispatch.export-at)"
+  max_reuse="$(read_key EXPORT_MAX_REUSE_SECONDS)"; max_reuse="${max_reuse:-900}"
+  # A misconfigured value must not decide how long a stale export is trusted,
+  # and must not abort the pass in a numeric test either.
+  case "$max_reuse" in *[!0-9]*|"") max_reuse=900 ;; esac
+  local reuse=no
+  if [ -s "$tasks_file" ] && [ -s "$token_file" ]; then
+    local observed_token cached_token last_export now_seconds
+    observed_token="$(env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
+      "$SKILL_DIR/bin/tracker-ops.sh" change-token "$fid" 2>/dev/null || true)"
+    cached_token="$(cat "$token_file" 2>/dev/null || true)"
+    if [ -n "$observed_token" ] && [ "$observed_token" = "$cached_token" ]; then
+      now_seconds="$(date -u +%s)"
+      last_export="$(cat "$export_stamp" 2>/dev/null || echo 0)"
+      case "$last_export" in *[!0-9]*|"") last_export=0 ;; esac
+      if [ "$((now_seconds - last_export))" -lt "$max_reuse" ]; then
+        reuse=yes
+      fi
+    fi
+  fi
+  if [ "$reuse" = yes ]; then
+    echo "dispatch: tracker unchanged; reusing the cached feature export"
+  else
+    env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
+      "$SKILL_DIR/bin/tracker-ops.sh" export "$fid" "$tasks_file" >/dev/null
+    # Record the token only after a successful export, so a failed export can
+    # never leave a token claiming the cached snapshot is current.
+    env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
+      "$SKILL_DIR/bin/tracker-ops.sh" change-token "$fid" 2>/dev/null \
+      > "$token_file" || : > "$token_file"
+    date -u +%s > "$export_stamp" 2>/dev/null || true
+  fi
   if [ "$dry" != "yes" ]; then
     local hold_result hold_actions hold_action hold_task hold_graph changed=no
     hold_result="$(python3 "$SKILL_DIR/bin/task-hold.py" sync \
@@ -629,8 +674,9 @@ EOF
   # pass, so this marker is the only evidence that separates a board nobody is
   # driving from one that simply finished its work.
   if [ "$dry" = "no" ]; then
-    printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      > "$(team_path "$dir" dispatch.last-pass)" 2>/dev/null || true
+    local pass_marker
+    pass_marker="$(team_path "$dir" dispatch.last-pass)"
+    printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$pass_marker"
   fi
 }
 
