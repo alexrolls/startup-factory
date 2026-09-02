@@ -53,6 +53,8 @@ FULL_PYTHON_TESTS=(
   tracker-adapter-pagination-test.py
   heartbeat-status-test.py
   task-hold-test.py
+  outbox-capability-supersede-test.py
+  board-status-test.py
   custom-tracker-release-snapshot-test.py
 )
 FULL_SHELL_TESTS=(
@@ -87,6 +89,8 @@ SMOKE_PYTHON_TESTS=(
   tracker-adapter-pagination-test.py
   heartbeat-status-test.py
   task-hold-test.py
+  outbox-capability-supersede-test.py
+  board-status-test.py
 )
 SMOKE_SHELL_TESTS=(
   update-installed-skill-test.sh
