@@ -109,6 +109,35 @@ class SummarizeTest(unittest.TestCase):
     def test_the_summary_stays_presentation_only(self) -> None:
         self.assertIs(self.summarize()["presentationOnly"], True)
 
+    def test_the_idle_threshold_is_configurable(self) -> None:
+        """A pass age between the custom and default thresholds must flip."""
+        arguments = {"counts": counts(queued=1), "last_pass": NOW - timedelta(minutes=8)}
+        self.assertEqual(self.summarize(**arguments)["verdict"], "IDLE")
+        self.assertEqual(
+            self.summarize(idle_minutes=5, **arguments)["verdict"], "STALLED"
+        )
+
+    def test_the_configured_threshold_is_reported_back(self) -> None:
+        self.assertEqual(self.summarize(idle_minutes=5)["idleMinutes"], 5)
+
+    def test_a_zero_idle_threshold_is_refused(self) -> None:
+        with self.assertRaises(board_status.BoardStatusError):
+            self.summarize(idle_minutes=0)
+
+    def test_the_threshold_is_inclusive_at_its_exact_boundary(self) -> None:
+        """Pins >= rather than >, so the boundary cannot drift unnoticed."""
+        arguments = {"counts": counts(queued=1)}
+        self.assertEqual(
+            self.summarize(last_pass=NOW - timedelta(minutes=15), **arguments)["verdict"],
+            "STALLED",
+        )
+        self.assertEqual(
+            self.summarize(
+                last_pass=NOW - timedelta(seconds=15 * 60 - 1), **arguments
+            )["verdict"],
+            "IDLE",
+        )
+
 
 class BoardLineTest(unittest.TestCase):
     def test_the_operator_line_names_work_artifacts_and_pass_age(self) -> None:

@@ -19,7 +19,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_STATUS_FIXTURE = ROOT / "config" / "statuses.config.json"
+DEFAULT_STATUS_FIXTURE = ROOT / "tests" / "fixtures" / "statuses.default-profile.json"
+PROJECT_UUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
 
 
 def load_definitions(adapter, extra_config=""):
@@ -52,7 +53,6 @@ class LinearChangeTokenTest(unittest.TestCase):
         os.environ["LINEAR_API_KEY"] = "offline-test-key"
         self.ns = load_definitions("Linear", "LINEAR_DEFAULT_TEAM=ENG\n")
         self.linear = self.ns["Linear"]()
-        self.linear.project_id = lambda feature_id: "project-1"
         self.requests = 0
 
     def respond(self, *, project="2026-09-02T10:00:00Z",
@@ -78,60 +78,80 @@ class LinearChangeTokenTest(unittest.TestCase):
                                 "issues": {"nodes": nodes,
                                            "pageInfo": {"hasNextPage": False}}}}
         self.linear.gql = gql
+        return gql
 
     def test_an_idle_project_costs_two_requests(self) -> None:
-        """The whole point: bounded cost that does not scale with task count."""
+        """The whole point: bounded cost that does not scale with task count.
+
+        A UUID feature id resolves without a lookup, so this counts the probe
+        itself. A name-configured [feature] adds exactly one resolution request,
+        which the next test pins; neither grows with [task] count.
+        """
         self.respond()
-        self.linear.change_token("FEATURE-1")
+        self.linear.change_token(PROJECT_UUID)
         self.assertEqual(self.requests, 2)
+
+    def test_a_name_configured_project_adds_one_resolution_request(self) -> None:
+        outer = self.respond()
+
+        def gql(query, variables=None):
+            if "projects(first: 2" in query:
+                self.requests += 1
+                return {"projects": {"nodes": [{"id": PROJECT_UUID,
+                                                "name": "Feature One"}]}}
+            return outer(query, variables)
+
+        self.linear.gql = gql
+        self.assertTrue(self.linear.change_token("Feature One"))
+        self.assertEqual(self.requests, 3)
 
     def test_the_token_is_stable_while_nothing_moves(self) -> None:
         self.respond()
-        first = self.linear.change_token("FEATURE-1")
-        second = self.linear.change_token("FEATURE-1")
+        first = self.linear.change_token(PROJECT_UUID)
+        second = self.linear.change_token(PROJECT_UUID)
         self.assertEqual(first, second)
         self.assertTrue(first.startswith("linear:"))
 
     def test_an_edited_issue_moves_the_token(self) -> None:
         self.respond()
-        before = self.linear.change_token("FEATURE-1")
+        before = self.linear.change_token(PROJECT_UUID)
         self.respond(issue="2026-09-02T11:45:00Z")
-        self.assertNotEqual(before, self.linear.change_token("FEATURE-1"))
+        self.assertNotEqual(before, self.linear.change_token(PROJECT_UUID))
 
     def test_a_new_comment_moves_the_token(self) -> None:
         """A review verdict arrives as a comment; missing it would strand it."""
         self.respond()
-        before = self.linear.change_token("FEATURE-1")
+        before = self.linear.change_token(PROJECT_UUID)
         self.respond(comment="2026-09-02T12:15:00Z")
-        self.assertNotEqual(before, self.linear.change_token("FEATURE-1"))
+        self.assertNotEqual(before, self.linear.change_token(PROJECT_UUID))
 
     def test_a_project_edit_moves_the_token(self) -> None:
         self.respond()
-        before = self.linear.change_token("FEATURE-1")
+        before = self.linear.change_token(PROJECT_UUID)
         self.respond(project="2026-09-02T12:00:00Z")
-        self.assertNotEqual(before, self.linear.change_token("FEATURE-1"))
+        self.assertNotEqual(before, self.linear.change_token(PROJECT_UUID))
 
     def test_an_empty_project_still_yields_a_token(self) -> None:
         self.respond(issue="", comment="")
-        self.assertTrue(self.linear.change_token("FEATURE-1"))
+        self.assertTrue(self.linear.change_token(PROJECT_UUID))
 
     def test_a_first_issue_moves_the_token_from_empty(self) -> None:
         self.respond(issue="", comment="")
-        before = self.linear.change_token("FEATURE-1")
+        before = self.linear.change_token(PROJECT_UUID)
         self.respond(comment="")
-        self.assertNotEqual(before, self.linear.change_token("FEATURE-1"))
+        self.assertNotEqual(before, self.linear.change_token(PROJECT_UUID))
 
     def test_a_malformed_issue_response_forces_a_full_export(self) -> None:
         self.respond(issue_nodes="not-a-list")
-        self.assertIsNone(self.linear.change_token("FEATURE-1"))
+        self.assertIsNone(self.linear.change_token(PROJECT_UUID))
 
     def test_a_malformed_comment_response_forces_a_full_export(self) -> None:
         self.respond(comment_nodes="not-a-list")
-        self.assertIsNone(self.linear.change_token("FEATURE-1"))
+        self.assertIsNone(self.linear.change_token(PROJECT_UUID))
 
     def test_a_missing_project_forces_a_full_export(self) -> None:
         self.linear.gql = lambda query, variables=None: {}
-        self.assertIsNone(self.linear.change_token("FEATURE-1"))
+        self.assertIsNone(self.linear.change_token(PROJECT_UUID))
 
     def test_an_oldest_first_connection_forces_a_full_export(self) -> None:
         """The ordering is checked, not trusted.
@@ -141,21 +161,21 @@ class LinearChangeTokenTest(unittest.TestCase):
         """
         self.respond(issue_nodes=[{"updatedAt": "2026-09-01T00:00:00Z"},
                                   {"updatedAt": "2026-09-02T11:00:00Z"}])
-        self.assertIsNone(self.linear.change_token("FEATURE-1"))
+        self.assertIsNone(self.linear.change_token(PROJECT_UUID))
 
     def test_an_oldest_first_comment_connection_forces_a_full_export(self) -> None:
         self.respond(comment_nodes=[{"updatedAt": "2026-09-01T00:00:00Z"},
                                     {"updatedAt": "2026-09-02T11:30:00Z"}])
-        self.assertIsNone(self.linear.change_token("FEATURE-1"))
+        self.assertIsNone(self.linear.change_token(PROJECT_UUID))
 
     def test_a_single_issue_project_needs_no_ordering_proof(self) -> None:
         """One node cannot be mis-ordered, so it is still a usable mark."""
         self.respond(issue_nodes=[{"updatedAt": "2026-09-02T11:00:00Z"}])
-        self.assertTrue(self.linear.change_token("FEATURE-1"))
+        self.assertTrue(self.linear.change_token(PROJECT_UUID))
 
     def test_a_non_string_timestamp_forces_a_full_export(self) -> None:
         self.respond(issue_nodes=[{"updatedAt": 1757000000}])
-        self.assertIsNone(self.linear.change_token("FEATURE-1"))
+        self.assertIsNone(self.linear.change_token(PROJECT_UUID))
 
 
 class MarkdownChangeTokenTest(unittest.TestCase):

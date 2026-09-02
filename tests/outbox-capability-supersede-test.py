@@ -231,6 +231,54 @@ class OutboxCapabilitySupersedeTest(unittest.TestCase):
             self.verify(payload, signature)
         self.assertIn("cannot read active capability", str(caught.exception))
 
+    def tombstones(self) -> Path:
+        return self.base / ".git" / "startup-factory-broker" / "outbox-revoked"
+
+    def test_a_group_readable_tombstone_is_treated_as_revoked(self) -> None:
+        """Revocation evidence that cannot be trusted must not let work publish."""
+        capability = self.mint_gate()
+        payload = entry()
+        signature = self.signed(capability, payload)
+        revoke_role(str(self.base), str(self.workspace), TEAM, ROLE)
+        self.mint_gate()
+
+        marker = self.tombstones() / (capability["id"] + ".revoked")
+        marker.chmod(0o644)
+
+        with self.assertRaises(CapabilityError) as caught:
+            self.verify(payload, signature)
+        self.assertIn("owner-only", str(caught.exception))
+
+    def test_a_symlinked_tombstone_is_treated_as_revoked(self) -> None:
+        capability = self.mint_gate()
+        payload = entry()
+        signature = self.signed(capability, payload)
+        revoke_role(str(self.base), str(self.workspace), TEAM, ROLE)
+        self.mint_gate()
+
+        marker = self.tombstones() / (capability["id"] + ".revoked")
+        marker.unlink()
+        marker.symlink_to(self.base / "elsewhere")
+
+        with self.assertRaises(CapabilityError) as caught:
+            self.verify(payload, signature)
+        self.assertIn("symlink", str(caught.exception))
+
+    def test_a_directory_in_place_of_a_tombstone_is_treated_as_revoked(self) -> None:
+        capability = self.mint_gate()
+        payload = entry()
+        signature = self.signed(capability, payload)
+        revoke_role(str(self.base), str(self.workspace), TEAM, ROLE)
+        self.mint_gate()
+
+        marker = self.tombstones() / (capability["id"] + ".revoked")
+        marker.unlink()
+        marker.mkdir()
+
+        with self.assertRaises(CapabilityError) as caught:
+            self.verify(payload, signature)
+        self.assertIn("regular file", str(caught.exception))
+
     def test_a_forged_signature_is_still_rejected_after_supersession(self) -> None:
         capability = self.mint_gate()
         payload = entry()
