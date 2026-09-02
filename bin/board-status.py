@@ -162,12 +162,15 @@ def summarize(
         since_pass = max(0, int((now - last_pass).total_seconds()))
     stale_pass = since_pass is None or since_pass >= idle_minutes * 60
 
-    if outstanding == 0 and pending == 0:
+    if live_agents > 0:
+        # A present, progressing agent outranks everything below. Safe to check
+        # first only because live excludes stalled agents; counting those as
+        # live is what used to let an entirely stuck board report WORKING.
+        verdict = "WORKING"
+    elif outstanding == 0 and pending == 0:
         # Nothing queued, in review, in flight, or waiting to publish. This is
         # the quiet end of a run and must stay quiet however old the last pass.
         verdict = "DRAINED"
-    elif live_agents > 0:
-        verdict = "WORKING"
     elif stalled_agents > 0 or stale_pass:
         verdict = "STALLED"
     else:
@@ -224,6 +227,16 @@ def board_line(summary: dict[str, Any]) -> str:
                 "" if summary["undrainedArtifacts"] == 1 else "s",
             )
         )
+    # Whether anything is alive is the operator's first question, and the
+    # verdict alone cannot answer it: WORKING and DRAINED both omit agents that
+    # matter -- a live agent with only blocked work left, or stalled agents the
+    # verdict already accounts for but does not quantify.
+    if summary["liveAgents"]:
+        parts.append("%d live agent%s" % (summary["liveAgents"],
+                                          "" if summary["liveAgents"] == 1 else "s"))
+    if summary.get("stalledAgents"):
+        parts.append("%d stalled agent%s" % (summary["stalledAgents"],
+                                             "" if summary["stalledAgents"] == 1 else "s"))
     if summary["secondsSinceLastPass"] is None:
         parts.append("no dispatch pass recorded")
     else:

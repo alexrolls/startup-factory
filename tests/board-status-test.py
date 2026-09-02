@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -130,6 +131,16 @@ class SummarizeTest(unittest.TestCase):
         summary = self.summarize(counts=counts(working=1), live_agents=1)
         self.assertEqual(summary["verdict"], "WORKING")
 
+    def test_a_live_agent_outranks_an_all_blocked_board(self) -> None:
+        """DRAINED must not hide a running agent.
+
+        Ordering DRAINED first would report the quiet end of a run while an
+        agent is demonstrably alive, which is the same false-all-clear shape
+        the stalled-agent and orphaned-task cases above pin.
+        """
+        summary = self.summarize(counts=counts(blocked=5), live_agents=1)
+        self.assertEqual(summary["verdict"], "WORKING")
+
     def test_the_idle_threshold_is_configurable(self) -> None:
         """A pass age between the custom and default thresholds must flip."""
         arguments = {"counts": counts(queued=1), "last_pass": NOW - timedelta(minutes=8)}
@@ -160,6 +171,58 @@ class SummarizeTest(unittest.TestCase):
         )
 
 
+class VerdictContractTest(unittest.TestCase):
+    """agent-health classifies verdicts by a naming convention across files.
+
+    Nothing in the language enforces that every non-progressing verdict
+    heartbeat-status.py adds keeps the "stalled:" prefix, so this pins the
+    convention itself: a future verdict that breaks it fails here instead of
+    silently making a stuck board look alive.
+    """
+
+    PROGRESSING = {"starting", "active"}
+    SOURCES = ("heartbeat-status.py", "agent-health.py", "pm-agent.py")
+
+    def emitted_verdicts(self) -> set[str]:
+        """Every verdict literal the health pipeline can produce.
+
+        Scanned line-wise rather than by assignment, because verdicts are also
+        produced from ternaries and dict literals that an assignment-shaped
+        pattern silently misses.
+        """
+        found: set[str] = set()
+        for name in self.SOURCES:
+            text = (ROOT / "bin" / name).read_text(encoding="utf-8")
+            found |= set(re.findall(r'"(stalled:[a-z-]+)"', text))
+            for line in text.splitlines():
+                # Only the right-hand side of a verdict assignment, so that a
+                # neighbouring dict key on the same line is not mistaken for a
+                # verdict value.
+                match = re.search(r'"?verdict"?\s*[=:]\s*(.*)$', line)
+                if match:
+                    found |= set(re.findall(r'"([a-z][a-z:-]{2,})"', match.group(1)))
+        return found - {"verdict"}
+
+    def test_every_emitted_verdict_is_classifiable(self) -> None:
+        agent_health = load("startup_factory_agent_health_contract", "agent-health.py")
+        emitted = self.emitted_verdicts()
+        self.assertGreaterEqual(
+            len({v for v in emitted if v.startswith("stalled:")}), 9,
+            "expected the known stalled verdicts to be discovered; the scan "
+            "found %r" % sorted(emitted),
+        )
+        for verdict in sorted(emitted):
+            with self.subTest(verdict=verdict):
+                absent = verdict in agent_health.ABSENT_VERDICTS
+                stalled = verdict.split(":", 1)[0] == agent_health.STALLED_PREFIX
+                progressing = verdict in self.PROGRESSING
+                self.assertTrue(
+                    absent or stalled or progressing,
+                    "%s is neither absent, stalled:*, nor a known progressing "
+                    "verdict; board status would count it as live" % verdict,
+                )
+
+
 class BoardLineTest(unittest.TestCase):
     def test_the_operator_line_names_work_artifacts_and_pass_age(self) -> None:
         summary = board_status.summarize(
@@ -184,6 +247,18 @@ class BoardLineTest(unittest.TestCase):
         )
         self.assertIn("1 queued task,", board_status.board_line(summary))
         self.assertIn("1 undrained artifact,", board_status.board_line(summary))
+
+    def test_the_line_names_live_and_stalled_agents(self) -> None:
+        """The verdict alone cannot tell an operator what is alive."""
+        working = board_status.summarize(
+            counts=counts(blocked=5), pending=0, last_pass=NOW, live_agents=1, now=NOW
+        )
+        self.assertIn("1 live agent", board_status.board_line(working))
+        stalled = board_status.summarize(
+            counts=counts(queued=1), pending=0, last_pass=NOW,
+            live_agents=0, stalled_agents=2, now=NOW,
+        )
+        self.assertIn("2 stalled agents", board_status.board_line(stalled))
 
     def test_a_board_with_no_recorded_pass_says_so(self) -> None:
         summary = board_status.summarize(

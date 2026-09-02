@@ -348,7 +348,7 @@ refresh_export_if_changed() { # <workspace> <featureId> <tasks-file>
   env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
     "$SKILL_DIR/bin/tracker-ops.sh" change-token "$fid" 2>/dev/null \
     > "$token_file" || : > "$token_file"
-  date -u +%s > "$export_stamp"
+  date -u +%s > "$export_stamp" 2>/dev/null || true
 }
 
 dispatch_once() { # dispatch_once <team> <featureId> <dry:yes|no> [target-task]
@@ -467,7 +467,7 @@ EOF
     # allowed to answer, so it must be observed before they drain it.
     local broker_work=no
     if [ -n "$(find "$(team_path "$dir" outbox/pending)" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)" ] \
-       || [ -n "$(find "$(team_path "$dir" integrations)" -mindepth 1 -maxdepth 1 ! -name '.*' -print -quit 2>/dev/null || true)" ]; then
+       || [ -n "$(find "$(team_path "$dir" integrations)" -mindepth 1 -maxdepth 1 -type f -name '*.json' -print -quit 2>/dev/null || true)" ]; then
       broker_work=yes
     fi
     "$SKILL_DIR/bin/finalize-integrations.sh" "$team" "$fid"

@@ -183,23 +183,26 @@ def _revoke_matching_records(records: Path, revoked: Path, matches) -> None:
     for path in entries:
         if not path.name.endswith(".json"):
             continue
+        # An individual unreadable record must not abort the revocation.  This
+        # directory is append-only for the life of the repository, so one
+        # truncated record -- what a crash during mint() leaves behind -- would
+        # otherwise permanently break every revoke, and with it the
+        # revoke-then-relaunch restart path for every role and team sharing the
+        # repository.  Skipping is safe rather than lenient: verification reads
+        # the same record through the same helper, so a record that cannot be
+        # read here cannot authenticate anything there either.
         try:
             info = path.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise CapabilityError("cannot inspect capability record: %s" % exc) from exc
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            raise CapabilityError("capability record is not a regular file")
-        try:
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                continue
             record = json.loads(_read_protected(path, "capability record"))
-        except (UnicodeError, ValueError) as exc:
-            raise CapabilityError("invalid capability record") from exc
+        except (CapabilityError, OSError, UnicodeError, ValueError):
+            continue
         if not isinstance(record, dict):
-            raise CapabilityError("invalid capability record")
+            continue
         capability_id = record.get("id")
         if not isinstance(capability_id, str) or path.name != capability_id + ".json":
-            raise CapabilityError("capability record identity mismatch")
+            continue
         if matches(record):
             _record_revocation(revoked, capability_id)
 
