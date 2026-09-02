@@ -38,7 +38,7 @@ Startup Factory does not replace your coding agent, repository, project-manageme
 - [Bring your own agents, tracker, and stack](#bring-your-own-agents-tracker-and-stack)
 - [Choose how much autonomy you want](#choose-how-much-autonomy-you-want)
 - [Safety is part of the architecture](#safety-is-part-of-the-architecture)
-- [What's new](#whats-new-in-0118)
+- [What's new](#whats-new-in-0119)
 - [Documentation](#documentation)
 - [Project status](#project-status)
 - [Contributing](#contributing)
@@ -405,6 +405,31 @@ The package installer has first-class targets for:
 
 Team roles are configured through command templates, so you can mix runtimes. For example, use Claude for the Team Lead and Principal Architect, Codex for the Sceptical Principal Architect and security review, Gemini for review diversity, and DeepSeek Harness or Aider for selected implementation tasks.
 
+[`config/team.config.md`](config/team.config.md) is the entire LLM coupling: one line per role giving the shell command that runs it. The launcher composes each agent's startup prompt into a file and substitutes its path for `{prompt_file}`:
+
+```
+TEAM_LEAD_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
+PRINCIPAL_ARCHITECT_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
+SCEPTICAL_ARCHITECT_CMD="codex exec --approve-for-me \"$(cat '{prompt_file}')\""
+BACKEND_CMD="codex exec --approve-for-me \"$(cat '{prompt_file}')\""
+REVIEWER_CMD="gemini --yolo \"$(cat '{prompt_file}')\""
+TEAM_DEFAULT_CMD="claude -p \"$(cat '{prompt_file}')\" --permission-mode acceptEdits"
+```
+
+Command templates for common CLIs:
+
+| LLM / CLI | Command template |
+|---|---|
+| Claude Code | `claude -p "$(cat '{prompt_file}')" --permission-mode acceptEdits` |
+| Codex CLI | `codex exec --approve-for-me "$(cat '{prompt_file}')"` |
+| Gemini CLI | `gemini --yolo "$(cat '{prompt_file}')"` |
+| DeepSeek Harness | `dsh --profile headless "$(cat '{prompt_file}')"` |
+| Any file-reading CLI | `yourcli --prompt-file {prompt_file}` |
+
+Command resolution per role: an explicit `<ROLE>_CMD` value is used; `<ROLE>_CMD=null` disables the role; an absent key falls back to `TEAM_DEFAULT_CMD`. That fallback is why the many specialist preset roles need no per-role keys — set `TEAM_DEFAULT_CMD` once and override only the roles you want on a different model. The three core review-board roles are the exception: a launch fails before any agent starts if one of their commands is `null` or unresolved.
+
+> ⚠️ **Safety:** these templates use unattended execution modes (`acceptEdits`, `--approve-for-me`, `--yolo`). Codex keeps its workspace-write sandbox and routes approval requests through automatic review. Workers may commit untrusted checkpoints only to task branches; only the integrator writes the feature branch. Every implementer is isolated in its own git worktree — but still run teams on a branch you can throw away, and review the tracker before merging to your main branch.
+
 The contract is intentionally thin: provide the prompt, let the agent read and edit files within its assigned boundary, capture the result, and trust the exit status. Adding another compatible CLI should not require rewriting the orchestration core.
 
 ### Project-management tools
@@ -459,6 +484,20 @@ Read the full contracts before enabling unattended or production operation:
 - [`reference/automation.md`](reference/automation.md)
 - [`reference/deployment.md`](reference/deployment.md)
 - [`reference/orchestration.md`](reference/orchestration.md)
+
+## What's new in 0.1.19
+
+This release rewrites the README as a landing page. It leads with what Startup
+Factory is, who it is for, and a two-minute quick start, then hands off to
+[`SKILL.md`](SKILL.md) and [`reference/`](reference/) for operational detail.
+
+Navigation is new: a table of contents, section anchors, and cross-links between
+related sections. The role-to-command mapping from
+[`config/team.config.md`](config/team.config.md) is documented alongside the
+unattended-execution safety note, and `### Safe updates` keeps the update,
+verify, and preserved-configuration contract in the README.
+
+No runtime, adapter, or packaging behavior changes in this release.
 
 ## What's new in 0.1.18
 
