@@ -43,9 +43,12 @@ teamwork_path = load_sibling("startup_factory_teamwork_path", "teamwork-path.py"
 board_status = load_sibling("startup_factory_board_status", "board-status.py")
 
 # Verdicts that mean no agent process remains.  Inverted rather than
-# enumerated, so a new "stalled:*" reason counts as a present-but-unhealthy
-# agent instead of silently making a stalled board look drained.
+# enumerated, so a new reason counts as a present agent instead of silently
+# making a stalled board look drained.
 ABSENT_VERDICTS = {"exited", "identity-mismatch"}
+# A present agent that is not progressing.  Counting these as live would let a
+# board of entirely stuck agents report WORKING, which is a false all-clear.
+STALLED_PREFIX = "stalled"
 
 
 def iso(value: datetime) -> str:
@@ -558,15 +561,22 @@ def build_boards(
         board_config = json.loads(
             (repository / "config" / "statuses.config.json").read_text(encoding="utf-8")
         )
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        # Every other failure in this feature surfaces as a warning; this one
+        # must too, or the board line disappears with no explanation at all.
+        warnings.append(f"Cannot read the status configuration for board summaries: {exc}")
         return []
     summaries: list[dict[str, Any]] = []
     for team in sorted({row["team"] for row in rows}):
-        live = sum(
-            1
+        present = [
+            row["verdict"]
             for row in rows
             if row["team"] == team and row["verdict"] not in ABSENT_VERDICTS
+        ]
+        stalled = sum(
+            1 for verdict in present if verdict.split(":", 1)[0] == STALLED_PREFIX
         )
+        live = len(present) - stalled
         try:
             workspace = Path(
                 teamwork_path.workspace(str(workspace_host), teamwork_root, team)
@@ -575,6 +585,7 @@ def build_boards(
                 workspace=workspace,
                 board=board_config,
                 live_agents=live,
+                stalled_agents=stalled,
                 now=now,
             )
         except (OSError, RuntimeError, SystemExit) as exc:

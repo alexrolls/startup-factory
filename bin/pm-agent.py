@@ -73,6 +73,7 @@ HEALTH_BOARD_KEYS = {
     "outstanding",
     "undrainedArtifacts",
     "liveAgents",
+    "stalledAgents",
     "lastPassAt",
     "secondsSinceLastPass",
     "idleMinutes",
@@ -695,7 +696,7 @@ def validate_health_snapshot(
             raise MonitorError("health snapshot board must remain presentation-only")
         for field in (
             "queued", "working", "review", "blocked", "outstanding",
-            "undrainedArtifacts", "liveAgents", "idleMinutes",
+            "undrainedArtifacts", "liveAgents", "stalledAgents", "idleMinutes",
         ):
             if type(board.get(field)) is not int or board[field] < 0:
                 raise MonitorError(f"health snapshot board {field} must be a non-negative integer")

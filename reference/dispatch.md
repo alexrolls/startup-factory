@@ -31,10 +31,16 @@ exhaust an hourly hosted-tracker budget without any work having changed — whic
 is how an affordable-looking mechanism becomes unusable and operators fall back
 to invisible manual dispatch.
 
-A pass therefore asks the adapter for a **change token** first
+A pass therefore asks the adapter for a **change token**
 (`tracker-ops.sh change-token <featureId>`) and reuses the cached export when
-the token has not moved. An idle pass costs a couple of requests instead of
-hundreds.
+the token has not moved.
+
+A pass reads the board **twice** — once before planning and once after the
+brokers run, to close the observation race their writes create. Both reads go
+through the same rule, which matters: gating only the first would leave every
+idle cycle paying full price for the second, and halve the cost rather than
+remove it. Anything a broker publishes is itself a tracker write, so it moves
+the token and the second read exports for real.
 
 The contract on that token is the important part:
 

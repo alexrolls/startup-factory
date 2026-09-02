@@ -137,28 +137,38 @@ def summarize(
     last_pass: datetime | None,
     live_agents: int,
     now: datetime,
+    stalled_agents: int = 0,
     idle_minutes: int = DEFAULT_IDLE_MINUTES,
 ) -> dict[str, Any]:
-    """Classify a board as working, idle, or stalled.
+    """Classify a board as working, idle, stalled, or drained.
 
-    STALLED is the state the operator cannot see today: work is waiting, no
-    agent is alive to take it, and no dispatch pass has run recently.  IDLE is
-    the same shape without the elapsed-time evidence, so it is reported without
-    claiming a pass was missed.
+    STALLED is the state the operator cannot see today: work is waiting and
+    nothing healthy is moving it.  IDLE is the same shape while a dispatch pass
+    is still recent, so it is reported without claiming a pass was missed.
+
+    The two false all-clears this must never produce are WORKING when the only
+    agents left are individually stalled, and DRAINED while an in-flight [task]
+    sits orphaned by a worker that already exited.  `live_agents` therefore
+    counts only agents that are present AND progressing, and outstanding work
+    includes the working [tasks] a dead worker leaves behind.
     """
     if idle_minutes < 1:
         raise BoardStatusError("idle minutes must be at least 1")
-    outstanding = counts.get("queued", 0) + counts.get("review", 0)
+    outstanding = (
+        counts.get("queued", 0) + counts.get("review", 0) + counts.get("working", 0)
+    )
     since_pass = None
     if last_pass is not None:
         since_pass = max(0, int((now - last_pass).total_seconds()))
     stale_pass = since_pass is None or since_pass >= idle_minutes * 60
 
-    if live_agents > 0:
-        verdict = "WORKING"
-    elif outstanding == 0 and pending == 0:
+    if outstanding == 0 and pending == 0:
+        # Nothing queued, in review, in flight, or waiting to publish. This is
+        # the quiet end of a run and must stay quiet however old the last pass.
         verdict = "DRAINED"
-    elif stale_pass:
+    elif live_agents > 0:
+        verdict = "WORKING"
+    elif stalled_agents > 0 or stale_pass:
         verdict = "STALLED"
     else:
         verdict = "IDLE"
@@ -172,6 +182,7 @@ def summarize(
         "outstanding": outstanding,
         "undrainedArtifacts": pending,
         "liveAgents": live_agents,
+        "stalledAgents": stalled_agents,
         "lastPassAt": last_pass.isoformat(timespec="seconds").replace("+00:00", "Z")
         if last_pass is not None
         else None,
@@ -228,6 +239,7 @@ def collect(
     board: dict[str, Any],
     live_agents: int,
     now: datetime,
+    stalled_agents: int = 0,
     idle_minutes: int = DEFAULT_IDLE_MINUTES,
 ) -> dict[str, Any]:
     names = status_names(board)
@@ -244,6 +256,7 @@ def collect(
         pending=count_pending(workspace),
         last_pass=last_pass_at(workspace),
         live_agents=live_agents,
+        stalled_agents=stalled_agents,
         now=now,
         idle_minutes=idle_minutes,
     )
@@ -256,6 +269,7 @@ def parser() -> argparse.ArgumentParser:
     parsed.add_argument("--workspace", required=True)
     parsed.add_argument("--status-config", required=True)
     parsed.add_argument("--live-agents", type=int, default=0)
+    parsed.add_argument("--stalled-agents", type=int, default=0)
     parsed.add_argument("--idle-minutes", type=int, default=DEFAULT_IDLE_MINUTES)
     parsed.add_argument("--json", action="store_true")
     return parsed
@@ -273,6 +287,7 @@ def main() -> int:
             workspace=Path(args.workspace),
             board=board,
             live_agents=args.live_agents,
+            stalled_agents=args.stalled_agents,
             now=datetime.now(timezone.utc),
             idle_minutes=args.idle_minutes,
         )

@@ -307,21 +307,26 @@ else
   echo "FAIL: unchanged tracker still paid for a full export"; FAILURES=$((FAILURES+1))
 fi
 # A real edit must defeat the cache: a missed change would strand the work.
+# A pass now refreshes twice (before planning and after the brokers), and the
+# second read legitimately reuses when the first just exported, so the evidence
+# of a full export is the stamp, not the log line.
+echo 0 > .teamwork/feat-team/dispatch.export-at
 printf '\n## 9 Fresh work [Planned]\n' >> "$FID"
-change_out="$(TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once 2>&1)"
-if echo "$change_out" | grep -q "tracker unchanged; reusing the cached feature export"; then
-  echo "FAIL: an edited [feature] was skipped as unchanged"; FAILURES=$((FAILURES+1))
-else
+TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once >/dev/null 2>&1
+if [ "$(cat .teamwork/feat-team/dispatch.export-at)" != "0" ]; then
   echo "ok: an edited [feature] forces a fresh export"
+else
+  echo "FAIL: an edited [feature] was skipped as unchanged"; FAILURES=$((FAILURES+1))
 fi
 check "edited task reached the snapshot" grep -q "Fresh work" .teamwork/feat-team/tasks.json
 # An elapsed reuse window forces a full export even when the token has not moved.
+TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once >/dev/null 2>&1
 echo 0 > .teamwork/feat-team/dispatch.export-at
-stale_out="$(TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once 2>&1)"
-if echo "$stale_out" | grep -q "tracker unchanged; reusing the cached feature export"; then
-  echo "FAIL: reuse was not bounded by EXPORT_MAX_REUSE_SECONDS"; FAILURES=$((FAILURES+1))
-else
+TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once >/dev/null 2>&1
+if [ "$(cat .teamwork/feat-team/dispatch.export-at)" != "0" ]; then
   echo "ok: reuse is bounded even when the token has not moved"
+else
+  echo "FAIL: reuse was not bounded by EXPORT_MAX_REUSE_SECONDS"; FAILURES=$((FAILURES+1))
 fi
 
 # -- agent-writable PID text is not a liveness authority -----------------------

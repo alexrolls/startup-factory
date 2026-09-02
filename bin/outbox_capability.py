@@ -166,6 +166,44 @@ def _record_revocation(revoked: Path, capability_id: str) -> None:
     )
 
 
+def _revoke_matching_records(records: Path, revoked: Path, matches) -> None:
+    """Tombstone every capability ever minted for the identity being revoked.
+
+    An active pointer names only the newest capability, so revoking through it
+    would miss earlier ones that a relaunch had already superseded -- exactly
+    the capabilities most likely to be holding an undrained artifact. Records
+    are immutable and never deleted, so they are the complete set. A capability
+    minted after this call gets a fresh id that no tombstone names, which is
+    what lets a revoke-then-relaunch restart keep working.
+    """
+    try:
+        entries = sorted(records.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        raise CapabilityError("cannot enumerate capability records: %s" % exc) from exc
+    for path in entries:
+        if not path.name.endswith(".json"):
+            continue
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise CapabilityError("cannot inspect capability record: %s" % exc) from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise CapabilityError("capability record is not a regular file")
+        try:
+            record = json.loads(_read_protected(path, "capability record"))
+        except (UnicodeError, ValueError) as exc:
+            raise CapabilityError("invalid capability record") from exc
+        if not isinstance(record, dict):
+            raise CapabilityError("invalid capability record")
+        capability_id = record.get("id")
+        if not isinstance(capability_id, str) or path.name != capability_id + ".json":
+            raise CapabilityError("capability record identity mismatch")
+        if matches(record):
+            _record_revocation(revoked, capability_id)
+
+
 def _is_revoked(revoked: Path, capability_id: str) -> bool:
     """Report whether an explicit revocation tombstone exists.
 
@@ -496,6 +534,17 @@ def revoke_task(repository: str, workspace: str, team: str, task: str) -> int:
     _safe_text(task, "taskId")
 
     records, active, revoked_dir = state_directories(repo)
+    _revoke_matching_records(
+        records,
+        revoked_dir,
+        lambda record: (
+            record.get("canonicalRepo") == str(repo)
+            and record.get("canonicalWorkspace") == str(workspace_real)
+            and record.get("team") == team
+            and record.get("executionKind") == "task"
+            and record.get("taskId") == task
+        ),
+    )
     revoked = 0
     for pointer in sorted(active.iterdir(), key=lambda item: item.name):
         try:
@@ -555,6 +604,17 @@ def revoke_role(repository: str, workspace: str, team: str, role: str) -> int:
         raise CapabilityError("invalid capability role")
 
     records, active, revoked_dir = state_directories(repo)
+    _revoke_matching_records(
+        records,
+        revoked_dir,
+        lambda record: (
+            record.get("canonicalRepo") == str(repo)
+            and record.get("canonicalWorkspace") == str(workspace_real)
+            and record.get("team") == team
+            and record.get("executionKind") == "gate"
+            and record.get("role") == role
+        ),
+    )
     revoked = 0
     for pointer in sorted(active.iterdir(), key=lambda item: item.name):
         try:

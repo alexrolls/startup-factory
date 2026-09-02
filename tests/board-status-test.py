@@ -109,6 +109,27 @@ class SummarizeTest(unittest.TestCase):
     def test_the_summary_stays_presentation_only(self) -> None:
         self.assertIs(self.summarize()["presentationOnly"], True)
 
+    def test_only_stalled_agents_is_not_working(self) -> None:
+        """A false all-clear: agents present, none of them progressing."""
+        summary = self.summarize(
+            counts=counts(queued=3),
+            live_agents=0,
+            stalled_agents=1,
+            last_pass=NOW,
+        )
+        self.assertEqual(summary["verdict"], "STALLED")
+
+    def test_an_orphaned_in_flight_task_is_not_drained(self) -> None:
+        """A false all-clear: a working [task] whose worker already exited."""
+        summary = self.summarize(
+            counts=counts(working=1), last_pass=NOW - timedelta(days=3)
+        )
+        self.assertEqual(summary["verdict"], "STALLED")
+
+    def test_an_in_flight_task_with_a_healthy_agent_is_working(self) -> None:
+        summary = self.summarize(counts=counts(working=1), live_agents=1)
+        self.assertEqual(summary["verdict"], "WORKING")
+
     def test_the_idle_threshold_is_configurable(self) -> None:
         """A pass age between the custom and default thresholds must flip."""
         arguments = {"counts": counts(queued=1), "last_pass": NOW - timedelta(minutes=8)}

@@ -231,6 +231,34 @@ class OutboxCapabilitySupersedeTest(unittest.TestCase):
             self.verify(payload, signature)
         self.assertIn("cannot read active capability", str(caught.exception))
 
+    def test_revocation_covers_a_capability_superseded_before_it(self) -> None:
+        """Revoking fences off the identity, not just the newest capability.
+
+        A revoke can only see whichever capability the active pointer names, so
+        an earlier boot's capability -- already superseded, still holding an
+        undrained artifact -- would never be tombstoned by id. launch-team.sh
+        restarts a role by revoking and relaunching, so "superseded, then
+        revoked, then relaunched" is an ordinary sequence, not an edge case.
+        """
+        first = self.mint_gate()
+        payload = entry()
+        signature = self.signed(first, payload)
+
+        self.mint_gate()  # a relaunch supersedes the boot that enqueued
+        revoke_role(str(self.base), str(self.workspace), TEAM, ROLE)
+        self.mint_gate()  # a further relaunch recreates the active pointer
+
+        with self.assertRaises(CapabilityError) as caught:
+            self.verify(payload, signature)
+        self.assertIn("revoked", str(caught.exception))
+
+    def test_a_capability_minted_after_a_revocation_still_publishes(self) -> None:
+        """Fencing an identity must not disable it forever."""
+        revoke_role(str(self.base), str(self.workspace), TEAM, ROLE)
+        capability = self.mint_gate()
+        payload = entry()
+        self.assertEqual(self.verify(payload, self.signed(capability, payload))["role"], ROLE)
+
     def tombstones(self) -> Path:
         return self.base / ".git" / "startup-factory-broker" / "outbox-revoked"
 
