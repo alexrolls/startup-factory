@@ -683,6 +683,7 @@ for required_file in \
   adapters/Markdown.md \
   bin/dispatch.sh \
   bin/agent-health.py \
+  bin/board-status.py \
   bin/heartbeat-status.py \
   bin/launch-team.sh \
   bin/process-lifecycle.py \

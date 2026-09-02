@@ -40,6 +40,12 @@ def load_sibling(name: str, filename: str):
 
 heartbeat_status = load_sibling("startup_factory_heartbeat_status", "heartbeat-status.py")
 teamwork_path = load_sibling("startup_factory_teamwork_path", "teamwork-path.py")
+board_status = load_sibling("startup_factory_board_status", "board-status.py")
+
+# Verdicts that mean no agent process remains.  Inverted rather than
+# enumerated, so a new "stalled:*" reason counts as a present-but-unhealthy
+# agent instead of silently making a stalled board look drained.
+ABSENT_VERDICTS = {"exited", "identity-mismatch"}
 
 
 def iso(value: datetime) -> str:
@@ -512,6 +518,14 @@ def build_snapshot(
             f"process{'es' if non_agent_processes_omitted != 1 else ''}."
         )
     rows.sort(key=lambda row: (row["team"], row["category"], row["instance"]))
+    boards = build_boards(
+        rows,
+        repository=repository,
+        workspace_host=workspace_host,
+        teamwork_root=teamwork_root,
+        now=now,
+        warnings=warnings,
+    )
     return {
         "schemaVersion": SCHEMA,
         "generatedAt": iso(now),
@@ -520,8 +534,55 @@ def build_snapshot(
         "presentationOnly": True,
         "nonAgentProcessesOmitted": non_agent_processes_omitted,
         "agents": rows,
+        "boards": boards,
         "warnings": warnings,
     }
+
+
+def build_boards(
+    rows: list[dict[str, Any]],
+    *,
+    repository: Path,
+    workspace_host: Path,
+    teamwork_root: str,
+    now: datetime,
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    """Summarize each team's board alongside its per-role rows.
+
+    A board summary is presentation only and must never be able to fail the
+    health view: a team whose board cannot be read is reported as unknown with
+    a warning, not raised.
+    """
+    try:
+        board_config = json.loads(
+            (repository / "config" / "statuses.config.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return []
+    summaries: list[dict[str, Any]] = []
+    for team in sorted({row["team"] for row in rows}):
+        live = sum(
+            1
+            for row in rows
+            if row["team"] == team and row["verdict"] not in ABSENT_VERDICTS
+        )
+        try:
+            workspace = Path(
+                teamwork_path.workspace(str(workspace_host), teamwork_root, team)
+            )
+            summary = board_status.collect(
+                workspace=workspace,
+                board=board_config,
+                live_agents=live,
+                now=now,
+            )
+        except (OSError, RuntimeError, SystemExit) as exc:
+            warnings.append(f"Cannot summarize the {team} board: {exc}")
+            continue
+        summary["team"] = team
+        summaries.append(summary)
+    return summaries
 
 
 def unmanaged_snapshot(
@@ -594,6 +655,8 @@ def render_table(snapshot: dict[str, Any]) -> str:
     lines.extend(line(row) for row in values)
     if not values:
         lines.append("(no managed agents for this project)")
+    for board in snapshot.get("boards", []):
+        lines.append(f"{board['team']}: {board_status.board_line(board)}")
     lines.append("* Percentages are self-reported, fresh, and presentation-only.")
     lines.extend(f"Warning: {warning}" for warning in snapshot["warnings"])
     return "\n".join(lines)

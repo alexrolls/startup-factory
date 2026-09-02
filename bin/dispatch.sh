@@ -625,6 +625,13 @@ print((matches[0]["state"]+"\t"+matches[0]["createdAt"]) if matches else "absent
   done <<EOF
 $plan
 EOF
+  # Record that a pass completed. Every role exiting is the normal end of a
+  # pass, so this marker is the only evidence that separates a board nobody is
+  # driving from one that simply finished its work.
+  if [ "$dry" = "no" ]; then
+    printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      > "$(team_path "$dir" dispatch.last-pass)" 2>/dev/null || true
+  fi
 }
 
 [ $# -ge 3 ] || die "usage: dispatch.sh <team> <featureId> --once|--watch [--dry-run] [--task <taskId>]"

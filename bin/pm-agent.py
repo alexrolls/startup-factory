@@ -57,7 +57,26 @@ HEALTH_SNAPSHOT_KEYS = {
     "presentationOnly",
     "nonAgentProcessesOmitted",
     "agents",
+    "boards",
     "warnings",
+}
+HEALTH_BOARD_SCHEMA = "board-status-v1"
+HEALTH_BOARD_VERDICTS = {"WORKING", "IDLE", "STALLED", "DRAINED"}
+HEALTH_BOARD_KEYS = {
+    "schemaVersion",
+    "team",
+    "verdict",
+    "queued",
+    "working",
+    "review",
+    "blocked",
+    "outstanding",
+    "undrainedArtifacts",
+    "liveAgents",
+    "lastPassAt",
+    "secondsSinceLastPass",
+    "idleMinutes",
+    "presentationOnly",
 }
 HEALTH_ROW_KEYS = {
     "team",
@@ -660,6 +679,34 @@ def validate_health_snapshot(
         parse_health_time(row["updatedAt"], "agent updatedAt")
         if row.get("nextActionBy") is not None:
             parse_health_time(row["nextActionBy"], "agent nextActionBy")
+    boards = value.get("boards")
+    if not isinstance(boards, list):
+        raise MonitorError("health snapshot boards must be a list")
+    for board in boards:
+        if not isinstance(board, dict) or set(board) != HEALTH_BOARD_KEYS:
+            raise MonitorError("health snapshot contains an unsupported board row")
+        if board.get("schemaVersion") != HEALTH_BOARD_SCHEMA:
+            raise MonitorError("health snapshot board uses an unsupported schema")
+        if not isinstance(board.get("team"), str) or not board["team"]:
+            raise MonitorError("health snapshot board team must be a non-empty string")
+        if board.get("verdict") not in HEALTH_BOARD_VERDICTS:
+            raise MonitorError("health snapshot board verdict is unsupported")
+        if board.get("presentationOnly") is not True:
+            raise MonitorError("health snapshot board must remain presentation-only")
+        for field in (
+            "queued", "working", "review", "blocked", "outstanding",
+            "undrainedArtifacts", "liveAgents", "idleMinutes",
+        ):
+            if type(board.get(field)) is not int or board[field] < 0:
+                raise MonitorError(f"health snapshot board {field} must be a non-negative integer")
+        since = board.get("secondsSinceLastPass")
+        if since is not None and (type(since) is not int or since < 0):
+            raise MonitorError("health snapshot board pass age must be non-negative or null")
+        last_pass = board.get("lastPassAt")
+        if last_pass is not None:
+            parse_health_time(last_pass, "board lastPassAt")
+        if (last_pass is None) != (since is None):
+            raise MonitorError("health snapshot board pass age does not match its timestamp")
     generated_at = parse_health_time(value.get("generatedAt"), "generatedAt")
     earliest = started_at.astimezone(timezone.utc) - timedelta(seconds=1)
     latest = finished_at.astimezone(timezone.utc) + timedelta(seconds=1)
