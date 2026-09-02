@@ -39,8 +39,14 @@ A pass reads the board **twice** — once before planning and once after the
 brokers run, to close the observation race their writes create. Both reads go
 through the same rule, which matters: gating only the first would leave every
 idle cycle paying full price for the second, and halve the cost rather than
-remove it. Anything a broker publishes is itself a tracker write, so it moves
-the token and the second read exports for real.
+remove it.
+
+The second read has one extra rule. When either broker had queued work, it
+exports unconditionally rather than consulting the token, because those writes
+are the pass's own and a hosted tracker does not promise that a read
+microseconds later already reflects them. Trusting the token there could plan
+on a snapshot missing the verdict just published. When the brokers had nothing
+queued they wrote nothing, and the token rules as it does at the top.
 
 The contract on that token is the important part:
 

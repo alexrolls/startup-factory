@@ -314,7 +314,7 @@ refresh_export_if_changed() { # <workspace> <featureId> <tasks-file>
   # sufficiently unusual tracker edit can fail to move one, so a full export
   # runs at least every EXPORT_MAX_REUSE_SECONDS regardless. A missed change
   # therefore delays an export; it can never cancel one.
-  local dir="$1" fid="$2" tasks_file="$3"
+  local dir="$1" fid="$2" tasks_file="$3" force="${4:-no}"
   # Declared then assigned: `local x="$(cmd)"` returns local's own status and
   # would hide a rejected path from set -e.
   local token_file export_stamp max_reuse
@@ -326,7 +326,7 @@ refresh_export_if_changed() { # <workspace> <featureId> <tasks-file>
   # time-based backstop meaningful when a token misses a change.
   case "$max_reuse" in *[!0-9]*|"") max_reuse=900 ;; esac
   [ "$max_reuse" -le 3600 ] || max_reuse=3600
-  if [ -s "$tasks_file" ] && [ -s "$token_file" ]; then
+  if [ "$force" = no ] && [ -s "$tasks_file" ] && [ -s "$token_file" ]; then
     local observed_token cached_token last_export now_seconds
     observed_token="$(env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
       "$SKILL_DIR/bin/tracker-ops.sh" change-token "$fid" 2>/dev/null || true)"
@@ -463,15 +463,24 @@ EOF
 
     # Only after task-scoped stops and durable holds are established may the
     # credentialed brokers publish artifacts or finalize integration evidence.
+    # Whether the brokers have queued work decides how the re-read below is
+    # allowed to answer, so it must be observed before they drain it.
+    local broker_work=no
+    if [ -n "$(find "$(team_path "$dir" outbox/pending)" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)" ] \
+       || [ -n "$(find "$(team_path "$dir" integrations)" -mindepth 1 -maxdepth 1 ! -name '.*' -print -quit 2>/dev/null || true)" ]; then
+      broker_work=yes
+    fi
     "$SKILL_DIR/bin/finalize-integrations.sh" "$team" "$fid"
     "$SKILL_DIR/bin/process-outbox.sh" "$team" "$fid"
-    # Re-read after the brokers, under the same rule as the export at the top
-    # of the pass. Anything they published is a tracker write, so it moves the
-    # token; if they published nothing and nobody else wrote either, the
-    # snapshot is still current and a second full export is pure cost. This
-    # export is unconditional otherwise, and it alone would keep every idle
-    # watch cycle at full price.
-    refresh_export_if_changed "$dir" "$fid" "$tasks_file"
+    # Re-read after the brokers to close the observation race their writes
+    # create. When they had nothing queued they wrote nothing, so the token
+    # rules as it does at the top of the pass and an idle cycle stays cheap --
+    # leaving this read ungated is what would keep every idle cycle at full
+    # price. When they did have work, export unconditionally: their writes are
+    # ours, and a hosted tracker does not promise that a read microseconds
+    # later already reflects them. Trusting the token there could plan on a
+    # snapshot missing the verdict we just published.
+    refresh_export_if_changed "$dir" "$fid" "$tasks_file" "$broker_work"
 
     # Close the observation race created by broker/finalizer work. If a human
     # moved a task to Blocked or reserved it with an ignored label during this

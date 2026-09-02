@@ -328,6 +328,20 @@ if [ "$(cat .teamwork/feat-team/dispatch.export-at)" != "0" ]; then
 else
   echo "FAIL: reuse was not bounded by EXPORT_MAX_REUSE_SECONDS"; FAILURES=$((FAILURES+1))
 fi
+# Queued broker work forces the post-broker export. The brokers' writes are our
+# own, and a hosted tracker does not promise a read microseconds later reflects
+# them, so the token must not be allowed to vouch for that snapshot.
+TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once >/dev/null 2>&1
+mkdir -p .teamwork/feat-team/outbox/pending
+echo '{}' > .teamwork/feat-team/outbox/pending/probe-entry.json
+echo 0 > .teamwork/feat-team/dispatch.export-at
+TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once >/dev/null 2>&1 || true
+if [ "$(cat .teamwork/feat-team/dispatch.export-at)" != "0" ]; then
+  echo "ok: queued broker work forces a fresh post-broker export"
+else
+  echo "FAIL: pending broker work still reused a cached export"; FAILURES=$((FAILURES+1))
+fi
+rm -f .teamwork/feat-team/outbox/pending/probe-entry.json
 
 # -- agent-writable PID text is not a liveness authority -----------------------
 mkdir -p .teamwork/feat-team/pids
