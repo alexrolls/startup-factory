@@ -528,6 +528,31 @@ class Linear:
         if observed != project_id:
             die("no Linear project '%s' — andon" % feature_id)
 
+    @staticmethod
+    def high_water_mark(nodes):
+        """Newest updatedAt in a connection ordered newest-first, or None.
+
+        `orderBy: updatedAt` is asked for and then *checked* rather than
+        trusted: two nodes are fetched, and if the first is not at least as
+        recent as the second the connection is not newest-first and the mark
+        would silently freeze. Returning None there costs a full export, which
+        is the safe direction. An empty connection has no mark but is still a
+        valid answer, so it reports the empty string rather than None.
+        """
+        if not isinstance(nodes, list):
+            return None
+        marks = []
+        for node in nodes[:2]:
+            value = (node or {}).get('updatedAt') if isinstance(node, dict) else None
+            if value is not None and not isinstance(value, str):
+                return None
+            marks.append(value or '')
+        if not marks:
+            return ''
+        if len(marks) > 1 and marks[0] < marks[1]:
+            return None
+        return marks[0]
+
     def change_token(self, feature_id):
         # Two requests, independent of [task] count, versus the hundreds a full
         # export costs. The token is a high-water mark over everything the
@@ -538,14 +563,14 @@ class Linear:
         # A high-water mark cannot prove a hard delete, which removes a row
         # without moving any surviving row's timestamp. That is why the caller
         # must also refresh on a bounded interval: a token this misses delays
-        # an export, it does not cancel it. Anything unreadable returns None,
-        # which forces the exhaustive export rather than a false "nothing
-        # moved".
+        # an export, it does not cancel it. Anything unreadable, or any
+        # connection that does not come back newest-first, returns None, which
+        # forces the exhaustive export rather than a false "nothing moved".
         project_id = self.project_id(feature_id)
         issues = self.gql('''query($id: String!) {
           project(id: $id) {
             updatedAt
-            issues(first: 1, orderBy: updatedAt, includeArchived: true) {
+            issues(first: 2, orderBy: updatedAt, includeArchived: true) {
               nodes { updatedAt }
               pageInfo { hasNextPage }
             }
@@ -553,26 +578,22 @@ class Linear:
         }''', {'id': project_id})
         project = (issues.get('project') or {}) if isinstance(issues, dict) else {}
         connection = project.get('issues') or {}
-        nodes = connection.get('nodes')
-        if not isinstance(nodes, list):
+        issue_mark = self.high_water_mark(connection.get('nodes'))
+        if issue_mark is None:
             return None
-        issue_mark = (nodes[0] or {}).get('updatedAt') if nodes else ''
         comments = self.gql('''query($id: ID!) {
           comments(
             filter: { project: { id: { eq: $id } } }
             orderBy: updatedAt
-            first: 1
+            first: 2
           ) {
             nodes { updatedAt }
           }
         }''', {'id': project_id})
-        comment_nodes = ((comments.get('comments') or {}).get('nodes')
-                         if isinstance(comments, dict) else None)
-        if not isinstance(comment_nodes, list):
-            return None
-        comment_mark = (comment_nodes[0] or {}).get('updatedAt') if comment_nodes else ''
-        if not isinstance(issue_mark, (str, type(None))) or not isinstance(
-                comment_mark, (str, type(None))):
+        comment_mark = self.high_water_mark(
+            (comments.get('comments') or {}).get('nodes')
+            if isinstance(comments, dict) else None)
+        if comment_mark is None:
             return None
         return 'linear:' + hashlib.sha256(json.dumps({
             'project': project.get('updatedAt') or '',

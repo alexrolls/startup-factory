@@ -58,14 +58,22 @@ class LinearChangeTokenTest(unittest.TestCase):
     def respond(self, *, project="2026-09-02T10:00:00Z",
                 issue="2026-09-02T11:00:00Z", comment="2026-09-02T11:30:00Z",
                 issue_nodes=None, comment_nodes=None):
+        """Answer both probe queries the way a newest-first connection would.
+
+        The adapter asks for two nodes so it can check the ordering it asked
+        for, so the stub returns a strictly older second node.
+        """
+        def newest_first(mark, older):
+            return [{"updatedAt": mark}, {"updatedAt": older}] if mark else []
+
         def gql(query, variables=None):
             self.requests += 1
             if "comments(" in query:
                 nodes = (comment_nodes if comment_nodes is not None
-                         else ([{"updatedAt": comment}] if comment else []))
+                         else newest_first(comment, "2026-09-01T00:00:00Z"))
                 return {"comments": {"nodes": nodes}}
             nodes = (issue_nodes if issue_nodes is not None
-                     else ([{"updatedAt": issue}] if issue else []))
+                     else newest_first(issue, "2026-09-01T00:00:00Z"))
             return {"project": {"updatedAt": project,
                                 "issues": {"nodes": nodes,
                                            "pageInfo": {"hasNextPage": False}}}}
@@ -123,6 +131,30 @@ class LinearChangeTokenTest(unittest.TestCase):
 
     def test_a_missing_project_forces_a_full_export(self) -> None:
         self.linear.gql = lambda query, variables=None: {}
+        self.assertIsNone(self.linear.change_token("FEATURE-1"))
+
+    def test_an_oldest_first_connection_forces_a_full_export(self) -> None:
+        """The ordering is checked, not trusted.
+
+        If the connection came back oldest-first the mark would freeze and the
+        cache would go stale silently, so the token refuses to answer.
+        """
+        self.respond(issue_nodes=[{"updatedAt": "2026-09-01T00:00:00Z"},
+                                  {"updatedAt": "2026-09-02T11:00:00Z"}])
+        self.assertIsNone(self.linear.change_token("FEATURE-1"))
+
+    def test_an_oldest_first_comment_connection_forces_a_full_export(self) -> None:
+        self.respond(comment_nodes=[{"updatedAt": "2026-09-01T00:00:00Z"},
+                                    {"updatedAt": "2026-09-02T11:30:00Z"}])
+        self.assertIsNone(self.linear.change_token("FEATURE-1"))
+
+    def test_a_single_issue_project_needs_no_ordering_proof(self) -> None:
+        """One node cannot be mis-ordered, so it is still a usable mark."""
+        self.respond(issue_nodes=[{"updatedAt": "2026-09-02T11:00:00Z"}])
+        self.assertTrue(self.linear.change_token("FEATURE-1"))
+
+    def test_a_non_string_timestamp_forces_a_full_export(self) -> None:
+        self.respond(issue_nodes=[{"updatedAt": 1757000000}])
         self.assertIsNone(self.linear.change_token("FEATURE-1"))
 
 
