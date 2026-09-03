@@ -301,6 +301,56 @@ print("dispatch-" + hashlib.sha256("\0".join(
 PY
 }
 
+refresh_export_if_changed() { # <workspace> <featureId> <tasks-file>
+  # Export the [feature] unless the adapter can prove nothing moved since the
+  # last successful export.
+  #
+  # The export dominates the cost of a pass: on a [feature] with hundreds of
+  # [tasks] it is hundreds of requests, and a pass performs more than one, so a
+  # watch loop at the default cadence can exhaust an hourly tracker budget with
+  # no work having changed.
+  #
+  # Reuse is bounded on purpose. A token is a high-water mark, and a
+  # sufficiently unusual tracker edit can fail to move one, so a full export
+  # runs at least every EXPORT_MAX_REUSE_SECONDS regardless. A missed change
+  # therefore delays an export; it can never cancel one.
+  local dir="$1" fid="$2" tasks_file="$3" force="${4:-no}"
+  # Declared then assigned: `local x="$(cmd)"` returns local's own status and
+  # would hide a rejected path from set -e.
+  local token_file export_stamp max_reuse
+  token_file="$(team_path "$dir" dispatch.change-token)"
+  export_stamp="$(team_path "$dir" dispatch.export-at)"
+  max_reuse="$(read_key EXPORT_MAX_REUSE_SECONDS)"; max_reuse="${max_reuse:-900}"
+  # A misconfigured value must not decide how long a stale export is trusted,
+  # and must not abort the pass in a numeric test either. The ceiling keeps the
+  # time-based backstop meaningful when a token misses a change.
+  case "$max_reuse" in *[!0-9]*|"") max_reuse=900 ;; esac
+  [ "$max_reuse" -le 3600 ] || max_reuse=3600
+  if [ "$force" = no ] && [ -s "$tasks_file" ] && [ -s "$token_file" ]; then
+    local observed_token cached_token last_export now_seconds
+    observed_token="$(env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
+      "$SKILL_DIR/bin/tracker-ops.sh" change-token "$fid" 2>/dev/null || true)"
+    cached_token="$(cat "$token_file" 2>/dev/null || true)"
+    if [ -n "$observed_token" ] && [ "$observed_token" = "$cached_token" ]; then
+      now_seconds="$(date -u +%s)"
+      last_export="$(cat "$export_stamp" 2>/dev/null || echo 0)"
+      case "$last_export" in *[!0-9]*|"") last_export=0 ;; esac
+      if [ "$((now_seconds - last_export))" -lt "$max_reuse" ]; then
+        echo "dispatch: tracker unchanged; reusing the cached feature export"
+        return 0
+      fi
+    fi
+  fi
+  env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
+    "$SKILL_DIR/bin/tracker-ops.sh" export "$fid" "$tasks_file" >/dev/null
+  # Record the token only after a successful export, so a failed export can
+  # never leave a token claiming the cached snapshot is current.
+  env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
+    "$SKILL_DIR/bin/tracker-ops.sh" change-token "$fid" 2>/dev/null \
+    > "$token_file" || : > "$token_file"
+  date -u +%s > "$export_stamp" 2>/dev/null || true
+}
+
 dispatch_once() { # dispatch_once <team> <featureId> <dry:yes|no> [target-task]
   local team="$1" fid="$2" dry="$3" target_task="${4:-}"
   local dir lock tasks_file; dir="$(teamroot "$team")"
@@ -345,8 +395,7 @@ dispatch_once() { # dispatch_once <team> <featureId> <dry:yes|no> [target-task]
 
   # Holds must observe the complete authoritative feature, including work that
   # is reserved from autonomous claiming with an ignored label.
-  env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
-    "$SKILL_DIR/bin/tracker-ops.sh" export "$fid" "$tasks_file" >/dev/null
+  refresh_export_if_changed "$dir" "$fid" "$tasks_file"
   if [ "$dry" != "yes" ]; then
     local hold_result hold_actions hold_action hold_task hold_graph changed=no
     hold_result="$(python3 "$SKILL_DIR/bin/task-hold.py" sync \
@@ -414,10 +463,24 @@ EOF
 
     # Only after task-scoped stops and durable holds are established may the
     # credentialed brokers publish artifacts or finalize integration evidence.
+    # Whether the brokers have queued work decides how the re-read below is
+    # allowed to answer, so it must be observed before they drain it.
+    local broker_work=no
+    if [ -n "$(find "$(team_path "$dir" outbox/pending)" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)" ] \
+       || [ -n "$(find "$(team_path "$dir" integrations)" -mindepth 1 -maxdepth 1 -type f -name '*.json' -print -quit 2>/dev/null || true)" ]; then
+      broker_work=yes
+    fi
     "$SKILL_DIR/bin/finalize-integrations.sh" "$team" "$fid"
     "$SKILL_DIR/bin/process-outbox.sh" "$team" "$fid"
-    env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
-      "$SKILL_DIR/bin/tracker-ops.sh" export "$fid" "$tasks_file" >/dev/null
+    # Re-read after the brokers to close the observation race their writes
+    # create. When they had nothing queued they wrote nothing, so the token
+    # rules as it does at the top of the pass and an idle cycle stays cheap --
+    # leaving this read ungated is what would keep every idle cycle at full
+    # price. When they did have work, export unconditionally: their writes are
+    # ours, and a hosted tracker does not promise that a read microseconds
+    # later already reflects them. Trusting the token there could plan on a
+    # snapshot missing the verdict we just published.
+    refresh_export_if_changed "$dir" "$fid" "$tasks_file" "$broker_work"
 
     # Close the observation race created by broker/finalizer work. If a human
     # moved a task to Blocked or reserved it with an ignored label during this
@@ -625,6 +688,14 @@ print((matches[0]["state"]+"\t"+matches[0]["createdAt"]) if matches else "absent
   done <<EOF
 $plan
 EOF
+  # Record that a pass completed. Every role exiting is the normal end of a
+  # pass, so this marker is the only evidence that separates a board nobody is
+  # driving from one that simply finished its work.
+  if [ "$dry" = "no" ]; then
+    local pass_marker
+    pass_marker="$(team_path "$dir" dispatch.last-pass)"
+    printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$pass_marker"
+  fi
 }
 
 [ $# -ge 3 ] || die "usage: dispatch.sh <team> <featureId> --once|--watch [--dry-run] [--task <taskId>]"

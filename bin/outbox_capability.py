@@ -111,12 +111,13 @@ def _protected_dir(path: Path) -> Path:
     return path
 
 
-def state_directories(repository: str | Path) -> tuple[Path, Path]:
+def state_directories(repository: str | Path) -> tuple[Path, Path, Path]:
     common = git_common_dir(repository)
     broker = _protected_dir(common / "startup-factory-broker")
     records = _protected_dir(broker / "outbox-capabilities")
     active = _protected_dir(broker / "outbox-active")
-    return records, active
+    revoked = _protected_dir(broker / "outbox-revoked")
+    return records, active, revoked
 
 
 def _write_exclusive(path: Path, content: bytes, mode: int = 0o600) -> None:
@@ -143,6 +144,88 @@ def _replace_owner_only(path: Path, content: bytes) -> None:
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+def _revocation_tombstone(revoked: Path, capability_id: str) -> Path:
+    """Path of the durable marker proving one capability was explicitly revoked.
+
+    Revocation and supersession both clear a capability's active pointer, so the
+    pointer alone cannot distinguish them once any later mint recreates it.  The
+    tombstone records the revoked identity itself, which no subsequent mint can
+    reproduce: capability ids are unique per mint.
+    """
+    return revoked / (capability_id + ".revoked")
+
+
+def _record_revocation(revoked: Path, capability_id: str) -> None:
+    if not CAPABILITY_ID.fullmatch(capability_id):
+        raise CapabilityError("cannot revoke an invalid capability identity")
+    _replace_owner_only(
+        _revocation_tombstone(revoked, capability_id),
+        (capability_id + "\n").encode("ascii"),
+    )
+
+
+def _revoke_matching_records(records: Path, revoked: Path, matches) -> None:
+    """Tombstone every capability ever minted for the identity being revoked.
+
+    An active pointer names only the newest capability, so revoking through it
+    would miss earlier ones that a relaunch had already superseded -- exactly
+    the capabilities most likely to be holding an undrained artifact. Records
+    are immutable and never deleted, so they are the complete set. A capability
+    minted after this call gets a fresh id that no tombstone names, which is
+    what lets a revoke-then-relaunch restart keep working.
+    """
+    try:
+        entries = sorted(records.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        raise CapabilityError("cannot enumerate capability records: %s" % exc) from exc
+    for path in entries:
+        if not path.name.endswith(".json"):
+            continue
+        # An individual unreadable record must not abort the revocation.  This
+        # directory is append-only for the life of the repository, so one
+        # truncated record -- what a crash during mint() leaves behind -- would
+        # otherwise permanently break every revoke, and with it the
+        # revoke-then-relaunch restart path for every role and team sharing the
+        # repository.  Skipping is safe rather than lenient: verification reads
+        # the same record through the same helper, so a record that cannot be
+        # read here cannot authenticate anything there either.
+        try:
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                continue
+            record = json.loads(_read_protected(path, "capability record"))
+        except (CapabilityError, OSError, UnicodeError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        capability_id = record.get("id")
+        if not isinstance(capability_id, str) or path.name != capability_id + ".json":
+            continue
+        if matches(record):
+            _record_revocation(revoked, capability_id)
+
+
+def _is_revoked(revoked: Path, capability_id: str) -> bool:
+    """Report whether an explicit revocation tombstone exists.
+
+    Any unreadable, non-regular, group/world-accessible, or mismatched
+    tombstone is treated as a revocation: a capability whose revocation
+    evidence cannot be trusted must not publish.
+    """
+    path = _revocation_tombstone(revoked, capability_id)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise CapabilityError("cannot inspect capability revocation: %s" % exc) from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise CapabilityError("capability revocation must be a non-symlink regular file")
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise CapabilityError("capability revocation must be owner-only")
+    return True
 
 
 def _active_key(record: Dict[str, Any]) -> str:
@@ -201,7 +284,7 @@ def mint(
     if ttl_seconds < 60 or ttl_seconds > 7 * 24 * 60 * 60:
         raise CapabilityError("capability TTL must be between 60 seconds and 7 days")
 
-    records, active = state_directories(repo)
+    records, active, _revoked = state_directories(repo)
     issued = int(time.time())
     capability_id = "cap-" + secrets.token_hex(16)
     secret = secrets.token_hex(32)
@@ -330,7 +413,7 @@ def _verify_entry(
 
     repo = _repo(repository)
     workspace_real = Path(os.path.realpath(workspace))
-    records, active = state_directories(repo)
+    records, active, revoked = state_directories(repo)
     raw = _read_protected(records / (capability_id + ".json"), "capability record")
     try:
         record = json.loads(raw)
@@ -346,11 +429,21 @@ def _verify_entry(
     if record.get("id") != capability_id:
         raise CapabilityError("capability record identity mismatch")
     if require_active:
-        active_id = _read_protected(
+        # An explicit revocation always wins.  Supersession does not: a relaunch
+        # replaces the active pointer of an equally-named instance, and the work
+        # the previous boot already enqueued is still authentic, still signed by
+        # a record that is still unexpired, and must still reach the board.
+        if _is_revoked(revoked, capability_id):
+            raise CapabilityError("producer capability was revoked")
+        # The pointer must still exist and be readable.  A cleared pointer with
+        # no tombstone is either a pre-tombstone revocation or a tampered state
+        # directory; neither proves this capability survived, so fail closed.
+        # Which id the pointer names no longer matters -- that only records
+        # which boot minted last, and the unexpired lease below is the bound
+        # that keeps a superseded producer from publishing indefinitely.
+        _read_protected(
             active / (_active_key(record) + ".id"), "active capability", 256
         )
-        if active_id.decode("ascii", errors="strict").strip() != capability_id:
-            raise CapabilityError("producer capability was superseded by a newer launch")
         now = int(time.time())
         if isinstance(record.get("expiresAt"), bool) or int(record.get("expiresAt", 0)) <= now:
             raise CapabilityError("producer capability expired")
@@ -443,7 +536,18 @@ def revoke_task(repository: str, workspace: str, team: str, task: str) -> int:
     _safe_text(team, "team", 63)
     _safe_text(task, "taskId")
 
-    records, active = state_directories(repo)
+    records, active, revoked_dir = state_directories(repo)
+    _revoke_matching_records(
+        records,
+        revoked_dir,
+        lambda record: (
+            record.get("canonicalRepo") == str(repo)
+            and record.get("canonicalWorkspace") == str(workspace_real)
+            and record.get("team") == team
+            and record.get("executionKind") == "task"
+            and record.get("taskId") == task
+        ),
+    )
     revoked = 0
     for pointer in sorted(active.iterdir(), key=lambda item: item.name):
         try:
@@ -483,6 +587,7 @@ def revoke_task(repository: str, workspace: str, team: str, task: str) -> int:
             and record.get("executionKind") == "task"
             and record.get("taskId") == task
         ):
+            _record_revocation(revoked_dir, capability_id)
             pointer.unlink()
             revoked += 1
     return revoked
@@ -501,7 +606,18 @@ def revoke_role(repository: str, workspace: str, team: str, role: str) -> int:
     if not ROLE.fullmatch(role):
         raise CapabilityError("invalid capability role")
 
-    records, active = state_directories(repo)
+    records, active, revoked_dir = state_directories(repo)
+    _revoke_matching_records(
+        records,
+        revoked_dir,
+        lambda record: (
+            record.get("canonicalRepo") == str(repo)
+            and record.get("canonicalWorkspace") == str(workspace_real)
+            and record.get("team") == team
+            and record.get("executionKind") == "gate"
+            and record.get("role") == role
+        ),
+    )
     revoked = 0
     for pointer in sorted(active.iterdir(), key=lambda item: item.name):
         try:
@@ -541,6 +657,7 @@ def revoke_role(repository: str, workspace: str, team: str, role: str) -> int:
             and record.get("executionKind") == "gate"
             and record.get("role") == role
         ):
+            _record_revocation(revoked_dir, capability_id)
             pointer.unlink()
             revoked += 1
     return revoked

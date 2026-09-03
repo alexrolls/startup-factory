@@ -1,0 +1,28 @@
+# Troubleshooting
+
+Symptoms an operator actually hits, and what each one means. Startup Factory
+is deliberately fail-closed: most entries here describe it stopping visibly
+rather than inventing state, so the fix is usually to supply the missing
+evidence rather than to bypass the check.
+
+| Symptom | Fix |
+|---|---|
+| Agent says the tracker is unavailable | Re-check the adapter's *Access mechanisms* (MCP block or exported API-key env vars); the agent stops rather than fabricating — that's by design |
+| Preflight reports a typed tracker failure | Treat `AUTH`/`NOT_FOUND` as credential or exact-scope configuration problems. Respect the provider reset hint for `RATELIMITED`; retry `NETWORK`, `TIMEOUT`, or `SERVER` only after checking service health. `MALFORMED_RESPONSE` is an andon: inspect the adapter/provider contract instead of retrying blindly. |
+| `start-task` reports that the feature branch is missing | Run the exact `git branch '<branch>' <base-commit>` command printed by the launcher, inspect the branch, then retry. No task worktree was created. |
+| `launch-team.sh` can't find a role | The role needs a brief in [`roles/`](../roles/) or [`teams/roles/`](../teams/roles/), and its `<ROLE>_CMD` (or `TEAM_DEFAULT_CMD`) must be set |
+| A role won't launch in a preset | An optional role may have `<ROLE>_CMD=null`; remove the line to fall back to `TEAM_DEFAULT_CMD`. Team Lead, Principal Architect, and Sceptical Principal Architect are mandatory, distinct rostered reviewers. Security must have a distinct launchable mapping but stays out of ordinary startup rosters; Deep Infra and Deep Security require it in the roster. Invalid mappings or missing commands reject launch. |
+| No `tmux` | Agents run as background processes automatically. With protected lifecycle state use `status`/`stop`; otherwise supervise them externally. Logs remain under `.teamwork/<team>/pids/` |
+| `status` says lifecycle supervision is disabled | Provision `BROKER_LIFECYCLE_ROOT` as documented in [`config/team.config.md`](../config/team.config.md); unmanaged manual mode deliberately refuses `stop` rather than trusting workspace PID text |
+| Team seems stuck | Run `bin/launch-team.sh status <team> --json`. A typed `stalled:<reason>` is semantic-heartbeat evidence joined to protected lifecycle identity; `exited` is normal idle state for a one-shot gate consumer, but an exited task worker without its required artifact is a recovery candidate. `identity-mismatch` is fail-closed and never signaled. The Team Lead uses one `worker-control.py request` rung at a time; inspect `.teamwork/<team>/control-outbox/{done,failed}/`, quarantine manifests, and `.teamwork/<team>/ESCALATIONS.md`. A `[Blocked]` task is intentionally human-held and never restarted by automation. |
+| `TURBO_MODE=safe` refuses launch | Safe Turbo requires protected lifecycle authority, enforced sandboxing, `TRACKER_WRITERS=broker`, `EXECUTION=parallel`, a meaningful non-no-op `WORKTREE_SETUP`, at least one meaningful `VALIDATE_SCRIPT`/`BUILD`/`TEST`/`LINT`/`FORMAT` command, `MAX_ACTIVE_IMPLEMENTERS` no higher than 4, and `REVIEW_MODE=parallel` in the selected preset. It never fixes conflicting settings silently. |
+| An eligible queued task never launches | Confirm automation is enabled and scheduled, the scriptable adapter has an exact scope, the task does not carry an `ignoredTaskLabels` value such as `human-work`, and `team-preset` is absent or exactly one allowed preset. If `requireMetadataOptIn` is true, also confirm the latest metadata says `automation: enabled`; conflicting or unordered metadata deliberately pauses. |
+| A human moved `[Blocked]` to queued but no fresh attempt starts | Inspect the generated resume-review request. A broker-authenticated `[resume-review]` must bind its exact hold and communication digest; changed requirements also need a later `[resume-plan]` and both architect design approvals, and the prior worktree must be clean. |
+| `--print-cron` rejects the scan interval | Conventional cron output supports minute divisors of 60 and whole-hour divisors of 24. Use a service timer or hosted scheduler for cadences such as seven minutes |
+| `another live pass owns the monitor lease` | One healthy pass is already running on this host. Do not start a second scheduler; multi-host operation needs a distributed lock or adapter-native compare-and-set |
+| Release waits for product acceptance | Publish a current feature-scope `[product-approval]` bound to the exact final feature HEAD and integration-evidence digest; stale or ambiguous evidence cannot release |
+| Release says it is awaiting CI | Inspect the protected `verifyCi` result for the exact release commit. Failed, pending, skipped, missing, stale, mismatched, or unverifiable required checks block every apply; fix CI and rerun the release transaction—never bypass or replace this proof with a tracker comment. |
+| Release says it is awaiting authorization | In `approval-required` mode, have the protected `verifyApproval` system authorize the exact manifest before its expiry; a board comment is intentionally insufficient |
+| Release is fenced after an uncertain apply, detached-worker loss (exit 125), post-launch authority change, or target mismatch | Inspect the protected transaction and target `status` evidence. Repair the provider hook/target state and let the transaction reconcile; never blindly re-run apply or delete the fence |
+| Want to verify the plumbing | `bash tests/run-all.sh --smoke` for a fast core check; `bash tests/run-all.sh` for the full offline suite (stub agents + local files; no LLM, no cost) |
+

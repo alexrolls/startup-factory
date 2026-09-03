@@ -48,6 +48,7 @@ def snapshot(**changes):
         "presentationOnly": True,
         "nonAgentProcessesOmitted": 0,
         "agents": [],
+        "boards": [],
         "warnings": [],
     }
     value.update(changes)
@@ -681,6 +682,7 @@ class HealthPublisherTest(unittest.TestCase):
                 "release-worker.py",
                 "process-lifecycle.py",
                 "agent-health.py",
+                "board-status.py",
                 "heartbeat-status.py",
                 "teamwork-path.py",
             ):

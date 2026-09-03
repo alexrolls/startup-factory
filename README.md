@@ -38,7 +38,7 @@ Startup Factory does not replace your coding agent, repository, project-manageme
 - [Bring your own agents, tracker, and stack](#bring-your-own-agents-tracker-and-stack)
 - [Choose how much autonomy you want](#choose-how-much-autonomy-you-want)
 - [Safety is part of the architecture](#safety-is-part-of-the-architecture)
-- [What's new](#whats-new-in-0119)
+- [What's new](#whats-new-in-0121)
 - [Documentation](#documentation)
 - [Project status](#project-status)
 - [Contributing](#contributing)
@@ -444,6 +444,8 @@ The contract is intentionally thin: provide the prompt, let the agent read and e
 
 The workflow speaks one generic vocabulary — `[feature]`, `[task]`, `[subtask]`, and configured statuses — while each adapter translates it into the selected tool.
 
+Credentials live in environment variables, never in the config files, and a hosted tracker needs its access wired once. See [`reference/tracker-access.md`](reference/tracker-access.md) for the exact key, scope, and env-var setup per tool.
+
 ### Engineering stack
 
 Startup Factory is language-, framework-, cloud-, and CI-provider-agnostic. Your repository defines the real build, test, lint, format, deployment, rollback, and verification commands.
@@ -484,6 +486,40 @@ Read the full contracts before enabling unattended or production operation:
 - [`reference/automation.md`](reference/automation.md)
 - [`reference/deployment.md`](reference/deployment.md)
 - [`reference/orchestration.md`](reference/orchestration.md)
+
+## What's new in 0.1.21
+
+This release documents what the README rewrite would otherwise have dropped.
+Troubleshooting and tracker access were reachable only from the old README, so
+replacing it would have removed them from the project entirely. They now live in
+[`reference/troubleshooting.md`](reference/troubleshooting.md) and
+[`reference/tracker-access.md`](reference/tracker-access.md), and the README
+links to both.
+
+## What's new in 0.1.20
+
+This release makes an idle dispatch pass affordable and a stalled board visible,
+and stops a relaunch destroying verdicts the previous boot had enqueued.
+
+A pass now asks the adapter for a cheap change token and reuses the cached
+[feature] export when nothing moved, so an idle pass costs a couple of requests
+instead of hundreds — a watch loop at the default cadence could otherwise
+exhaust an hourly hosted-tracker budget with no work having changed. Reuse is
+bounded on every side: a full export runs at least every
+`EXPORT_MAX_REUSE_SECONDS`, the token is recorded only after a successful
+export, and an adapter that cannot promise the token moves whenever the export
+would simply omits it.
+
+`launch-team.sh health` adds a board-level line per team, because every role
+reaching `exited` is the normal end of a pass and per-role output cannot
+separate a board that finished from one nobody is driving.
+
+Gate capabilities are minted with a stable instance, so relaunching a role
+replaced its active pointer and orphaned every artifact the previous boot had
+enqueued — including independent review verdicts. Supersession no longer blocks
+publication; the unexpired lease is the bound. Explicit revocation still stops a
+capability, now through durable tombstones that also cover capabilities an
+earlier relaunch had superseded.
 
 ## What's new in 0.1.19
 
@@ -562,6 +598,8 @@ reviews, integration, or releases.
 | [`reference/guardrails.md`](reference/guardrails.md) | Denied actions, exact human approvals, and allowed operations |
 | [`reference/deployment.md`](reference/deployment.md) | Provider-neutral, recoverable production delivery |
 | [`reference/evidence-providers.md`](reference/evidence-providers.md) | Commit-bound external evidence and provider contracts |
+| [`reference/tracker-access.md`](reference/tracker-access.md) | Wiring a tracker: access mechanisms, scopes, and credential env vars |
+| [`reference/troubleshooting.md`](reference/troubleshooting.md) | Symptoms an operator hits, and what each fail-closed stop means |
 | [`config/`](config/) | Tracker, planning, team, automation, guardrail, and deployment configuration |
 | [`adapters/`](adapters/) | Shipped project-management adapters and the custom adapter template |
 | [GitHub Releases](https://github.com/alexrolls/startup-factory/releases) | Version history and release notes |
