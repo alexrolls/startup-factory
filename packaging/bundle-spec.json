@@ -43,6 +43,7 @@
     "bin/delivery_profile.py",
     "bin/evidence_provider.py",
     "bin/agent-health.py",
+    "bin/board-status.py",
     "bin/heartbeat-status.py",
     "bin/process-lifecycle.py",
     "bin/teamwork-path.py",

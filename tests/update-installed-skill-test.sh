@@ -49,6 +49,7 @@ done
 for required_file in \
   adapters/_TEMPLATE.md \
   bin/agent-health.py \
+  bin/board-status.py \
   bin/dispatch.sh \
   bin/heartbeat-status.py \
   bin/launch-team.sh \

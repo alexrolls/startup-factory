@@ -80,6 +80,11 @@ AGENT_SANDBOX_HOME=null          # Optional absolute mode-0700 directory outside
 DOCTOR_TIMEOUT_SECONDS=60        # Per distinct configured command. team/gate-team runs one
                                  # non-mutating prompt/auth round trip before launching any role.
 POLL_INTERVAL_SECONDS=120        # Fallback only; local runtime events wake dispatch within ~1s
+EXPORT_MAX_REUSE_SECONDS=900     # Longest a dispatch pass may reuse the cached [feature] export when
+                                 # the adapter reports the tracker unchanged. A full export always
+                                 # runs once this elapses, so a change token that misses an edit
+                                 # delays an export rather than cancelling one. Adapters without a
+                                 # change token export every pass regardless.
 STUCK_AFTER_MINUTES=15           # Lead treats silence longer than this as "stuck"
 ESCALATE_AFTER_ATTEMPTS=2        # Failed unblock attempts before the Lead escalates to the human
 TURBO_MODE=off                   # off|safe. Safe is a fail-closed readiness profile; it never
