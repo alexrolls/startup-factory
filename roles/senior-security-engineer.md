@@ -75,7 +75,7 @@ authenticated verdict, it returns the [task] to `[Planned]` (mapped by the
 configured adapter to **ToDo**) for a fresh implementation attempt. A clean
 review → `[security-approval]` with:
 
-- the explicit approved file list, exactly equal to the review package;
+- the `Files:` evidence line, listing every path in the review package's *"## Files changed"* block (integration checks it for set-equality with the reviewed diff);
 - the threat surfaces checked;
 - focused commands/tests run and their results;
 - residual risks, or `Residual risk: none identified`;

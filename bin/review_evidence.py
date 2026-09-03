@@ -24,6 +24,12 @@ SIGNATURE_RE = re.compile(
     r"^(?:\s*(?:—|-)\s*)[a-z0-9-]+(?:\s*\((?:posted by[^)]*|as [^)]+)\))?\s*$",
     re.IGNORECASE,
 )
+PUBLICATION_TRAILER_RE = re.compile(r"^\s*delivery-id:\s*\S+\s*$", re.IGNORECASE)
+FILES_EVIDENCE_RE = re.compile(r"(?mi)^[ \t]*files[ \t]*:[ \t]*([^\n]+?)[ \t]*$")
+FILES_EVIDENCE_PROSE_RE = re.compile(
+    r"(?mi)^[ \t]*(?:files\s+approved[^:\n]*|approved\s+files[^:\n]*)[ \t]*:[ \t]*([^\n]+?)[ \t]*$"
+)
+FILES_SEPARATOR_RE = re.compile(r"[,·•]")
 REQUEST_FIELDS = ("Review-Base-Commit", "Task-Branch-Head", "Review-Package-SHA256")
 REQUEST_REVIEW_GATES_FIELD = "Review-Gates"
 APPROVAL_BINDING_FIELDS = (
@@ -59,6 +65,57 @@ def digest(body: str) -> str:
 def marker(body: str) -> str:
     match = MARKER_RE.match(normalize(body))
     return match.group(1) if match else ""
+
+
+def strip_publication_trailer(body: str) -> str:
+    """Drop the trailer the publication path appends to a body after it is authored.
+
+    `tracker-ops.sh comment-once` appends `delivery-id: <id>` as the last line of
+    every artifact it publishes, i.e. *after* the role signature.  Anything that
+    reads a published artifact from the tail — a signature match, a "last line"
+    heuristic — sees the trailer instead of what the role wrote.  Readers call
+    this first so that the tail of the returned text is the tail the author
+    actually wrote.
+
+    The trailer is deliberately not moved at the writing end: it is appended last
+    by contract, and the hold-verification path reconstructs a published body as
+    `body + "\\n\\ndelivery-id: " + id` to prove a comment was not tampered with.
+    """
+    lines = normalize(body).strip().split("\n")
+    while lines and (not lines[-1].strip() or PUBLICATION_TRAILER_RE.match(lines[-1])):
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+def parse_files_evidence(body: str) -> set[str] | None:
+    """Return the reviewed file set an artifact declares, or None when absent.
+
+    The canonical form is `Files: a, b, c`.  Reviewers also routinely label the
+    same evidence `Files approved (exact):` or `Approved files (...):`, and list
+    the paths with middots or spaces instead of commas, because that reads better
+    inside a prose verdict.  All of those state the same fact, so all of them are
+    accepted here; the caller still has to prove the parsed set equals the exact
+    reviewed Git file set, which is where the actual guarantee lives.
+
+    The canonical label wins whenever it is present, so an artifact that carries
+    one keeps its existing meaning no matter what prose surrounds it; the looser
+    labels are consulted only when there is no `Files:` line to read.
+    """
+    text = normalize(body)
+    match = FILES_EVIDENCE_RE.search(text) or FILES_EVIDENCE_PROSE_RE.search(text)
+    if not match:
+        return None
+    values = {part.strip().strip("`") for part in FILES_SEPARATOR_RE.split(match.group(1))}
+    values.discard("")
+    # A single remaining value that still contains whitespace is a space-separated
+    # list.  Comma/middot separation is resolved first so that a path containing a
+    # space survives the ordinary case.
+    if len(values) == 1:
+        only = next(iter(values))
+        if re.search(r"\s", only):
+            values = {part.strip().strip("`") for part in only.split()}
+            values.discard("")
+    return values
 
 
 def fields(body: str, names: tuple[str, ...]) -> dict[str, str]:

@@ -62,7 +62,7 @@ the current need. Change your position when better evidence arrives.
    not stand in for the actual entry path.
    Problems become one numbered `[review-findings]` comment and requeue the
    [task] to `[Planned]` for a fresh attempt. Otherwise post
-   `[sceptical-architecture-approval]` with the exact approved file list. Submit
+   `[sceptical-architecture-approval]` carrying the `Files:` evidence line, listing every path in the review package's *"## Files changed"* block (integration checks it for set-equality with the reviewed diff). Submit
    the verdict through the outbox so it binds to the current review request,
    task-branch HEAD, and package digest.
 

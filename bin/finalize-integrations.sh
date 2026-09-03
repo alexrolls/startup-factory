@@ -291,7 +291,7 @@ from pathlib import Path
 entry_raw,snapshot_raw,repo_raw,workspace_raw,team,feature,board_raw,review_module_raw,skill_raw,policy_source_raw=sys.argv[1:]
 entry,snapshot,repo,workspace=Path(entry_raw),Path(snapshot_raw),Path(repo_raw).resolve(),Path(workspace_raw).resolve()
 sys.dont_write_bytecode=True; sys.path.insert(0,str(Path(review_module_raw).resolve().parent))
-from review_evidence import EvidenceError, SUPPORTING_GATE_MARKERS, request_binding, validate as validate_review_evidence
+from review_evidence import EvidenceError, SUPPORTING_GATE_MARKERS, parse_files_evidence, request_binding, validate as validate_review_evidence
 from task_metadata import required_review_gates
 from team_policy import TeamPolicyError, load_team_policy
 def fail(message): raise SystemExit("finalize-integrations: prepared authorization: "+message)
@@ -388,9 +388,10 @@ for index,comment in enumerate(comments):
     match=marker_re.match(str(comment.get("body") or ""))
     if match: positions[match.group(1)]=index
 def files(body,marker):
-    match=re.search(r"(?mi)^\s*Files:\s*([^\n]+)$",body)
-    if not match: fail("[%s] lacks Files evidence"%marker)
-    return {part.strip().strip("`") for part in match.group(1).split(",") if part.strip()}
+    values=parse_files_evidence(body)
+    if values is None: fail("[%s] lacks Files evidence — declare it as 'Files: <path>, <path>'"%marker)
+    if not values: fail("[%s] has an empty Files: evidence"%marker)
+    return values
 raw=subprocess.run(["git","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false","diff","--name-only","-z",
                     data["reviewBaseCommit"]+".."+data["taskBranchHead"]],cwd=repo,capture_output=True,env=env,check=True).stdout
 actual={item.decode("utf-8","surrogateescape") for item in raw.split(b"\0") if item}
@@ -644,7 +645,7 @@ repo, workspace = Path(repo_raw).resolve(), Path(workspace_raw).resolve()
 entry = Path(entry_raw)
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(review_module_raw).resolve().parent))
-from review_evidence import EvidenceError, SUPPORTING_GATE_MARKERS, request_binding, validate as validate_review_evidence
+from review_evidence import EvidenceError, SUPPORTING_GATE_MARKERS, parse_files_evidence, request_binding, validate as validate_review_evidence
 from task_metadata import required_review_gates
 from team_policy import TeamPolicyError, load_team_policy
 GIT_ENV = {name: os.environ[name] for name in ("PATH", "TMPDIR", "LANG", "LC_ALL") if name in os.environ}
@@ -1070,10 +1071,9 @@ if snapshot_raw:
     # and each declared supporting approval. Bind every verdict to the exact
     # reviewed Git file set.
     def file_list(body, marker):
-        match = re.search(r"(?mi)^\s*Files:\s*([^\n]+)$", body)
-        if not match:
-            fail("[%s] is missing its Files: evidence" % marker)
-        values = {part.strip().strip("`") for part in match.group(1).split(",") if part.strip()}
+        values = parse_files_evidence(body)
+        if values is None:
+            fail("[%s] is missing its Files: evidence — declare it as 'Files: <path>, <path>'" % marker)
         if not values:
             fail("[%s] has an empty Files: evidence" % marker)
         return values
@@ -1094,8 +1094,17 @@ if snapshot_raw:
         for gate in review_binding["reviewGates"]
     )
     for marker, index in approval_file_markers:
-        if file_list(str(comments[index].get("body") or ""), marker) != actual_files:
-            fail("[%s] Files: evidence does not equal the exact reviewed Git file set" % marker)
+        declared = file_list(str(comments[index].get("body") or ""), marker)
+        if declared != actual_files:
+            fail(
+                "[%s] Files: evidence does not equal the exact reviewed Git file set"
+                " (declared but not changed: %s; changed but not declared: %s)"
+                % (
+                    marker,
+                    ", ".join(sorted(declared - actual_files)) or "none",
+                    ", ".join(sorted(actual_files - declared)) or "none",
+                )
+            )
 
     signer_markers = (
         ("TEAM_LEAD", "team-lead-approval", team_lead),

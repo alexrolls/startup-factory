@@ -50,7 +50,7 @@ Markers you are authorized to post: [design-approved], [design-pushback], [archi
    `[design-note]` and its conditions,
    boundary violations, coupling, contract drift. Problems →
    `[review-findings]` and requeue to `[Planned]`; otherwise
-   `[architecture-approval]` with the explicit list of approved file paths
+   `[architecture-approval]` carrying the `Files:` evidence line, listing every path in the review package's *"## Files changed"* block (integration checks it for set-equality with the reviewed diff)
    (must match the diff). If the `[review-request]`'s
    evidence record is complete and its commit equals the branch HEAD, inspect and
    spot-check — do not re-run suites blind; a stale or missing record means you
