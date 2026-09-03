@@ -47,6 +47,7 @@ FULL_PYTHON_TESTS=(
   product-acceptance-test.py
   superpowers-planning-test.py
   review-evidence-test.py
+  published-artifact-parsing-test.py
   delivery-profile-test.py
   evidence-provider-test.py
   release-lifecycle-test.py
@@ -85,6 +86,7 @@ SMOKE_PYTHON_TESTS=(
   product-acceptance-test.py
   superpowers-planning-test.py
   review-evidence-test.py
+  published-artifact-parsing-test.py
   delivery-profile-test.py
   evidence-provider-test.py
   tracker-adapter-pagination-test.py

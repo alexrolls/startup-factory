@@ -41,9 +41,10 @@ path. Read only that packet and the code needed for its task. Missing context is
    the feature branch. Leave the worktree clean.
 7. **Request review.** Write the full task report, then submit a
    `[review-request]` through `bin/submit-artifact.sh`. It carries the task-branch
-   HEAD, changed-file list, an evidence record per configured command with the
-   exact packet command and its baseline comparison, and a `NOT validated:`
-   section. The outbox performs the tracker write and status
+   HEAD, the `Files:` evidence line listing every path in the review package's
+   *"## Files changed"* block (integration checks it for set-equality with the
+   reviewed diff), an evidence record per configured command with the exact
+   packet command and its baseline comparison, and a `NOT validated:` section. The outbox performs the tracker write and status
    transition idempotently; direct process exit is not completion.
 8. **Rework.** On `[review-findings]`, the [task] returns to `[Planned]`
    (adapter status **ToDo**). The dispatcher launches a fresh numbered attempt;

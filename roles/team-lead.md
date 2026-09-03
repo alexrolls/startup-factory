@@ -194,7 +194,7 @@ Any unmet requirement or standard → one numbered `[review-findings]` comment
 with evidence, impact, and required remediation; request the transition
 `[Review] → [Planned]` (the adapter maps `[Planned]` to **ToDo**) so the
 dispatcher creates a fresh implementation attempt. A clean pass →
-`[team-lead-approval]` with the exact approved file list, checklist results,
+`[team-lead-approval]` carrying the `Files:` evidence line, listing every path in the review package's *"## Files changed"* block (integration checks it for set-equality with the reviewed diff), checklist results,
 validation/CI evidence reviewed, and residual concerns. Submit through the
 outbox so the broker binds the verdict to the current request, task-branch HEAD,
 and package digest.

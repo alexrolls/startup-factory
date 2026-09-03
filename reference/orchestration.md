@@ -346,13 +346,13 @@ pre-v2 comments count as round 0). WIP narration, setup chatter, and restated
 | `[resume-plan]` | team-lead | Revised implementation plan after a `requirements-changed` resume verdict. It must be later than that verdict and followed by both later design approvals before a clean-worktree hold can clear. |
 | `[api-ready]` | backend | Contract available for frontend: endpoints, request/response shapes. Also sent by mailbox. |
 | `[divergence]` | implementer | What was done differently from the [task]/design note and why. Additive — **never edit the original [task] description.** |
-| `[review-request]` | implementer | Ready for review: what changed, list of changed files, an **evidence record per configured validation command** (see *Evidence and re-execution*), its exact baseline comparison, an explicit `NOT validated:` section for anything not run (with reason), and any index-only staging operation performed. Hand-scoped substitutes do not satisfy a broader configured command. A claimed result without its evidence record **is** NOT validated. Written when moving to `[Review]`. `review-package.sh` emits a sibling binding manifest; reviewers read that file and let the broker add bindings instead of retyping hashes. |
+| `[review-request]` | implementer | Ready for review: what changed, list of changed files, an **evidence record per configured validation command** (see *Evidence and re-execution*), its exact baseline comparison, an explicit `NOT validated:` section for anything not run (with reason), and any index-only staging operation performed. Hand-scoped substitutes do not satisfy a broader configured command. A claimed result without its evidence record **is** NOT validated. Written when moving to `[Review]`. `review-package.sh` emits a sibling binding manifest; reviewers read that file and let the broker add bindings instead of retyping hashes. Must carry the **`Files:` evidence line** (see below). |
 | `[review-findings]` | reviewer / qa / team-lead / principal-architect / sceptical-architect / security-reviewer | Numbered problems that must be fixed. Task goes back to `[Planned]`/`ToDo` for a fresh attempt. |
-| `[review-approval]` | reviewer / qa | Optional supporting approval with the **explicit list of approved file paths**. |
-| `[team-lead-approval]` | team-lead | Mandatory independent specification, quality, test, and operability sign-off with exact files. |
+| `[review-approval]` | reviewer / qa | Optional supporting approval carrying the **`Files:` evidence line** (see below). |
+| `[team-lead-approval]` | team-lead | Mandatory independent specification, quality, test, and operability sign-off, carrying the **`Files:` evidence line** (see below). |
 | `[architecture-approval]` | principal-architect | Same, from the architecture review. |
-| `[sceptical-architecture-approval]` | sceptical-architect | Independent architecture challenge cleared, with the same exact file-list and review-package binding. |
-| `[security-approval]` | security-reviewer | Independent security sign-off required when the effective review gates include `security`; includes threat surfaces, focused verification, residual risk, and exact files. |
+| `[sceptical-architecture-approval]` | sceptical-architect | Independent architecture challenge cleared, with the same **`Files:` evidence line** (see below) and review-package binding. |
+| `[security-approval]` | security-reviewer | Independent security sign-off required when the effective review gates include `security`; includes threat surfaces, focused verification, residual risk, and the **`Files:` evidence line** (see below). |
 | `[product-approval]` | product owner role (e.g. `senior-technical-product-manager`; the team-lead where no product role exists) | Scope/acceptance sign-off: scope ruling, acceptance-criteria verdict, any conditions. |
 | `[product-pushback]` | product owner role (same) | Scope gate closed: what must change in scope or acceptance criteria before work proceeds. |
 | `[handoff]` | team-lead | Reassignment: summary of state so a fresh agent can resume. |
@@ -360,6 +360,35 @@ pre-v2 comments count as round 0). WIP narration, setup chatter, and restated
 | `[digest]` | dispatcher projection | **One per [feature], upserted mechanically** from the tracker snapshot: one line per [task] with tracker status and execution stage. Linear/GitHub/Markdown use a managed description block where feature comments are unavailable. |
 | `[andon]` | any role | Stop-the-line report: what failed, exact error, what you did NOT do. |
 | `[escalation]` | team-lead | Needs the human. Required shape: `question:` (one sentence), `context:` (≤ 4 lines), `options:` (≥ 2, each with a one-line consequence), `default-if-silent: <option> after <N hours>`. Also appended to `ESCALATIONS.md`. An `[escalation]` without options + default is a protocol error (`[andon]`). |
+
+### The `Files:` evidence line — machine-checked, so write it exactly
+
+The `[review-request]` and **every** approval that binds it must carry the reviewed
+file set on its own line. This is not prose for a human reader: the integrator
+parses it and requires **set-equality** with `git diff --name-only <base>..<head>`.
+An artifact without a parseable line, or with one naming a different set, fails
+integration — after every review has completed, which is the expensive place to
+find out.
+
+Write it as one line, paths separated by commas:
+
+```
+Files: CLAUDE.md, backend/tests/test_widget.py, scripts/deploy.sh
+```
+
+- **Take the paths from the package, not from memory.** The review package's
+  *"## Files changed"* block is generated from the same diff the integrator
+  compares against; every path in it belongs on the line, and nothing else does.
+  Recalling the set from what you reviewed is how it drifts.
+- The label may also read `Files approved (exact):` or `Approved files (…):`, and
+  middots or spaces are accepted in place of commas, so a verdict can stay
+  readable as prose. The canonical `Files:` + commas form is still what you should
+  emit when you have the choice.
+- One line per artifact. The set must be the **whole** reviewed diff, not the
+  subset a given reviewer looked hardest at — a reviewer who wants to approve less
+  than the diff writes `[review-findings]`, not a shorter list.
+- Any branch movement changes the diff and therefore this line, in the fresh
+  request and in every fresh approval.
 
 ## Contract registry — parallel plans share names, not assumptions
 

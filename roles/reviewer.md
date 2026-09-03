@@ -44,7 +44,7 @@ the three core review-board approvals and every declared supporting gate.
 checklist item needs a `file:line` citation for the implementation AND a citation
 for the test that proves it. Compare the final file list with the review package's
 changed set and confirm the package Head still equals the task branch HEAD. They must match.
-Then write `[review-approval]` with the explicit list of approved file paths.
+Then write `[review-approval]` carrying the `Files:` evidence line, listing every path in the review package's *"## Files changed"* block (integration checks it for set-equality with the reviewed diff).
 Submit it through the outbox; the credentialed broker adds the exact request
 digest, task-branch HEAD, and package digest. Never copy those bindings from an
 older round or type a substitute by hand.

@@ -15,11 +15,27 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 from product_acceptance import ProductAcceptancePending, evaluate as evaluate_product_acceptance, validate_request
+from review_evidence import strip_publication_trailer
 from task_metadata import effective_review_gates, parse_task_metadata, required_review_gates
 
 
 MARKER_RE = re.compile(r"^\s*\[([\w-]+)\]")
 HOLD_STATES = {"blocked", "resume-review-pending", "manual-takeover"}
+SIGNER_RE = re.compile(r"(?:—|-)\s*([\w-]+)(?:\s*\((?:posted by[^)]*|as [^)]+)\))?\s*$")
+
+
+def approval_signer(task: dict, index: int) -> str | None:
+    """Resolve the role that signed a published artifact.
+
+    The signature is the last thing the role writes, so this matches from the
+    tail — but only after the publication trailer is removed.  Reading the raw
+    body instead resolves every artifact to the trailing delivery id, which
+    matches no configured role, and a task whose gates all look foreign to the
+    planner is silently dropped from every queue.
+    """
+    body = str((task.get("comments") or [])[index].get("body") or "")
+    signature = SIGNER_RE.search(strip_publication_trailer(body))
+    return signature.group(1) if signature else None
 
 
 def last(task: dict, *names: str) -> int:
@@ -545,14 +561,6 @@ def main() -> None:
     ]
     team_lead_review_queue, architecture_queue, sceptical_architecture_queue = [], [], []
     security_queue, qa_queue, merge_queue, anomalies = [], [], [], []
-
-    def approval_signer(task: dict, index: int) -> str | None:
-        body = str((task.get("comments") or [])[index].get("body") or "")
-        signature = re.search(
-            r"(?:\u2014|-)\s*([\w-]+)(?:\s*\((?:posted by[^)]*|as [^)]+)\))?\s*$",
-            body.strip(),
-        )
-        return signature.group(1) if signature else None
 
     for task in tasks:
         if task.get("status") != review_status:
