@@ -487,6 +487,29 @@ Read the full contracts before enabling unattended or production operation:
 - [`reference/deployment.md`](reference/deployment.md)
 - [`reference/orchestration.md`](reference/orchestration.md)
 
+## What's new in 0.1.22
+
+Two defects could stop a board permanently, and the contract behind one of them
+was documented nowhere.
+
+A published artifact carries a `delivery-id:` trailer appended after the role
+signature, so resolving the signing role from the end of the body returned the
+delivery id instead of a role. Every gate then looked foreign to the planner: on
+a [task] with a declared supporting review gate the core-approval branch was
+never entered, the merge queue was unreachable, and the same reviewer was
+relaunched every pass while the board reported itself idle. Signature resolution
+now skips that trailer.
+
+The integration authorizer also accepted only a `Files:` line split on commas,
+while reviewers publish the same evidence as `Files approved (exact): a - b`.
+Those artifacts failed after every review had finished. Both authorizer sites now
+share one parser that accepts the prose labels and middot or space separators,
+with the canonical `Files:` label still winning wherever it appears; set-equality
+against the reviewed Git diff is unchanged. That contract is now specified in
+[`reference/orchestration.md`](reference/orchestration.md) and in every role brief
+that publishes a file list, and a set mismatch names which paths differ in each
+direction.
+
 ## What's new in 0.1.21
 
 This release documents what the README rewrite would otherwise have dropped.
