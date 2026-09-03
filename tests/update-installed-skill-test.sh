@@ -629,6 +629,37 @@ else
   FAILURES=$((FAILURES + 1))
 fi
 
+# A local edit to a shipped file is about to be discarded by the incoming
+# version. The updater records the hash it installed, so it can say so instead
+# of reverting the edit silently.
+DRIFT_INSTALL="$TMP/drift-install"
+mkdir -p "$DRIFT_INSTALL"
+env STARTUP_FACTORY_REMOTE_URL="$UPSTREAM" STARTUP_FACTORY_REF=main \
+  bash "$ROOT/bin/update-installed-skill.sh" --install-dir "$DRIFT_INSTALL" \
+    > "$TMP/drift-install.out"
+
+env STARTUP_FACTORY_REMOTE_URL="$UPSTREAM" STARTUP_FACTORY_REF=main \
+  bash "$ROOT/bin/update-installed-skill.sh" --install-dir "$DRIFT_INSTALL" --dry-run \
+    > "$TMP/drift-clean.out"
+if grep -q 'modified locally' "$TMP/drift-clean.out"; then
+  echo "FAIL: an unmodified installation was reported as locally modified"
+  FAILURES=$((FAILURES + 1))
+else
+  echo "ok: an unmodified installation reports no local drift"
+fi
+
+printf '\n# local edit that upstream does not have\n' >> "$DRIFT_INSTALL/bin/tracker-ops.sh"
+env STARTUP_FACTORY_REMOTE_URL="$UPSTREAM" STARTUP_FACTORY_REF=main \
+  bash "$ROOT/bin/update-installed-skill.sh" --install-dir "$DRIFT_INSTALL" --dry-run \
+    > "$TMP/drift-dirty.out"
+if grep -q 'modified locally' "$TMP/drift-dirty.out" && \
+   grep -q 'bin/tracker-ops.sh' "$TMP/drift-dirty.out"; then
+  echo "ok: a locally modified shipped file is named before it is replaced"
+else
+  echo "FAIL: a locally modified shipped file was not reported"
+  FAILURES=$((FAILURES + 1))
+fi
+
 echo "---"
 if [ "$FAILURES" -ne 0 ]; then
   echo "$FAILURES updater test(s) failed"

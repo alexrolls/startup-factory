@@ -66,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
     _mutation_arguments(install)
     update = subparsers.add_parser("update", help="safely update an existing installation")
     _mutation_arguments(update)
+    update.add_argument(
+        "--allow-downgrade",
+        action="store_true",
+        help="write the selected bundle even when it is older than the installed version",
+    )
     verify = subparsers.add_parser("verify", help="verify installed runtime files and provenance")
     _target_arguments(verify)
     initialize_parser = subparsers.add_parser(
@@ -227,6 +232,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     command=args.command,
                     overwrite_config=bool(args.overwrite_config),
                     dry_run=bool(args.dry_run),
+                    allow_downgrade=bool(getattr(args, "allow_downgrade", False)),
                 )
         _print_result(result, as_json=json_output)
         return 0

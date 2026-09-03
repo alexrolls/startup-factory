@@ -36,6 +36,7 @@ BUNDLE_PREFIX = "startup-factory/"
 BUNDLE_MANIFEST = ".startup-factory-bundle.json"
 OWNERSHIP_MANIFEST = ".startup-factory-owned-files"
 INSTALL_PROVENANCE = ".startup-factory-install.json"
+SOURCE_INSTALL_PROVENANCE = ".startup-factory-source-install.json"
 SKILL_NAME = "startup-factory"
 SCHEMA_VERSION = 1
 POLICY_VERSION = 1
@@ -915,6 +916,64 @@ def _swap_stage(stage: Path, target: Path) -> None:
             raise InstallerError(f"update succeeded but old backup could not be removed: {backup}: {exc}") from exc
 
 
+def _stable_semver(value: object) -> tuple[int, int, int] | None:
+    """Parse a release version, or None when it is not stable numeric SemVer."""
+    if not isinstance(value, str):
+        return None
+    parts = value.split(".")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)  # type: ignore[return-value]
+
+
+def _assert_source_managed_install_untouched(target: Path) -> None:
+    """Refuse to convert a source-managed installation into a release one.
+
+    `bin/update-installed-skill.sh` already refuses the mirror image of this —
+    it will not update a release-CLI install because it cannot carry the
+    canonical bundle provenance. Leaving this direction open means a routine
+    `update` silently replaces a source install with whatever version the
+    index resolves, which can be older than what the project already has.
+    """
+    if (target / INSTALL_PROVENANCE).is_file():
+        return
+    if not (target / SOURCE_INSTALL_PROVENANCE).is_file():
+        return
+    raise InstallerError(
+        "this installation is source-managed (it carries "
+        f"{SOURCE_INSTALL_PROVENANCE} and no release provenance); update it with "
+        "bin/update-installed-skill.sh, which preserves its source provenance"
+    )
+
+
+def _assert_not_downgrade(bundle: ValidatedBundle, target: Path, allow_downgrade: bool) -> None:
+    """Refuse to write an older bundle over a newer installation.
+
+    A published index is not always ahead of the installation: a release can be
+    mid-flight, or half-published if the post-publish verification fails, so
+    `@latest` legitimately resolves to the previous version. Writing it would
+    revert whatever the newer version fixed, without a word.
+    """
+    if allow_downgrade:
+        return
+    provenance_path = target / INSTALL_PROVENANCE
+    if not provenance_path.is_file() or provenance_path.is_symlink():
+        return
+    try:
+        installed = _load_json_file(provenance_path, "install provenance").get("version")
+    except InstallerError:
+        return
+    current = _stable_semver(installed)
+    incoming = _stable_semver(bundle.manifest.version)
+    if current is None or incoming is None or incoming >= current:
+        return
+    raise InstallerError(
+        f"refusing to downgrade the installation: {installed} is already installed and "
+        f"the selected bundle is {bundle.manifest.version}. Re-run with a newer version, "
+        "or pass --allow-downgrade to overwrite it deliberately"
+    )
+
+
 def install_or_update(
     bundle: ValidatedBundle,
     target: Path,
@@ -922,10 +981,14 @@ def install_or_update(
     command: str,
     overwrite_config: bool,
     dry_run: bool,
+    allow_downgrade: bool = False,
 ) -> OperationResult:
     if command not in {"install", "update"}:
         raise ValueError(f"unsupported command: {command}")
     target = _canonical_target(target)
+    if command == "update":
+        _assert_source_managed_install_untouched(target)
+        _assert_not_downgrade(bundle, target, allow_downgrade)
     plan = make_plan(
         bundle,
         target,
@@ -940,6 +1003,12 @@ def install_or_update(
             locked_target = _canonical_target(target)
             if locked_target != target:
                 raise InstallerError("install destination changed while acquiring the installer lock")
+            if command == "update":
+                # Re-assert under the lock for the same reason the plan is rebuilt
+                # here: the provenance these guards read could have changed between
+                # the first check and the moment this operation gained authority.
+                _assert_source_managed_install_untouched(target)
+                _assert_not_downgrade(bundle, target, allow_downgrade)
             plan = make_plan(
                 bundle,
                 target,

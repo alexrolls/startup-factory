@@ -487,6 +487,31 @@ Read the full contracts before enabling unattended or production operation:
 - [`reference/deployment.md`](reference/deployment.md)
 - [`reference/orchestration.md`](reference/orchestration.md)
 
+## What's new in 0.1.23
+
+Updating an installation could quietly undo work, in three different ways.
+
+A local edit to a shipped file was replaced without a word. The updater already
+records the hash of every file it installs, but only consulted it when deciding
+whether a *retired* file was safe to delete — never for files the incoming
+version overwrites. It now names them: `WARNING: 2 upstream file(s) were
+modified locally since they were installed`, in both the dry run and the applied
+update, so a local fix is either re-applied deliberately or upstreamed.
+
+`update` also had no notion of version order and would write an older bundle over
+a newer installation. A published index is not always ahead of what is installed
+— a release can be mid-flight, or half-published when post-publish verification
+fails — so `@latest` legitimately resolves to the previous version, and
+installing it reverted whatever the newer one fixed. Downgrades are now refused
+unless `--allow-downgrade` says otherwise.
+
+Finally, `bin/update-installed-skill.sh` already refuses release-managed
+installations because it cannot carry their bundle provenance, but the mirror
+image was open: the release CLI would convert a source-managed installation
+without comment, which is how the previous two problems combined into a silent
+revert. `update` now refuses it and names the updater that preserves source
+provenance.
+
 ## What's new in 0.1.22
 
 Two defects could stop a board permanently, and the contract behind one of them
