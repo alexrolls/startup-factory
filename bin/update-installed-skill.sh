@@ -301,6 +301,8 @@ collect_preserved_paths() {
   local local_file relative_file source_file
   preserved_paths="$tmp/preserved-paths"
   : > "$preserved_paths"
+  locally_modified_paths="$tmp/locally-modified-paths"
+  : > "$locally_modified_paths"
   validate_owned_manifest
 
   if [ ! -d "$install_dir" ]; then
@@ -350,6 +352,16 @@ collect_preserved_paths() {
     source_file="$checkout/$relative_file"
     if [ -e "$source_file" ] || [ -L "$source_file" ]; then
       if ! $has_ownership_manifest || is_old_owned "$relative_file"; then
+        # An upstream-owned file is replaced by the incoming version. If the
+        # project edited it since it was installed, that edit is about to be
+        # discarded — silently, which is how a local fix gets reverted by a
+        # routine sync and nobody notices until the behaviour it fixed returns.
+        # The install already records the hash it wrote, so say so.
+        if $has_ownership_hashes && [ -f "$local_file" ] && \
+           ! current_file_matches_old_hash "$relative_file" && \
+           ! { [ -f "$source_file" ] && cmp -s "$local_file" "$source_file"; }; then
+          printf '%s\n' "$relative_file" >> "$locally_modified_paths"
+        fi
         continue
       fi
       if [ -f "$source_file" ] && cmp -s "$local_file" "$source_file"; then
@@ -738,6 +750,17 @@ done < "$tracked_paths"
 install_parent="$(dirname "$install_dir")"
 install_name="$(basename "$install_dir")"
 
+report_locally_modified() {
+  local count
+  [ -n "${locally_modified_paths:-}" ] && [ -s "$locally_modified_paths" ] || return 0
+  count="$(wc -l < "$locally_modified_paths" | tr -d ' ')"
+  echo
+  echo "WARNING: $count upstream file(s) were modified locally since they were installed."
+  echo "The incoming version replaces them, so those local edits are discarded:"
+  sed 's/^/  - /' "$locally_modified_paths"
+  echo "Re-apply anything still needed, or upstream it so the next sync keeps it."
+}
+
 if $dry_run; then
   collect_preserved_paths
   stage_dir="$tmp/stage"
@@ -749,6 +772,7 @@ if $dry_run; then
   echo "Resolved source commit: $resolved_commit"
   echo "Planned filesystem changes: $change_count"
   echo "Dry run complete; no destination files were written."
+  report_locally_modified
 else
   mkdir -p "$install_parent"
   lock_dir="$install_parent/.$install_name.startup-factory.lock"
@@ -801,6 +825,7 @@ else
   if ! $overwrite_config; then
     echo "Preserved existing project configuration and project-owned files."
   fi
+  report_locally_modified
 fi
 
 target_repo="$(git -C "$install_dir" rev-parse --show-toplevel 2>/dev/null || true)"

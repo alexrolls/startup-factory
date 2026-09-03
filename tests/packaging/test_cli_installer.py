@@ -465,6 +465,55 @@ class CliInstallerTest(unittest.TestCase):
         with self.assertRaisesRegex(installer.InstallerError, "trusted sidecar"):
             installer.validate_bundle(self.bundle_v1, expected_sha256="0" * 64)
 
+    def test_update_refuses_to_write_an_older_bundle_over_a_newer_install(self) -> None:
+        # A published index is not always ahead of the installation: a release
+        # can be mid-flight or half-published, so "latest" legitimately resolves
+        # to the previous version. Writing it would revert whatever the newer
+        # version fixed, silently.
+        newer = write_bundle(self.root / "v2.tar.gz", version="2.0.0")
+        target = self.install(bundle=newer)
+        before = (target / "bin/runtime.sh").read_bytes()
+
+        code, output, error = self.update(target, self.bundle_v1)
+
+        self.assertNotEqual(code, 0, output)
+        self.assertIn("refusing to downgrade", output + error)
+        self.assertIn("2.0.0", output + error)
+        self.assertEqual((target / "bin/runtime.sh").read_bytes(), before)
+
+    def test_update_downgrade_needs_an_explicit_flag(self) -> None:
+        newer = write_bundle(self.root / "v2-flagged.tar.gz", version="2.0.0")
+        target = self.install(bundle=newer)
+
+        code, output, error = self.update(target, self.bundle_v1, "--allow-downgrade")
+
+        self.assertEqual(code, 0, output + error)
+
+    def test_update_allows_the_same_or_a_newer_version(self) -> None:
+        target = self.install()
+        for label, version in (("same", "1.0.0"), ("newer", "1.0.1")):
+            with self.subTest(label=label):
+                bundle = write_bundle(self.root / f"{label}.tar.gz", version=version)
+                code, output, error = self.update(target, bundle)
+                self.assertEqual(code, 0, output + error)
+
+    def test_update_refuses_a_source_managed_installation(self) -> None:
+        # bin/update-installed-skill.sh already refuses the mirror image of this.
+        # Leaving this direction open lets a routine update silently convert a
+        # source install and replace it with whatever version the index serves.
+        target = self.install()
+        (target / installer.INSTALL_PROVENANCE).unlink()
+        (target / installer.SOURCE_INSTALL_PROVENANCE).write_text(
+            json.dumps({"schemaVersion": 1, "name": "startup-factory", "sourceCommit": "a" * 40}),
+            encoding="utf-8",
+        )
+
+        code, output, error = self.update(target, self.bundle_v1)
+
+        self.assertNotEqual(code, 0, output)
+        self.assertIn("source-managed", output + error)
+        self.assertIn("update-installed-skill.sh", output + error)
+
     def test_failed_swap_rolls_back_original_installation(self) -> None:
         target = self.install()
         payload_v2 = base_payload("2")
