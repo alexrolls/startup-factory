@@ -15,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bin"))
-from outbox_capability import mint, sign_entry
+from outbox_capability import delivery_directory, mint, sign_entry
 
 SCRIPT = ROOT / "bin" / "task-hold.py"
 BROKER_EVIDENCE = ROOT / "bin" / "broker_evidence.py"
@@ -141,25 +141,27 @@ class TaskHoldTest(unittest.TestCase):
     ) -> None:
         done = self.workspace / "outbox" / "done"
         done.mkdir(parents=True, exist_ok=True)
-        staged = self.workspace / "outbox" / "staged"
-        staged.mkdir(parents=True, exist_ok=True)
+        bodies = self.workspace / "outbox" / "bodies"
+        bodies.mkdir(parents=True, exist_ok=True)
+        pending = self.workspace / "outbox" / "pending"
+        pending.mkdir(parents=True, exist_ok=True)
         raw_body = body.encode("utf-8")
-        body_path = staged / (delivery + ".source.md")
-        body_path.write_bytes(raw_body)
+        identifier = "receipt-%s" % delivery
+        producer_body_path = bodies / (identifier + ".md")
+        producer_body_path.write_bytes(raw_body)
         receipt = {
             "schemaVersion": 1,
-            "id": "receipt-%s" % delivery,
+            "id": identifier,
             "team": TEAM,
             "featureId": FEATURE,
             "taskId": task_id,
-            "attempt": 0,
+            "attempt": 1,
             "actor": actor,
             "marker": marker,
+            "bodyPath": str(producer_body_path),
             "targetStatus": None,
-            "phase": "published",
-            "deliveryId": delivery,
-            "stagedBodyPath": str(body_path),
-            "stagedBodySha256": "sha256:" + hashlib.sha256(raw_body).hexdigest(),
+            "phase": "pending",
+            "createdAt": "2026-09-19T10:00:00+00:00",
         }
         receipt.update(overrides)
         capability = self.capabilities[actor]
@@ -171,9 +173,44 @@ class TaskHoldTest(unittest.TestCase):
             capability["instance"],
             capability["expiresAt"],
         )
-        (done / ("%s-%s.json" % (marker, delivery))).write_text(
-            json.dumps(receipt, indent=2) + "\n"
+        source_entry = pending / (identifier + ".json")
+        source_entry_raw = json.dumps(
+            receipt, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8") + b"\n"
+        source_entry.write_bytes(source_entry_raw)
+        protected = delivery_directory(
+            self.base, self.workspace, str(receipt["team"]), FEATURE
         )
+        staged_body = protected / (delivery + ".source.md")
+        staged_body.write_bytes(raw_body)
+        staged_body.chmod(0o400)
+        publish_body = protected / (delivery + ".publish.md")
+        publish_body.write_bytes(raw_body)
+        publish_body.chmod(0o400)
+        body_digest = "sha256:" + hashlib.sha256(raw_body).hexdigest()
+        receipt.update(
+            {
+                "brokerSchemaVersion": 1,
+                "deliveryId": delivery,
+                "brokerAssignedAt": "2026-09-19T10:00:01+00:00",
+                "sourceEntryPath": str(source_entry),
+                "sourceEntrySha256": "sha256:"
+                + hashlib.sha256(source_entry_raw).hexdigest(),
+                "stagedBodyPath": str(staged_body),
+                "stagedBodySha256": body_digest,
+                "publishBodyPath": str(publish_body),
+                "publishBodySha256": body_digest,
+                "reviewBinding": None,
+                "brokerPhase": "published",
+            }
+        )
+        record_raw = json.dumps(
+            receipt, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8") + b"\n"
+        protected_record = protected / (identifier + ".entry.json")
+        protected_record.write_bytes(record_raw)
+        protected_record.chmod(0o600)
+        (done / ("%s-%s.json" % (marker, delivery))).write_bytes(record_raw)
 
     def marker_comment(
         self,
@@ -403,6 +440,16 @@ class TaskHoldTest(unittest.TestCase):
         delivery = marker["body"].rsplit("delivery-id: ", 1)[1]
         receipt = next(
             (self.workspace / "outbox" / "done").glob("*%s*.json" % delivery)
+        )
+        protected_record = json.loads(receipt.read_text())
+        self.assertEqual(protected_record["phase"], "pending")
+        self.assertEqual(protected_record["brokerPhase"], "published")
+        self.assertEqual(
+            Path(protected_record["stagedBodyPath"]).parent.resolve(),
+            delivery_directory(self.base, self.workspace, TEAM, FEATURE).resolve(),
+        )
+        self.assertFalse(
+            Path(protected_record["stagedBodyPath"]).is_relative_to(self.workspace)
         )
         environment = dict(os.environ)
         environment["STARTUP_FACTORY_LIFECYCLE_STATE_ROOT"] = str(
@@ -858,7 +905,10 @@ class TaskHoldTest(unittest.TestCase):
             .replace("summary: signed original review", "summary: mutable forged review")
             .encode("utf-8")
         )
-        forged_path = self.workspace / "outbox" / "staged" / (delivery + ".publish.md")
+        forged_path = self.workspace / "outbox" / "attacker-staged" / (
+            delivery + ".publish.md"
+        )
+        forged_path.parent.mkdir(parents=True)
         forged_path.write_bytes(forged_body)
         receipt["publishBodyPath"] = str(forged_path)
         receipt["publishBodySha256"] = "sha256:" + hashlib.sha256(forged_body).hexdigest()

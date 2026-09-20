@@ -38,11 +38,12 @@ or delivery decision needs judgment.
 
 Automation is fail-closed by default. Install the reviewed skill outside the
 target checkout and every agent mount; the supervisor, Python interpreter,
-automation/team/project-management configs, runner, and broker scripts must be
-owned by the scheduler identity or root and not group/world writable. Keep the
-shipped `TEAM_MODE=true` setting, configure the scriptable adapter, copy
-`config/automation.config.json` to that protected installation, set `enabled`,
-and verify a dry run from the target checkout:
+automation/team/project-management configs, and broker scripts must be owned by
+the scheduler identity or root and not group/world writable. The separately
+configured sandbox runner and all its ancestors are root-owned under the stricter
+contract below. Keep the shipped `TEAM_MODE=true` setting, configure the
+scriptable adapter, copy `config/automation.config.json` to that protected
+installation, set `enabled`, and verify a dry run from the target checkout:
 
 ```bash
 STARTUP_FACTORY_PROJECT_ROOT=/absolute/target-checkout \
@@ -69,25 +70,51 @@ chain is revalidated; user-owned or writable symlinks are rejected. The
 portable template `/usr/bin:/bin` therefore works on both usrmerge Linux and
 platforms whose bash remains only under `/bin`.
 
+`STARTUP_FACTORY_AUTOMATION_CONFIG` and `STARTUP_FACTORY_PM_CONFIG` are the one
+intentional config-path exception: they are service-level inputs selected by
+the scheduler, not task or agent ambient authority. Their values must name
+canonical absolute files outside the target repository whose complete parent
+chains and leaf files are supervisor/root-owned, non-symlink, and protected
+from group/world writes. Shared temporary hierarchies such as `/tmp` and
+`/private/tmp` are rejected even when the selected leaf sits below a private
+child directory. The supervisor propagates the authenticated canonical source
+paths to its authority-bearing children; they reject a missing or mismatched
+path instead of silently substituting bundled policy. Do not forward either
+variable from task processes. Once those files are authenticated, per-operation
+environment values still cannot switch `TRACKER_ADAPTER`, shrink ignored-label
+fencing, or redirect the lifecycle root; they may only repeat the exact
+protected configuration.
+
 `requireAgentSandbox` and `requireSingleTrackerWriter` are mandatory invariants;
 setting either to false or omitting it is a configuration error. The supervisor
 also requires `TRACKER_WRITERS=broker`, a non-no-op `WORKTREE_SETUP`, at least one
 non-no-op `VALIDATE_*` command, `AGENT_SANDBOX_ENFORCED=true`, and a valid
-`AGENT_SANDBOX_RUNNER`. The runner must be an absolute protected executable
-outside the repository, owned by the executor or root, non-symlink, regular,
-executable, and not group/world-writable. The launcher routes every LLM command
-and `WORKTREE_SETUP` through `runner --workdir <absolute> -- /usr/bin/env -i ...`;
-the runner supplies the actual OS/container/network isolation.
+`AGENT_SANDBOX_RUNNER`. The runner must use its canonical absolute path outside
+both the repository and installed runtime. The executable and its complete
+ancestor chain must be real, root-owned, and not writable by the executor,
+group, or world; an operator-owned mode-0700 wrapper is deliberately refused.
+The launcher revalidates that boundary immediately before every enforced
+execution, then routes each LLM command and `WORKTREE_SETUP` through
+`runner --workdir <absolute> -- /usr/bin/env -i ...`; the runner supplies the
+actual OS/container/network isolation.
 
 Autonomous preflight also requires an absolute, pre-created mode-0700
-`BROKER_LIFECYCLE_ROOT` (or scheduler-provided
-`STARTUP_FACTORY_LIFECYCLE_STATE_ROOT`) disjoint from both the target checkout and
-the installed skill. Every path component must be broker/root-owned,
+`BROKER_LIFECYCLE_ROOT` disjoint from both the target checkout and the installed
+skill. `STARTUP_FACTORY_LIFECYCLE_STATE_ROOT` is an optional exact-repeat
+assertion for protected parent processes; it cannot select or replace the
+configured root. Every path component must be broker/root-owned,
 non-symlink, and not group/world-writable; consequently a root below shared
 `/tmp` is intentionally refused. Keep this root outside every agent sandbox
 mount. Only the deterministic broker may access its HMAC key and authenticated
 PID/start-identity/tmux records. The emitted cron command pins the canonical root
 so child launch/dispatch processes use the same authority store.
+
+The same config-binding applies to routing fences. `TRACKER_ADAPTER`, when
+present, must exactly repeat `PRODUCT_MANAGEMENT_TOOL`, and
+`STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON` must exactly repeat the protected
+`ignoredTaskLabels` array. Dispatch, integration, the portfolio supervisor, and
+release fail before mutation if a caller tries to switch the adapter, remove a
+human-work label, or redirect lifecycle authority through environment state.
 
 Install the printed line in one scheduler only. For hosted schedulers, configure
 the equivalent of `concurrencyPolicy: Forbid`. The filesystem lease prevents

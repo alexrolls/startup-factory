@@ -22,9 +22,7 @@ check() {
 
 # Run the production module against an isolated skill config. The shipped team
 # config is intentionally unsafe-by-default and must remain that way.
-PM_SANDBOX_RUNNER="$TMP/protected-agent-sandbox-runner"
-printf '#!/bin/sh\nexit 0\n' > "$PM_SANDBOX_RUNNER"
-chmod 700 "$PM_SANDBOX_RUNNER"
+PM_SANDBOX_RUNNER=/usr/bin/env
 TEST_SKILL="$TMP/skill"
 PM_LIFECYCLE_ROOT="$TMP/protected-lifecycle"
 mkdir -m 700 "$PM_LIFECYCLE_ROOT"
@@ -61,7 +59,7 @@ assert spec.loader is not None
 spec.loader.exec_module(module)
 module.SKILL_DIR = pathlib.Path(os.environ["PM_TEST_SKILL_DIR"])
 if os.environ.get("PM_TEST_RELEASE_HARNESS") == "1":
-    def test_release_handoff(project, *, dry_run=False):
+    def test_release_handoff(project, *, dry_run=False, **_policy_sources):
         return (
             [os.environ["STARTUP_FACTORY_RELEASE_FEATURE"]],
             None,
@@ -184,6 +182,7 @@ cat > "$PM_CONFIG" <<'EOF'
 PRODUCT_MANAGEMENT_TOOL=Fake
 TEAM_MODE=true
 EOF
+cp "$PM_CONFIG" "$TEST_SKILL/config/project-management.config.md"
 
 SCAN="$TMP/scan.json"
 LOG="$TMP/ops.log"
@@ -229,6 +228,11 @@ cat > "$TRACKER" <<'EOF'
 set -euo pipefail
 case "$1" in
   scan)
+    printf 'policy-binding\t%s\t%s\t%s\t%s\n' \
+      "${TRACKER_ADAPTER:-}" \
+      "${STARTUP_FACTORY_AUTOMATION_CONFIG:-}" \
+      "${STARTUP_FACTORY_PM_CONFIG:-}" \
+      "${STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON:-}" >> "$PM_TEST_LOG"
     printf 'scan\n' >> "$PM_TEST_LOG"
     [ -z "${PM_TEST_SCAN_SLEEP:-}" ] || sleep "$PM_TEST_SCAN_SLEEP"
     cp "$PM_SCAN_FILE" "$2"
@@ -313,6 +317,72 @@ monitor() {
       "$MONITOR" --once
 }
 
+monitor_override() {
+  env "$@" STARTUP_FACTORY_PROJECT_ROOT="$REPO" \
+      STARTUP_FACTORY_AUTOMATION_CONFIG="$CONFIG" \
+      STARTUP_FACTORY_PM_CONFIG="$PM_CONFIG" \
+      STARTUP_FACTORY_TRACKER_OPS="$TRACKER" \
+      STARTUP_FACTORY_LAUNCH_TEAM="$LAUNCH" \
+      STARTUP_FACTORY_DISPATCH="$DISPATCH" \
+      STARTUP_FACTORY_RELEASE_FEATURE="$FAKE_RELEASE" \
+      PM_TEST_RELEASE_HARNESS=1 PM_SCAN_FILE="$SCAN" PM_TEST_LOG="$LOG" \
+      PM_FEATURE_STATE_FILE="$FEATURE_STATE_FILE" \
+      "$MONITOR" --once
+}
+
+CUSTOM_LABEL_CONFIG="$TMP/custom-label-automation.json"
+python3 - "$CONFIG" "$CUSTOM_LABEL_CONFIG" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1]))
+value['workspaceRoot']='.teamwork/custom-label-policy'
+value['ignoredTaskLabels']=['manual-only']
+json.dump(value,open(sys.argv[2],'w'))
+PY
+: > "$LOG"
+env STARTUP_FACTORY_PROJECT_ROOT="$REPO" \
+    STARTUP_FACTORY_AUTOMATION_CONFIG="$CUSTOM_LABEL_CONFIG" \
+    STARTUP_FACTORY_PM_CONFIG="$PM_CONFIG" STARTUP_FACTORY_TRACKER_OPS="$TRACKER" \
+    STARTUP_FACTORY_LAUNCH_TEAM="$LAUNCH" STARTUP_FACTORY_DISPATCH="$DISPATCH" \
+    STARTUP_FACTORY_RELEASE_FEATURE="$FAKE_RELEASE" PM_TEST_RELEASE_HARNESS=1 \
+    PM_SCAN_FILE="$SCAN" PM_TEST_LOG="$LOG" PM_FEATURE_STATE_FILE="$FEATURE_STATE_FILE" \
+    "$MONITOR" --once --dry-run >/dev/null
+check "custom ignored-label and non-default adapter sources reach tracker exactly" \
+  python3 - "$LOG" "$CUSTOM_LABEL_CONFIG" "$PM_CONFIG" <<'PY'
+import json, os, sys
+log, automation, pm = sys.argv[1:]
+automation = os.path.realpath(automation)
+pm = os.path.realpath(pm)
+expected = ["policy-binding", "Fake", automation, pm]
+lines = [line.rstrip("\n").split("\t") for line in open(log, encoding="utf-8")]
+assert any(line[:4] == expected for line in lines), lines
+with open(automation, encoding="utf-8") as handle:
+    assert json.load(handle)["ignoredTaskLabels"] == ["manual-only"]
+PY
+: > "$LOG"
+
+PM_FORGED_LIFECYCLE_ROOT="$TMP/forged-lifecycle"
+mkdir -m 700 "$PM_FORGED_LIFECYCLE_ROOT"
+for override_case in lifecycle adapter labels; do
+  case "$override_case" in
+    lifecycle) override=(STARTUP_FACTORY_LIFECYCLE_STATE_ROOT="$PM_FORGED_LIFECYCLE_ROOT"); expected='must exactly repeat canonical BROKER_LIFECYCLE_ROOT' ;;
+    adapter) override=(TRACKER_ADAPTER=Markdown); expected='must exactly repeat configured PRODUCT_MANAGEMENT_TOOL' ;;
+    labels) override=(STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='[]'); expected='must exactly repeat configured ignoredTaskLabels' ;;
+  esac
+  before_ops=0
+  [ ! -f "$LOG" ] || before_ops="$(wc -l < "$LOG")"
+  if override_out="$(monitor_override "${override[@]}" 2>&1)"; then
+    echo "FAIL: pm-agent accepted $override_case authority override"; FAILURES=$((FAILURES+1))
+  elif printf '%s' "$override_out" | grep -q "$expected"; then
+    echo "ok: pm-agent rejects $override_case authority override"
+  else
+    echo "FAIL: pm-agent $override_case authority override wrong error: $override_out"; FAILURES=$((FAILURES+1))
+  fi
+  after_ops=0
+  [ ! -f "$LOG" ] || after_ops="$(wc -l < "$LOG")"
+  [ "$before_ops" = "$after_ops" ] \
+    || { echo "FAIL: pm-agent mutated tracker before rejecting $override_case override"; FAILURES=$((FAILURES+1)); }
+done
+
 preflight_refused() { # preflight_refused <name> <config> <skill-root> <needle>
   local name="$1" config="$2" skill="$3" needle="$4" out
   if out="$(env PM_TEST_SKILL_DIR="$skill" STARTUP_FACTORY_PROJECT_ROOT="$REPO" \
@@ -338,12 +408,21 @@ PY
 preflight_refused "requireAgentSandbox=false" "$TMP/no-sandbox-invariant.json" "$TEST_SKILL" "cannot be disabled"
 preflight_refused "requireSingleTrackerWriter=false" "$TMP/no-writer-invariant.json" "$TEST_SKILL" "cannot be disabled"
 
+WRITABLE_CONFIG_PARENT="$TMP/writable-config-parent"
+mkdir "$WRITABLE_CONFIG_PARENT"
+chmod 777 "$WRITABLE_CONFIG_PARENT"
+cp "$CONFIG" "$WRITABLE_CONFIG_PARENT/automation.json"
+preflight_refused "writable supervisor config parent" \
+  "$WRITABLE_CONFIG_PARENT/automation.json" "$TEST_SKILL" \
+  "parent chain must be supervisor/root-owned and not group/world writable"
+chmod 700 "$WRITABLE_CONFIG_PARENT"
+
 python3 - "$CONFIG" "$TMP/bad-ignored-labels.json" <<'PY'
 import json,sys
 data=json.load(open(sys.argv[1])); data['ignoredTaskLabels']=['human-work','Human-Work']
 json.dump(data,open(sys.argv[2],'w'))
 PY
-preflight_refused "case-insensitive duplicate ignored labels" "$TMP/bad-ignored-labels.json" "$TEST_SKILL" "case-insensitive duplicates"
+preflight_refused "case-insensitive duplicate ignored labels" "$TMP/bad-ignored-labels.json" "$TEST_SKILL" "case-insensitive duplicate"
 
 python3 - "$CONFIG" \
     "$TMP/bad-observe-statuses.json" \
@@ -399,7 +478,7 @@ cp "$PM_SANDBOX_RUNNER" "$WRITABLE_AGENT_RUNNER"
 chmod 722 "$WRITABLE_AGENT_RUNNER"
 sed_i "s|^AGENT_SANDBOX_RUNNER=.*|AGENT_SANDBOX_RUNNER=\"$WRITABLE_AGENT_RUNNER\"|" "$WRITABLE_RUNNER_SKILL/config/team.config.md"
 preflight_refused "missing protected agent runner" "$CONFIG" "$NO_RUNNER_SKILL" "AGENT_SANDBOX_RUNNER"
-preflight_refused "repository-local agent runner" "$CONFIG" "$LOCAL_RUNNER_SKILL" "external to the agent repository"
+preflight_refused "repository-local agent runner" "$CONFIG" "$LOCAL_RUNNER_SKILL" "must be root-owned"
 preflight_refused "writable agent runner" "$CONFIG" "$WRITABLE_RUNNER_SKILL" "group- or world-writable"
 rm "$LOCAL_AGENT_RUNNER"
 
@@ -495,6 +574,16 @@ for name, relative in module.RELEASE_SNAPSHOT_FILES.items():
     shutil.copy2(source / relative, destination)
     destination.chmod(0o600)
     digests[name] = "sha256:" + hashlib.sha256(destination.read_bytes()).hexdigest()
+pm_config = external / "config/project-management.config.md"
+pm_config.write_text(
+    pm_config.read_text().replace(
+        "PRODUCT_MANAGEMENT_TOOL=Markdown", "PRODUCT_MANAGEMENT_TOOL=Fake", 1
+    )
+)
+pm_config.chmod(0o600)
+digests["project-management.config.md"] = (
+    "sha256:" + hashlib.sha256(pm_config.read_bytes()).hexdigest()
+)
 custom_backend = external / "extensions/tracker-backends/Fake.py"
 custom_backend.parent.mkdir(parents=True, exist_ok=True)
 custom_backend.write_text("class Backend:\n    pass\n")

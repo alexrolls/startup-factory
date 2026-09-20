@@ -12,7 +12,9 @@ SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_STATUS_FIXTURE="$SKILL_DIR/tests/fixtures/statuses.default-profile.json"
 TMP="$(mktemp -d)"
 TMP="$(cd "$TMP" && pwd -P)"
-trap 'rm -rf "$TMP"' EXIT
+LIFECYCLE_ROOT="$(mktemp -d "$HOME/.sf-launcher-lifecycle.XXXXXXXX")"
+LIFECYCLE_ROOT="$(cd "$LIFECYCLE_ROOT" && pwd -P)"
+trap 'rm -rf "$TMP" "$LIFECYCLE_ROOT"' EXIT
 FAILURES=0
 check() { # check <desc> <cmd...>
   local desc="$1"; shift
@@ -38,8 +40,7 @@ EOF
 chmod 700 "$SANDBOX_RUNNER"
 export SANDBOX_RUNNER_LOG
 : > "$SANDBOX_RUNNER_LOG"
-LIFECYCLE_ROOT="$TMP/protected-lifecycle"
-mkdir -m 700 "$LIFECYCLE_ROOT"
+chmod 700 "$LIFECYCLE_ROOT"
 
 # -- fixture repo ------------------------------------------------------------
 cd "$TMP"
@@ -51,10 +52,12 @@ git add .gitignore
 git commit -q -m init
 git checkout -q -b test-feature
 mkdir -p .claude/skills/pm
-cp -R "$SKILL_DIR/roles" "$SKILL_DIR/reference" "$SKILL_DIR/bin" "$SKILL_DIR/teams" .claude/skills/pm/
+cp -R "$SKILL_DIR/roles" "$SKILL_DIR/reference" "$SKILL_DIR/bin" \
+  "$SKILL_DIR/src" "$SKILL_DIR/teams" .claude/skills/pm/
 mkdir -p .claude/skills/pm/config
 cp "$DEFAULT_STATUS_FIXTURE" .claude/skills/pm/config/statuses.config.json
-cp "$SKILL_DIR/config/planning.config.md" .claude/skills/pm/config/
+cp "$SKILL_DIR/config/planning.config.md" "$SKILL_DIR/config/automation.config.json" \
+  .claude/skills/pm/config/
 cat > .claude/skills/pm/config/team.config.md <<'EOF'
 ```
 TEAM_LEAD_CMD="true"
@@ -82,7 +85,42 @@ VALIDATE_LINT=null
 EOF
 sed_i "s|^AGENT_SANDBOX_RUNNER=.*|AGENT_SANDBOX_RUNNER=\"$SANDBOX_RUNNER\"|" .claude/skills/pm/config/team.config.md
 sed_i "s|^BROKER_LIFECYCLE_ROOT=.*|BROKER_LIFECYCLE_ROOT=\"$LIFECYCLE_ROOT\"|" .claude/skills/pm/config/team.config.md
+cat > .claude/skills/pm/config/project-management.config.md <<'EOF'
+```
+PRODUCT_MANAGEMENT_TOOL=Markdown
+MARKDOWN_ROOT=.
+STATUS_CONFIG=config/statuses.config.json
+```
+EOF
 LAUNCH=".claude/skills/pm/bin/launch-team.sh"
+
+prepare_task_claim() { # team feature task role attempt [target]
+  local claim_team="$1" claim_feature="$2" claim_task="$3" claim_role="$4"
+  local claim_attempt="$5" claim_target="${6:-Active}" claim_workspace claim_id
+  claim_workspace="$PWD/.teamwork/$claim_team"
+  claim_id="$(python3 - "$claim_team" "$claim_feature" "$claim_task" "$claim_role" "$claim_attempt" "$claim_target" <<'PY'
+import hashlib,sys
+print("dispatch-"+hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest()[:32])
+PY
+)"
+  python3 .claude/skills/pm/bin/runtime-state.py claim \
+    --repo "$PWD" --workspace "$claim_workspace" --team "$claim_team" \
+    --feature "$claim_feature" --task "$claim_task" --role "$claim_role" \
+    --attempt "$claim_attempt" --claim-id "$claim_id" --target "$claim_target" >/dev/null
+  printf '[claim]\nclaim-id: %s\nrole: %s\ntarget-status: %s\n\n— dispatcher\n' \
+    "$claim_id" "$claim_role" "$claim_target" | \
+    .claude/skills/pm/bin/tracker-ops.sh comment "$claim_task" - >/dev/null
+}
+
+check "managed tmux launch pins the verified authority interpreter" \
+  grep -Fq 'printf -v quoted_python '\''%q'\'' "$AUTHORITY_PYTHON"' "$LAUNCH"
+check "managed tmux wrapper isolates the pinned interpreter" \
+  grep -Fq 'shell_cmd="exec $quoted_python -I -B $quoted_wrapper' "$LAUNCH"
+if grep -Eq 'quoted_python=.*command -v python3' "$LAUNCH"; then
+  echo "FAIL: managed tmux launch resolves ambient python3"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: managed tmux launch never resolves ambient python3"
+fi
 
 printf 'TRACKER_WRITERS=all\n' >> .claude/skills/pm/config/team.config.md
 if "$LAUNCH" status test-feature >duplicate-config.out 2>&1; then
@@ -93,9 +131,204 @@ else
   echo "FAIL: launcher reported wrong duplicate-key error"; FAILURES=$((FAILURES+1))
 fi
 sed_i '$d' .claude/skills/pm/config/team.config.md
+CFG_SANDBOX=.claude/skills/pm/config/team.config.md
+
+# -- command values are parsed inertly and reach the real launcher entry path --
+set_config_line() { # set_config_line KEY RAW_ASSIGNMENT_VALUE (no sed escaping)
+  python3 - "$CFG_SANDBOX" "$1" "$2" <<'PY'
+import sys
+
+path, key, raw = sys.argv[1:]
+lines = open(path, encoding="utf-8").read().splitlines()
+replaced = False
+for index, line in enumerate(lines):
+    if "=" in line and line.split("=", 1)[0] == key:
+        lines[index] = "%s=%s" % (key, raw)
+        replaced = True
+if not replaced:
+    lines.insert(1, "%s=%s" % (key, raw))
+open(path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+PY
+}
+
+legacy_read_key() { # Deliberately retain the pre-fix parser as a negative control.
+  local line
+  line="$(grep -m1 "^$1=" "$CFG_SANDBOX" || true)"
+  line="${line#*=}"
+  if [ "${line#\"}" != "$line" ]; then
+    line="${line#\"}"; line="${line%%\"*}"
+  fi
+  printf '%s' "$line"
+}
+
+# Deterministic fake model CLI: records its own argv count and the exact bytes of
+# the single prompt argument, so field splitting cannot pass unnoticed.
+cat > quoted-prompt-cli <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s' "$#" > "${QUOTED_PROMPT_ARGC:-quoted-prompt-argc.txt}"
+[ "$#" -eq 2 ] && [ "$1" = "--prompt" ] || exit 81
+printf '%s' "$2" > "${QUOTED_PROMPT_OUT:-quoted-prompt-received.txt}"
+EOF
+chmod +x quoted-prompt-cli
+
+# The shipped role defaults use exactly this shape: one outer double-quoted
+# configuration value whose interior prompt substitution is quote-escaped.
+QUOTED_TEMPLATE='"./quoted-prompt-cli --prompt \"$(cat '"'"'{prompt_file}'"'"')\""'
+NORMALIZED_TEMPLATE='./quoted-prompt-cli --prompt "$(cat '"'"'{prompt_file}'"'"')"'
+PRESERVED_TEMPLATE='./quoted-prompt-cli --prompt \"$(cat '"'"'{prompt_file}'"'"')\"'
+set_config_line FRONTEND_CMD "$QUOTED_TEMPLATE"
+
+# Negative control 1 — the pre-fix parser truncates the shipped template.
+legacy_command="$(legacy_read_key FRONTEND_CMD)"
+if [ "$legacy_command" = "$NORMALIZED_TEMPLATE" ]; then
+  echo "FAIL: broken-parser negative control unexpectedly preserved a quoted prompt template"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: broken-parser negative control reproduces quoted prompt truncation ($legacy_command)"
+fi
+
+# Negative control 2 — retaining the configuration escape bytes reaches
+# /bin/bash -c as literal quote bytes and field-splits a multiline prompt.
+CONTROL_PROMPT="$TMP/control-prompt.md"
+printf 'alpha line one\nbeta line two\n' > "$CONTROL_PROMPT"
+QUOTED_PROMPT_ARGC="$TMP/control-argc.txt" QUOTED_PROMPT_OUT="$TMP/control-received.txt" \
+  /bin/bash -c "${PRESERVED_TEMPLATE//\{prompt_file\}/$CONTROL_PROMPT}" >/dev/null 2>&1 || true
+if [ "$(cat "$TMP/control-argc.txt" 2>/dev/null || echo missing)" = 2 ]; then
+  echo "FAIL: escape-preserving control unexpectedly delivered one prompt argument"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: removal of functional quote normalization field-splits the prompt (argc $(cat "$TMP/control-argc.txt" 2>/dev/null || echo missing))"
+fi
+QUOTED_PROMPT_ARGC="$TMP/normalized-argc.txt" QUOTED_PROMPT_OUT="$TMP/normalized-received.txt" \
+  /bin/bash -c "${NORMALIZED_TEMPLATE//\{prompt_file\}/$CONTROL_PROMPT}" >/dev/null 2>&1 || true
+check "normalized template delivers exactly one prompt argument" \
+  test "$(cat "$TMP/normalized-argc.txt" 2>/dev/null || echo missing)" = 2
+
+# Production path — exercise the real launcher in its supported unmanaged
+# manual mode, isolating this parser assertion from sandbox/lifecycle trust.
+set_config_line AGENT_SANDBOX_ENFORCED false
+set_config_line BROKER_LIFECYCLE_ROOT null
+rm -f quoted-prompt-argc.txt quoted-prompt-received.txt
+if TEAM_RUNNER=background "$LAUNCH" start quoted-command FEAT-QUOTED frontend >quoted-start.out 2>&1; then
+  for _ in $(seq 1 50); do [ -s quoted-prompt-argc.txt ] && break; sleep 0.1; done
+else
+  echo "FAIL: launcher refused the shipped quoted command template: $(cat quoted-start.out)"; FAILURES=$((FAILURES+1))
+fi
+QUOTED_PROMPT_PATH=.teamwork/quoted-command/prompts/frontend.md
+check "launcher composed a multiline prompt for the quoted template" \
+  test "$(wc -l < "$QUOTED_PROMPT_PATH" 2>/dev/null || echo 0)" -gt 5
+check "shipped quoted template delivers exactly one prompt argument" \
+  test "$(cat quoted-prompt-argc.txt 2>/dev/null || echo missing)" = 2
+check "shipped command substitution removes only trailing prompt newlines" \
+  python3 - "$QUOTED_PROMPT_PATH" quoted-prompt-received.txt <<'PY'
+from pathlib import Path
+import sys
+
+raw = Path(sys.argv[1]).read_bytes()
+received = Path(sys.argv[2]).read_bytes()
+assert raw.endswith(b"\n")
+assert received == raw.rstrip(b"\n")
+PY
+set_config_line FRONTEND_CMD null
+set_config_line AGENT_SANDBOX_ENFORCED true
+set_config_line BROKER_LIFECYCLE_ROOT "$LIFECYCLE_ROOT"
+
+cp "$CFG_SANDBOX" "$TMP/team.config.parser-cases"
+expect_config_refused() { # description KEY raw-value expected-error-fragment
+  local description="$1" key="$2" raw="$3" expected="$4" out
+  cp "$TMP/team.config.parser-cases" "$CFG_SANDBOX"
+  set_config_line "$key" "$raw"
+  if out="$("$LAUNCH" status malformed-value 2>&1)"; then
+    echo "FAIL: $description accepted"; FAILURES=$((FAILURES+1))
+  elif printf '%s' "$out" | grep -q "$expected"; then
+    echo "ok: $description rejected"
+  else
+    echo "FAIL: $description produced the wrong error: $out"; FAILURES=$((FAILURES+1))
+  fi
+  cp "$TMP/team.config.parser-cases" "$CFG_SANDBOX"
+}
+expect_config_refused "unmatched outer quote" TEAMWORK_ROOT '"unterminated' "unmatched outer quote"
+expect_config_refused "trailing bytes after an outer quote" TEAMWORK_ROOT '".teamwork" junk' "trailing bytes"
+expect_config_refused "ambiguous escape inside an outer quoted value" TEAMWORK_ROOT '".teamwork\q"' "unsupported escape"
+expect_config_refused "outer-quoted empty value" TEAMWORK_ROOT '""' "empty value"
+
+expect_config_start_refused() { # description raw-value team
+  local description="$1" raw="$2" team="$3" out
+  cp "$TMP/team.config.parser-cases" "$CFG_SANDBOX"
+  set_config_line TEAM_DEFAULT_CMD "$raw"
+  if out="$(TEAM_RUNNER=background "$LAUNCH" start "$team" FEAT-MALFORMED backend 2>&1)"; then
+    echo "FAIL: $description accepted and launched"; FAILURES=$((FAILURES+1))
+  elif printf '%s' "$out" | grep -q "unmatched quote or escape"; then
+    echo "ok: $description rejected before launch"
+  else
+    echo "FAIL: $description produced the wrong error: $out"; FAILURES=$((FAILURES+1))
+  fi
+  check "$description creates no workspace" test ! -e ".teamwork/$team"
+  cp "$TMP/team.config.parser-cases" "$CFG_SANDBOX"
+}
+expect_config_start_refused "comment trimming cannot synthesize a dangling command escape" \
+  'cmd\   # note' malformed-comment-escape
+expect_config_start_refused "comment trimming cannot synthesize a lone dangling escape" \
+  '\   # disabled' malformed-comment-lone-escape
+
+expect_malformed_config_line_refused() { # description replacement expected-error-fragment
+  local description="$1" replacement="$2" expected="$3" out
+  cp "$TMP/team.config.parser-cases" "$CFG_SANDBOX"
+  sed_i "s|^TEAMWORK_ROOT=.*|$replacement|" "$CFG_SANDBOX"
+  if out="$("$LAUNCH" status malformed-line 2>&1)"; then
+    echo "FAIL: $description accepted"; FAILURES=$((FAILURES+1))
+  elif printf '%s' "$out" | grep -q "$expected"; then
+    echo "ok: $description rejected"
+  else
+    echo "FAIL: $description produced the wrong error: $out"; FAILURES=$((FAILURES+1))
+  fi
+  cp "$TMP/team.config.parser-cases" "$CFG_SANDBOX"
+}
+expect_malformed_config_line_refused "indented key-like assignment" ' TEAMWORK_ROOT=.teamwork' "malformed configuration assignment"
+expect_malformed_config_line_refused "space before assignment separator" 'TEAMWORK_ROOT =.teamwork' "malformed configuration assignment"
+expect_malformed_config_line_refused "mixed-case key-like assignment" 'Teamwork_ROOT=.teamwork' "malformed configuration assignment"
+expect_config_refused "DEL control character" TEAMWORK_ROOT "$(printf '.teamwork\177unsafe')" "control character"
+expect_config_refused "C1 control character" TEAMWORK_ROOT "$(printf '.teamwork\302\200unsafe')" "control character"
+
+expect_config_value() { # description KEY raw-value expected-value
+  local description="$1" key="$2" raw="$3" expected="$4" actual
+  cp "$TMP/team.config.parser-cases" "$CFG_SANDBOX"
+  set_config_line "$key" "$raw"
+  actual="$("$LAUNCH" config-value "$key" 2>&1)" || actual="<error> $actual"
+  if [ "$actual" = "$expected" ]; then
+    echo "ok: $description"
+  else
+    echo "FAIL: $description — expected <$expected> got <$actual>"; FAILURES=$((FAILURES+1))
+  fi
+  cp "$TMP/team.config.parser-cases" "$CFG_SANDBOX"
+}
+expect_config_value "unquoted command value is preserved" TEAM_DEFAULT_CMD \
+  'codex exec --approve-for-me {prompt_file}' 'codex exec --approve-for-me {prompt_file}'
+expect_config_value "interior horizontal tab is preserved" TEAM_DEFAULT_CMD \
+  "$(printf 'codex\texec {prompt_file}')" "$(printf 'codex\texec {prompt_file}')"
+expect_config_value "outer-quoted escapes normalize to shell-grouping quotes" TEAM_DEFAULT_CMD \
+  '"claude -p \"$(cat '"'"'{prompt_file}'"'"')\" --permission-mode acceptEdits"' \
+  'claude -p "$(cat '"'"'{prompt_file}'"'"')" --permission-mode acceptEdits'
+expect_config_value "escaped backslash normalizes to one backslash" TEAM_DEFAULT_CMD \
+  '"printf %s\\\\ {prompt_file}"' 'printf %s\\ {prompt_file}'
+expect_config_value "assignment-prefixed command values survive" TEAM_DEFAULT_CMD \
+  '"STARTUP_FACTORY_LLM_RUNTIME=other dsh \"$(cat '"'"'{prompt_file}'"'"')\""' \
+  'STARTUP_FACTORY_LLM_RUNTIME=other dsh "$(cat '"'"'{prompt_file}'"'"')"'
+expect_config_value "true trailing comment after an outer quote is stripped" TEAM_DEFAULT_CMD \
+  '"claude -p {prompt_file}"   # role default' 'claude -p {prompt_file}'
+expect_config_value "inline comment in an unquoted value is stripped" TEAM_DEFAULT_CMD \
+  'claude -p {prompt_file}   # role default' 'claude -p {prompt_file}'
+expect_config_value "a hash inside outer quotes is value data" TEAM_DEFAULT_CMD \
+  '"claude -p {prompt_file} --tag a#b"' 'claude -p {prompt_file} --tag a#b'
+expect_config_value "single-quoted values keep interior double quotes literally" TEAM_DEFAULT_CMD \
+  "'claude -p \"literal\"'" 'claude -p "literal"'
+expect_config_value "exact null maps to absent" TEAM_DEFAULT_CMD 'null' ''
+
+sed_i 's|^TEAMWORK_ROOT=.*|TEAMWORK_ROOT=$(touch parser-evaluation-sentinel)|' "$CFG_SANDBOX"
+"$LAUNCH" status inert-value >/dev/null 2>&1 || true
+check "configuration parsing never evaluates substitutions" test ! -e parser-evaluation-sentinel
+cp "$TMP/team.config.parser-cases" "$CFG_SANDBOX"
 
 # -- enforced sandbox runner trust and direct-mode fallback -----------------
-CFG_SANDBOX=.claude/skills/pm/config/team.config.md
 expect_runner_refused() { # description value expected-error
   local description="$1" value="$2" expected="$3" out
   sed_i "s|^AGENT_SANDBOX_RUNNER=.*|AGENT_SANDBOX_RUNNER=\"$value\"|" "$CFG_SANDBOX"
@@ -121,11 +354,61 @@ cp "$SANDBOX_RUNNER" "$NONEXEC_RUNNER"
 chmod 600 "$NONEXEC_RUNNER"
 
 expect_runner_refused "relative sandbox runner" "relative-runner" "path must be absolute"
-expect_runner_refused "repository-local sandbox runner" "$INSIDE_RUNNER" "external to the agent repository"
+expect_runner_refused "repository-local sandbox runner" "$INSIDE_RUNNER" "must be root-owned"
 expect_runner_refused "symlink sandbox runner" "$SYMLINK_RUNNER" "must not be a symlink"
 expect_runner_refused "directory sandbox runner" "$TMP" "regular file"
 expect_runner_refused "group/world-writable sandbox runner" "$WRITABLE_RUNNER" "group- or world-writable"
 expect_runner_refused "non-executable sandbox runner" "$NONEXEC_RUNNER" "must be executable"
+expect_runner_refused "operator-owned sandbox runner" "$SANDBOX_RUNNER" "must be root-owned"
+
+# A root-owned system executable satisfies the same structural trust contract
+# used by recovery validation. Status never executes it as a sandbox runner.
+sed_i 's|^AGENT_SANDBOX_RUNNER=.*|AGENT_SANDBOX_RUNNER="/usr/bin/env"|' "$CFG_SANDBOX"
+if "$LAUNCH" validate-board >/dev/null 2>&1; then
+  echo "ok: root-protected system runner is accepted"
+else
+  echo "FAIL: root-protected system runner was refused"; FAILURES=$((FAILURES+1))
+fi
+
+# The remaining tests exercise argv routing with an executable fixture. Patch
+# only the throwaway copied launcher after the production trust assertions;
+# no packaged/runtime code contains a test-mode bypass.
+python3 - "$LAUNCH" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+replacements = (
+    (
+        'if metadata.st_uid != 0:\n    fail("file must be root-owned")',
+        'if metadata.st_uid not in {0, os.geteuid()}:\n'
+        '    fail("file must be owned by the fixture executor or root")',
+    ),
+    (
+        'if executor_can_write:\n    fail("file must not be writable by the executor")',
+        'if executor_can_write and metadata.st_uid != os.geteuid():\n'
+        '    fail("file must not be writable by the executor")',
+    ),
+    (
+        'if ancestor_metadata.st_uid != 0:\n'
+        '        fail(f"ancestor must be root-owned: {ancestor}")',
+        'if ancestor_metadata.st_uid not in {0, os.geteuid()}:\n'
+        '        fail(f"ancestor must be fixture-executor/root-owned: {ancestor}")',
+    ),
+    (
+        'if executor_can_write:\n'
+        '        fail(f"ancestor must not be writable by the executor: {ancestor}")',
+        'if executor_can_write and ancestor_metadata.st_uid != os.geteuid():\n'
+        '        fail(f"ancestor must not be writable by the executor: {ancestor}")',
+    ),
+)
+for old, new in replacements:
+    if text.count(old) != 1:
+        raise SystemExit(f"fixture patch contract drifted: {old!r}")
+    text = text.replace(old, new)
+path.write_text(text, encoding="utf-8")
+PY
 
 sed_i 's|^AGENT_SANDBOX_ENFORCED=.*|AGENT_SANDBOX_ENFORCED=false|' "$CFG_SANDBOX"
 sed_i 's|^AGENT_SANDBOX_RUNNER=.*|AGENT_SANDBOX_RUNNER="relative-runner"|' "$CFG_SANDBOX"
@@ -136,6 +419,19 @@ check "manual non-enforced mode retains direct execution" test -f .teamwork/manu
 [ "$runner_lines_before" = "$runner_lines_after" ] \
   && echo "ok: manual non-enforced mode does not invoke configured runner" \
   || { echo "FAIL: manual non-enforced mode invoked sandbox runner"; FAILURES=$((FAILURES+1)); }
+sed_i 's|^BROKER_LIFECYCLE_ROOT=.*|BROKER_LIFECYCLE_ROOT=null|' "$CFG_SANDBOX"
+TEAM_RUNNER=background "$LAUNCH" start manual-unmanaged FEAT-UNMANAGED backend
+check "manual non-enforced mode remains available without lifecycle authority" \
+  test -f .teamwork/manual-unmanaged/prompts/backend.md
+if STARTUP_FACTORY_LIFECYCLE_STATE_ROOT="$LIFECYCLE_ROOT" \
+    "$LAUNCH" status manual-unmanaged >ambient-root.out 2>&1; then
+  echo "FAIL: ambient lifecycle root replaced absent config"; FAILURES=$((FAILURES+1))
+elif grep -q 'cannot replace an absent BROKER_LIFECYCLE_ROOT' ambient-root.out; then
+  echo "ok: ambient lifecycle root cannot replace absent config"
+else
+  echo "FAIL: ambient lifecycle replacement reported wrong error"; FAILURES=$((FAILURES+1))
+fi
+sed_i "s|^BROKER_LIFECYCLE_ROOT=.*|BROKER_LIFECYCLE_ROOT=\"$LIFECYCLE_ROOT\"|" "$CFG_SANDBOX"
 sed_i 's|^AGENT_SANDBOX_RUNNER=.*|AGENT_SANDBOX_RUNNER="'"$SANDBOX_RUNNER"'"|' "$CFG_SANDBOX"
 sed_i 's|^AGENT_SANDBOX_ENFORCED=.*|AGENT_SANDBOX_ENFORCED=true|' "$CFG_SANDBOX"
 : > "$SANDBOX_RUNNER_LOG"
@@ -216,7 +512,8 @@ else
   echo "ok: Gemini CLI command excludes Superpowers planning instructions"
 fi
 
-sed_i 's|^FRONTEND_CMD=.*|FRONTEND_CMD="./dsh --profile headless \"$(cat '\''{prompt_file}'\'')\""|' "$CFG_SANDBOX"
+# Shipped-shape outer-quoted template with an escaped interior prompt substitution.
+set_config_line FRONTEND_CMD '"./dsh --profile headless \"$(cat '"'"'{prompt_file}'"'"')\""'
 TEAM_RUNNER=background "$LAUNCH" start dsh-planning FEAT-DSH frontend
 dsh_prompt=.teamwork/dsh-planning/prompts/frontend.md
 check "DeepSeek Harness command is classified as non-Claude" grep -q "LLM runtime family: other" "$dsh_prompt"
@@ -307,8 +604,8 @@ cat > env-probe.sh <<'EOF'
 printf '%s|%s|%s|%s\n' "${LINEAR_API_KEY-unset}" "${AWS_ACCESS_KEY_ID-unset}" "${KUBECONFIG-unset}" "${SSH_AUTH_SOCK-unset}" > agent-env.txt
 printf '%s|%s|%s|%s\n' "${SAFE_AGENT_FLAG-unset}" "${UNLISTED_AGENT_VALUE-unset}" "${STARTUP_FACTORY_ROLE-unset}" "${STARTUP_FACTORY_EXECUTION_KIND-unset}" >> agent-env.txt
 printf '%s\n' "${HOME-unset}" >> agent-env.txt
-case "${STARTUP_FACTORY_OUTBOX_CAPABILITY_ID-unset}|${STARTUP_FACTORY_OUTBOX_CAPABILITY_SECRET-unset}|${STARTUP_FACTORY_CANONICAL_REPO-unset}|${STARTUP_FACTORY_CANONICAL_WORKSPACE-unset}" in
-  cap-[0-9a-f][0-9a-f]*\|[0-9a-f][0-9a-f]*\|/*\|/*) echo capability-context-valid >> agent-env.txt ;;
+case "${STARTUP_FACTORY_OUTBOX_CAPABILITY_ID-unset}|${STARTUP_FACTORY_OUTBOX_CAPABILITY_SECRET-unset}|${STARTUP_FACTORY_OUTBOX_CAPABILITY_EXPIRES_AT-unset}|${STARTUP_FACTORY_OUTBOX_TRANSPORT-unset}|${STARTUP_FACTORY_CANONICAL_REPO-unset}|${STARTUP_FACTORY_CANONICAL_WORKSPACE-unset}" in
+  unset\|unset\|unset\|/*\|/*\|/*) echo capability-context-valid >> agent-env.txt ;;
   *) echo capability-context-invalid >> agent-env.txt ;;
 esac
 EOF
@@ -334,6 +631,27 @@ assert any(name.endswith('.json') for name in os.listdir(records))
 assert all(stat.S_IMODE(os.stat(os.path.join(records,name)).st_mode) == 0o600 for name in os.listdir(records))
 PY
 
+# Lifecycle supervision remains available for explicitly unenforced/manual
+# execution, but publication authority never crosses that boundary.  A manual
+# child must not receive even the non-secret socket locator or canonical
+# publication routing context.
+cat > unenforced-env-probe.sh <<'EOF'
+#!/usr/bin/env bash
+case "${STARTUP_FACTORY_OUTBOX_TRANSPORT-unset}|${STARTUP_FACTORY_INSTANCE-unset}|${STARTUP_FACTORY_CANONICAL_REPO-unset}|${STARTUP_FACTORY_CANONICAL_WORKSPACE-unset}" in
+  unset\|unset\|unset\|unset) echo no-publication-authority > unenforced-env.txt ;;
+  *) echo publication-authority-leaked > unenforced-env.txt ;;
+esac
+EOF
+chmod +x unenforced-env-probe.sh
+sed_i 's|^AGENT_SANDBOX_ENFORCED=.*|AGENT_SANDBOX_ENFORCED=false|' .claude/skills/pm/config/team.config.md
+sed_i 's|^BACKEND_CMD=.*|BACKEND_CMD="./unenforced-env-probe.sh {prompt_file}"|' .claude/skills/pm/config/team.config.md
+TEAM_RUNNER=background "$LAUNCH" start manual-unenforced FEAT-MANUAL backend >/dev/null
+for i in $(seq 1 20); do [ -f unenforced-env.txt ] && break; sleep 0.1; done
+check "unenforced lifecycle-supervised agent receives no publication authority" \
+  grep -q '^no-publication-authority$' unenforced-env.txt
+sed_i 's|^AGENT_SANDBOX_ENFORCED=.*|AGENT_SANDBOX_ENFORCED=true|' .claude/skills/pm/config/team.config.md
+sed_i 's|^BACKEND_CMD=.*|BACKEND_CMD="./env-probe.sh {prompt_file}"|' .claude/skills/pm/config/team.config.md
+
 AGENT_CLI_HOME="$TMP/agent-cli-home"
 mkdir -m 700 "$AGENT_CLI_HOME"
 printf 'AGENT_SANDBOX_HOME="%s"\n' "$AGENT_CLI_HOME" >> .claude/skills/pm/config/team.config.md
@@ -350,6 +668,7 @@ else
   echo "ok: launcher refuses ambient HOME inheritance"
 fi
 sed_i 's|^AGENT_ENV_ALLOWLIST=.*|AGENT_ENV_ALLOWLIST="PATH TMPDIR LANG LC_ALL TERM SAFE_AGENT_FLAG"|' .claude/skills/pm/config/team.config.md
+sed_i 's|^BACKEND_CMD=.*|BACKEND_CMD="cat {prompt_file} > backend-received.txt"|' .claude/skills/pm/config/team.config.md
 sed_i '/^AGENT_SANDBOX_HOME=/d' .claude/skills/pm/config/team.config.md
 
 sed_i 's|^AGENT_ENV_ALLOWLIST=.*|AGENT_ENV_ALLOWLIST="PATH LINEAR_API_KEY"|' .claude/skills/pm/config/team.config.md
@@ -362,12 +681,85 @@ sed_i 's|^AGENT_ENV_ALLOWLIST=.*|AGENT_ENV_ALLOWLIST="PATH TMPDIR LANG LC_ALL TE
 
 # -- doctor: real env/prompt/auth round trip before a persistent team launch ---
 cp .claude/skills/pm/config/team.config.md "$TMP/team.config.before-doctor"
-sed_i 's|^TEAM_LEAD_CMD=.*|TEAM_LEAD_CMD="cat '\''{prompt_file}'\''"|' .claude/skills/pm/config/team.config.md
-sed_i 's|^SENIOR_SECURITY_ENGINEER_CMD=.*|SENIOR_SECURITY_ENGINEER_CMD="cat '\''{prompt_file}'\''"|' .claude/skills/pm/config/team.config.md
-sed_i 's|^SENIOR_QA_ENGINEER_CMD=.*|SENIOR_QA_ENGINEER_CMD="cat '\''{prompt_file}'\''"|' .claude/skills/pm/config/team.config.md
-sed_i 's|^TEAM_DEFAULT_CMD=.*|TEAM_DEFAULT_CMD="cat '\''{prompt_file}'\''"|' .claude/skills/pm/config/team.config.md
+sed_i 's|^AGENT_SANDBOX_ENFORCED=.*|AGENT_SANDBOX_ENFORCED=false|' .claude/skills/pm/config/team.config.md
+sed_i 's|^BROKER_LIFECYCLE_ROOT=.*|BROKER_LIFECYCLE_ROOT=null|' .claude/skills/pm/config/team.config.md
+if doctor_out="$("$LAUNCH" doctor full-stack doctor-no-lifecycle FEAT-DOCTOR 2>&1)"; then
+  echo "FAIL: doctor accepted missing lifecycle authority"; FAILURES=$((FAILURES+1))
+elif printf '%s' "$doctor_out" | grep -q 'doctor: BROKER_LIFECYCLE_ROOT'; then
+  echo "ok: doctor requires pre-created lifecycle authority"
+else
+  echo "FAIL: doctor produced the wrong lifecycle error: $doctor_out"; FAILURES=$((FAILURES+1))
+fi
+cp "$TMP/team.config.before-doctor" .claude/skills/pm/config/team.config.md
+cat > doctor-cli-a <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$#" -eq 2 ] && [ "$1" = "--prompt" ] && [ -n "${HOME:-}" ] || exit 71
+python3 - "$2" <<'PY'
+import re
+import sys
+
+lines = sys.argv[1].splitlines()
+assert lines[:3] == [
+    "This is a non-mutating agent CLI startup and authentication check.",
+    "Do not inspect or modify files, call tools, or continue other work.",
+    "Reply with exactly this token and nothing else:",
+]
+assert len(lines) == 4 and re.fullmatch(r"STARTUP_FACTORY_DOCTOR_OK_[0-9a-f]{24}", lines[3])
+print(lines[3])
+PY
+EOF
+cp doctor-cli-a doctor-cli-b
+chmod +x doctor-cli-a doctor-cli-b
+cat > doctor-cli-echo <<'EOF'
+#!/usr/bin/env bash
+python3 - "$2" <<'PY'
+import sys
+lines = sys.argv[1].splitlines()
+print("Reply with exactly this token and nothing else:")
+print(lines[-1])
+PY
+EOF
+cat > doctor-cli-extra <<'EOF'
+#!/usr/bin/env bash
+python3 - "$2" <<'PY'
+import sys
+token = sys.argv[1].splitlines()[-1]
+print(token)
+print("extra output")
+PY
+EOF
+cat > doctor-cli-adversarial <<'EOF'
+#!/usr/bin/env bash
+python3 - "$1" "$2" <<'PY'
+import sys
+
+mode, prompt = sys.argv[1:]
+token = prompt.splitlines()[-1]
+responses = {
+    "same-line-prefix": "prefix" + token,
+    "same-line-suffix": token + "suffix",
+    "same-line-duplicate": token + token,
+    "duplicate-line": token + "\n" + token,
+}
+print(responses[mode])
+PY
+EOF
+chmod +x doctor-cli-echo doctor-cli-extra doctor-cli-adversarial
+DOCTOR_CLI_HOME="$TMP/doctor-cli-home"
+mkdir -m 700 "$DOCTOR_CLI_HOME"
+set_config_line AGENT_SANDBOX_HOME "\"$DOCTOR_CLI_HOME\""
+set_config_line TEAM_LEAD_CMD '"./doctor-cli-a --prompt \"$(cat '"'"'{prompt_file}'"'"')\""'
+set_config_line SENIOR_SECURITY_ENGINEER_CMD '"./doctor-cli-b --prompt \"$(cat '"'"'{prompt_file}'"'"')\""'
+set_config_line SENIOR_QA_ENGINEER_CMD '"./doctor-cli-b --prompt \"$(cat '"'"'{prompt_file}'"'"')\""'
+set_config_line TEAM_DEFAULT_CMD '"./doctor-cli-a --prompt \"$(cat '"'"'{prompt_file}'"'"')\""'
+# Both normalized null spellings must remain disabled even with a viable
+# TEAM_DEFAULT_CMD. Doctor's covered-role count makes accidental fallback
+# observable without launching either disabled role.
+set_config_line SENIOR_TECHNICAL_PRODUCT_MANAGER_CMD ' null '
+set_config_line SENIOR_FULL_STACK_ENGINEER_CMD '"null"'
 doctor_out="$("$LAUNCH" doctor full-stack doctor-team FEAT-DOCTOR)"
-printf '%s' "$doctor_out" | grep -Eq "distinct command\(s\) verified, covering [0-9]+ enabled roster role\(s\)" \
+printf '%s' "$doctor_out" | grep -Eq "2 distinct command\(s\) verified, covering 6 enabled roster role\(s\)" \
   && echo "ok: doctor reports verified commands and covered roles accurately" \
   || { echo "FAIL: doctor did not complete: $doctor_out"; FAILURES=$((FAILURES+1)); }
 sed_i 's|^SENIOR_QA_ENGINEER_CMD=.*|SENIOR_QA_ENGINEER_CMD="false"|' .claude/skills/pm/config/team.config.md
@@ -381,11 +773,33 @@ fi
 sed_i 's|^SENIOR_QA_ENGINEER_CMD=.*|SENIOR_QA_ENGINEER_CMD="true"|' .claude/skills/pm/config/team.config.md
 if doctor_out="$("$LAUNCH" doctor full-stack doctor-no-token FEAT-DOCTOR 2>&1)"; then
   echo "FAIL: doctor accepted exit zero without the prompt challenge token"; FAILURES=$((FAILURES+1))
-elif printf '%s' "$doctor_out" | grep -q "did not complete the prompt/authentication round trip"; then
+elif printf '%s' "$doctor_out" | grep -q "did not return exactly the prompt challenge token"; then
   echo "ok: doctor rejects exit zero without the prompt challenge token"
 else
   echo "FAIL: doctor produced the wrong no-token failure: $doctor_out"; FAILURES=$((FAILURES+1))
 fi
+for bad_cli in doctor-cli-echo doctor-cli-extra; do
+  set_config_line SENIOR_QA_ENGINEER_CMD \
+    '"./'"$bad_cli"' --prompt \"$(cat '"'"'{prompt_file}'"'"')\""'
+  if doctor_out="$("$LAUNCH" doctor full-stack "doctor-$bad_cli" FEAT-DOCTOR 2>&1)"; then
+    echo "FAIL: doctor accepted non-exact token output from $bad_cli"; FAILURES=$((FAILURES+1))
+  elif printf '%s' "$doctor_out" | grep -q "did not return exactly the prompt challenge token"; then
+    echo "ok: doctor rejects non-exact token output from $bad_cli"
+  else
+    echo "FAIL: doctor produced the wrong non-exact response failure: $doctor_out"; FAILURES=$((FAILURES+1))
+  fi
+done
+for mode in same-line-prefix same-line-suffix same-line-duplicate duplicate-line; do
+  set_config_line SENIOR_QA_ENGINEER_CMD \
+    '"./doctor-cli-adversarial '"$mode"' \"$(cat '"'"'{prompt_file}'"'"')\""'
+  if doctor_out="$("$LAUNCH" doctor full-stack "doctor-$mode" FEAT-DOCTOR 2>&1)"; then
+    echo "FAIL: doctor accepted $mode challenge-token output"; FAILURES=$((FAILURES+1))
+  elif printf '%s' "$doctor_out" | grep -q "did not return exactly the prompt challenge token"; then
+    echo "ok: doctor rejects $mode challenge-token output"
+  else
+    echo "FAIL: doctor produced the wrong $mode response failure: $doctor_out"; FAILURES=$((FAILURES+1))
+  fi
+done
 cp "$TMP/team.config.before-doctor" .claude/skills/pm/config/team.config.md
 
 # Broker mode strips tracker credentials from the team lead too. The broker is
@@ -485,7 +899,7 @@ else
   echo "ok: in-repository cross-team workspace symlink refused"
 fi
 check "cross-team symlink wrote no prompt" test ! -e .teamwork/other-team/prompts/backend.md
-if "$LAUNCH" worktree test-feature '../escape-role' T-BAD >/dev/null 2>&1; then
+if "$LAUNCH" worktree test-feature unsafe-feature.md '../escape-role' T-BAD >/dev/null 2>&1; then
   echo "FAIL: unsafe role should be refused before worktree path use"; FAILURES=$((FAILURES+1))
 else
   echo "ok: unsafe role refused before worktree path use"
@@ -511,9 +925,61 @@ if TEAM_RUNNER=background "$LAUNCH" start test-feature FEAT-1 reviewer 2>/dev/nu
 else
   echo "ok: explicit-null role refused (no fallback)"
 fi
+for null_case in ' null ' '"null"'; do
+  set_config_line REVIEWER_CMD "$null_case"
+  if disabled_out="$(TEAM_RUNNER=background "$LAUNCH" start test-feature FEAT-1 reviewer 2>&1)"; then
+    echo "FAIL: normalized explicit-null role fell back to TEAM_DEFAULT_CMD"; FAILURES=$((FAILURES+1))
+  elif printf '%s' "$disabled_out" | grep -q "role 'reviewer' is disabled"; then
+    echo "ok: normalized explicit-null role refused without fallback ($null_case)"
+  else
+    echo "FAIL: normalized explicit-null role produced the wrong refusal: $disabled_out"; FAILURES=$((FAILURES+1))
+  fi
+done
+set_config_line REVIEWER_CMD null
 
 # -- worktree subcommand -------------------------------------------------------
-if missing_branch_out="$("$LAUNCH" worktree missing-feature backend T-MISSING 2>&1)"; then
+cat > worktree-feature.md <<'EOF'
+# Worktree helper fixture [Active]
+
+## 1 Re-add one governed worktree [Active]
+
+**Assignee:** backend
+
+Exercise idempotent worktree creation.
+
+## 2 Provision governed attempts [Active]
+
+**Assignee:** backend
+
+Exercise setup and generation reuse.
+
+## 3 Reject failed provisioning [Active]
+
+**Assignee:** backend
+
+Exercise rollback after setup failure.
+EOF
+WORKTREE_FID=worktree-feature.md
+T42_TASK="$WORKTREE_FID#1"
+T77_TASK="$WORKTREE_FID#2"
+T78_TASK="$WORKTREE_FID#3"
+prepare_task_claim test-feature "$WORKTREE_FID" "$T42_TASK" backend 1
+prepare_task_claim test-feature "$WORKTREE_FID" "$T77_TASK" backend 1
+prepare_task_claim test-feature "$WORKTREE_FID" "$T78_TASK" backend 1
+
+cat > missing-worktree-feature.md <<'EOF'
+# Missing branch fixture [Active]
+
+## 1 Refuse implicit feature branch creation [Active]
+
+**Assignee:** backend
+
+The launcher must report how to create the intended feature branch.
+EOF
+MISSING_WORKTREE_FID=missing-worktree-feature.md
+MISSING_WORKTREE_TASK="$MISSING_WORKTREE_FID#1"
+prepare_task_claim missing-feature "$MISSING_WORKTREE_FID" "$MISSING_WORKTREE_TASK" backend 1
+if missing_branch_out="$("$LAUNCH" worktree missing-feature "$MISSING_WORKTREE_FID" backend "$MISSING_WORKTREE_TASK" 2>&1)"; then
   echo "FAIL: missing feature branch was accepted"; FAILURES=$((FAILURES+1))
 elif printf '%s' "$missing_branch_out" | grep -q "feature branch 'missing-feature' does not exist.*git branch 'missing-feature' <base-commit>"; then
   echo "ok: missing feature branch reports an actionable creation command"
@@ -522,9 +988,9 @@ else
 fi
 check "missing feature branch creates no task worktree" test ! -e .teamwork/missing-feature/worktrees
 
-T42_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key T-42)"
+T42_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$T42_TASK")"
 T42_WT=".teamwork/test-feature/worktrees/backend#1-$T42_KEY"
-"$LAUNCH" worktree test-feature backend T-42
+"$LAUNCH" worktree test-feature "$WORKTREE_FID" backend "$T42_TASK"
 check "worktree created"  test -d "$T42_WT"
 check "worktree branch"   git -C "$T42_WT" rev-parse --abbrev-ref HEAD
 [ "$(git -C "$T42_WT" rev-parse --abbrev-ref HEAD)" = "agent-task/test-feature/$T42_KEY" ] \
@@ -532,21 +998,21 @@ check "worktree branch"   git -C "$T42_WT" rev-parse --abbrev-ref HEAD
 
 # -- worktree re-add: remove the worktree dir but keep the branch, re-add should succeed --
 git worktree remove "$T42_WT"
-"$LAUNCH" worktree test-feature backend T-42
+"$LAUNCH" worktree test-feature "$WORKTREE_FID" backend "$T42_TASK"
 check "worktree re-add with existing branch" test -d "$T42_WT"
 
 # -- worktree provisioning: WORKTREE_SETUP runs once, fail-loud -----------------
 CFG_WT=.claude/skills/pm/config/team.config.md
 printf 'WORKTREE_SETUP="! env | grep -q '\''^LINEAR_API_KEY='\'' && ! env | grep -q '\''^HOME='\'' && touch provisioned.txt"\n' >> "$CFG_WT"
-T77_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key T-77)"
-T78_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key T-78)"
-LINEAR_API_KEY=must-not-leak HOME=/secret/home "$LAUNCH" worktree test-feature backend T-77
+T77_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$T77_TASK")"
+T78_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$T78_TASK")"
+LINEAR_API_KEY=must-not-leak HOME=/secret/home "$LAUNCH" worktree test-feature "$WORKTREE_FID" backend "$T77_TASK"
 check "WORKTREE_SETUP provisioned the tree" test -f ".teamwork/test-feature/worktrees/backend#1-$T77_KEY/provisioned.txt"
 check "WORKTREE_SETUP receives no scheduler credentials or ambient HOME" test -f ".teamwork/test-feature/worktrees/backend#1-$T77_KEY/provisioned.txt"
 check "WORKTREE_SETUP uses protected runner argv" grep -Fq "$PWD/.teamwork/test-feature/worktrees/backend#1-$T77_KEY|/usr/bin/env|-i" "$SANDBOX_RUNNER_LOG"
 sed_i '/^WORKTREE_SETUP=/d' "$CFG_WT"
 printf 'WORKTREE_SETUP="false"\n' >> "$CFG_WT"
-if "$LAUNCH" worktree test-feature backend T-78 >/dev/null 2>&1; then
+if "$LAUNCH" worktree test-feature "$WORKTREE_FID" backend "$T78_TASK" >/dev/null 2>&1; then
   echo "FAIL: failing WORKTREE_SETUP should die"; FAILURES=$((FAILURES+1))
 else
   echo "ok: failing WORKTREE_SETUP is fail-loud"
@@ -555,10 +1021,12 @@ check "failed provisioning removed the tree" test ! -d ".teamwork/test-feature/w
 sed_i '/^WORKTREE_SETUP="false"$/d' "$CFG_WT"
 
 # -- attempt-bound relaunch isolation ------------------------------------------
-"$LAUNCH" worktree-remove test-feature backend T-77
+"$LAUNCH" compose-task test-feature "$WORKTREE_FID" backend "$T77_TASK" 1 >/dev/null
+"$LAUNCH" worktree-remove test-feature backend "$T77_TASK"
 check "worktree-remove cleaned the dir" test ! -d ".teamwork/test-feature/worktrees/backend#1-$T77_KEY"
 git worktree list | grep -q "backend#1-$T77_KEY" && { echo "FAIL: stale worktree registration"; FAILURES=$((FAILURES+1)); } || echo "ok: worktree pruned"
-"$LAUNCH" worktree test-feature backend T-77 2
+prepare_task_claim test-feature "$WORKTREE_FID" "$T77_TASK" backend 2
+"$LAUNCH" worktree test-feature "$WORKTREE_FID" backend "$T77_TASK" 2
 check "attempt 2 gets a fresh tree on the same branch" test -d ".teamwork/test-feature/worktrees/backend#2-$T77_KEY"
 [ "$(git -C ".teamwork/test-feature/worktrees/backend#2-$T77_KEY" rev-parse --abbrev-ref HEAD)" = "agent-task/test-feature/$T77_KEY" ] \
   && echo "ok: attempt 2 reuses task branch" || { echo "FAIL: attempt-2 branch"; FAILURES=$((FAILURES+1)); }
@@ -889,6 +1357,32 @@ STATUS_CONFIG=config/statuses.config.json
 ```
 EOF
 
+# Direct task paths also export tracker state, so adapter authority must be
+# bound before they create a task worktree, packet, prompt, or worker.
+if TRACKER_ADAPTER=GitHubIssues "$LAUNCH" compose-task \
+    adapter-compose missing-feature.md backend missing-feature.md#1 1 \
+    >adapter-compose.out 2>&1; then
+  echo "FAIL: compose-task accepted tracker adapter replacement"; FAILURES=$((FAILURES+1))
+elif grep -q 'must exactly repeat configured PRODUCT_MANAGEMENT_TOOL' adapter-compose.out; then
+  echo "ok: compose-task rejects tracker adapter replacement before mutation"
+else
+  echo "FAIL: compose-task adapter refusal has wrong error"; FAILURES=$((FAILURES+1))
+fi
+check "compose-task adapter refusal creates no task workspace" \
+  test ! -e .teamwork/adapter-compose
+
+if TRACKER_ADAPTER=GitHubIssues TEAM_RUNNER=background "$LAUNCH" start-task \
+    adapter-start missing-feature.md backend missing-feature.md#1 1 \
+    >adapter-start.out 2>&1; then
+  echo "FAIL: start-task accepted tracker adapter replacement"; FAILURES=$((FAILURES+1))
+elif grep -q 'must exactly repeat configured PRODUCT_MANAGEMENT_TOOL' adapter-start.out; then
+  echo "ok: start-task rejects tracker adapter replacement before mutation"
+else
+  echo "FAIL: start-task adapter refusal has wrong error"; FAILURES=$((FAILURES+1))
+fi
+check "start-task adapter refusal creates no task workspace" \
+  test ! -e .teamwork/adapter-start
+
 # -- dirty-attempt quarantine inventories ignored bytes and converges replay --
 cat > quarantine-feature.md <<'EOF'
 # Quarantine fixture [Active]
@@ -943,6 +1437,7 @@ QUARANTINE_SUFFIX="$(python3 -c 'import hashlib; print(hashlib.sha256(b"attempt-
 QUARANTINE_MANIFEST="$PWD/.teamwork/$QUARANTINE_TEAM/quarantine/$QUARANTINE_KEY/attempt-1-$QUARANTINE_SUFFIX.json"
 git branch "$QUARANTINE_TEAM"
 mkdir -p "$PWD/.teamwork/$QUARANTINE_TEAM"
+prepare_task_claim "$QUARANTINE_TEAM" "$QUARANTINE_FID" "$QUARANTINE_TASK" backend 1
 TEAM_RUNNER=background "$LAUNCH" start-task \
   "$QUARANTINE_TEAM" "$QUARANTINE_FID" backend "$QUARANTINE_TASK" 1 >/dev/null
 check "quarantine fixture attempt exits" wait_task_exit \
@@ -954,6 +1449,7 @@ mkdir -p "$QUARANTINE_SOURCE/ignored-quarantine"
 printf 'ignored but valuable WIP\000with bytes\n' > "$QUARANTINE_SOURCE/ignored-quarantine/wip.bin"
 printf 'external target remains untouched\n' > "$TMP/outside-quarantine-target"
 ln -s "$TMP/outside-quarantine-target" "$QUARANTINE_SOURCE/ignored-quarantine/outside-link"
+prepare_task_claim "$QUARANTINE_TEAM" "$QUARANTINE_FID" "$QUARANTINE_TASK" backend 2
 TEAM_RUNNER=background "$LAUNCH" start-task \
   "$QUARANTINE_TEAM" "$QUARANTINE_FID" backend "$QUARANTINE_TASK" 2 >/dev/null
 check "ignored-only WIP is quarantined, never removed as clean" test -d "$QUARANTINE_DEST"
@@ -1081,6 +1577,7 @@ REPLAY_MANIFEST="$PWD/.teamwork/$REPLAY_TEAM/quarantine/$REPLAY_KEY/attempt-1-$Q
 REPLAY_BRANCH="agent-quarantine/$REPLAY_TEAM/$REPLAY_KEY/a1-$QUARANTINE_SUFFIX"
 git branch "$REPLAY_TEAM"
 mkdir -p "$PWD/.teamwork/$REPLAY_TEAM"
+prepare_task_claim "$REPLAY_TEAM" "$QUARANTINE_FID" "$REPLAY_TASK" backend 1
 TEAM_RUNNER=background "$LAUNCH" start-task \
   "$REPLAY_TEAM" "$QUARANTINE_FID" backend "$REPLAY_TASK" 1 >/dev/null
 check "post-move replay fixture attempt exits" wait_task_exit \
@@ -1110,6 +1607,7 @@ prepare = [p for p in receipts.glob("*.prepare.json") if json.loads(p.read_text(
 final = [p for p in receipts.glob("*.final.json") if json.loads(p.read_text())["operation"]["team"] == team]
 assert len(prepare) == 1 and not final
 PY
+prepare_task_claim "$REPLAY_TEAM" "$QUARANTINE_FID" "$REPLAY_TASK" backend 2
 TEAM_RUNNER=background "$LAUNCH" start-task \
   "$REPLAY_TEAM" "$QUARANTINE_FID" backend "$REPLAY_TASK" 2 >/dev/null
 check "post-move replay preserves quarantined bytes" \
@@ -1171,7 +1669,510 @@ fi
 
 # -- lifecycle authority is external; workspace/PID tampering never selects a signal target --
 CFG_LIFECYCLE=.claude/skills/pm/config/team.config.md
-sed_i 's|^BACKEND_CMD=.*|BACKEND_CMD="sleep 30"|' "$CFG_LIFECYCLE"
+sed_i 's|^BACKEND_CMD=.*|BACKEND_CMD="sleep 120"|' "$CFG_LIFECYCLE"
+
+# The supported macOS/Python 3.10-3.12 combinations do not expose os.waitid.
+# Exercise the portable waitpid reaper on every platform and pin the source
+# boundary so a future waitid-only regression cannot hide behind newer CI.
+if grep -Fq 'os.waitid' "$LAUNCH"; then
+  echo "FAIL: background reaper requires unavailable os.waitid"
+  FAILURES=$((FAILURES+1))
+else
+  echo "ok: background reaper uses the portable waitpid contract"
+fi
+PORTABLE_REAPER_HELPER="$TMP/portable-background-reaper-test.py"
+cat > "$PORTABLE_REAPER_HELPER" <<'PY'
+import json
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+launch, lifecycle, lifecycle_root, repository, team = sys.argv[1:]
+environment = dict(__import__("os").environ)
+environment["TEAM_RUNNER"] = "background"
+log = Path(repository, ".teamwork", team, "pids", "backend.log")
+
+
+def launch_once(previous_generation):
+    result = subprocess.run(
+        [launch, "start", team, "FEAT-PORTABLE-REAPER", "backend"],
+        cwd=repository,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit(70)
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        observed = subprocess.run(
+            [
+                sys.executable,
+                lifecycle,
+                "list",
+                "--root",
+                lifecycle_root,
+                "--repo",
+                repository,
+                "--team",
+                team,
+            ],
+            cwd=repository,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if observed.returncode != 0:
+            raise SystemExit(71)
+        rows = [json.loads(line) for line in observed.stdout.splitlines() if line.strip()]
+        if len(rows) != 1:
+            raise SystemExit(72)
+        generation = rows[0]["createdAt"]
+        if generation == previous_generation or rows[0]["state"] == "live":
+            time.sleep(0.02)
+            continue
+        if rows[0]["state"] != "dead":
+            raise SystemExit(73)
+        contents = log.read_text(encoding="utf-8")
+        if "Traceback" in contents or "AttributeError" in contents:
+            raise SystemExit(74)
+        return generation
+    raise SystemExit(75)
+
+
+first = launch_once("")
+second = launch_once(first)
+if first == second:
+    raise SystemExit(76)
+PY
+set_config_line BACKEND_CMD '"true"'
+if python3 "$PORTABLE_REAPER_HELPER" "$PWD/$LAUNCH" \
+    "$PWD/.claude/skills/pm/bin/process-lifecycle.py" \
+    "$LIFECYCLE_ROOT" "$PWD" lifecycle-portable-reaper; then
+  echo "ok: short-lived background roles reap and relaunch without a traceback"
+else
+  echo "FAIL: portable background reaper did not retire and relaunch cleanly"
+  FAILURES=$((FAILURES+1))
+fi
+set_config_line BACKEND_CMD '"sleep 120"'
+
+# Linux CI runners may act as subreapers without promptly waitpid()ing orphaned
+# grandchildren.  Reproduce that host shape deterministically: the actual
+# launcher must leave only its out-of-group wrapper zombie behind, while the
+# registered PID=PGID=SID child is reaped and therefore reports dead.
+LINUX_REAPER_HELPER="$TMP/linux-background-reaper-test.py"
+cat > "$LINUX_REAPER_HELPER" <<'PY'
+import ctypes
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+launch, lifecycle, lifecycle_root, repository, team = sys.argv[1:]
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+    raise SystemExit(70)
+
+environment = dict(os.environ)
+environment["TEAM_RUNNER"] = "background"
+try:
+    launched = subprocess.run(
+        [launch, "start", team, "FEAT-REAPER", "backend"],
+        cwd=repository,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=15,
+        check=False,
+    )
+except subprocess.TimeoutExpired:
+    raise SystemExit(71)
+if launched.returncode != 0:
+    raise SystemExit(72)
+
+managed_pid = 0
+first_created = ""
+deadline = time.monotonic() + 8
+while time.monotonic() < deadline:
+    observed = subprocess.run(
+        [
+            sys.executable,
+            lifecycle,
+            "list",
+            "--root",
+            lifecycle_root,
+            "--repo",
+            repository,
+            "--team",
+            team,
+        ],
+        cwd=repository,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if observed.returncode != 0:
+        raise SystemExit(73)
+    rows = [json.loads(line) for line in observed.stdout.splitlines() if line.strip()]
+    if len(rows) != 1:
+        raise SystemExit(74)
+    managed_pid = rows[0]["pid"]
+    first_created = rows[0]["createdAt"]
+    if rows[0]["state"] == "dead":
+        break
+    if rows[0]["state"] != "live":
+        raise SystemExit(75)
+    time.sleep(0.02)
+else:
+    raise SystemExit(76)
+
+children_path = Path(f"/proc/{os.getpid()}/task/{os.getpid()}/children")
+deadline = time.monotonic() + 8
+zombies = []
+while time.monotonic() < deadline:
+    children = children_path.read_text(encoding="ascii").split()
+    zombies = []
+    for value in children:
+        pid = int(value)
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        except FileNotFoundError:
+            continue
+        fields = raw[raw.rfind(")") + 2 :].split()
+        if len(fields) >= 4 and fields[0] == "Z":
+            # The retained wrapper must be outside the managed session.  A
+            # zombie at the lifecycle PID/PGID would reproduce the CI defect.
+            if pid == managed_pid or int(fields[2]) == managed_pid:
+                raise SystemExit(77)
+            zombies.append(pid)
+    if zombies:
+        break
+    time.sleep(0.02)
+else:
+    raise SystemExit(78)
+
+# Keep the first wrapper zombie unreaped while launching the exact same role.
+# Its PID is outside lifecycle authority and must not block or alias the new
+# self-registered generation.
+relaunched = subprocess.run(
+    [launch, "start", team, "FEAT-REAPER", "backend"],
+    cwd=repository,
+    env=environment,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    timeout=15,
+    check=False,
+)
+if relaunched.returncode != 0:
+    raise SystemExit(79)
+second_pid = 0
+deadline = time.monotonic() + 8
+while time.monotonic() < deadline:
+    observed = subprocess.run(
+        [
+            sys.executable,
+            lifecycle,
+            "list",
+            "--root",
+            lifecycle_root,
+            "--repo",
+            repository,
+            "--team",
+            team,
+        ],
+        cwd=repository,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if observed.returncode != 0:
+        raise SystemExit(80)
+    rows = [json.loads(line) for line in observed.stdout.splitlines() if line.strip()]
+    if len(rows) != 1:
+        raise SystemExit(81)
+    if rows[0]["createdAt"] == first_created:
+        time.sleep(0.02)
+        continue
+    second_pid = rows[0]["pid"]
+    if rows[0]["state"] == "dead":
+        break
+    if rows[0]["state"] != "live":
+        raise SystemExit(82)
+    time.sleep(0.02)
+else:
+    raise SystemExit(83)
+
+managed_pids = {managed_pid, second_pid}
+deadline = time.monotonic() + 8
+while time.monotonic() < deadline:
+    children = children_path.read_text(encoding="ascii").split()
+    zombies = []
+    for value in children:
+        pid = int(value)
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        except FileNotFoundError:
+            continue
+        fields = raw[raw.rfind(")") + 2 :].split()
+        if len(fields) >= 4 and fields[0] == "Z":
+            if pid in managed_pids or int(fields[2]) in managed_pids:
+                raise SystemExit(84)
+            zombies.append(pid)
+    if len(zombies) >= 2:
+        break
+    time.sleep(0.02)
+else:
+    raise SystemExit(85)
+
+for pid in zombies:
+    os.waitpid(pid, 0)
+PY
+
+if [ "$(uname -s)" = Linux ]; then
+  # Keep the managed child alive just long enough for its launcher parent to
+  # exit, so the outer reaper is deterministically adopted by our subreaper.
+  set_config_line BACKEND_CMD '"sleep 0.2"'
+  if python3 "$LINUX_REAPER_HELPER" "$PWD/$LAUNCH" \
+      "$PWD/.claude/skills/pm/bin/process-lifecycle.py" \
+      "$LIFECYCLE_ROOT" "$PWD" lifecycle-background-reaper; then
+    echo "ok: unreaped wrapper zombie stays outside lifecycle authority across same-role relaunch"
+  else
+    rc=$?
+    echo "FAIL: background reaper did not retire the registered child under a non-reaping host (helper rc=$rc)"
+    FAILURES=$((FAILURES+1))
+  fi
+  set_config_line BACKEND_CMD '"sleep 120"'
+else
+  echo "skip: Linux orphan-zombie background reaper regression"
+fi
+
+# Remove the protected FIFO after self-registration but before shell release.
+# The launcher must fail promptly, stop and forget only that authenticated
+# generation, and never spill its launch token into the role log or stdout.
+RELEASE_FAILURE_HELPER="$TMP/background-release-failure-test.py"
+RELEASE_FAILURE_METADATA="$TMP/background-release-failure-metadata.json"
+RELEASE_FAILURE_OUTPUT="$TMP/background-release-failure.out"
+cat > "$RELEASE_FAILURE_HELPER" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import threading
+import time
+
+launch, lifecycle_root, repository, team, metadata_path, output_path = sys.argv[1:]
+stop = threading.Event()
+injected = threading.Event()
+
+
+def break_release():
+    root = Path(lifecycle_root)
+    while not stop.is_set():
+        for candidate in root.rglob("group.pid"):
+            try:
+                raw = candidate.read_bytes()
+                value = json.loads(raw.decode("ascii"))
+                if set(value) != {"createdAt", "launchToken", "pid"}:
+                    continue
+                Path(metadata_path).write_bytes(raw)
+                (candidate.parent / "go").unlink()
+            except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeError):
+                continue
+            injected.set()
+            return
+        time.sleep(0.001)
+
+
+watcher = threading.Thread(target=break_release, daemon=True)
+watcher.start()
+environment = dict(os.environ)
+environment["TEAM_RUNNER"] = "background"
+started = time.monotonic()
+process = subprocess.Popen(
+    [launch, "start", team, "FEAT-RELEASE", "backend"],
+    cwd=repository,
+    env=environment,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+)
+try:
+    output, _ = process.communicate(timeout=20)
+except subprocess.TimeoutExpired:
+    process.terminate()
+    output, _ = process.communicate(timeout=5)
+    Path(output_path).write_bytes(output)
+    raise SystemExit(70)
+finally:
+    stop.set()
+watcher.join(timeout=1)
+Path(output_path).write_bytes(output)
+if not injected.is_set():
+    raise SystemExit(71)
+if process.returncode == 0:
+    raise SystemExit(72)
+if time.monotonic() - started > 12:
+    raise SystemExit(73)
+PY
+
+set_config_line BACKEND_CMD '"true"'
+if python3 "$RELEASE_FAILURE_HELPER" "$PWD/$LAUNCH" "$LIFECYCLE_ROOT" "$PWD" \
+    lifecycle-release-failure "$RELEASE_FAILURE_METADATA" "$RELEASE_FAILURE_OUTPUT"; then
+  echo "ok: missing background release FIFO fails promptly without blocking"
+else
+  echo "FAIL: missing background release FIFO did not fail closed within its bound"
+  FAILURES=$((FAILURES+1))
+fi
+if grep -q 'could not release protected background launch barrier' "$RELEASE_FAILURE_OUTPUT"; then
+  echo "ok: background release failure is reported"
+else
+  echo "FAIL: background release failure reported the wrong diagnostic"
+  FAILURES=$((FAILURES+1))
+fi
+release_failure_token=""
+if [ -s "$RELEASE_FAILURE_METADATA" ]; then
+  release_failure_token="$(python3 - "$RELEASE_FAILURE_METADATA" <<'PY'
+import json
+import sys
+
+print(json.load(open(sys.argv[1], encoding="ascii"))["launchToken"])
+PY
+)"
+else
+  echo "FAIL: background release failure captured no lifecycle metadata"
+  FAILURES=$((FAILURES+1))
+fi
+if [ -n "$release_failure_token" ] && grep -Fq "$release_failure_token" \
+    .teamwork/lifecycle-release-failure/pids/backend.log "$RELEASE_FAILURE_OUTPUT"; then
+  echo "FAIL: background release failure leaked its lifecycle token"
+  FAILURES=$((FAILURES+1))
+else
+  echo "ok: background release failure keeps lifecycle token out of diagnostics"
+fi
+if [ -e .teamwork/lifecycle-release-failure/pids/backend.pid ]; then
+  echo "FAIL: background release failure left a workspace marker"
+  FAILURES=$((FAILURES+1))
+else
+  echo "ok: background release failure removes its workspace marker"
+fi
+if python3 .claude/skills/pm/bin/process-lifecycle.py list \
+    --root "$LIFECYCLE_ROOT" --repo "$PWD" \
+    --team lifecycle-release-failure | grep -q .; then
+  echo "FAIL: background release failure left a lifecycle record"
+  FAILURES=$((FAILURES+1))
+else
+  echo "ok: background release failure retires its exact lifecycle generation"
+fi
+set_config_line BACKEND_CMD '"sleep 120"'
+
+LIFECYCLE_WITNESS="$TMP/lifecycle-witness.py"
+LIFECYCLE_READY_DIR="$TMP/lifecycle-witness-ready"
+LIFECYCLE_SIGNAL_DIR="$TMP/lifecycle-witness-signals"
+mkdir -p "$LIFECYCLE_READY_DIR" "$LIFECYCLE_SIGNAL_DIR"
+cat > "$LIFECYCLE_WITNESS" <<'PY'
+#!/usr/bin/env python3
+import os
+from pathlib import Path
+import signal
+import sys
+
+ready_dir, signal_dir = map(Path, sys.argv[1:3])
+mode = sys.argv[3]
+if mode not in {"term-exit", "ignore"}:
+    raise SystemExit("invalid witness mode")
+instance = os.environ.get("STARTUP_FACTORY_INSTANCE", sys.argv[4] if len(sys.argv) > 4 else "")
+if not instance or "/" in instance or instance in {".", ".."}:
+    raise SystemExit("invalid witness instance")
+
+
+def observed(signum, _frame):
+    name = signal.Signals(signum).name
+    (signal_dir / f"{instance}.{name}").write_text("observed\n", encoding="ascii")
+    if mode == "term-exit" and signum == signal.SIGTERM:
+        raise SystemExit(0)
+
+
+for watched in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(watched, observed)
+(ready_dir / f"{instance}.ready").write_text("ready\n", encoding="ascii")
+while True:
+    signal.pause()
+PY
+chmod 700 "$LIFECYCLE_WITNESS"
+
+wait_for_witness_ready() { # ready-path
+  local ready="$1"
+  for _i in $(seq 1 600); do
+    [ -s "$ready" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+signal_witness_is_quiet() { # directory instance
+  local directory="$1" instance="$2"
+  [ ! -e "$directory/$instance.SIGTERM" ] \
+    && [ ! -e "$directory/$instance.SIGINT" ] \
+    && [ ! -e "$directory/$instance.SIGHUP" ]
+}
+
+signal_witness_stays_quiet() { # directory instance
+  local directory="$1" instance="$2"
+  for _i in $(seq 1 10); do
+    signal_witness_is_quiet "$directory" "$instance" || return 1
+    sleep 0.05
+  done
+}
+
+process_group_is_live() { # pgid
+  kill -0 -- "-$1"
+}
+
+require_live_task() { # description team role task attempt instance
+  local description="$1" team="$2" role="$3" task="$4" attempt="$5" instance="$6"
+  local output rc diagnostic log
+  set +e
+  output="$("$LAUNCH" live-task "$team" "$role" "$task" "$attempt" 2>&1)"
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    echo "ok: $description"
+    return 0
+  fi
+  diagnostic="$(
+    python3 .claude/skills/pm/bin/process-lifecycle.py list \
+      --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$team" 2>/dev/null | \
+    python3 -c 'import json,sys
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    row=json.loads(line)
+    print("%s/%s:%s" % (row.get("category"), row.get("instance"), row.get("state")))'
+  )" || diagnostic='<unavailable>'
+  log="$PWD/.teamwork/$team/pids/tasks/$instance.log"
+  echo "FAIL: $description (rc=$rc, output=$output, lifecycle=${diagnostic:-<empty>}, log=$log)"
+  if [ -f "$log" ]; then
+    echo "--- bounded fixture log ---"
+    tail -40 "$log"
+    echo "--- end fixture log ---"
+  fi
+  FAILURES=$((FAILURES+1))
+}
 
 record_for() { # team instance
   python3 - "$LIFECYCLE_ROOT" "$1" "$2" <<'PY'
@@ -1290,6 +2291,388 @@ print(count)
 PY
 }
 
+# Public worktree creation and compose-task share one lineage-gated mutation
+# path. A tampered claim must fail before either entry point creates a task
+# branch, worktree, tracker snapshot, packet, prompt, heartbeat, capability,
+# or process marker.
+COMPOSE_FENCE_TEAM=compose-lineage-fence
+COMPOSE_FENCE_FEATURE=compose-lineage-feature.md
+COMPOSE_FENCE_TASK="$COMPOSE_FENCE_FEATURE#1"
+COMPOSE_FENCE_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$COMPOSE_FENCE_TASK")"
+COMPOSE_FENCE_WORKSPACE="$PWD/.teamwork/$COMPOSE_FENCE_TEAM"
+COMPOSE_FENCE_BRANCH="agent-task/$COMPOSE_FENCE_TEAM/$COMPOSE_FENCE_KEY"
+cat > "$COMPOSE_FENCE_FEATURE" <<'EOF'
+# Compose lineage fence fixture [Active]
+
+## 1 Refuse worktree effects [Active]
+
+**Assignee:** backend
+
+Invalid immutable lineage may not create task-local Git or runtime state.
+EOF
+git branch "$COMPOSE_FENCE_TEAM"
+prepare_task_claim \
+  "$COMPOSE_FENCE_TEAM" "$COMPOSE_FENCE_FEATURE" "$COMPOSE_FENCE_TASK" backend 1
+python3 - "$COMPOSE_FENCE_WORKSPACE/claims/$COMPOSE_FENCE_KEY.json" <<'PY'
+import json,sys
+path=sys.argv[1]
+value=json.load(open(path))
+value["claimDigest"]="sha256:"+"0"*64
+with open(path,"w",encoding="utf-8") as stream:
+    json.dump(value,stream,indent=2)
+    stream.write("\n")
+PY
+
+if "$LAUNCH" worktree "$COMPOSE_FENCE_TEAM" "$COMPOSE_FENCE_FEATURE" \
+    backend "$COMPOSE_FENCE_TASK" 1 >compose-fence-worktree.out 2>&1; then
+  echo "FAIL: public worktree accepted mutated claim lineage"; FAILURES=$((FAILURES+1))
+elif grep -qi 'lineage\|claim' compose-fence-worktree.out; then
+  echo "ok: public worktree rejects mutated lineage before Git effects"
+else
+  echo "FAIL: public worktree lineage refusal had wrong error: $(cat compose-fence-worktree.out)"; FAILURES=$((FAILURES+1))
+fi
+check "failed public worktree creates no task branch" \
+  bash -c '! git show-ref --verify --quiet "$1"' _ "refs/heads/$COMPOSE_FENCE_BRANCH"
+check "failed public worktree creates no worktree root" \
+  test ! -e "$COMPOSE_FENCE_WORKSPACE/worktrees"
+check "failed public worktree publishes no tracker snapshot" \
+  test ! -e "$COMPOSE_FENCE_WORKSPACE/tasks.json"
+
+if STARTUP_FACTORY_LLM_RUNTIME=codex "$LAUNCH" compose-task \
+    "$COMPOSE_FENCE_TEAM" "$COMPOSE_FENCE_FEATURE" backend "$COMPOSE_FENCE_TASK" 1 \
+    >compose-fence-task.out 2>&1; then
+  echo "FAIL: compose-task accepted mutated claim lineage"; FAILURES=$((FAILURES+1))
+elif grep -qi 'lineage\|claim' compose-fence-task.out; then
+  echo "ok: compose-task rejects mutated lineage before worktree creation"
+else
+  echo "FAIL: compose-task lineage refusal had wrong error: $(cat compose-fence-task.out)"; FAILURES=$((FAILURES+1))
+fi
+check "failed compose-task creates no task branch" \
+  bash -c '! git show-ref --verify --quiet "$1"' _ "refs/heads/$COMPOSE_FENCE_BRANCH"
+check "failed compose-task creates no worktree" \
+  test ! -e "$COMPOSE_FENCE_WORKSPACE/worktrees/backend#1-$COMPOSE_FENCE_KEY"
+check "failed compose-task creates no packet artifacts" \
+  test ! -e "$COMPOSE_FENCE_WORKSPACE/artifacts"
+check "failed compose-task creates no prompt" \
+  test ! -e "$COMPOSE_FENCE_WORKSPACE/prompts/tasks"
+check "failed compose-task creates no heartbeat" \
+  test ! -e "$COMPOSE_FENCE_WORKSPACE/heartbeats"
+check "failed compose-task creates no process marker" \
+  test ! -e "$COMPOSE_FENCE_WORKSPACE/pids/tasks"
+check "failed compose-task mints no capability" \
+  test "$(active_capability_count "$COMPOSE_FENCE_TEAM" task "$COMPOSE_FENCE_TASK")" -eq 0
+
+# An unchanged durable claim is valid for same-generation packet replay, but it
+# is not authority to mint the next execution generation. Exercise the shared
+# preflight through every public entry point with both live and dead prior
+# generations; only restart-task may supply the internal broker-restart flag.
+GENERATION_FENCE_TEAM=generation-advance-fence
+GENERATION_FENCE_FEATURE=generation-advance-feature.md
+GENERATION_FENCE_WORKSPACE="$PWD/.teamwork/$GENERATION_FENCE_TEAM"
+cat > "$GENERATION_FENCE_FEATURE" <<'EOF'
+# Generation advance fence fixture [Active]
+
+## 1 Live worktree refusal [Active]
+
+**Assignee:** backend
+
+An unchanged claim cannot create the next worktree while attempt one is live.
+
+## 2 Live compose refusal [Active]
+
+**Assignee:** backend
+
+An unchanged claim cannot compose the next packet while attempt one is live.
+
+## 3 Live start refusal [Active]
+
+**Assignee:** backend
+
+An unchanged claim cannot start the next worker while attempt one is live.
+
+## 4 Dead worktree refusal [Active]
+
+**Assignee:** backend
+
+An unchanged claim cannot create the next worktree after attempt one exits.
+
+## 5 Dead compose refusal [Active]
+
+**Assignee:** backend
+
+An unchanged claim cannot compose the next packet after attempt one exits.
+
+## 6 Dead start refusal [Active]
+
+**Assignee:** backend
+
+An unchanged claim cannot start the next worker after attempt one exits.
+
+## 7 Authorized broker restart [Active]
+
+**Assignee:** backend
+
+An exact protected restart grant may advance one unchanged-claim generation.
+EOF
+git branch "$GENERATION_FENCE_TEAM"
+
+expect_generation_advance_rejected() { # label command...
+  local generation_label="$1" generation_output
+  shift
+  generation_output="$TMP/generation-advance-$generation_label.out"
+  if "$@" >"$generation_output" 2>&1; then
+    echo "FAIL: $generation_label accepted an unchanged-claim generation advance"
+    FAILURES=$((FAILURES+1))
+  elif grep -q 'unchanged-claim generation advance requires an authenticated broker restart' \
+      "$generation_output"; then
+    echo "ok: $generation_label rejects unchanged-claim generation advance"
+  else
+    echo "FAIL: $generation_label reported the wrong refusal: $(cat "$generation_output")"
+    FAILURES=$((FAILURES+1))
+  fi
+}
+
+exercise_generation_fence() { # liveness entry-point task-number
+  local generation_liveness="$1" generation_entry="$2" generation_number="$3"
+  local generation_task generation_key generation_instance generation_execution generation_ready
+  local generation_capabilities_before
+  generation_task="$GENERATION_FENCE_FEATURE#$generation_number"
+  generation_key="$(python3 .claude/skills/pm/bin/runtime-state.py key "$generation_task")"
+  generation_instance="backend--$generation_key--a1"
+  generation_execution="$GENERATION_FENCE_WORKSPACE/executions/$generation_key.json"
+  prepare_task_claim \
+    "$GENERATION_FENCE_TEAM" "$GENERATION_FENCE_FEATURE" "$generation_task" backend 1
+  TEAM_RUNNER=background "$LAUNCH" start-task \
+    "$GENERATION_FENCE_TEAM" "$GENERATION_FENCE_FEATURE" backend "$generation_task" 1 \
+    >/dev/null
+  if [ "$generation_liveness" = live ]; then
+    generation_ready="$LIFECYCLE_READY_DIR/$generation_instance.ready"
+    check "$generation_entry fence fixture installs its signal handlers" \
+      wait_for_witness_ready "$generation_ready"
+    require_live_task "$generation_entry fence fixture is live" \
+      "$GENERATION_FENCE_TEAM" backend "$generation_task" 1 "$generation_instance"
+  else
+    check "$generation_entry fence fixture is dead" wait_task_exit \
+      "$GENERATION_FENCE_TEAM" backend "$generation_task" 1
+  fi
+  generation_capabilities_before="$(
+    active_capability_count "$GENERATION_FENCE_TEAM" task "$generation_task"
+  )"
+  case "$generation_entry" in
+    worktree)
+      expect_generation_advance_rejected "$generation_liveness-worktree" \
+        "$LAUNCH" worktree "$GENERATION_FENCE_TEAM" "$GENERATION_FENCE_FEATURE" \
+          backend "$generation_task" 2
+      ;;
+    compose-task)
+      expect_generation_advance_rejected "$generation_liveness-compose-task" \
+        env STARTUP_FACTORY_LLM_RUNTIME=codex "$LAUNCH" compose-task \
+          "$GENERATION_FENCE_TEAM" "$GENERATION_FENCE_FEATURE" backend \
+          "$generation_task" 2
+      ;;
+    start-task)
+      expect_generation_advance_rejected "$generation_liveness-start-task" \
+        env TEAM_RUNNER=background "$LAUNCH" start-task \
+          "$GENERATION_FENCE_TEAM" "$GENERATION_FENCE_FEATURE" backend \
+          "$generation_task" 2
+      ;;
+    *) echo "FAIL: unknown generation fence entry point"; FAILURES=$((FAILURES+1)) ;;
+  esac
+  check "$generation_liveness $generation_entry preserves attempt-one execution" \
+    python3 -c 'import json,sys; raise SystemExit(json.load(open(sys.argv[1]))["attempt"] != 1)' \
+      "$generation_execution"
+  check "$generation_liveness $generation_entry preserves attempt-one worktree" \
+    test -d "$GENERATION_FENCE_WORKSPACE/worktrees/backend#1-$generation_key"
+  check "$generation_liveness $generation_entry creates no attempt-two worktree" \
+    test ! -e "$GENERATION_FENCE_WORKSPACE/worktrees/backend#2-$generation_key"
+  check "$generation_liveness $generation_entry creates no attempt-two packet" \
+    test ! -e "$GENERATION_FENCE_WORKSPACE/artifacts/$generation_key/attempt-2"
+  check "$generation_liveness $generation_entry mints no replacement capability" \
+    test "$(active_capability_count "$GENERATION_FENCE_TEAM" task "$generation_task")" \
+      -eq "$generation_capabilities_before"
+  if [ "$generation_liveness" = live ]; then
+    require_live_task "$generation_entry refusal leaves attempt one live" \
+      "$GENERATION_FENCE_TEAM" backend "$generation_task" 1 "$generation_instance"
+    "$LAUNCH" stop-task "$GENERATION_FENCE_TEAM" "$generation_task" >/dev/null
+  else
+    check "$generation_entry refusal preserves dead lifecycle evidence" \
+      test "$(record_count "$GENERATION_FENCE_TEAM" "$generation_instance")" -eq 1
+  fi
+}
+
+GENERATION_LIVE_COMMAND="\"$LIFECYCLE_WITNESS $LIFECYCLE_READY_DIR $LIFECYCLE_SIGNAL_DIR term-exit\""
+set_config_line BACKEND_CMD "$GENERATION_LIVE_COMMAND"
+for task_command_key in TASK_FAST_CMD TASK_STANDARD_CMD TASK_STRONG_CMD; do
+  set_config_line "$task_command_key" "$GENERATION_LIVE_COMMAND"
+done
+exercise_generation_fence live worktree 1
+exercise_generation_fence live compose-task 2
+exercise_generation_fence live start-task 3
+set_config_line BACKEND_CMD '"true"'
+for task_command_key in TASK_FAST_CMD TASK_STANDARD_CMD TASK_STRONG_CMD; do
+  set_config_line "$task_command_key" '"true"'
+done
+exercise_generation_fence dead worktree 4
+exercise_generation_fence dead compose-task 5
+exercise_generation_fence dead start-task 6
+GENERATION_DIRECT_TASK="$GENERATION_FENCE_FEATURE#4"
+GENERATION_DIRECT_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$GENERATION_DIRECT_TASK")"
+expect_generation_advance_rejected "dead-direct-task-packet" \
+  .claude/skills/pm/bin/task-packet.sh \
+    "$GENERATION_FENCE_TEAM" "$GENERATION_FENCE_FEATURE" "$GENERATION_DIRECT_TASK" \
+    backend 2 \
+    "$GENERATION_FENCE_WORKSPACE/worktrees/backend#2-$GENERATION_DIRECT_KEY" \
+    "agent-task/$GENERATION_FENCE_TEAM/$GENERATION_DIRECT_KEY"
+check "direct task-packet preserves attempt-one execution" \
+  python3 -c 'import json,sys; raise SystemExit(json.load(open(sys.argv[1]))["attempt"] != 1)' \
+    "$GENERATION_FENCE_WORKSPACE/executions/$GENERATION_DIRECT_KEY.json"
+check "direct task-packet creates no attempt-two artifacts" \
+  test ! -e "$GENERATION_FENCE_WORKSPACE/artifacts/$GENERATION_DIRECT_KEY/attempt-2"
+GENERATION_RESTART_TASK="$GENERATION_FENCE_FEATURE#7"
+GENERATION_RESTART_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$GENERATION_RESTART_TASK")"
+GENERATION_RESTART_INSTANCE="backend--$GENERATION_RESTART_KEY--a1"
+GENERATION_RESTART_CONTROL=control-77777777777777777777777777777777
+prepare_task_claim \
+  "$GENERATION_FENCE_TEAM" "$GENERATION_FENCE_FEATURE" "$GENERATION_RESTART_TASK" backend 1
+TEAM_RUNNER=background "$LAUNCH" start-task \
+  "$GENERATION_FENCE_TEAM" "$GENERATION_FENCE_FEATURE" backend \
+  "$GENERATION_RESTART_TASK" 1 >/dev/null
+check "broker restart fixture attempt exits" wait_task_exit \
+  "$GENERATION_FENCE_TEAM" backend "$GENERATION_RESTART_TASK" 1
+GENERATION_RESTART_RECORD="$(
+  record_for "$GENERATION_FENCE_TEAM" "$GENERATION_RESTART_INSTANCE"
+)"
+GENERATION_RESTART_CREATED="$(
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["createdAt"])' \
+    "$GENERATION_RESTART_RECORD"
+)"
+python3 .claude/skills/pm/bin/control-grant.py issue \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" \
+  --team "$GENERATION_FENCE_TEAM" --feature "$GENERATION_FENCE_FEATURE" \
+  --action restart-task --target "$GENERATION_RESTART_TASK" --attempt 1 \
+  --generation "$GENERATION_RESTART_CREATED" \
+  --control-id "$GENERATION_RESTART_CONTROL" --reason authorized >/dev/null
+GENERATION_RESTART_OUTPUT="$(
+  TEAM_RUNNER=background STARTUP_FACTORY_CONTROL_BROKER=1 \
+    STARTUP_FACTORY_CONTROL_REASON=authorized \
+    STARTUP_FACTORY_EXPECTED_LIFECYCLE_CREATED_AT="$GENERATION_RESTART_CREATED" \
+    "$LAUNCH" restart-task "$GENERATION_FENCE_TEAM" "$GENERATION_FENCE_FEATURE" \
+      "$GENERATION_RESTART_TASK" 1 "$GENERATION_RESTART_CONTROL"
+)"
+if printf '%s\n' "$GENERATION_RESTART_OUTPUT" | grep -q 'restarted task.*attempt 2'; then
+  echo "ok: exact protected broker evidence advances one unchanged-claim generation"
+else
+  echo "FAIL: exact protected broker restart did not advance: $GENERATION_RESTART_OUTPUT"
+  FAILURES=$((FAILURES+1))
+fi
+check "broker restart publishes attempt-two execution" \
+  python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); raise SystemExit(value["attempt"] != 2 or value["claimLineage"]["claimAttempt"] != 1)' \
+    "$GENERATION_FENCE_WORKSPACE/executions/$GENERATION_RESTART_KEY.json"
+check "broker restart publishes attempt-two packet" \
+  test -f "$GENERATION_FENCE_WORKSPACE/artifacts/$GENERATION_RESTART_KEY/attempt-2/task-packet.json"
+check "broker restart replacement exits" wait_task_exit \
+  "$GENERATION_FENCE_TEAM" backend "$GENERATION_RESTART_TASK" 2
+for task_command_key in TASK_FAST_CMD TASK_STANDARD_CMD TASK_STRONG_CMD; do
+  set_config_line "$task_command_key" null
+done
+set_config_line BACKEND_CMD '"sleep 120"'
+
+# -- claim-lineage fences precede worktree retirement, revocation, and restart --
+LINEAGE_FENCE_TEAM=lineage-fence
+LINEAGE_FENCE_FEATURE=lineage-fence-feature.md
+LINEAGE_FENCE_TASK="$LINEAGE_FENCE_FEATURE#1"
+LINEAGE_FENCE_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$LINEAGE_FENCE_TASK")"
+LINEAGE_FENCE_INSTANCE="backend--$LINEAGE_FENCE_KEY--a1"
+LINEAGE_FENCE_WORKSPACE="$PWD/.teamwork/$LINEAGE_FENCE_TEAM"
+LINEAGE_FENCE_WORKTREE="$LINEAGE_FENCE_WORKSPACE/worktrees/backend#1-$LINEAGE_FENCE_KEY"
+LINEAGE_FENCE_CONTROL=control-88888888888888888888888888888888
+cat > "$LINEAGE_FENCE_FEATURE" <<'EOF'
+# Lineage fence fixture [Active]
+
+## 1 Refuse mutation before effects [Active]
+
+**Assignee:** backend
+
+track: backend
+parallel-safe: true
+files: src/lineage-fence.txt
+resources: lineage:fence
+
+Invalid immutable lineage must stop every relaunch/restart side effect.
+EOF
+git branch "$LINEAGE_FENCE_TEAM"
+sed_i 's|^BACKEND_CMD=.*|BACKEND_CMD="true"|' "$CFG_LIFECYCLE"
+prepare_task_claim \
+  "$LINEAGE_FENCE_TEAM" "$LINEAGE_FENCE_FEATURE" "$LINEAGE_FENCE_TASK" backend 1
+TEAM_RUNNER=background "$LAUNCH" start-task \
+  "$LINEAGE_FENCE_TEAM" "$LINEAGE_FENCE_FEATURE" backend "$LINEAGE_FENCE_TASK" 1 >/dev/null
+check "lineage-fence fixture attempt exits" wait_task_exit \
+  "$LINEAGE_FENCE_TEAM" backend "$LINEAGE_FENCE_TASK" 1
+LINEAGE_FENCE_RECORD="$(record_for "$LINEAGE_FENCE_TEAM" "$LINEAGE_FENCE_INSTANCE")"
+LINEAGE_FENCE_GENERATION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["createdAt"])' "$LINEAGE_FENCE_RECORD")"
+prepare_task_claim \
+  "$LINEAGE_FENCE_TEAM" "$LINEAGE_FENCE_FEATURE" "$LINEAGE_FENCE_TASK" backend 2
+python3 - "$LINEAGE_FENCE_WORKSPACE/executions/$LINEAGE_FENCE_KEY.json" <<'PY'
+import json,sys
+path=sys.argv[1]
+value=json.load(open(path))
+value["lineageDigest"]="sha256:"+"0"*64
+with open(path,"w",encoding="utf-8") as stream:
+    json.dump(value,stream,indent=2)
+    stream.write("\n")
+PY
+LINEAGE_FENCE_CAPABILITIES_BEFORE="$(
+  active_capability_count "$LINEAGE_FENCE_TEAM" task "$LINEAGE_FENCE_TASK"
+)"
+
+if TEAM_RUNNER=background "$LAUNCH" start-task \
+    "$LINEAGE_FENCE_TEAM" "$LINEAGE_FENCE_FEATURE" backend "$LINEAGE_FENCE_TASK" 2 \
+    >lineage-fence-start.out 2>&1; then
+  echo "FAIL: start-task accepted mutated claim lineage"; FAILURES=$((FAILURES+1))
+elif grep -qi 'lineage\|claim' lineage-fence-start.out; then
+  echo "ok: start-task rejects mutated lineage before attempt retirement"
+else
+  echo "FAIL: start-task lineage refusal had wrong error: $(cat lineage-fence-start.out)"; FAILURES=$((FAILURES+1))
+fi
+check "failed lineage start preserves prior worktree" test -d "$LINEAGE_FENCE_WORKTREE"
+check "failed lineage start creates no replacement worktree" \
+  test ! -e "$LINEAGE_FENCE_WORKSPACE/worktrees/backend#2-$LINEAGE_FENCE_KEY"
+check "failed lineage start creates no replacement packet" \
+  test ! -e "$LINEAGE_FENCE_WORKSPACE/artifacts/$LINEAGE_FENCE_KEY/attempt-2"
+check "failed lineage start creates no replacement heartbeat" \
+  test ! -e "$LINEAGE_FENCE_WORKSPACE/heartbeats/backend--$LINEAGE_FENCE_KEY--a2"
+check "failed lineage start mints no replacement capability" \
+  test "$(active_capability_count "$LINEAGE_FENCE_TEAM" task "$LINEAGE_FENCE_TASK")" \
+    -eq "$LINEAGE_FENCE_CAPABILITIES_BEFORE"
+
+python3 .claude/skills/pm/bin/control-grant.py issue \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" \
+  --team "$LINEAGE_FENCE_TEAM" --feature "$LINEAGE_FENCE_FEATURE" \
+  --action restart-task --target "$LINEAGE_FENCE_TASK" --attempt 1 \
+  --generation "$LINEAGE_FENCE_GENERATION" --control-id "$LINEAGE_FENCE_CONTROL" \
+  --reason authorized >/dev/null
+if TEAM_RUNNER=background STARTUP_FACTORY_CONTROL_BROKER=1 \
+    STARTUP_FACTORY_CONTROL_REASON=authorized \
+    STARTUP_FACTORY_EXPECTED_LIFECYCLE_CREATED_AT="$LINEAGE_FENCE_GENERATION" \
+    "$LAUNCH" restart-task "$LINEAGE_FENCE_TEAM" "$LINEAGE_FENCE_FEATURE" \
+      "$LINEAGE_FENCE_TASK" 1 "$LINEAGE_FENCE_CONTROL" \
+    >lineage-fence-restart.out 2>&1; then
+  echo "FAIL: restart-task accepted mutated claim lineage"; FAILURES=$((FAILURES+1))
+elif grep -qi 'lineage\|claim' lineage-fence-restart.out; then
+  echo "ok: restart-task rejects mutated lineage before destructive effects"
+else
+  echo "FAIL: restart-task lineage refusal had wrong error: $(cat lineage-fence-restart.out)"; FAILURES=$((FAILURES+1))
+fi
+check "failed lineage restart does not revoke prior capability" \
+  test "$(active_capability_count "$LINEAGE_FENCE_TEAM" task "$LINEAGE_FENCE_TASK")" \
+    -eq "$LINEAGE_FENCE_CAPABILITIES_BEFORE"
+check "failed lineage restart does not forget lifecycle generation" \
+  test "$(record_count "$LINEAGE_FENCE_TEAM" "$LINEAGE_FENCE_INSTANCE")" -eq 1
+check "failed lineage restart preserves prior worktree" test -d "$LINEAGE_FENCE_WORKTREE"
+check "failed lineage restart creates no replacement worktree" \
+  test ! -e "$LINEAGE_FENCE_WORKSPACE/worktrees/backend#2-$LINEAGE_FENCE_KEY"
+sed_i 's|^BACKEND_CMD=.*|BACKEND_CMD="sleep 120"|' "$CFG_LIFECYCLE"
+
 # A tmux pane is only a presentation/supervisor identity.  The task itself is
 # bound to a separate authenticated session/group so descendants cannot escape
 # merely because their pane wrapper exits.
@@ -1363,10 +2746,21 @@ check "stop signals the protected identity instead of workspace PID" bash -c "! 
 kill "$workspace_victim_pid" 2>/dev/null || true
 wait "$workspace_victim_pid" 2>/dev/null || true
 
+AUTH_READY_DIR="$TMP/lifecycle-auth-ready"
+AUTH_SIGNAL_DIR="$TMP/lifecycle-auth-signals"
+mkdir -p "$AUTH_READY_DIR" "$AUTH_SIGNAL_DIR"
+set_config_line BACKEND_CMD "\"$LIFECYCLE_WITNESS $AUTH_READY_DIR $AUTH_SIGNAL_DIR ignore\""
 TEAM_RUNNER=background "$LAUNCH" start lifecycle-auth FEAT-LIFE backend >/dev/null
 auth_record="$(record_for lifecycle-auth backend)"
 auth_agent_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$auth_record")"
-sleep 30 & auth_victim_pid=$!
+check "protected lifecycle signal witness becomes ready before tamper" wait_for_witness_ready \
+  "$AUTH_READY_DIR/gate:backend.ready"
+check "protected lifecycle fixture is live before tamper" kill -0 "$auth_agent_pid"
+STARTUP_FACTORY_INSTANCE=auth-victim \
+  "$LIFECYCLE_WITNESS" "$AUTH_READY_DIR" "$AUTH_SIGNAL_DIR" ignore &
+auth_victim_pid=$!
+check "substituted-process signal witness becomes ready before tamper" wait_for_witness_ready \
+  "$AUTH_READY_DIR/auth-victim.ready"
 python3 - "$auth_record" "$auth_victim_pid" <<'PY'
 import json, sys
 path, victim = sys.argv[1:]
@@ -1381,12 +2775,19 @@ elif grep -q 'authentication failed\|failed authentication' lifecycle-auth-stop.
 else
   echo "FAIL: protected lifecycle tamper returned wrong error: $(cat lifecycle-auth-stop.out)"; FAILURES=$((FAILURES+1))
 fi
-check "tampered protected record does not signal original process" kill -0 "$auth_agent_pid"
+check "tampered protected record sends no observable signal to original group" \
+  signal_witness_stays_quiet "$AUTH_SIGNAL_DIR" 'gate:backend'
+check "tampered protected record leaves the original fixture group live" \
+  process_group_is_live "$auth_agent_pid"
 check "tampered protected record does not signal substituted process" kill -0 "$auth_victim_pid"
-kill "$auth_agent_pid" "$auth_victim_pid" 2>/dev/null || true
+check "tampered protected record sends no observable signal to substituted process" \
+  signal_witness_stays_quiet "$AUTH_SIGNAL_DIR" auth-victim
+kill -KILL -- "-$auth_agent_pid" 2>/dev/null || true
+kill -KILL "$auth_victim_pid" 2>/dev/null || true
 wait "$auth_agent_pid" 2>/dev/null || true
 wait "$auth_victim_pid" 2>/dev/null || true
 rm -f "$auth_record"
+set_config_line BACKEND_CMD '"sleep 120"'
 
 TEAM_RUNNER=background "$LAUNCH" start lifecycle-identity FEAT-LIFE backend >/dev/null
 identity_record="$(record_for lifecycle-identity backend)"

@@ -148,8 +148,7 @@ Pre-integration launch and workspace handling are also fail closed:
   depth; the OS sandbox must still prevent races and writes outside the assigned
   worktree.
 - LLM processes start under `env -i`. Only names in `AGENT_ENV_ALLOWLIST`, fixed
-  `STARTUP_FACTORY_*` role metadata, a short-lived per-instance outbox signing
-  capability, and
+  `STARTUP_FACTORY_*` role metadata, and
   `AWS_EC2_METADATA_DISABLED=true` are passed through. Never add a secret,
   production credential, deploy token, SSH agent socket, or privileged runtime
   endpoint to that allowlist. Known cloud/release variables are refused by the
@@ -160,6 +159,48 @@ Pre-integration launch and workspace handling are also fail closed:
   `env -i` does not block network traffic or filesystem reads by itself. The
   required OS/container/CI sandbox and identity policy must deny metadata-service
   routes, host sockets, undeclared egress, and paths outside the assigned mount.
+  Only an enforced launch through a validated external sandbox runner receives
+  the non-secret, generation-bound publication-socket locator and canonical
+  routing context. Manual/unenforced children may remain lifecycle-supervised,
+  but receive no authenticated publication transport.
+- Late-invalidation recovery validation uses a second, narrower `env -i`
+  boundary after a revert is prepared. Its positive list is exactly `PATH`,
+  `TMPDIR`, `LANG`, `LC_ALL`, `TERM`, and `NO_COLOR`; all other configured names
+  fail closed. The helper itself starts through absolute `/usr/bin/python3 -I -B`
+  under a fixed environment, and changed Git paths cross as bounded NUL records.
+  In unenforced mode this is credential scrubbing, not an OS sandbox. Enforced
+  mode requires a canonical external runner whose file and complete ancestor
+  chain are root-owned, non-writable by the executor/group/world, and rechecked
+  immediately before launch. Commands have bounded time/output and process-group
+  cleanup. Validation failure aborts the pending revert.
+- The deterministic outbox broker pins one canonical, identity-checked Python
+  3.10+ interpreter selected only from approved standard host toolchain roots;
+  unauthenticated environment overrides are ignored. Every authority-bearing launch uses its
+  absolute path with `-I -B` under a fixed `env -i` environment. Its
+  nested tracker/review shell tools receive that same absolute interpreter
+  directly through `STARTUP_FACTORY_PINNED_PYTHON`; they execute it with `-I -B`
+  rather than creating a replaceable temporary `PATH` shim. Other executable
+  lookup uses only root-owned, non-group/world-writable canonical directories
+  from the validated `trustedPath`, with Python and shell startup-hook variables
+  removed.
+  Ambient `python3`, `gh`, `PYTHONPATH`, user `sitecustomize`, and startup hooks
+  therefore cannot execute while lifecycle keys or protected publication
+  receipts are accessible; a missing trusted interpreter fails closed. The
+  broker requires `BROKER_LIFECYCLE_ROOT`, validates its complete path chain,
+  and accepts `STARTUP_FACTORY_LIFECYCLE_STATE_ROOT` only when it repeats that
+  configured canonical root. Tracker adapter subprocesses retain adapter
+  credentials but receive neither lifecycle/HMAC authority nor caller-selected
+  adapter or ignored-label policy; those policy values come only from installed
+  configuration.
+- Authority-bearing launcher `PATH` validation likewise retains only
+  root-owned canonical directory chains with no group/world write bit. A
+  caller-owned directory is rejected even at mode `0700`, because its owner can
+  replace a command after validation. Intentionally untrusted model CLI
+  commands may use an absolute executable or dedicated wrapper; they still run
+  behind the credential-free agent environment and configured sandbox and do
+  not turn their parent directory into launcher authority. Individually pinned
+  Python runtimes use a narrower file-identity capture and recheck contract;
+  production should prefer a root-managed runtime or separate service identity.
 - The release executor uses three additional positive environment allowlists:
   non-secret planning/attestation/approval variables, minimum tracker-broker
   variables, and the non-secret release-hook base. Credential-file names require
@@ -194,15 +235,36 @@ record. Protocol gate markers additionally require a valid HMAC capability for
 the exact launcher-created role instance; the broker derives the effective actor
 from its protected verifier record, never from producer JSON or tracker text.
 Capabilities bind the canonical repository/workspace, team, feature, role,
-execution kind, instance, and expiry. A newer launch of the same instance
-supersedes the old capability. A tracker signature alone never satisfies that
-boundary.
+execution kind, process generation, and expiry. The worker receives no raw key:
+it gets only a non-secret locator for a launcher-owned supervisor that verifies
+native stable peer identity and bounded ancestry before signing. Task lanes are
+stable by task id across attempts and roles; gate lanes are stable by concrete
+role. A newer launch therefore supersedes the old generation. A tracker
+signature alone never satisfies that boundary.
+
+Signing and durable exact-package admission occur atomically under the broker
+authority lock. Mint, revoke, protected hold mutation, and the final tracker
+effect use that same lock, giving stop/hold/effect one fail-closed order. A
+supervisor exact-revokes itself on exit without deleting a successor pointer.
+Only an entry/body pair admitted before that fence may be recovered afterward;
+stale generations cannot admit a new or modified package.
+
+The worker-authored envelope is a closed immutable schema whose `phase` remains
+`pending`; unknown fields and changes to its body path, target, or phase are
+rejected. Broker progression (`brokerPhase`) and the exact staged/final bytes
+live only in owner-only Git-common broker storage outside the agent-writable
+workspace. The broker secure-opens and re-hashes those exact bytes immediately
+before a serialized tracker effect. A workspace copy of a completed receipt is
+audit data only and cannot be replayed as a new producer package.
 
 Verifier records live below the Git common directory, outside linked task
 worktrees, with owner-only modes. That placement and file mode are defense in
 depth, not same-UID isolation: the required OS/container sandbox must make the
 broker capability directory unreadable and unwritable to every agent process
-while allowing only the deterministic launcher/broker to access it. It must also
+while allowing only the deterministic launcher/broker to access it. The only
+worker-side transport exception is `connect` to its exact lifecycle-root socket;
+the sandbox must deny directory listing and every read/write/create/rename/
+unlink operation on lifecycle state and transport parents. It must also
 prevent an agent from inspecting another process's environment or command line.
 If this separation is unavailable, gate-marker authentication is not safe; do
 not run autonomous gate publication.

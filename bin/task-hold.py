@@ -19,7 +19,12 @@ sys.dont_write_bytecode = True
 MODULE_DIR = Path(__file__).resolve().parent
 if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
-from outbox_capability import CapabilityError, verify_published_entry
+from outbox_capability import (
+    CapabilityError,
+    authority_lock,
+    delivery_directory,
+    verify_published_entry,
+)
 from broker_evidence import EvidenceError, verify_delivery
 from team_policy import TeamPolicyError, load_team_policy
 
@@ -517,7 +522,8 @@ def broker_receipt(
         "featureId": feature,
         "taskId": task_id,
         "marker": marker,
-        "phase": "published",
+        "phase": "pending",
+        "brokerPhase": "published",
         "deliveryId": delivery,
         "targetStatus": None,
     }
@@ -543,8 +549,9 @@ def broker_receipt(
     # publish-path metadata in the workspace receipt.
     if receipt.get("publishBodyPath") and receipt.get("publishBodySha256") != producer_digest:
         return False
-    staged = existing_directory(workspace, "outbox", "staged")
-    if staged is None:
+    try:
+        staged = delivery_directory(repository, workspace, team, feature)
+    except (CapabilityError, OSError, ValueError):
         return False
     raw_path = receipt.get("publishBodyPath") or receipt.get("stagedBodyPath")
     digest_field = (
@@ -969,6 +976,13 @@ def ignored_label_set(raw: str) -> set[str]:
 
 
 def sync(args: argparse.Namespace) -> dict:
+    """Serialize hold/manual-takeover mutations with publication effects."""
+    repository = Path(args.repo).resolve(strict=True)
+    with authority_lock(repository):
+        return _sync_locked(args)
+
+
+def _sync_locked(args: argparse.Namespace) -> dict:
     repository = Path(args.repo).resolve(strict=True)
     workspace = workspace_path(args.workspace)
     payload = regular_json(Path(args.tasks), "tracker snapshot")
@@ -1436,7 +1450,7 @@ def main() -> int:
         if args.command == "authorize-claim":
             print(json.dumps(authorize_claim(args), sort_keys=True, separators=(",", ":")))
             return 0
-    except HoldError as exc:
+    except (HoldError, CapabilityError) as exc:
         print("task-hold: %s" % exc, file=sys.stderr)
         return 1
     return 2

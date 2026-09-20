@@ -6,13 +6,8 @@ SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="$SKILL_DIR/config/team.config.md"
 
 read_key() {
-  local line value _t
-  line="$(grep -m1 "^$1=" "$CONFIG" || true)"
-  value="${line#*=}"
-  if [ "${value#\"}" != "$value" ]; then value="${value#\"}"; value="${value%%\"*}"
-  else value="${value%%[[:space:]]#*}"; _t="${value##*[![:space:]]}"; value="${value%"$_t"}"; fi
-  [ "$value" = "null" ] && value=""
-  printf '%s' "$value"
+  python3 "$SKILL_DIR/bin/config-value.py" --config "$CONFIG" \
+    --label "team config" --prefix sync-progress value "$1"
 }
 
 [ $# -eq 3 ] || { echo "usage: sync-progress.sh <team> <featureId> <tasks.json>" >&2; exit 2; }

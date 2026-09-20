@@ -2,36 +2,90 @@
 # Merge one approved task branch and hand its immutable transaction to the tracker broker.
 set -euo pipefail
 umask 077
+STARTUP_FACTORY_CALLER_PATH="${PATH:-/usr/bin:/bin}"
+PATH=/usr/bin:/bin
+export PATH
+unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE
+unset PYTHONNOUSERSITE PYTHONSAFEPATH PYTHONDONTWRITEBYTECODE
+unset LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH
 
-SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+script_directory="${BASH_SOURCE[0]%/*}"
+[ "$script_directory" != "${BASH_SOURCE[0]}" ] || script_directory=.
+SKILL_DIR="$(cd "$script_directory/.." && pwd -P)"
+. "$SKILL_DIR/bin/authority-bootstrap.sh"
+python3() { authority_runtime_python "$@"; }
 CONFIG="$SKILL_DIR/config/team.config.md"
+DEFAULT_PM_CONFIG="$SKILL_DIR/config/project-management.config.md"
+DEFAULT_AUTOMATION_CONFIG="$SKILL_DIR/config/automation.config.json"
 
 die() { echo "integrate-task: $*" >&2; exit 1; }
+GIT_EXECUTABLE="$(python3 "$SKILL_DIR/bin/delivery_profile.py" git-executable)" \
+  || die "controlled Git executable is unavailable"
 read_key() {
-  local line value _t
-  line="$(grep -m1 "^$1=" "$CONFIG" || true)"
-  value="${line#*=}"
-  if [ "${value#\"}" != "$value" ]; then value="${value#\"}"; value="${value%%\"*}"
-  else value="${value%%[[:space:]]#*}"; _t="${value##*[![:space:]]}"; value="${value%"$_t"}"; fi
-  [ "$value" = "null" ] && value=""
-  printf '%s' "$value"
+  python3 "$SKILL_DIR/bin/config-value.py" --config "$CONFIG" \
+    --label "team config" --prefix integrate-task value "$1"
 }
 
-# Broker authorization must use the protected hold authority even when this
-# script is invoked directly rather than through the PM supervisor.
-if [ -z "${STARTUP_FACTORY_LIFECYCLE_STATE_ROOT:-}" ]; then
-  configured_lifecycle_root="$(read_key BROKER_LIFECYCLE_ROOT)"
-  if [ -n "$configured_lifecycle_root" ]; then
-    export STARTUP_FACTORY_LIFECYCLE_STATE_ROOT="$configured_lifecycle_root"
-  fi
-fi
+# Mutation authority comes only from installed configuration. Ambient values
+# are accepted solely as exact-repeat assertions made by a protected caller.
+AUTHORITY_REPO="$(/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  git -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "$PWD" rev-parse --show-toplevel)" \
+  || die "cannot resolve canonical repository before authority binding"
+authority_args=(policy-source --default-config "$DEFAULT_PM_CONFIG" --repo "$AUTHORITY_REPO" --skill "$SKILL_DIR" --label "project-management config")
+[ -z "${STARTUP_FACTORY_PM_CONFIG+x}" ] \
+  || authority_args+=(--ambient "$STARTUP_FACTORY_PM_CONFIG")
+PM_CONFIG="$(authority_python "$SKILL_DIR/bin/authority_config.py" "${authority_args[@]}")" \
+  || die "project-management policy source is unavailable"
+export STARTUP_FACTORY_PM_CONFIG="$PM_CONFIG"
+
+authority_args=(policy-source --default-config "$DEFAULT_AUTOMATION_CONFIG" --repo "$AUTHORITY_REPO" --skill "$SKILL_DIR" --label "automation config")
+[ -z "${STARTUP_FACTORY_AUTOMATION_CONFIG+x}" ] \
+  || authority_args+=(--ambient "$STARTUP_FACTORY_AUTOMATION_CONFIG")
+AUTOMATION_CONFIG="$(authority_python "$SKILL_DIR/bin/authority_config.py" "${authority_args[@]}")" \
+  || die "automation policy source is unavailable"
+export STARTUP_FACTORY_AUTOMATION_CONFIG="$AUTOMATION_CONFIG"
+
+authority_args=(lifecycle-root --team-config "$CONFIG" --repo "$AUTHORITY_REPO" --skill "$SKILL_DIR" --required)
+[ -z "${STARTUP_FACTORY_LIFECYCLE_STATE_ROOT+x}" ] \
+  || authority_args+=(--ambient "$STARTUP_FACTORY_LIFECYCLE_STATE_ROOT")
+STARTUP_FACTORY_LIFECYCLE_STATE_ROOT="$(
+  authority_python "$SKILL_DIR/bin/authority_config.py" "${authority_args[@]}"
+)" || die "configured lifecycle authority is unavailable"
+export STARTUP_FACTORY_LIFECYCLE_STATE_ROOT
+
+authority_args=(tracker-adapter --pm-config "$PM_CONFIG")
+[ -z "${TRACKER_ADAPTER+x}" ] || authority_args+=(--ambient "$TRACKER_ADAPTER")
+TRACKER_ADAPTER="$(authority_python "$SKILL_DIR/bin/authority_config.py" "${authority_args[@]}")" \
+  || die "configured tracker adapter authority is unavailable"
+export TRACKER_ADAPTER
+
+authority_args=(ignored-labels --automation-config "$AUTOMATION_CONFIG")
+[ -z "${STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON+x}" ] \
+  || authority_args+=(--ambient "$STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON")
+STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON="$(
+  authority_python "$SKILL_DIR/bin/authority_config.py" "${authority_args[@]}"
+)" || die "configured human-work label policy is unavailable"
+export STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON
+
+PATH="$(authority_python "$SKILL_DIR/bin/authority_config.py" runtime-path \
+  --value "$STARTUP_FACTORY_CALLER_PATH" --repo "$AUTHORITY_REPO" --skill "$SKILL_DIR")" \
+  || die "caller runtime PATH is not a protected executable search path"
+export PATH
 
 git_unprivileged() {
-  local args=(-i "PATH=${PATH:-/usr/bin:/bin}" "GIT_CONFIG_GLOBAL=/dev/null" "GIT_CONFIG_NOSYSTEM=1")
+  local args=(-i "PATH=/usr/bin:/bin" "LANG=C" "LC_ALL=C"
+    "GIT_ATTR_NOSYSTEM=1" "GIT_CONFIG_GLOBAL=/dev/null" "GIT_CONFIG_NOSYSTEM=1"
+    "GIT_CONFIG_SYSTEM=/dev/null" "GIT_ALLOW_PROTOCOL=" "GIT_PROTOCOL_FROM_USER=0"
+    "GIT_NO_LAZY_FETCH=1" "GIT_NO_REPLACE_OBJECTS=1" "GIT_TERMINAL_PROMPT=0")
   [ -z "${TMPDIR-}" ] || args+=("TMPDIR=$TMPDIR")
-  [ -z "${LANG-}" ] || args+=("LANG=$LANG")
-  [ -z "${LC_ALL-}" ] || args+=("LC_ALL=$LC_ALL")
-  /usr/bin/env "${args[@]}" git -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+  /usr/bin/env "${args[@]}" "$GIT_EXECUTABLE" \
+    -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    -c core.attributesFile=/dev/null -c credential.helper= \
+    -c commit.gpgSign=false -c tag.gpgSign=false \
+    -c fetch.recurseSubmodules=false -c merge.default=text \
+    -c merge.renormalize=false -c protocol.allow=never \
+    -c rerere.autoupdate=false -c rerere.enabled=false \
+    -c submodule.recurse=false "$@"
 }
 
 [ $# -ge 5 ] && [ $# -le 6 ] || {
@@ -137,8 +191,7 @@ PY
 assert_tracker_task_review_authorized() {
   [ ! -L "$merge_snapshot" ] || die "fresh merge snapshot path is a symlink"
   [ ! -e "$merge_snapshot" ] || [ -f "$merge_snapshot" ] || die "fresh merge snapshot path is not a regular file"
-  if ! env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
-    "$SKILL_DIR/bin/tracker-ops.sh" export "$feature" "$merge_snapshot" >/dev/null; then
+  if ! "$SKILL_DIR/bin/tracker-ops.sh" export "$feature" "$merge_snapshot" >/dev/null; then
     die "fresh tracker export unavailable; merge/integration remains stopped"
   fi
   python3 - "$merge_snapshot" "$SKILL_DIR/config/statuses.config.json" "$feature" "$task" <<'PY'
@@ -402,7 +455,8 @@ PY
   [ -f "$tasks_snapshot" ] && [ ! -L "$tasks_snapshot" ] \
     || die "missing safe tracker snapshot; dispatcher must export current approvals first"
   approval_evidence_digest="$("$SKILL_DIR/bin/finalize-integrations.sh" --evidence \
-    "$tasks_snapshot" "$task" "$review_base_commit" "$task_branch_head" "$review_package_digest" "$preset_file")"
+    "$tasks_snapshot" "$task" "$review_base_commit" "$task_branch_head" "$review_package_digest" \
+    "$role" "$attempt" "$preset_file")"
   [ -z "$(git_unprivileged -C "$repo" status --porcelain -uall)" ] || die "feature-branch checkout is dirty"
 
   assert_task_not_held
@@ -474,6 +528,19 @@ raise SystemExit(0 if -5 <= age <= 300 else 1)
 PY
 }
 
+expected_merge_tree="$(python3 "$SKILL_DIR/bin/delivery_profile.py" merge-tree \
+  --repo "$repo" --base "$base_commit" --head "$task_branch_head" \
+  --merge-base "$review_base_commit")" \
+  || die "cannot compute the controlled canonical integration tree"
+
+assert_canonical_index() {
+  local observed_tree
+  observed_tree="$(git_unprivileged -C "$repo" write-tree)" \
+    || die "cannot inspect the prepared integration index"
+  [ "$observed_tree" = "$expected_merge_tree" ] \
+    || die "prepared integration index differs from the canonical reviewed overlay"
+}
+
 head_now="$(git_unprivileged -C "$repo" rev-parse HEAD)"
 commit=""
 if [ "$head_now" != "$base_commit" ]; then
@@ -491,12 +558,22 @@ else
     [ -z "$(git_unprivileged -C "$repo" status --porcelain -uall)" ] || die "feature-branch checkout is dirty"
     assert_task_not_held
     assert_tracker_task_review_authorized
-    if ! git_unprivileged -C "$repo" merge --no-ff --no-commit "$branch"; then
+    # Establish only the two-parent merge state. The content tree is built by
+    # the controlled disjoint-overlay helper above, never by repository-local
+    # merge drivers or ambient Git configuration.
+    if ! git_unprivileged -C "$repo" merge --no-ff --no-commit --no-edit \
+      --no-verify-signatures --strategy=ours "$task_branch_head"; then
       git_unprivileged -C "$repo" merge --abort >/dev/null 2>&1 || true
-      die "merge conflict; return the task branch to the worker"
+      die "could not establish the controlled integration merge state"
     fi
+    if ! git_unprivileged -C "$repo" read-tree --reset -u "$expected_merge_tree"; then
+      git_unprivileged -C "$repo" merge --abort >/dev/null 2>&1 || true
+      die "could not materialize the canonical reviewed overlay"
+    fi
+    assert_canonical_index
     if [ "${INTEGRATION_TEST_CRASH_AT:-}" = "after-merge" ]; then kill -KILL "$$"; fi
   fi
+  assert_canonical_index
   if ! run_validation "$repo" "$changed_file_list"; then
     git_unprivileged -C "$repo" merge --abort >/dev/null 2>&1 || true
     die "feature-branch validation failed; merge aborted"
@@ -510,6 +587,12 @@ else
     git_unprivileged -C "$repo" merge --abort >/dev/null 2>&1 \
       || die "task became held/Blocked and the in-progress merge could not be safely aborted"
     die "task became held/Blocked during integration validation; merge safely aborted before commit"
+  fi
+  assert_canonical_index
+  if ! git_unprivileged -C "$repo" diff --quiet --no-ext-diff --no-textconv \
+    --ignore-submodules=none --; then
+    git_unprivileged -C "$repo" merge --abort >/dev/null 2>&1 || true
+    die "integration validation modified tracked worktree content; merge safely aborted"
   fi
 trailers="$(printf '%s\n' \
   "Feature-Id: $feature" \
@@ -531,6 +614,9 @@ fi
 parents="$(git_unprivileged -C "$repo" show -s --format=%P "$commit")"
 [ "$parents" = "$base_commit $task_branch_head" ] \
   || die "integration commit parents do not preserve exact base + reviewed head"
+commit_tree="$(git_unprivileged -C "$repo" show -s --format=%T "$commit")"
+[ "$commit_tree" = "$expected_merge_tree" ] \
+  || die "integration commit tree differs from the canonical reviewed overlay"
 commit_message="$(git_unprivileged -C "$repo" show -s --format=%B "$commit")"
 printf '%s\n' "$commit_message" | grep -Fqx "Integration-Preparation: $preparation_id" \
   || die "recovered integration commit lacks its exact prepared-transaction binding"

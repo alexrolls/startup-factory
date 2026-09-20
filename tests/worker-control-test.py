@@ -161,11 +161,19 @@ raise SystemExit(int(os.environ.get("FAKE_HOLD_EXIT", "0")))
         executions = self.workspace / "executions"
         executions.mkdir()
         self.execution_path = executions / f"{self.task_key}.json"
-        self.write_execution(self.attempt)
         claims = self.workspace / "claims"
         claims.mkdir()
         self.claim_path = claims / f"{self.task_key}.json"
         self.write_claim(self.attempt)
+        self.write_execution(self.attempt)
+        claim = json.loads(self.claim_path.read_text(encoding="utf-8"))
+        claim_receipt = (
+            "[claim]\n"
+            f"claim-id: {claim['claimId']}\n"
+            f"role: {claim['role']}\n"
+            f"target-status: {claim['targetStatus']}\n\n"
+            "— dispatcher"
+        )
         self.tasks = {
             "team": self.team,
             "featureId": self.feature,
@@ -175,6 +183,7 @@ raise SystemExit(int(os.environ.get("FAKE_HOLD_EXIT", "0")))
                     "status": "Active",
                     "labels": [],
                     "revision": "task-r1",
+                    "comments": [{"body": claim_receipt}],
                 }
             ],
         }
@@ -199,6 +208,19 @@ raise SystemExit(int(os.environ.get("FAKE_HOLD_EXIT", "0")))
         return f"{slug}-{hashlib.sha256(task.encode()).hexdigest()[:10]}"
 
     def write_execution(self, attempt: int) -> None:
+        claim = json.loads(self.claim_path.read_text(encoding="utf-8"))
+        lineage = {
+            "schemaVersion": 1,
+            "team": self.team,
+            "featureId": self.feature,
+            "taskId": self.task,
+            "taskKey": self.task_key,
+            "targetStatus": claim["targetStatus"],
+            "claimAttempt": claim["attempt"],
+            "role": claim["role"],
+            "claimId": claim["claimId"],
+            "claimDigest": claim["claimDigest"],
+        }
         self.execution_path.write_text(
             json.dumps(
                 {
@@ -214,12 +236,19 @@ raise SystemExit(int(os.environ.get("FAKE_HOLD_EXIT", "0")))
                         / "worktrees"
                         / f"backend#{attempt}-{self.task_key}"
                     ),
+                    "claimLineage": lineage,
+                    "lineageDigest": worker_control.sha256_bytes(
+                        worker_control.canonical(lineage)
+                    ),
                 }
             ),
             encoding="utf-8",
         )
 
     def write_claim(self, attempt: int, *, role: str = "backend") -> None:
+        claim_id = worker_control.deterministic_claim_id(
+            self.team, self.feature, self.task, role, attempt, "Active"
+        )
         identity = {
             "schemaVersion": 1,
             "team": self.team,
@@ -228,7 +257,7 @@ raise SystemExit(int(os.environ.get("FAKE_HOLD_EXIT", "0")))
             "taskKey": self.task_key,
             "attempt": attempt,
             "role": role,
-            "claimId": f"dispatch-{attempt}",
+            "claimId": claim_id,
             "targetStatus": "Active",
         }
         self.claim_path.write_text(
@@ -243,6 +272,17 @@ raise SystemExit(int(os.environ.get("FAKE_HOLD_EXIT", "0")))
             ),
             encoding="utf-8",
         )
+        if hasattr(self, "tasks"):
+            self.tasks["tasks"][0]["comments"] = [
+                {
+                    "body": (
+                        "[claim]\n"
+                        f"claim-id: {claim_id}\n"
+                        f"role: {role}\n"
+                        "target-status: Active\n\n— dispatcher"
+                    )
+                }
+            ]
 
     def complete_nudge(self, request: dict, *, age_seconds: int = 121) -> None:
         directory, key = worker_control.result_authority(
@@ -406,7 +446,9 @@ raise SystemExit(int(os.environ.get("FAKE_HOLD_EXIT", "0")))
             if line
         ]
 
-    def request_command_context(self) -> tuple[argparse.Namespace, dict[str, str]]:
+    def request_command_context(
+        self,
+    ) -> tuple[argparse.Namespace, dict[str, str], dict]:
         capability = mint(
             str(self.repository),
             str(self.workspace),
@@ -435,13 +477,9 @@ raise SystemExit(int(os.environ.get("FAKE_HOLD_EXIT", "0")))
             "STARTUP_FACTORY_ROLE": "team-lead",
             "STARTUP_FACTORY_EXECUTION_KIND": "gate",
             "STARTUP_FACTORY_INSTANCE": "team-lead",
-            "STARTUP_FACTORY_OUTBOX_CAPABILITY_ID": capability["id"],
-            "STARTUP_FACTORY_OUTBOX_CAPABILITY_SECRET": capability["secret"],
-            "STARTUP_FACTORY_OUTBOX_CAPABILITY_EXPIRES_AT": str(
-                capability["expiresAt"]
-            ),
+            "STARTUP_FACTORY_OUTBOX_TRANSPORT": "/tmp/test-publication.sock",
         }
-        return args, environment
+        return args, environment, capability
 
     def write_pending(self, request: dict) -> Path:
         pending = self.workspace / "control-outbox" / "pending"
@@ -495,6 +533,61 @@ raise SystemExit(int(os.environ.get("FAKE_HOLD_EXIT", "0")))
         )
         self.assertIn(request["id"], grants[0])
 
+    def test_clean_retry_keeps_original_claim_lineage_for_control(self):
+        self.write_execution(self.attempt + 1)
+        self.attempt += 1
+        binding = worker_control.bound_task_state(
+            self.workspace, self.tasks, self.team, self.feature, self.task
+        )
+        self.assertEqual(2, binding["claim"]["attempt"])
+        self.assertEqual(3, binding["execution"]["attempt"])
+        self.assertEqual(2, binding["claimLineage"]["claimAttempt"])
+
+        request = self.request(action="nudge-task", identity_seed="clean-retry-nudge")
+        self.reconcile_one(request)
+        self.assertTrue((self.workspace / "mailbox" / "backend").exists())
+        self.assertEqual([], self.launcher_records())
+
+    def test_tracker_status_does_not_rewrite_immutable_claim_target(self):
+        self.tasks["tasks"][0]["status"] = "Review"
+        self.tasks["tasks"][0]["revision"] = "task-r2"
+        binding = worker_control.bound_task_state(
+            self.workspace, self.tasks, self.team, self.feature, self.task
+        )
+        self.assertEqual("Review", binding["observedTaskStatus"])
+        self.assertEqual("Active", binding["claim"]["targetStatus"])
+        self.assertEqual("Active", binding["claimLineage"]["targetStatus"])
+
+    def test_lineage_mutation_fails_before_control_effect(self):
+        execution = json.loads(self.execution_path.read_text(encoding="utf-8"))
+        execution["claimLineage"]["claimId"] += "-forged"
+        execution["lineageDigest"] = worker_control.sha256_bytes(
+            worker_control.canonical(execution["claimLineage"])
+        )
+        self.execution_path.write_text(json.dumps(execution), encoding="utf-8")
+        with self.assertRaisesRegex(
+            worker_control.ControlError, "lineage identity or digest"
+        ):
+            worker_control.bound_task_state(
+                self.workspace, self.tasks, self.team, self.feature, self.task
+            )
+        self.assertEqual([], self.launcher_records())
+        self.assertEqual([], self.grant_records())
+
+    def test_mutated_tracker_claim_receipt_fails_before_control_effect(self):
+        self.tasks["tasks"][0]["comments"][0]["body"] = (
+            "[claim]\nclaim-id: dispatch-00000000000000000000000000000000\n"
+            "role: backend\ntarget-status: Active\n\n— dispatcher"
+        )
+        with self.assertRaisesRegex(
+            worker_control.ControlError, "exact fresh tracker-side receipt"
+        ):
+            worker_control.bound_task_state(
+                self.workspace, self.tasks, self.team, self.feature, self.task
+            )
+        self.assertEqual([], self.launcher_records())
+        self.assertEqual([], self.grant_records())
+
     def test_forged_non_lead_and_expired_requests_are_rejected(self):
         forged = self.request(identity_seed="forged")
         signature = forged["producerCapability"]["signature"]
@@ -544,12 +637,12 @@ raise SystemExit(int(os.environ.get("FAKE_HOLD_EXIT", "0")))
 
     def test_task_attempt_status_and_hold_compare_and_set_refuse(self):
         stale_attempt = self.request(identity_seed="attempt")
-        self.write_execution(self.attempt + 1)
         self.write_claim(self.attempt + 1)
+        self.write_execution(self.attempt + 1)
         with self.assertRaisesRegex(worker_control.ControlError, "observedExecutionSha256 is stale"):
             self.reconcile_one(stale_attempt)
-        self.write_execution(self.attempt)
         self.write_claim(self.attempt)
+        self.write_execution(self.attempt)
 
         wrong_status = self.request(identity_seed="status")
         review_tasks = json.loads(json.dumps(self.tasks))
@@ -707,8 +800,21 @@ raise SystemExit(int(os.environ.get("FAKE_HOLD_EXIT", "0")))
             self.reconcile_one(stale_nudge)
 
     def test_request_retries_verify_pending_signature_and_ignore_done_squat(self):
-        args, environment = self.request_command_context()
-        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+        args, environment, capability = self.request_command_context()
+
+        def sign_request(_locator, value, body):
+            return sign_entry(
+                value,
+                body,
+                capability["id"],
+                capability["secret"],
+                capability["instance"],
+                capability["expiresAt"],
+            )
+
+        with mock.patch.object(
+            worker_control, "request_signature", side_effect=sign_request
+        ), mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
             worker_control.time, "time", return_value=self.clock
         ), mock.patch("sys.stdout"):
             self.assertEqual(0, worker_control.request_command(args))
@@ -720,13 +826,17 @@ raise SystemExit(int(os.environ.get("FAKE_HOLD_EXIT", "0")))
         valid = json.loads(target.read_text(encoding="utf-8"))
 
         # A valid duplicate is idempotent, but a forged pending copy is rejected.
-        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+        with mock.patch.object(
+            worker_control, "request_signature", side_effect=sign_request
+        ), mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
             worker_control.time, "time", return_value=self.clock + 1
         ), mock.patch("sys.stdout"):
             self.assertEqual(0, worker_control.request_command(args))
         valid["producerCapability"]["signature"] = "hmac-sha256:" + "0" * 64
         target.write_text(json.dumps(valid), encoding="utf-8")
-        with mock.patch.dict(os.environ, environment, clear=False), self.assertRaisesRegex(
+        with mock.patch.object(
+            worker_control, "request_signature", side_effect=sign_request
+        ), mock.patch.dict(os.environ, environment, clear=False), self.assertRaisesRegex(
             worker_control.ControlError, "capability rejected"
         ):
             worker_control.request_command(args)
@@ -736,7 +846,9 @@ raise SystemExit(int(os.environ.get("FAKE_HOLD_EXIT", "0")))
         done = self.workspace / "control-outbox" / "done" / target.name
         done.write_text("{}\n", encoding="utf-8")
         done.chmod(0o600)
-        with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+        with mock.patch.object(
+            worker_control, "request_signature", side_effect=sign_request
+        ), mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
             worker_control.time, "time", return_value=self.clock + 2
         ), mock.patch("sys.stdout"):
             self.assertEqual(0, worker_control.request_command(args))

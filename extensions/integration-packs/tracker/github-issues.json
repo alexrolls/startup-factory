@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "tracker-github-issues",
+  "kind": "tracker",
+  "displayName": "GitHub Issues tracker",
+  "summary": "Select the GitHub Issues tracker while keeping authentication outside repository configuration.",
+  "compatibility": {
+    "minimumVersion": "0.2.0",
+    "platforms": ["darwin", "linux"],
+    "state": "supported"
+  },
+  "prerequisites": ["The GitHub Issues adapter is installed, and its existing gh CLI or MCP access mode owns authentication."],
+  "credentials": {
+    "policy": "adapter-managed",
+    "required": []
+  },
+  "capability": {
+    "adapter": "GitHubIssues",
+    "teamMode": true
+  }
+}

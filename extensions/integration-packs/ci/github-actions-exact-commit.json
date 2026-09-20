@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "github-actions-exact-commit",
+  "kind": "ci",
+  "displayName": "GitHub Actions exact-commit evidence",
+  "summary": "Create an inactive exact-commit CI evidence boundary with a non-empty required-check contract.",
+  "compatibility": {
+    "minimumVersion": "0.2.0",
+    "platforms": ["darwin", "linux"],
+    "state": "supported"
+  },
+  "prerequisites": [
+    "The target uses the named exact-commit check, or a distinct project-local pack replaces it with the target's real protected check names."
+  ],
+  "credentials": {
+    "policy": "adapter-managed",
+    "required": []
+  },
+  "capability": {
+    "provider": "github-actions",
+    "evidenceContract": "exact-commit-green-checks",
+    "outputFile": "verification.json",
+    "template": {
+      "schemaVersion": 1,
+      "active": false,
+      "provider": "github-actions",
+      "commitBinding": "exact",
+      "proofContract": "exact-commit-green-checks",
+      "requiredChecks": [
+        "Runtime, package, and reproducible artifacts"
+      ],
+      "activation": "operator-reviewed-copy"
+    }
+  }
+}

@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import warnings
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,15 @@ from typing import Callable, Iterator
 
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(SKILL_DIR / "src"))
+
+from startup_factory_cli.config_values import (  # noqa: E402
+    ConfigValueError,
+    parse_config_bytes,
+    value_for,
+)
+
 COMMAND_TIMEOUT_SECONDS = 120
 COMMAND_KILL_GRACE_SECONDS = 5
 RELEASE_TIMEOUT_SECONDS = 7200
@@ -97,6 +107,10 @@ HEALTH_ROW_KEYS = {
 }
 RELEASE_SNAPSHOT_FILES = {
     "release-feature.py": Path("bin/release-feature.py"),
+    "authority_config.py": Path("bin/authority_config.py"),
+    "config-value.py": Path("bin/config-value.py"),
+    "config_values.py": Path("src/startup_factory_cli/config_values.py"),
+    "authority-bootstrap.sh": Path("bin/authority-bootstrap.sh"),
     "policy-check.py": Path("bin/policy-check.py"),
     "tracker-ops.sh": Path("bin/tracker-ops.sh"),
     "finalize-integrations.sh": Path("bin/finalize-integrations.sh"),
@@ -105,9 +119,11 @@ RELEASE_SNAPSHOT_FILES = {
     "task-hold.py": Path("bin/task-hold.py"),
     "outbox_capability.py": Path("bin/outbox_capability.py"),
     "broker_evidence.py": Path("bin/broker_evidence.py"),
+    "delivery_profile.py": Path("bin/delivery_profile.py"),
     "retrospective.py": Path("bin/retrospective.py"),
     "runtime-state.py": Path("bin/runtime-state.py"),
     "ticket_content_security.py": Path("bin/ticket_content_security.py"),
+    "secret_safety.py": Path("src/startup_factory_cli/secret_safety.py"),
     "task_metadata.py": Path("bin/task_metadata.py"),
     "product_acceptance.py": Path("bin/product_acceptance.py"),
     "teamwork-path.py": Path("bin/teamwork-path.py"),
@@ -116,12 +132,30 @@ RELEASE_SNAPSHOT_FILES = {
     "guardrails.config.json": Path("config/guardrails.config.json"),
     "team.config.md": Path("config/team.config.md"),
     "project-management.config.md": Path("config/project-management.config.md"),
+    "automation.config.json": Path("config/automation.config.json"),
 }
 BUILTIN_TRACKER_ADAPTERS = {"Linear", "Jira", "GitHubIssues", "Markdown"}
 
 
 class MonitorError(RuntimeError):
     pass
+
+
+_AUTHORITY_RESOLVER: types.ModuleType | None = None
+
+
+def authority_resolver() -> types.ModuleType:
+    """Load securely captured resolver bytes without consulting import paths."""
+    global _AUTHORITY_RESOLVER
+    if _AUTHORITY_RESOLVER is not None:
+        return _AUTHORITY_RESOLVER
+    path = Path(__file__).resolve().with_name("authority_config.py")
+    raw, _digest = capture_protected_file(path, "authority configuration resolver")
+    module = types.ModuleType("startup_factory_authority_config")
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    _AUTHORITY_RESOLVER = module
+    return module
 
 
 def unprivileged_git_environment(source: dict[str, str] | None = None) -> dict[str, str]:
@@ -544,25 +578,18 @@ def read_teamwork_root() -> str:
     team_config = (SKILL_DIR / "config" / "team.config.md").resolve()
     raw, _ = capture_protected_file(team_config, "team config")
     try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise MonitorError("team config must be UTF-8 text") from exc
-    match = re.search(r"^TEAMWORK_ROOT=([^\s#]+)", text, re.MULTILINE)
-    value = (match.group(1).strip('"') if match else ".teamwork")
-    return ".teamwork" if value in {"", "null"} else value
+        value = value_for(parse_config_bytes(raw, "team config"), "TEAMWORK_ROOT")
+    except ConfigValueError as exc:
+        raise MonitorError(f"team config: {exc}") from exc
+    return value or ".teamwork"
 
 
 def parse_key_values(text: str, path: Path) -> dict[str, str | None]:
-    values: dict[str, str | None] = {}
-    for match in re.finditer(r"^([A-Z_]+)=(.*)$", text, re.MULTILINE):
-        if match.group(1) in values:
-            raise MonitorError(
-                f"duplicate configuration key {match.group(1)} in {path}; "
-                "safety settings must have one unambiguous value"
-            )
-        value = match.group(2).split("#", 1)[0].strip().strip('"')
-        values[match.group(1)] = None if value == "null" else value
-    return values
+    try:
+        parsed = parse_config_bytes(text.encode("utf-8"), str(path))
+    except (ConfigValueError, UnicodeEncodeError) as exc:
+        raise MonitorError(f"invalid configuration {path}: {exc}") from exc
+    return {key: value_for(parsed, key) for key in parsed}
 
 
 def read_key_values(path: Path) -> dict[str, str | None]:
@@ -716,11 +743,12 @@ def validate_health_snapshot(
     return value
 
 
-def validate_pm_automation(project: Path) -> None:
-    path = Path(os.environ.get("STARTUP_FACTORY_PM_CONFIG") or SKILL_DIR / "config" / "project-management.config.md").expanduser()
-    if not path.is_absolute() or path.is_symlink():
-        raise MonitorError("project-management config must be an absolute, non-symlink protected file")
-    resolved = path.resolve()
+def validate_pm_automation(project: Path) -> tuple[str, Path]:
+    path = Path(
+        os.environ.get("STARTUP_FACTORY_PM_CONFIG")
+        or SKILL_DIR / "config" / "project-management.config.md"
+    )
+    resolved = validate_protected_config_path(path, "project-management config")
     try:
         resolved.relative_to(project)
     except ValueError:
@@ -734,7 +762,15 @@ def validate_pm_automation(project: Path) -> None:
         raise MonitorError("project-management config must be UTF-8 text") from exc
     if values.get("TEAM_MODE") != "true":
         raise MonitorError("portfolio automation requires TEAM_MODE=true")
-    adapter = os.environ.get("TRACKER_ADAPTER") or values.get("PRODUCT_MANAGEMENT_TOOL")
+    try:
+        adapter = authority_resolver().configured_tracker_adapter(
+            resolved,
+            os.environ.get("TRACKER_ADAPTER")
+            if "TRACKER_ADAPTER" in os.environ
+            else None,
+        )
+    except RuntimeError as exc:
+        raise MonitorError(str(exc)) from exc
     if adapter == "Linear":
         if values.get("LINEAR_ACCESS") != "rest":
             raise MonitorError("Linear cron/service automation requires LINEAR_ACCESS=rest")
@@ -758,6 +794,7 @@ def validate_pm_automation(project: Path) -> None:
             raise MonitorError(
                 "GitHub portfolio automation requires an explicit GITHUB_REPO=owner/repository scope"
             )
+    return adapter, resolved
 
 
 def meaningful_command(value: str | None) -> bool:
@@ -785,74 +822,95 @@ def validate_agent_sandbox_runner(project: Path, values: dict[str, str | None]) 
         raise MonitorError("AGENT_SANDBOX_RUNNER must be a regular file")
     if not metadata.st_mode & 0o111 or not os.access(runner, os.X_OK):
         raise MonitorError("AGENT_SANDBOX_RUNNER must be executable")
-    if metadata.st_uid not in {0, os.geteuid()}:
-        raise MonitorError("AGENT_SANDBOX_RUNNER must be owned by the executor or root")
     if stat.S_IMODE(metadata.st_mode) & 0o022:
         raise MonitorError("AGENT_SANDBOX_RUNNER must not be group- or world-writable")
+    if metadata.st_uid != 0:
+        raise MonitorError("AGENT_SANDBOX_RUNNER must be root-owned")
     try:
         resolved = runner.resolve(strict=True)
-        resolved.relative_to(project.resolve(strict=True))
-    except ValueError:
-        return
     except OSError as exc:
         raise MonitorError(f"cannot resolve AGENT_SANDBOX_RUNNER {runner}: {exc}") from exc
-    raise MonitorError("AGENT_SANDBOX_RUNNER must be external to the agent repository")
+    if resolved != runner:
+        raise MonitorError(
+            "AGENT_SANDBOX_RUNNER must use its canonical absolute path"
+        )
+    for boundary, label in (
+        (project.resolve(strict=True), "agent repository"),
+        (SKILL_DIR.resolve(strict=True), "installed runtime"),
+    ):
+        try:
+            resolved.relative_to(boundary)
+        except ValueError:
+            pass
+        else:
+            raise MonitorError(
+                f"AGENT_SANDBOX_RUNNER must be external to the {label}"
+            )
+    try:
+        executor_can_write = os.access(resolved, os.W_OK, effective_ids=True)
+    except (NotImplementedError, TypeError):
+        executor_can_write = os.access(resolved, os.W_OK)
+    if executor_can_write:
+        raise MonitorError(
+            "AGENT_SANDBOX_RUNNER must not be writable by the executor"
+        )
+    ancestor = resolved.parent
+    while True:
+        try:
+            ancestor_metadata = ancestor.lstat()
+        except OSError as exc:
+            raise MonitorError(
+                f"cannot inspect AGENT_SANDBOX_RUNNER ancestor {ancestor}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(ancestor_metadata.st_mode) or not stat.S_ISDIR(
+            ancestor_metadata.st_mode
+        ):
+            raise MonitorError(
+                f"AGENT_SANDBOX_RUNNER ancestor must be a real directory: {ancestor}"
+            )
+        if stat.S_IMODE(ancestor_metadata.st_mode) & 0o022:
+            raise MonitorError(
+                "AGENT_SANDBOX_RUNNER ancestor must not be group- or "
+                f"world-writable: {ancestor}"
+            )
+        if ancestor_metadata.st_uid != 0:
+            raise MonitorError(
+                f"AGENT_SANDBOX_RUNNER ancestor must be root-owned: {ancestor}"
+            )
+        try:
+            executor_can_write = os.access(
+                ancestor, os.W_OK, effective_ids=True
+            )
+        except (NotImplementedError, TypeError):
+            executor_can_write = os.access(ancestor, os.W_OK)
+        if executor_can_write:
+            raise MonitorError(
+                "AGENT_SANDBOX_RUNNER ancestor must not be writable by the "
+                f"executor: {ancestor}"
+            )
+        if ancestor == ancestor.parent:
+            break
+        ancestor = ancestor.parent
 
 
 def validate_lifecycle_state_root(
     project: Path, values: dict[str, str | None]
 ) -> Path:
-    raw = os.environ.get("STARTUP_FACTORY_LIFECYCLE_STATE_ROOT") or values.get(
-        "BROKER_LIFECYCLE_ROOT"
+    del values  # The resolver re-reads the exact protected config bytes.
+    team_config = (SKILL_DIR / "config" / "team.config.md").resolve()
+    ambient = (
+        os.environ.get("STARTUP_FACTORY_LIFECYCLE_STATE_ROOT")
+        if "STARTUP_FACTORY_LIFECYCLE_STATE_ROOT" in os.environ
+        else None
     )
-    if not raw:
-        raise MonitorError(
-            "autonomous launch requires BROKER_LIFECYCLE_ROOT or "
-            "STARTUP_FACTORY_LIFECYCLE_STATE_ROOT"
-        )
-    root = Path(raw)
-    if not root.is_absolute() or Path(os.path.normpath(str(root))) != root:
-        raise MonitorError(
-            "autonomous lifecycle state root must be an absolute normalized path"
-        )
-    current = Path(root.anchor)
-    components = [current]
-    for part in root.parts[1:]:
-        current /= part
-        components.append(current)
-    for current in components:
-        try:
-            metadata = current.lstat()
-        except OSError as exc:
-            raise MonitorError(
-                f"cannot stat lifecycle state path component {current}: {exc}"
-            ) from exc
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise MonitorError(
-                f"lifecycle state path components must be non-symlink directories: {current}"
-            )
-        if metadata.st_uid not in {0, os.geteuid()} or stat.S_IMODE(metadata.st_mode) & 0o022:
-            raise MonitorError(
-                "lifecycle state path components must be broker/root-owned and not "
-                f"group/world-writable: {current}"
-            )
-    if stat.S_IMODE(root.lstat().st_mode) != 0o700:
-        raise MonitorError("autonomous lifecycle state root must have mode 0700")
     try:
-        resolved = root.resolve(strict=True)
-        boundaries = (project.resolve(strict=True), SKILL_DIR.resolve(strict=True))
-    except OSError as exc:
-        raise MonitorError(f"cannot resolve autonomous lifecycle state root: {exc}") from exc
-    for boundary in boundaries:
-        try:
-            common = Path(os.path.commonpath((str(resolved), str(boundary))))
-        except ValueError:
-            continue
-        if common in {resolved, boundary}:
-            raise MonitorError(
-                "lifecycle state root must be disjoint from both the agent repository "
-                "and the mounted skill installation"
-            )
+        resolved = authority_resolver().configured_lifecycle_root(
+            team_config, project, SKILL_DIR, ambient, required=True
+        )
+    except RuntimeError as exc:
+        raise MonitorError(str(exc)) from exc
+    if resolved is None:
+        raise MonitorError("autonomous launch requires BROKER_LIFECYCLE_ROOT")
     if not os.access(resolved, os.R_OK | os.W_OK | os.X_OK):
         raise MonitorError("lifecycle state root is not accessible to the broker executor")
     return resolved
@@ -955,6 +1013,57 @@ def capture_protected_file(
         if observed != expected_digest:
             raise MonitorError(f"{label} digest does not match the protected deployment config")
     return value, observed
+
+
+def validate_protected_config_path(path: Path, label: str) -> Path:
+    """Authenticate a supervisor-selected external config and its parent chain."""
+    if not path.is_absolute():
+        raise MonitorError(f"{label} must be an absolute, non-symlink protected file")
+    candidate = Path(os.path.abspath(path))
+    if candidate.is_symlink():
+        raise MonitorError(f"{label} must be an absolute, non-symlink protected file")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise MonitorError(f"cannot resolve {label}: {exc}") from exc
+    if resolved != candidate:
+        raise MonitorError(f"{label} must use its canonical non-symlink path")
+    for shared in (Path("/tmp"), Path("/private/tmp")):
+        try:
+            resolved.relative_to(shared)
+        except ValueError:
+            pass
+        else:
+            raise MonitorError(
+                f"{label} must not live below a shared temporary directory"
+            )
+    current = Path(resolved.anchor)
+    for part in resolved.parent.parts[1:]:
+        current /= part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise MonitorError(f"cannot inspect {label} parent {current}: {exc}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise MonitorError(f"{label} parent chain must contain non-symlink directories")
+        mode = stat.S_IMODE(info.st_mode)
+        sticky_shared_ancestor = (
+            current != resolved.parent
+            and info.st_uid == 0
+            and bool(mode & stat.S_ISVTX)
+        )
+        homebrew_group_write = (
+            info.st_uid == os.geteuid()
+            and str(resolved).startswith("/opt/homebrew/")
+            and not mode & 0o002
+        )
+        if info.st_uid not in {0, os.geteuid()} or (
+            mode & 0o022 and not sticky_shared_ancestor and not homebrew_group_write
+        ):
+            raise MonitorError(
+                f"{label} parent chain must be supervisor/root-owned and not group/world writable: {current}"
+            )
+    return resolved
 
 
 def private_directory(path: Path, label: str) -> Path:
@@ -1083,6 +1192,7 @@ def validate_supervisor_install(project: Path) -> Path:
         ("agent-health.py", "agent health collector"),
         ("heartbeat-status.py", "agent heartbeat classifier"),
         ("teamwork-path.py", "agent health path policy"),
+        ("authority_config.py", "authority configuration resolver"),
     ):
         candidate = worker.with_name(filename)
         if candidate.is_symlink():
@@ -1101,10 +1211,7 @@ def validate_supervisor_install(project: Path) -> Path:
 
 
 def load_protected_automation_config(path: Path) -> tuple[dict, Path]:
-    candidate = path.expanduser()
-    if not candidate.is_absolute() or candidate.is_symlink():
-        raise MonitorError("automation config must be an absolute, non-symlink protected file")
-    resolved = candidate.resolve()
+    resolved = validate_protected_config_path(path, "automation config")
     raw, _ = capture_protected_file(resolved, "automation config")
     try:
         config = strict_json(raw.decode("utf-8"))
@@ -1511,6 +1618,8 @@ def validate_release_deadline(config: dict) -> None:
 def validate_release_handoff(
     project: Path,
     *,
+    automation_config_path: Path | None = None,
+    pm_config_path: Path | None = None,
     dry_run: bool = False,
 ) -> tuple[list[str] | None, str | None, dict[str, str] | None]:
     """Authenticate and snapshot an external executor before its first instruction."""
@@ -1592,12 +1701,44 @@ def validate_release_handoff(
             "STARTUP_FACTORY_RELEASE_FEATURE must name bin/release-feature.py in the external skill install"
         )
     release_env = minimal_release_environment(config)
-    release_env["STARTUP_FACTORY_TEAM_POLICY_SOURCE_ROOT"] = str(source_root)
     snapshot_files = dict(RELEASE_SNAPSHOT_FILES)
-    pm_values = read_key_values(source_root / "config" / "project-management.config.md")
-    tracker_adapter = release_env.get("TRACKER_ADAPTER") or pm_values.get(
-        "PRODUCT_MANAGEMENT_TOOL"
+    pm_config = validate_protected_config_path(
+        pm_config_path
+        or Path(
+            os.environ.get("STARTUP_FACTORY_PM_CONFIG")
+            or source_root / "config" / "project-management.config.md"
+        ),
+        "project-management config",
     )
+    automation_config = validate_protected_config_path(
+        automation_config_path
+        or Path(
+            os.environ.get("STARTUP_FACTORY_AUTOMATION_CONFIG")
+            or source_root / "config" / "automation.config.json"
+        ),
+        "automation config",
+    )
+    for policy_path, label in (
+        (pm_config, "project-management config"),
+        (automation_config, "automation config"),
+    ):
+        try:
+            policy_path.relative_to(project)
+        except ValueError:
+            pass
+        else:
+            raise MonitorError(f"{label} must live outside the agent repository")
+    read_key_values(pm_config)  # Preserve duplicate/config readability checks.
+    try:
+        tracker_adapter = authority_resolver().configured_tracker_adapter(
+            pm_config,
+            release_env.get("TRACKER_ADAPTER")
+            if "TRACKER_ADAPTER" in release_env
+            else None,
+        )
+    except RuntimeError as exc:
+        raise MonitorError(str(exc)) from exc
+    release_env["TRACKER_ADAPTER"] = tracker_adapter
     if not isinstance(tracker_adapter, str) or not re.fullmatch(
         r"[A-Za-z][A-Za-z0-9_-]{0,63}", tracker_adapter
     ):
@@ -1612,6 +1753,10 @@ def validate_release_handoff(
         raise MonitorError(
             "trustedCodeDigests must contain the exact protected release helper set"
         )
+    policy_sources = {
+        "project-management.config.md": pm_config,
+        "automation.config.json": automation_config,
+    }
     captured: dict[str, tuple[bytes, str]] = {}
     for name, relative in snapshot_files.items():
         expected_digest = configured.get(name)
@@ -1620,12 +1765,15 @@ def validate_release_handoff(
         ):
             raise MonitorError(f"external release helper {name} needs a pinned sha256 digest")
         captured[name] = capture_protected_file(
-            source_root / relative,
+            policy_sources.get(name, source_root / relative),
             f"external release helper {name}",
             expected_digest,
         )
 
     if dry_run:
+        release_env["STARTUP_FACTORY_TEAM_POLICY_SOURCE_ROOT"] = str(source_root)
+        release_env["STARTUP_FACTORY_PM_CONFIG"] = str(pm_config)
+        release_env["STARTUP_FACTORY_AUTOMATION_CONFIG"] = str(automation_config)
         return (
             isolated_release_command(resolved.parent, resolved),
             str(config_path.resolve()),
@@ -1662,6 +1810,13 @@ def validate_release_handoff(
         config_digest,
         0o400,
         "authenticated deployment config snapshot",
+    )
+    release_env["STARTUP_FACTORY_TEAM_POLICY_SOURCE_ROOT"] = str(snapshot)
+    release_env["STARTUP_FACTORY_PM_CONFIG"] = str(
+        snapshot / RELEASE_SNAPSHOT_FILES["project-management.config.md"]
+    )
+    release_env["STARTUP_FACTORY_AUTOMATION_CONFIG"] = str(
+        snapshot / RELEASE_SNAPSHOT_FILES["automation.config.json"]
     )
     return (
         isolated_release_command(
@@ -2452,32 +2607,19 @@ def has_launch_eligible_task(items: list[dict], launch_statuses: frozenset[str])
     return eligible
 
 
-def ignored_task_labels(automation: dict) -> tuple[str, ...]:
+def ignored_task_labels(automation: dict, config_path: Path) -> tuple[str, ...]:
     """Return canonical case-insensitive labels excluded from autonomous work."""
-    raw = automation.get("ignoredTaskLabels", ["human-work"])
-    if not isinstance(raw, list):
-        raise MonitorError("ignoredTaskLabels must be a list of label names")
-    labels: list[str] = []
-    seen: set[str] = set()
-    for value in raw:
-        if not isinstance(value, str):
-            raise MonitorError("ignoredTaskLabels must contain only label names")
-        label = value.strip()
-        if (
-            not label
-            or label != value
-            or len(label) > 255
-            or any(ord(char) < 32 for char in label)
-        ):
-            raise MonitorError(
-                "ignoredTaskLabels entries must be canonical non-empty label names up to 255 characters"
-            )
-        canonical = label.casefold()
-        if canonical in seen:
-            raise MonitorError("ignoredTaskLabels must not contain case-insensitive duplicates")
-        seen.add(canonical)
-        labels.append(canonical)
-    return tuple(labels)
+    del automation  # The resolver re-reads the authenticated config path.
+    ambient = (
+        os.environ.get("STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON")
+        if "STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON" in os.environ
+        else None
+    )
+    try:
+        labels = authority_resolver().configured_ignored_labels(config_path, ambient)
+    except RuntimeError as exc:
+        raise MonitorError(str(exc)) from exc
+    return tuple(label.casefold() for label in labels)
 
 
 def partition_automated_tasks(
@@ -3230,13 +3372,20 @@ def one_pass(*, dry_run: bool) -> int:
     if not enabled and not dry_run:
         print("pm-agent: disabled (set enabled=true in config/automation.config.json)")
         return 0
-    validate_pm_automation(project)
+    tracker_adapter, pm_config_path = validate_pm_automation(project)
     lifecycle_root = validate_team_safety(config, project)
+    ignored_labels = ignored_task_labels(config, config_path)
     release_command, deployment_config, release_environment = validate_release_handoff(
-        project, dry_run=dry_run
+        project,
+        automation_config_path=config_path,
+        pm_config_path=pm_config_path,
+        dry_run=dry_run,
     )
     automation_root = contained(project, str(config.get("workspaceRoot") or ""), "workspaceRoot")
     env = supervisor_child_environment()
+    env["TRACKER_ADAPTER"] = tracker_adapter
+    env["STARTUP_FACTORY_AUTOMATION_CONFIG"] = str(config_path)
+    env["STARTUP_FACTORY_PM_CONFIG"] = str(pm_config_path)
     env["TRACKER_PROJECT_ROOT"] = str(project)
     env["STARTUP_FACTORY_RETROSPECTIVE_PROJECT_ROOT"] = str(project)
     env["STARTUP_FACTORY_LIFECYCLE_STATE_ROOT"] = str(lifecycle_root)
@@ -3249,7 +3398,6 @@ def one_pass(*, dry_run: bool) -> int:
         return 0
     try:
         statuses, launch_statuses = resolve_portfolio_policy(config)
-        ignored_labels = ignored_task_labels(config)
         if dry_run:
             with tempfile.TemporaryDirectory(prefix="startup-factory-scan-") as temp:
                 scan = scan_board(project, env, statuses, Path(temp) / "scan.json")
@@ -3542,7 +3690,7 @@ def one_pass(*, dry_run: bool) -> int:
                 )
             try:
                 items = export_registered_feature(project, env, feature_id, authorization_path)
-            except MonitorError as exc:
+            except MonitorError:
                 print(
                     f"pm-agent: {safe_log_value(feature_id)} not launched: "
                     "the complete authoritative [feature] export could not be verified",
@@ -4080,6 +4228,7 @@ def watch_supervisor(
 
 def print_cron() -> int:
     config, config_path, project, interpreter = bootstrap_automation()
+    _tracker_adapter, pm_config_path = validate_pm_automation(project)
     lifecycle_root = validate_team_safety(config, project)
     seconds = scan_interval_seconds(config)
     if seconds < 60 or seconds % 60:
@@ -4113,6 +4262,7 @@ def print_cron() -> int:
         f"cd {shlex.quote(str(project))} && "
         f"STARTUP_FACTORY_PROJECT_ROOT={shlex.quote(str(project))} "
         f"STARTUP_FACTORY_AUTOMATION_CONFIG={shlex.quote(str(config_path))} "
+        f"STARTUP_FACTORY_PM_CONFIG={shlex.quote(str(pm_config_path))} "
         f"STARTUP_FACTORY_LIFECYCLE_STATE_ROOT={shlex.quote(str(lifecycle_root))} "
         f"PATH={shlex.quote(ACTIVE_TRUSTED_PATH)} "
         f"{shlex.quote(str(interpreter))} -I -S -E -s {shlex.quote(str(Path(__file__).resolve()))} --once "

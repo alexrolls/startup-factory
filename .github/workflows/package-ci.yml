@@ -15,10 +15,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  minimum-python:
+    name: Python 3.10 source compatibility
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up the minimum supported Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.10"
+
+      - name: Prove source compatibility on Python 3.10
+        env:
+          PYTHONPATH: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -c 'import sys; assert sys.version_info[:2] == (3, 10), sys.version'
+          python -m startup_factory_cli version --json
+          python -m unittest discover -s tests/packaging -p "test_*.py" -v
+
   package:
     name: Runtime, package, and reproducible artifacts
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 60
 
     steps:
       - name: Check out the tested commit
@@ -38,8 +65,74 @@ jobs:
           set -euo pipefail
           runtime_tmp="$RUNNER_TEMP/startup-factory-runtime"
           install -d -m 700 "$runtime_tmp"
-          /usr/bin/python3 -c 'import sys; assert sys.version_info >= (3, 10)'
-          PATH="/usr/bin:/bin" TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh
+          setup_prefix="$(python -I -S -E -s -c 'import sys; print(sys.base_prefix)')"
+          test "$RUNNER_TOOL_CACHE" = "/opt/hostedtoolcache"
+          case "$setup_prefix" in
+            "$RUNNER_TOOL_CACHE"/Python/3.14.*/x64) ;;
+            *) echo "unexpected setup-python prefix: $setup_prefix" >&2; exit 1 ;;
+          esac
+          version_root="$(dirname "$setup_prefix")"
+          python_root="$(dirname "$version_root")"
+          test "$python_root" = "$RUNNER_TOOL_CACHE/Python"
+          sudo chown root:root /opt "$RUNNER_TOOL_CACHE" "$python_root" "$version_root"
+          sudo chmod go-w /opt "$RUNNER_TOOL_CACHE" "$python_root" "$version_root"
+          sudo chown -R root:root "$setup_prefix"
+          sudo chmod -R go-w "$setup_prefix"
+          protected_python="$setup_prefix/bin/python3"
+          "$protected_python" -I -B -S -E -s - "$setup_prefix" <<'PY'
+          import bz2
+          import ctypes
+          import hashlib
+          import lzma
+          import sqlite3
+          import ssl
+          import stat
+          import sys
+          import sysconfig
+          from pathlib import Path
+
+          root = Path(sys.argv[1]).resolve(strict=True)
+          assert sys.version_info[:2] == (3, 14), sys.version
+          assert Path(sys.executable).resolve(strict=True).is_relative_to(root)
+          assert Path(sys.prefix).resolve(strict=True) == root
+          assert Path(sys.base_prefix).resolve(strict=True) == root
+          assert Path(sysconfig.get_path("stdlib")).resolve(strict=True).is_relative_to(root)
+          current = root
+          while True:
+              info = current.lstat()
+              assert not stat.S_ISLNK(info.st_mode), current
+              assert info.st_uid == 0, current
+              assert not stat.S_IMODE(info.st_mode) & 0o022, current
+              if current == Path("/"):
+                  break
+              current = current.parent
+          for path in (root, *root.rglob("*")):
+              if path.is_symlink():
+                  assert path.resolve(strict=True).is_relative_to(root), path
+                  continue
+              info = path.stat()
+              assert info.st_uid == 0, path
+              assert not stat.S_IMODE(info.st_mode) & 0o022, path
+          maps = Path("/proc/self/maps")
+          assert maps.is_file()
+          mapped = {
+              Path(fields[-1]).resolve(strict=True)
+              for line in maps.read_text(encoding="utf-8").splitlines()
+              if len(fields := line.split(maxsplit=5)) == 6
+              and fields[-1].startswith("/")
+              and Path(fields[-1]).exists()
+          }
+          toolcache = Path("/opt/hostedtoolcache")
+          for path in mapped:
+              if path.is_relative_to(toolcache):
+                  assert path.is_relative_to(root), path
+          assert any(
+              path.name.startswith("libpython3.14") and path.is_relative_to(root)
+              for path in mapped
+          )
+          PY
+          PATH="$setup_prefix/bin:/usr/bin:/bin" \
+            TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh
 
       - name: Run packaging unit tests
         run: python -m unittest discover -s tests/packaging -p "test_*.py" -v
@@ -144,19 +237,57 @@ jobs:
             )
           done
 
-      - name: Install the pinned build toolchain
-        run: >-
-          python -m pip install --disable-pip-version-check
-          build==1.3.0 packaging==26.2 pyproject-hooks==1.2.0
-          setuptools==83.0.0 wheel==0.47.0
-
-      - name: Build wheel and sdist twice from clean trees
+      - name: Build wheel and sdist twice with an isolated pinned toolchain
         shell: bash
         run: |
           set -euo pipefail
-          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
-          python -m build --no-isolation --outdir "$PWD/build/dist-a" "$PWD/build/package-a"
-          python -m build --no-isolation --outdir "$PWD/build/dist-b" "$PWD/build/package-b"
+          test "$RUNNER_TOOL_CACHE" = "/opt/hostedtoolcache"
+          shopt -s nullglob
+          setup_prefixes=("$RUNNER_TOOL_CACHE"/Python/3.14.*/x64)
+          test "${#setup_prefixes[@]}" -eq 1
+          setup_prefix="${setup_prefixes[0]}"
+          protected_python="$setup_prefix/bin/python3"
+          "$protected_python" -I -B -S -E -s - "$setup_prefix" <<'PY'
+          import stat
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1]).resolve(strict=True)
+          assert sys.version_info[:2] == (3, 14), sys.version
+          assert Path(sys.executable).resolve(strict=True).is_relative_to(root)
+          assert Path(sys.prefix).resolve(strict=True) == root
+          assert Path(sys.base_prefix).resolve(strict=True) == root
+          current = root
+          while True:
+              info = current.lstat()
+              assert not stat.S_ISLNK(info.st_mode), current
+              assert info.st_uid == 0, current
+              assert not stat.S_IMODE(info.st_mode) & 0o022, current
+              if current == Path("/"):
+                  break
+              current = current.parent
+          PY
+          build_env="$(mktemp -d "$RUNNER_TEMP/startup-factory-build.XXXXXX")"
+          "$protected_python" -I -B -m venv --copies "$build_env"
+          build_python="$build_env/bin/python"
+          "$build_python" -I -B -E -s - "$setup_prefix" "$build_env" <<'PY'
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1]).resolve(strict=True)
+          environment = Path(sys.argv[2]).resolve(strict=True)
+          assert sys.version_info[:2] == (3, 14), sys.version
+          assert Path(sys.executable).resolve(strict=True).is_relative_to(environment)
+          assert Path(sys.prefix).resolve(strict=True) == environment
+          assert Path(sys.base_prefix).resolve(strict=True) == root
+          PY
+          "$build_python" -I -B -m pip install --disable-pip-version-check \
+            build==1.3.0 packaging==26.2 pyproject-hooks==1.2.0 \
+            setuptools==83.0.0 wheel==0.47.0
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
+          "$build_python" -I -B -m build --no-isolation --outdir "$PWD/build/dist-a" "$PWD/build/package-a"
+          "$build_python" -I -B -m build --no-isolation --outdir "$PWD/build/dist-b" "$PWD/build/package-b"
 
       - name: Normalize sdist container metadata deterministically
         shell: bash

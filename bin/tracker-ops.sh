@@ -28,9 +28,10 @@
 #   tracker-ops.sh upsert-deployment <featureId> [bodyfile]                 # one managed [deployment] projection
 #
 # Adapter comes from PRODUCT_MANAGEMENT_TOOL in config/project-management.config.md
-# (override with TRACKER_ADAPTER=<Name>). Credentials come from the environment,
-# exactly as the adapter's Access mechanisms section names them. Any failure is an
-# andon stop: non-zero exit, no fallback, no fabricated success.
+# (`TRACKER_ADAPTER`, when present, may only repeat that configured value).
+# Credentials come from the environment, exactly as the adapter's Access
+# mechanisms section names them. Any failure is an andon stop: non-zero exit,
+# no fallback, no fabricated success.
 set -euo pipefail
 
 # Preserve caller stdin on fd 4 for comment bodies, then feed the embedded
@@ -39,9 +40,22 @@ set -euo pipefail
 # success without executing the broker.
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 exec 4<&0
-exec python3 - "$SKILL_DIR" "$@" <<'PYEOF'
+tracker_python=(python3)
+if [ -n "${STARTUP_FACTORY_PINNED_PYTHON:-}" ]; then
+  case "$STARTUP_FACTORY_PINNED_PYTHON" in
+    /*) ;;
+    *) echo "tracker-ops: pinned Python must be absolute — andon" >&2; exit 1 ;;
+  esac
+  [ -f "$STARTUP_FACTORY_PINNED_PYTHON" ] \
+    && [ -x "$STARTUP_FACTORY_PINNED_PYTHON" ] \
+    && [ ! -L "$STARTUP_FACTORY_PINNED_PYTHON" ] \
+    || { echo "tracker-ops: pinned Python is unavailable — andon" >&2; exit 1; }
+  tracker_python=("$STARTUP_FACTORY_PINNED_PYTHON" -I -B)
+fi
+exec "${tracker_python[@]}" - "$SKILL_DIR" "$@" <<'PYEOF'
 import hashlib, importlib.util, json, os, re, stat, subprocess, sys, time, urllib.request, urllib.error, urllib.parse
 from datetime import date, datetime, timezone
+from pathlib import Path
 
 sys.dont_write_bytecode = True
 
@@ -65,8 +79,20 @@ ARGS = sys.argv[2:]
 sys.path.insert(0, os.path.join(SKILL_DIR, 'bin'))
 try:
     from ticket_content_security import TicketContentSecurityError, protect_ticket_content
+    from authority_config import (
+        AuthorityConfigError,
+        configured_ignored_labels,
+        configured_tracker_adapter,
+        resolve_policy_source,
+    )
+    from delivery_profile import DeliveryProfileError, repository_root
+    from startup_factory_cli.config_values import (
+        ConfigValueError,
+        parse_config_bytes,
+        value_for,
+    )
 except (ImportError, OSError) as e:
-    die("cannot load ticket content security policy: %s — andon" % e)
+    die("cannot load tracker authority policy: %s — andon" % e)
 
 def protect_outbound_ticket_text(value, destination, structural=False):
     """Return tracker-safe text, or refuse unsafe structural field values."""
@@ -88,22 +114,51 @@ def protect_outbound_ticket_text(value, destination, structural=False):
 
 # ---- config -----------------------------------------------------------------
 def read_config_keys(path):
-    keys = {}
     try:
-        with open(path) as f:
-            for line in f:
-                m = re.match(r'^([A-Z_]+)=(.*)$', line.strip())
-                if m:
-                    v = m.group(2).split('#', 1)[0].strip().strip('"')
-                    keys[m.group(1)] = None if v == 'null' else v
-    except OSError as e:
+        parsed = parse_config_bytes(Path(path).read_bytes(), 'project-management config')
+    except (OSError, ConfigValueError) as e:
         die("cannot read %s: %s" % (path, e))
-    return keys
+    return {key: value_for(parsed, key) for key in parsed}
 
-PM_CONFIG = read_config_keys(os.path.join(SKILL_DIR, 'config', 'project-management.config.md'))
-ADAPTER = os.environ.get('TRACKER_ADAPTER') or PM_CONFIG.get('PRODUCT_MANAGEMENT_TOOL')
-if not ADAPTER:
-    die("no adapter: set PRODUCT_MANAGEMENT_TOOL in config/project-management.config.md")
+project_root_raw = os.environ.get('TRACKER_PROJECT_ROOT')
+try:
+    project_root = repository_root(project_root_raw or os.getcwd())
+except DeliveryProfileError as exc:
+    die("cannot establish canonical Git project root: %s — andon" % exc)
+if project_root_raw is not None and project_root_raw != str(project_root):
+    die("TRACKER_PROJECT_ROOT must exactly repeat the canonical Git top level — andon")
+os.environ['TRACKER_PROJECT_ROOT'] = str(project_root)
+default_pm_config = Path(SKILL_DIR) / 'config' / 'project-management.config.md'
+default_automation_config = Path(SKILL_DIR) / 'config' / 'automation.config.json'
+try:
+    PM_CONFIG_PATH = resolve_policy_source(
+        default_pm_config,
+        project_root,
+        Path(SKILL_DIR),
+        os.environ.get('STARTUP_FACTORY_PM_CONFIG'),
+        label='project-management config',
+    )
+    AUTOMATION_CONFIG_PATH = resolve_policy_source(
+        default_automation_config,
+        project_root,
+        Path(SKILL_DIR),
+        os.environ.get('STARTUP_FACTORY_AUTOMATION_CONFIG'),
+        label='automation config',
+    )
+    ADAPTER = configured_tracker_adapter(
+        PM_CONFIG_PATH,
+        os.environ.get('TRACKER_ADAPTER'),
+    )
+    BOUND_IGNORED_TASK_LABELS = {
+        value.casefold()
+        for value in configured_ignored_labels(
+            AUTOMATION_CONFIG_PATH,
+            os.environ.get('STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON'),
+        )
+    }
+except AuthorityConfigError as exc:
+    die("policy source binding failed: %s — andon" % exc)
+PM_CONFIG = read_config_keys(str(PM_CONFIG_PATH))
 
 try:
     OPERATION_TIMEOUT = int(os.environ.get('TRACKER_OPERATION_TIMEOUT_SECONDS', '60'))
@@ -246,8 +301,17 @@ def adf_text(value):
     if isinstance(value, str):
         return value
     if isinstance(value, list):
+        # A broker-authored Jira comment uses explicit ADF hardBreak nodes so
+        # every newline, including an empty line, survives round-trip. Joining
+        # those children with another separator would change authenticated
+        # review bytes; other tracker-provided block lists keep legacy joining.
+        if any(isinstance(item, dict) and item.get('type') == 'hardBreak'
+               for item in value):
+            return ''.join(adf_text(x) for x in value)
         return '\n'.join(filter(None, (adf_text(x) for x in value)))
     if isinstance(value, dict):
+        if value.get('type') == 'hardBreak':
+            return '\n'
         own = value.get('text') or ''
         nested = adf_text(value.get('content') or [])
         return '\n'.join(x for x in (own, nested) if x)
@@ -393,24 +457,10 @@ def normalize_task_record(raw, context, feature_field=False):
     return value
 
 def ignored_task_labels_from_environment():
-    raw = os.environ.get('STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON')
-    if raw is None:
-        return set()
-    try:
-        values = json.loads(raw)
-    except (TypeError, ValueError) as exc:
-        die("STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON is not valid JSON — andon")
-    if not isinstance(values, list):
-        die("STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON must be a JSON list — andon")
-    labels = set()
-    for value in values:
-        if not isinstance(value, str) or not value or value != value.strip():
-            die("STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON contains a malformed label — andon")
-        canonical = value.casefold()
-        if canonical in labels:
-            die("STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON contains a duplicate label — andon")
-        labels.add(canonical)
-    return labels
+    # Retain the historical function name for the mutation call sites, but the
+    # value is now bound once to the authenticated automation config.  Ambient
+    # JSON is only an exact-repeat assertion checked during startup.
+    return set(BOUND_IGNORED_TASK_LABELS)
 
 def task_has_ignored_label(task, ignored_labels):
     return bool(ignored_labels.intersection(label.casefold() for label in task.get('labels') or []))
@@ -1261,20 +1311,29 @@ class Jira:
 
     @staticmethod
     def adf(text):
+        content = []
+        for index, line in enumerate(text.split('\n')):
+            if index:
+                content.append({'type': 'hardBreak'})
+            if line:
+                content.append({'type': 'text', 'text': line})
         return {'type': 'doc', 'version': 1, 'content': [
-            {'type': 'paragraph', 'content': [{'type': 'text', 'text': para}]}
-            for para in text.split('\n\n')]}
+            {'type': 'paragraph', 'content': content}
+        ]}
 
     def comment(self, task_id, body):
         resp = self.api('/rest/api/3/issue/%s/comment' % task_id, {'body': self.adf(body)})
         if not resp.get('id'):
             die("Jira comment creation returned no comment id — andon")
+        if adf_text(resp.get('body')) != body:
+            die("Jira comment creation did not read back the requested body — andon")
         return resp['id']
 
     def update_comment(self, task_id, comment_id, body):
         resp = self.api('/rest/api/3/issue/%s/comment/%s' % (task_id, comment_id),
                         {'body': self.adf(body)}, method='PUT')
-        if str(resp.get('id')) != str(comment_id):
+        if (str(resp.get('id')) != str(comment_id)
+                or adf_text(resp.get('body')) != body):
             die("Jira comment update did not read back comment %s — andon" % comment_id)
 
     def upsert_progress(self, task_id, body):
@@ -1516,7 +1575,18 @@ class GitHubIssues:
     def comment(self, task_id, body):
         out = self.gh('issue', 'comment', str(task_id), '--body-file', '-', stdin=body)
         m = re.search(r'#issuecomment-(\d+)', out)
-        return m.group(1) if m else None
+        if not m:
+            die("GitHub comment creation returned no comment id — andon")
+        comment_id = m.group(1)
+        repo = self.repo_name()
+        try:
+            created = json.loads(self.raw_gh(
+                'api', 'repos/%s/issues/comments/%s' % (repo, comment_id)))
+        except (TypeError, ValueError):
+            die("GitHub comment creation returned an unreadable comment — andon")
+        if str(created.get('id')) != comment_id or created.get('body') != body:
+            die("GitHub comment creation did not read back the requested body — andon")
+        return comment_id
 
     def update_comment(self, task_id, comment_id, body):
         repo = PM_CONFIG.get('GITHUB_REPO')
@@ -1533,6 +1603,12 @@ class GitHubIssues:
             die("gh exceeded the %ss tracker operation deadline" % OPERATION_TIMEOUT)
         if r.returncode != 0:
             die("gh failed: %s\n%s" % (' '.join(cmd), r.stderr.strip()))
+        try:
+            updated = json.loads(r.stdout)
+        except (TypeError, ValueError):
+            die("GitHub comment update returned an unreadable comment — andon")
+        if str(updated.get('id')) != str(comment_id) or updated.get('body') != body:
+            die("GitHub comment update did not read back the requested body — andon")
 
     def repo_name(self):
         if PM_CONFIG.get('GITHUB_REPO'):
@@ -2068,14 +2144,17 @@ class Markdown:
         content = body[len(marker):].lstrip(' :') if marker_m else body
         lines = content.split('\n')
         if marker in (
+            '[review-request]', '[review-approval]',
+            '[team-lead-approval]', '[architecture-approval]',
+            '[sceptical-architecture-approval]', '[security-approval]',
             '[product-approval]', '[product-pushback]',
             '[resume-review]', '[resume-plan]', '[dependency-hold]',
             '[design-approved]', '[design-pushback]',
         ) or body.startswith('[DENIED ACTION]'):
-            # The release gate parses an exact structured envelope, and a
-            # denied-action audit record must keep its marker literal. Preserve
-            # both byte-for-byte (apart from Markdown quote prefixes) instead of
-            # folding the first field into the legacy dated first line.
+            # Security/release gates parse these exact structured envelopes,
+            # and a denied-action audit record must keep its marker literal.
+            # Preserve both byte-for-byte (apart from Markdown quote prefixes)
+            # instead of folding the first field into the legacy dated line.
             quoted = '\n'.join('> %s' % line for line in body.split('\n'))
         else:
             quoted = '> %s (%s): %s' % (marker, date.today().isoformat(), lines[0])

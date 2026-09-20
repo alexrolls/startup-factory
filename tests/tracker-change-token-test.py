@@ -28,12 +28,21 @@ def load_definitions(adapter, extra_config=""):
     embedded = source.split("<<'PYEOF'\n", 1)[1].rsplit("\nPYEOF", 1)[0]
     definitions = embedded.split("\nBACKENDS =", 1)[0]
     temp = tempfile.TemporaryDirectory()
-    skill = Path(temp.name)
+    skill = Path(temp.name).resolve()
     (skill / "config").mkdir()
     (skill / "bin").mkdir()
+    shutil.copytree(ROOT / "src", skill / "src")
     shutil.copy(DEFAULT_STATUS_FIXTURE, skill / "config" / "statuses.config.json")
     shutil.copy(ROOT / "bin" / "ticket_content_security.py",
                 skill / "bin" / "ticket_content_security.py")
+    shutil.copy(ROOT / "bin" / "authority_config.py",
+                skill / "bin" / "authority_config.py")
+    shutil.copy(ROOT / "bin" / "delivery_profile.py",
+                skill / "bin" / "delivery_profile.py")
+    shutil.copy(ROOT / "bin" / "task_metadata.py",
+                skill / "bin" / "task_metadata.py")
+    shutil.copy(ROOT / "config" / "automation.config.json",
+                skill / "config" / "automation.config.json")
     (skill / "config" / "project-management.config.md").write_text(
         "PRODUCT_MANAGEMENT_TOOL=%s\nSTATUS_CONFIG=config/statuses.config.json\n%s"
         % (adapter, extra_config))

@@ -651,6 +651,7 @@ class HealthPublisherTest(unittest.TestCase):
                 "agent-health.py",
                 "heartbeat-status.py",
                 "teamwork-path.py",
+                "authority_config.py",
             )
             for name in required:
                 (install / name).write_text("# fixture\n", encoding="utf-8")
@@ -675,8 +676,15 @@ class HealthPublisherTest(unittest.TestCase):
             install = root / "protected-install"
             bin_dir = install / "bin"
             config_dir = install / "config"
+            package_dir = install / "src" / "startup_factory_cli"
             bin_dir.mkdir(parents=True)
             config_dir.mkdir()
+            package_dir.mkdir(parents=True)
+            shutil.copy2(
+                ROOT / "src" / "startup_factory_cli" / "config_values.py",
+                package_dir / "config_values.py",
+            )
+            (package_dir / "__init__.py").write_text("", encoding="utf-8")
             for name in (
                 "pm-agent.py",
                 "release-worker.py",
@@ -685,6 +693,7 @@ class HealthPublisherTest(unittest.TestCase):
                 "board-status.py",
                 "heartbeat-status.py",
                 "teamwork-path.py",
+                "authority_config.py",
             ):
                 shutil.copy2(ROOT / "bin" / name, bin_dir / name)
             primary = root / "primary"

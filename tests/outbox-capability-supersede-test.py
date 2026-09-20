@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Black-box tests separating capability supersession from revocation.
-
-A relaunch mints a new capability into the active pointer of an equally-named
-role instance.  The work the previous boot already enqueued is still authentic
-and must still publish; only an explicit revocation may stop it.
-"""
+"""Black-box tests for fail-closed capability supersession and revocation."""
 
 from __future__ import annotations
 
@@ -22,10 +17,18 @@ sys.path.insert(0, str(ROOT / "bin"))
 from outbox_capability import (  # noqa: E402
     CapabilityError,
     mint,
+    revoke_exact,
     revoke_role,
     revoke_task,
+    sign_active_entry,
     sign_entry,
     verify_entry,
+)
+from review_evidence import (  # noqa: E402
+    EvidenceError,
+    bind_approval_request,
+    bind_request,
+    finalize_bound_approval,
 )
 
 FEATURE = "FEATURE-1"
@@ -41,11 +44,13 @@ def entry(actor: str = ROLE, *, marker: str = "architecture-approval") -> dict:
         "id": "entry-1",
         "team": TEAM,
         "featureId": FEATURE,
-        "taskId": "-",
-        "attempt": 0,
+        "taskId": "TASK-1",
+        "attempt": 1,
         "actor": actor,
         "marker": marker,
+        "bodyPath": "/canonical/producer-body.md",
         "targetStatus": None,
+        "phase": "pending",
         "createdAt": "2026-09-02T10:00:00Z",
     }
 
@@ -108,24 +113,18 @@ class OutboxCapabilitySupersedeTest(unittest.TestCase):
         self.assertEqual(verified["role"], ROLE)
         self.assertEqual(verified["executionKind"], "gate")
 
-    def test_relaunch_does_not_destroy_what_the_previous_boot_enqueued(self) -> None:
-        """The regression this suite exists for.
-
-        A gate verdict is produced, then the role is relaunched four seconds
-        later before the outbox drain runs.  The verdict is authentic and
-        unexpired, so it must still publish.
-        """
+    def test_relaunch_fences_what_the_previous_boot_enqueued(self) -> None:
         first = self.mint_gate()
         payload = entry()
         signature = self.signed(first, payload)
 
         self.mint_gate()  # relaunch: same instance, replaces the active pointer
 
-        verified = self.verify(payload, signature)
-        self.assertEqual(verified["role"], ROLE)
+        with self.assertRaises(CapabilityError) as caught:
+            self.verify(payload, signature)
+        self.assertIn("superseded", str(caught.exception))
 
-    def test_three_gate_verdicts_survive_one_relaunch(self) -> None:
-        """Three review-board roles share one relaunch's blast radius."""
+    def test_three_stale_gate_generations_are_all_fenced(self) -> None:
         roles = ("principal-architect", "sceptical-architect", "senior-security-engineer")
         enqueued = []
         for role in roles:
@@ -138,7 +137,9 @@ class OutboxCapabilitySupersedeTest(unittest.TestCase):
 
         for role, (payload, signature) in zip(roles, enqueued):
             with self.subTest(role=role):
-                self.assertEqual(self.verify(payload, signature)["role"], role)
+                with self.assertRaises(CapabilityError) as caught:
+                    self.verify(payload, signature)
+                self.assertIn("superseded", str(caught.exception))
 
     def test_revocation_still_rejects(self) -> None:
         capability = self.mint_gate()
@@ -198,12 +199,133 @@ class OutboxCapabilitySupersedeTest(unittest.TestCase):
             self.verify(payload, signature)
         self.assertIn("revoked", str(caught.exception))
 
-    def test_expiry_still_bounds_a_superseded_capability(self) -> None:
-        """Supersession is no longer the bound, so the lease must still be."""
+    def test_new_task_attempt_supersedes_the_stable_task_lane(self) -> None:
+        first = mint(
+            str(self.base), str(self.workspace), TEAM, FEATURE, "implementer",
+            "task", "TASK-1", 1, "task:TASK-1:1",
+        )
+        payload = entry(actor="implementer", marker="handoff")
+        payload.update({"taskId": "TASK-1", "attempt": 1})
+        signature = self.signed(first, payload)
+
+        mint(
+            str(self.base), str(self.workspace), TEAM, FEATURE, "senior-engineer",
+            "task", "TASK-1", 2, "task:TASK-1:2",
+        )
+
+        with self.assertRaises(CapabilityError) as caught:
+            self.verify(payload, signature)
+        self.assertIn("superseded", str(caught.exception))
+
+    def test_exact_revoke_never_removes_a_successor_pointer(self) -> None:
+        first = self.mint_gate()
+        second = self.mint_gate()
+        self.assertEqual(
+            revoke_exact(str(self.base), str(self.workspace), first["id"]), 0
+        )
+        payload = entry()
+        verified = self.verify(payload, self.signed(second, payload))
+        self.assertEqual(verified["role"], ROLE)
+
+    def test_durably_admitted_exact_package_recovers_after_revoke(self) -> None:
+        capability = self.mint_gate()
+        payload = entry()
+        signature = sign_active_entry(
+            str(self.base), str(self.workspace), capability["id"], payload, BODY
+        )
+
+        revoke_exact(str(self.base), str(self.workspace), capability["id"])
+
+        self.assertEqual(self.verify(payload, signature)["role"], ROLE)
+
+    def test_admission_does_not_authorize_a_mutated_entry(self) -> None:
+        capability = self.mint_gate()
+        payload = entry()
+        signature = sign_active_entry(
+            str(self.base), str(self.workspace), capability["id"], payload, BODY
+        )
+        revoke_exact(str(self.base), str(self.workspace), capability["id"])
+        mutated = dict(payload)
+        mutated["createdAt"] = "2026-09-02T10:00:01Z"
+
+        with self.assertRaises(CapabilityError):
+            self.verify(mutated, signature)
+
+    def test_publication_admission_requires_the_exact_closed_producer_schema(self) -> None:
+        capability = self.mint_gate()
+        for name, mutated in (
+            ("missing-body-path", {key: value for key, value in entry().items() if key != "bodyPath"}),
+            ("unknown-field", {**entry(), "workerChosenPhase": "published"}),
+            ("mutated-phase", {**entry(), "phase": "commented"}),
+            ("relative-body-path", {**entry(), "bodyPath": "body.md"}),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(CapabilityError):
+                    sign_active_entry(
+                        str(self.base), str(self.workspace), capability["id"], mutated, BODY
+                    )
+
+    def test_signature_binds_phase_body_path_and_target_status(self) -> None:
+        capability = self.mint_gate()
+        payload = entry()
+        signature = self.signed(capability, payload)
+        for name, value in (
+            ("bodyPath", "/canonical/other-body.md"),
+            ("targetStatus", "Review"),
+        ):
+            mutated = dict(payload)
+            mutated[name] = value
+            with self.subTest(name=name):
+                with self.assertRaises(CapabilityError):
+                    self.verify(mutated, signature)
+        mutated = dict(payload)
+        mutated["phase"] = "published"
+        with self.assertRaises(CapabilityError):
+            self.verify(mutated, signature)
+
+    def test_revoked_admitted_a_approval_cannot_be_rebound_to_request_b(self) -> None:
+        request_a = bind_request(
+            "[review-request]\nFiles: app.py\n",
+            "a" * 40,
+            "b" * 40,
+            "sha256:" + "c" * 64,
+        )
+        request_b = bind_request(
+            "[review-request]\nFiles: app.py\n",
+            "a" * 40,
+            "d" * 40,
+            "sha256:" + "e" * 64,
+        )
+        body = bind_approval_request(
+            "[architecture-approval]\nFiles: app.py\n\n- principal-architect\n",
+            request_a,
+        ).encode()
+        capability = self.mint_gate()
+        payload = entry()
+        payload["bodyPath"] = "/canonical/approval-a.md"
+        payload["producerCapability"] = sign_active_entry(
+            str(self.base), str(self.workspace), capability["id"], payload, body
+        )
+        revoke_exact(str(self.base), str(self.workspace), capability["id"])
+        body_digest = "sha256:" + hashlib.sha256(body).hexdigest()
+        self.assertEqual(
+            ROLE,
+            verify_entry(
+                str(self.base), str(self.workspace), payload, body_digest
+            )["role"],
+        )
+        with self.assertRaisesRegex(EvidenceError, "producer binding does not match"):
+            finalize_bound_approval(
+                body.decode(),
+                request_b,
+                ROLE,
+                capability["id"] + ":" + capability["instance"],
+            )
+
+    def test_expiry_bounds_an_active_capability(self) -> None:
         capability = self.mint_gate(ttl_seconds=60)
         payload = entry()
         signature = self.signed(capability, payload)
-        self.mint_gate()
 
         import outbox_capability
 
@@ -229,7 +351,7 @@ class OutboxCapabilitySupersedeTest(unittest.TestCase):
 
         with self.assertRaises(CapabilityError) as caught:
             self.verify(payload, signature)
-        self.assertIn("cannot read active capability", str(caught.exception))
+        self.assertIn("not active", str(caught.exception))
 
     def test_revocation_covers_a_capability_superseded_before_it(self) -> None:
         """Revoking fences off the identity, not just the newest capability.
@@ -307,11 +429,10 @@ class OutboxCapabilitySupersedeTest(unittest.TestCase):
             self.verify(payload, signature)
         self.assertIn("regular file", str(caught.exception))
 
-    def test_a_forged_signature_is_still_rejected_after_supersession(self) -> None:
+    def test_a_forged_signature_is_rejected_while_active(self) -> None:
         capability = self.mint_gate()
         payload = entry()
         signature = self.signed(capability, payload)
-        self.mint_gate()
 
         forged = dict(signature)
         forged["signature"] = "hmac-sha256:" + "0" * 64
@@ -319,9 +440,8 @@ class OutboxCapabilitySupersedeTest(unittest.TestCase):
             self.verify(payload, forged)
         self.assertIn("signature mismatch", str(caught.exception))
 
-    def test_a_superseded_capability_cannot_publish_for_another_role(self) -> None:
+    def test_a_capability_cannot_publish_for_another_role(self) -> None:
         capability = self.mint_gate()
-        self.mint_gate()
 
         payload = entry(actor="team-lead")
         with self.assertRaises(CapabilityError) as caught:

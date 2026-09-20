@@ -6,6 +6,7 @@ set -euo pipefail
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_STATUS_FIXTURE="$SKILL_DIR/tests/fixtures/statuses.default-profile.json"
 TMP="$(mktemp -d)"
+TMP="$(cd "$TMP" && pwd -P)"
 trap 'rm -rf "$TMP"' EXIT
 FAILURES=0
 check() { # check <desc> <cmd...>
@@ -25,10 +26,16 @@ refuse() { # refuse <desc> <needle> <cmd...>
 
 # -- project-owned custom backend delegation -----------------------------------
 CUSTOM_SKILL="$TMP/custom-skill"
-mkdir -p "$CUSTOM_SKILL/bin" "$CUSTOM_SKILL/config" "$CUSTOM_SKILL/extensions/tracker-backends"
+mkdir -p "$CUSTOM_SKILL/bin" "$CUSTOM_SKILL/config" \
+  "$CUSTOM_SKILL/extensions/tracker-backends" "$CUSTOM_SKILL/src"
 cp "$SKILL_DIR/bin/tracker-ops.sh" "$CUSTOM_SKILL/bin/"
 cp "$SKILL_DIR/bin/ticket_content_security.py" "$CUSTOM_SKILL/bin/"
+cp -R "$SKILL_DIR/src/startup_factory_cli" "$CUSTOM_SKILL/src/"
+cp "$SKILL_DIR/bin/authority_config.py" "$CUSTOM_SKILL/bin/"
+cp "$SKILL_DIR/bin/delivery_profile.py" "$SKILL_DIR/bin/task_metadata.py" \
+  "$CUSTOM_SKILL/bin/"
 cp "$DEFAULT_STATUS_FIXTURE" "$CUSTOM_SKILL/config/statuses.config.json"
+cp "$SKILL_DIR/config/automation.config.json" "$CUSTOM_SKILL/config/"
 cat > "$CUSTOM_SKILL/config/project-management.config.md" <<'EOF'
 ```
 PRODUCT_MANAGEMENT_TOOL=Acme
@@ -114,9 +121,21 @@ class Backend:
     def __init__(self, context):
         self.context = context
 PY
+cat > "$CUSTOM_SKILL/config/project-management.config.md" <<'EOF'
+```
+PRODUCT_MANAGEMENT_TOOL=Incomplete
+STATUS_CONFIG=config/statuses.config.json
+```
+EOF
 refuse "incomplete custom backend contract is refused" "missing methods" \
   env TRACKER_ADAPTER=Incomplete "$CUSTOM_OPS" scan "$TMP/unused.json" --status Planned
 
+cat > "$CUSTOM_SKILL/config/project-management.config.md" <<'EOF'
+```
+PRODUCT_MANAGEMENT_TOOL=Acme
+STATUS_CONFIG=config/statuses.config.json
+```
+EOF
 refuse "custom backend cannot bypass human-only Blocked exit" "human-only" \
   env TRACKER_ADAPTER=Acme ACME_STATUS=Blocked CUSTOM_MUTATION_OUT="$TMP/custom-mutations" \
     "$CUSTOM_OPS" state ACME-1 Planned
@@ -130,9 +149,14 @@ check "refused custom operations never reach mutation primitives" \
 
 # -- fixture: a skill copy configured for the Markdown adapter ------------------
 cd "$TMP"
-mkdir -p skill/config skill/bin
+git init -q
+mkdir -p skill/config skill/bin skill/src
 cp "$SKILL_DIR/bin/tracker-ops.sh" skill/bin/
 cp "$SKILL_DIR/bin/ticket_content_security.py" skill/bin/
+cp -R "$SKILL_DIR/src/startup_factory_cli" skill/src/
+cp "$SKILL_DIR/bin/authority_config.py" skill/bin/
+cp "$SKILL_DIR/bin/delivery_profile.py" "$SKILL_DIR/bin/task_metadata.py" skill/bin/
+cp "$SKILL_DIR/config/automation.config.json" skill/config/
 cp "$DEFAULT_STATUS_FIXTURE" skill/config/statuses.config.json
 cat > skill/config/project-management.config.md <<'EOF'
 ```
@@ -152,7 +176,7 @@ cat > feat/feature.md <<'EOF'
 ## 1 Add form [Planned]
 
 **Assignee:** —
-**Labels:** human-work, needs-review
+**Labels:** needs-review
 
 Build the form.
 
@@ -169,6 +193,19 @@ T="feat/feature.md"
 
 # -- probe: minimal feature-local access check ---------------------------------
 check "probe verifies feature access without exporting tasks" "$OPS" probe "$T"
+cp skill/config/automation.config.json repository-automation.json
+cp skill/config/project-management.config.md repository-pm.md
+mkdir subdirectory
+cd subdirectory
+refuse "subdirectory invocation rejects a repo-local automation policy override" \
+  "disjoint from the repository" \
+  env STARTUP_FACTORY_AUTOMATION_CONFIG="$TMP/repository-automation.json" \
+    "$TMP/$OPS" probe "$T"
+refuse "subdirectory invocation rejects a repo-local PM policy override" \
+  "disjoint from the repository" \
+  env STARTUP_FACTORY_PM_CONFIG="$TMP/repository-pm.md" \
+    "$TMP/$OPS" probe "$T"
+cd "$TMP"
 
 # -- generated PM surfaces: one task progress block + one feature digest -------
 printf '[progress]\ncredential: %s\n' "$OUTBOUND_SECRET" | "$OPS" upsert-progress "$T#2" - >/dev/null
@@ -234,6 +271,27 @@ comment=next(comment for comment in comments if comment['body'].startswith('[pro
 assert comment['body']==open('product-body.txt').read().rstrip('\n')
 assert str(comment['revision']).startswith('markdown-offset:')
 assert str(comment['revision']).split(':',1)[1].isdigit()
+PY
+
+cat > review-body.txt <<'EOF'
+[review-request]
+Files: a.py
+Review-Package-Digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Review-Base-Commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+Task-Branch-Head: cccccccccccccccccccccccccccccccccccccccc
+Review-Gates: none
+— backend
+EOF
+"$OPS" comment "$T#1" review-body.txt
+check "receipt-governed review envelope stays byte-exact in Markdown" python3 - "$OPS" "$T" <<'PY'
+import json,subprocess,sys,tempfile
+ops,feature=sys.argv[1:]
+with tempfile.NamedTemporaryFile() as out:
+    subprocess.run([ops,'export',feature,out.name],check=True,stdout=subprocess.DEVNULL)
+    payload=json.load(open(out.name))
+comments=next(task for task in payload['tasks'] if task['taskId']==feature+'#1')['comments']
+comment=next(comment for comment in comments if comment['body'].startswith('[review-request]'))
+assert comment['body']==open('review-body.txt').read().rstrip('\n')
 PY
 
 # -- comment-once: uncertain delivery retries stay idempotent ------------------
@@ -361,7 +419,7 @@ assert byid['$T#1']['status'] == 'Ready to deploy'
 assert byid['$T#2']['status'] == 'Planned'
 assert byid['$T#1']['assignee'] == 'backend'
 assert byid['$T#2']['assignee'] is None
-assert byid['$T#1']['labels'] == ['human-work', 'needs-review']
+assert byid['$T#1']['labels'] == ['needs-review']
 assert '[design-note]' not in byid['$T#1']['description']
 assert '**Assignee:**' not in byid['$T#1']['description']
 assert '**Labels:**' not in byid['$T#1']['description']
@@ -371,14 +429,16 @@ assert byid['$T#2']['blockedBy'] == ['$T#1'], byid['$T#2'].get('blockedBy')
 assert byid['$T#1']['blockedBy'] == []
 "
 
+perl -0pi -e 's/\*\*Labels:\*\* needs-review/**Labels:** human-work, needs-review/' "$T"
 STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='["human-work"]' "$OPS" export "$T" filtered-tasks.json
 check "ignored label filters autonomous feature export" python3 -c "
 import json
 d=json.load(open('filtered-tasks.json'))
 assert [task['taskId'] for task in d['tasks']] == ['$T#2']
 "
-refuse "malformed ignored-label policy fails closed" "must be a JSON list" \
+refuse "malformed ignored-label policy fails closed" "must be a JSON array" \
   env STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='{}' "$OPS" export "$T" filtered-tasks.json
+perl -0pi -e 's/\*\*Labels:\*\* human-work, needs-review/**Labels:** needs-review/' "$T"
 
 # -- board scan: generic statuses, parent grouping, routing inputs ---------------
 mkdir -p blocked
@@ -462,7 +522,7 @@ ln -s feat linked-feat
 ln -s feat/feature.md linked-feature.md
 refuse "symlinked Markdown directory refused" "symlinked component" "$OPS" export linked-feat/feature.md out.json
 refuse "symlinked Markdown feature refused" "symlinked component" "$OPS" export linked-feature.md out.json
-refuse "unmapped adapter refused"     "no tracker-ops backend"  env TRACKER_ADAPTER=Nonesuch "$OPS" state "$T#2" Review
+refuse "adapter mismatch refused"      "must exactly repeat"     env TRACKER_ADAPTER=Nonesuch "$OPS" state "$T#2" Review
 refuse "Markdown update-comment refused"  "append-only"  bash -c "printf 'x\n' | '$OPS' update-comment '$T#2' some-id -"
 refuse "update-comment arg check"         "usage:"       "$OPS" update-comment onlyone
 

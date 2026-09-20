@@ -90,6 +90,42 @@ class BundleBuilderTest(unittest.TestCase):
             }.issubset(required)
         )
 
+    def test_repository_spec_requires_shared_secret_safety_runtime(self) -> None:
+        spec = json.loads(REPOSITORY_SPEC_PATH.read_text(encoding="utf-8"))
+        self.assertIn(
+            "src/startup_factory_cli/secret_safety.py",
+            spec["requiredPaths"],
+        )
+
+    def test_repository_spec_requires_shared_config_parser_and_contract_tests(self) -> None:
+        spec = json.loads(REPOSITORY_SPEC_PATH.read_text(encoding="utf-8"))
+        required = set(spec["requiredPaths"])
+        self.assertTrue(
+            {
+                "bin/config-value.py",
+                "src/startup_factory_cli/config_values.py",
+                "tests/config-values-test.py",
+            }.issubset(required)
+        )
+
+    def test_repository_spec_requires_lineage_runtime_and_tests(self) -> None:
+        spec = json.loads(REPOSITORY_SPEC_PATH.read_text(encoding="utf-8"))
+        required = set(spec["requiredPaths"])
+        self.assertTrue(
+            {
+                "bin/lineage-migration.py",
+                "tests/claim-lineage-runtime-test.py",
+                "tests/lineage-migration-test.py",
+            }.issubset(required)
+        )
+        for relative in (
+            "bin/lineage-migration.py",
+            "tests/claim-lineage-runtime-test.py",
+            "tests/lineage-migration-test.py",
+        ):
+            with self.subTest(path=relative):
+                self.assertEqual((ROOT / relative).stat().st_mode & 0o111, 0o111)
+
     def make_repo(self, name: str) -> tuple[Path, str]:
         repo = self.temp / name
         repo.mkdir()

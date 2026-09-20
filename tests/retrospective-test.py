@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import stat
 import subprocess
@@ -189,22 +190,81 @@ class RetrospectiveTest(unittest.TestCase):
         record(self.project, "TASK-PRIOR", report)
         workspace = self.project / ".teamwork" / "test"
         workspace.mkdir(parents=True)
+        workspace = workspace.resolve()
         retrospective_snapshot = workspace / "project-retrospective.md"
         snapshot(self.project, retrospective_snapshot)
+
+        team = "test"
+        feature = "FEATURE-1"
+        task_id = "TASK-NEXT"
+        role = "backend"
+        attempt = 1
+        target = "Active"
+        runtime_state = ROOT / "bin" / "runtime-state.py"
+        key = subprocess.run(
+            [sys.executable, str(runtime_state), "key", task_id],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        claim_id = "dispatch-" + hashlib.sha256(
+            "\0".join(
+                (team, feature, task_id, role, str(attempt), target)
+            ).encode()
+        ).hexdigest()[:32]
+        subprocess.run(
+            [
+                sys.executable,
+                str(runtime_state),
+                "claim",
+                "--workspace",
+                str(workspace),
+                "--repo",
+                str(self.project),
+                "--team",
+                team,
+                "--feature",
+                feature,
+                "--task",
+                task_id,
+                "--role",
+                role,
+                "--attempt",
+                str(attempt),
+                "--claim-id",
+                claim_id,
+                "--target",
+                target,
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
 
         tasks = workspace / "tasks.json"
         tasks.write_text(
             json.dumps(
                 {
                     "schemaVersion": 1,
-                    "featureId": "FEATURE-1",
+                    "featureId": feature,
                     "tasks": [
                         {
-                            "taskId": "TASK-NEXT",
+                            "taskId": task_id,
                             "title": "Next task",
-                            "status": "Planned",
+                            "status": target,
                             "description": "Implement the next small change.",
-                            "comments": [],
+                            "assignee": role,
+                            "comments": [
+                                {
+                                    "body": (
+                                        "[claim]\n"
+                                        f"claim-id: {claim_id}\n"
+                                        f"role: {role}\n"
+                                        f"target-status: {target}\n\n"
+                                        "— dispatcher"
+                                    )
+                                }
+                            ],
                             "blockedBy": [],
                             "labels": [],
                         }
@@ -216,24 +276,26 @@ class RetrospectiveTest(unittest.TestCase):
         config.write_text("VALIDATE_TEST=null\n")
         command = [
             sys.executable,
-            str(ROOT / "bin" / "runtime-state.py"),
+            str(runtime_state),
             "packet",
             "--workspace",
             str(workspace),
             "--tasks",
             str(tasks),
+            "--team",
+            team,
             "--feature",
-            "FEATURE-1",
+            feature,
             "--task",
-            "TASK-NEXT",
+            task_id,
             "--role",
-            "backend",
+            role,
             "--attempt",
-            "1",
+            str(attempt),
             "--worktree",
-            str(self.project),
+            str(workspace / "worktrees" / f"{role}#{attempt}-{key}"),
             "--branch",
-            "agent-task/test/task-next",
+            f"agent-task/{team}/{key}",
             "--config",
             str(config),
             "--contracts",

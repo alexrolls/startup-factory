@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "tracker-linear",
+  "kind": "tracker",
+  "displayName": "Linear tracker",
+  "summary": "Select the Linear tracker without placing its API credential in the repository.",
+  "compatibility": {
+    "minimumVersion": "0.2.0",
+    "platforms": ["darwin", "linux"],
+    "state": "supported"
+  },
+  "prerequisites": ["The Linear adapter is installed, and its existing MCP or REST access mode owns authentication."],
+  "credentials": {
+    "policy": "adapter-managed",
+    "required": []
+  },
+  "capability": {
+    "adapter": "Linear",
+    "teamMode": true
+  }
+}

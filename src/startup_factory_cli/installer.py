@@ -25,6 +25,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
 from . import __version__
+from .config_values import ConfigValueError, read_config_file, value_for
 
 try:  # Startup Factory's operational runtime is POSIX-only.
     import fcntl
@@ -122,6 +123,23 @@ class SyncPlan:
 
 
 @dataclasses.dataclass(frozen=True)
+class MigrationDiagnostic:
+    """One actionable warning about preserved pre-upgrade authority config."""
+
+    diagnostic_id: str
+    message: str
+    remediation: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "id": self.diagnostic_id,
+            "level": "warning",
+            "message": self.message,
+            "remediation": self.remediation,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class OperationResult:
     action: str
     target: Path
@@ -133,6 +151,7 @@ class OperationResult:
     plan: SyncPlan | None = None
     verified_files: int = 0
     preserved_configs: tuple[str, ...] = ()
+    migration_diagnostics: tuple[MigrationDiagnostic, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -147,6 +166,9 @@ class OperationResult:
         }
         if self.plan is not None:
             result["changes"] = self.plan.as_dict()
+            result["migrationDiagnostics"] = [
+                diagnostic.as_dict() for diagnostic in self.migration_diagnostics
+            ]
         if self.action == "verify":
             result["verifiedFiles"] = self.verified_files
             result["preservedConfigs"] = list(self.preserved_configs)
@@ -926,6 +948,161 @@ def _stable_semver(value: object) -> tuple[int, int, int] | None:
     return tuple(int(part) for part in parts)  # type: ignore[return-value]
 
 
+def _config_assignments(path: Path, keys: set[str]) -> dict[str, str | None]:
+    """Read normalized values through the runtime's canonical inert grammar."""
+
+    try:
+        parsed = read_config_file(path, "preserved team config")
+    except ConfigValueError as exc:
+        raise InstallerError(f"preserved team config is invalid: {exc}") from exc
+    return {key: value_for(parsed, key) for key in keys}
+
+
+def _configured_path_value(raw: str | None) -> str | None:
+    """Return the already-normalized protected-path scalar."""
+
+    return raw
+
+
+def _inside(path: Path, boundary: Path) -> bool:
+    try:
+        path.relative_to(boundary)
+    except ValueError:
+        return False
+    return True
+
+
+def _runner_migration_problem(
+    configured: str | None,
+    *,
+    target: Path,
+    project: Path | None,
+) -> str | None:
+    """Return why a preserved enforced runner fails the 0.2 protected contract."""
+
+    if configured is None or configured in {"", "null"}:
+        return "AGENT_SANDBOX_RUNNER is missing or null"
+    runner = Path(configured)
+    if not runner.is_absolute() or configured != os.path.normpath(configured):
+        return "AGENT_SANDBOX_RUNNER is not a normalized absolute path"
+    try:
+        metadata = runner.lstat()
+    except OSError as exc:
+        return f"AGENT_SANDBOX_RUNNER is unavailable: {exc}"
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        return "AGENT_SANDBOX_RUNNER is not a non-symlink regular file"
+    if not metadata.st_mode & 0o111 or not os.access(runner, os.X_OK):
+        return "AGENT_SANDBOX_RUNNER is not executable"
+    if metadata.st_uid != 0:
+        return "AGENT_SANDBOX_RUNNER is not root-owned"
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        return "AGENT_SANDBOX_RUNNER is group- or world-writable"
+    try:
+        resolved = runner.resolve(strict=True)
+        target_boundary = target.resolve(strict=True)
+        project_boundary = project.resolve(strict=True) if project is not None else None
+    except OSError as exc:
+        return f"cannot resolve AGENT_SANDBOX_RUNNER boundary: {exc}"
+    if resolved != runner:
+        return "AGENT_SANDBOX_RUNNER is not its canonical absolute path"
+    if _inside(resolved, target_boundary):
+        return "AGENT_SANDBOX_RUNNER is inside the installed runtime"
+    if project_boundary is not None and _inside(resolved, project_boundary):
+        return "AGENT_SANDBOX_RUNNER is inside the project repository"
+    ancestor = resolved.parent
+    while True:
+        try:
+            ancestor_metadata = ancestor.lstat()
+        except OSError as exc:
+            return f"cannot inspect AGENT_SANDBOX_RUNNER ancestor {ancestor}: {exc}"
+        if stat.S_ISLNK(ancestor_metadata.st_mode) or not stat.S_ISDIR(
+            ancestor_metadata.st_mode
+        ):
+            return f"AGENT_SANDBOX_RUNNER ancestor is not a real directory: {ancestor}"
+        if ancestor_metadata.st_uid != 0:
+            return f"AGENT_SANDBOX_RUNNER ancestor is not root-owned: {ancestor}"
+        if stat.S_IMODE(ancestor_metadata.st_mode) & 0o022:
+            return (
+                "AGENT_SANDBOX_RUNNER ancestor is group- or world-writable: "
+                f"{ancestor}"
+            )
+        try:
+            operator_can_write = os.access(ancestor, os.W_OK, effective_ids=True)
+        except (NotImplementedError, TypeError):
+            operator_can_write = os.access(ancestor, os.W_OK)
+        if operator_can_write:
+            return f"AGENT_SANDBOX_RUNNER ancestor is writable by the operator: {ancestor}"
+        if ancestor == ancestor.parent:
+            break
+        ancestor = ancestor.parent
+    try:
+        operator_can_write_runner = os.access(runner, os.W_OK, effective_ids=True)
+    except (NotImplementedError, TypeError):
+        operator_can_write_runner = os.access(runner, os.W_OK)
+    if operator_can_write_runner:
+        return "AGENT_SANDBOX_RUNNER is writable by the operator"
+    return None
+
+
+def _migration_diagnostics(
+    bundle: ValidatedBundle,
+    plan: SyncPlan,
+    *,
+    project: Path | None,
+) -> tuple[MigrationDiagnostic, ...]:
+    """Diagnose preserved authority config without changing or trusting it."""
+
+    team_config = "config/team.config.md"
+    if team_config not in plan.preserved_configs:
+        return ()
+    incoming = bundle.payload.get(team_config, b"")
+    try:
+        incoming_text = incoming.decode("utf-8")
+    except UnicodeError:
+        return ()
+    keys: set[str] = set()
+    if re.search(r"(?m)^BROKER_LIFECYCLE_ROOT=", incoming_text):
+        keys.add("BROKER_LIFECYCLE_ROOT")
+    if re.search(r"(?m)^AGENT_SANDBOX_ENFORCED=", incoming_text) and re.search(
+        r"(?m)^AGENT_SANDBOX_RUNNER=", incoming_text
+    ):
+        keys.update(("AGENT_SANDBOX_ENFORCED", "AGENT_SANDBOX_RUNNER"))
+    if not keys:
+        return ()
+    values = _config_assignments(plan.target / team_config, keys)
+    diagnostics: list[MigrationDiagnostic] = []
+    lifecycle = _configured_path_value(values.get("BROKER_LIFECYCLE_ROOT"))
+    if "BROKER_LIFECYCLE_ROOT" in keys and lifecycle in {None, ""}:
+        diagnostics.append(
+            MigrationDiagnostic(
+                "lifecycle-authority.unconfigured",
+                "Preserved config/team.config.md has no configured BROKER_LIFECYCLE_ROOT; "
+                "authority-bearing operations remain fail-closed.",
+                "Pre-create a canonical external mode-0700 lifecycle directory, set its "
+                "absolute path as BROKER_LIFECYCLE_ROOT, then run startup-factory doctor. "
+                "STARTUP_FACTORY_LIFECYCLE_STATE_ROOT may only repeat that exact value.",
+            )
+        )
+    if values.get("AGENT_SANDBOX_ENFORCED") == "true":
+        problem = _runner_migration_problem(
+            _configured_path_value(values.get("AGENT_SANDBOX_RUNNER")),
+            target=plan.target,
+            project=project,
+        )
+        if problem is not None:
+            diagnostics.append(
+                MigrationDiagnostic(
+                    "sandbox-runner.reprovision-required",
+                    f"Preserved enforced sandbox runner is not production-safe: {problem}.",
+                    "Reprovision the runner outside the project and installed runtime under "
+                    "a canonical path whose executable and complete ancestor chain are "
+                    "root-owned and not writable by the executor, group, or world; update "
+                    "AGENT_SANDBOX_RUNNER, then run startup-factory doctor.",
+                )
+            )
+    return tuple(diagnostics)
+
+
 def _assert_source_managed_install_untouched(target: Path) -> None:
     """Refuse to convert a source-managed installation into a release one.
 
@@ -982,6 +1159,7 @@ def install_or_update(
     overwrite_config: bool,
     dry_run: bool,
     allow_downgrade: bool = False,
+    project: Path | None = None,
 ) -> OperationResult:
     if command not in {"install", "update"}:
         raise ValueError(f"unsupported command: {command}")
@@ -995,6 +1173,7 @@ def install_or_update(
         command=command,
         overwrite_config=overwrite_config,
     )
+    diagnostics = _migration_diagnostics(bundle, plan, project=project)
     if not dry_run:
         _ensure_parent_directory(target.parent)
         with _parent_lock(target):
@@ -1015,6 +1194,7 @@ def install_or_update(
                 command=command,
                 overwrite_config=overwrite_config,
             )
+            diagnostics = _migration_diagnostics(bundle, plan, project=project)
             stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.stage.", dir=target.parent))
             try:
                 try:
@@ -1038,6 +1218,7 @@ def install_or_update(
         archive_sha256=bundle.archive_sha256,
         dry_run=dry_run,
         plan=plan,
+        migration_diagnostics=diagnostics,
     )
 
 

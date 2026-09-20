@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import types
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,15 @@ from product_acceptance import (
 
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(SKILL_DIR / "src"))
+
+from startup_factory_cli.config_values import (  # noqa: E402
+    ConfigValueError,
+    parse_config_bytes,
+    value_for,
+)
+
 TRUSTED_SKILL_DIR = SKILL_DIR
 # /bin is canonicalized when it is an OS-owned usrmerge alias. Keeping it in
 # the portable template also supplies bash on platforms where /usr/bin lacks it.
@@ -41,6 +51,7 @@ BOUND_GIT_DIR_ID: tuple[int, int] | None = None
 BOUND_GIT_COMMON_DIR_ID: tuple[int, int] | None = None
 PROTECTED_POLICY_CACHE: tuple[Path, dict] | None = None
 PROTECTED_HOOK_ROOT: Path | None = None
+BOUND_IGNORED_TASK_LABELS: tuple[str, ...] | None = None
 ACTIVE_HOOK_PROCESS: subprocess.Popen[str] | None = None
 DANGEROUS_ENVIRONMENT_NAMES = {
     "HOME", "BASH_ENV", "ENV", "CDPATH", "GLOBIGNORE", "SHELLOPTS",
@@ -754,9 +765,97 @@ def validate_trusted_file(path: Path, expected_digest: object, label: str, *, al
     read_trusted_file(path, expected_digest, label, allow_root_owner=allow_root_owner)
 
 
+def captured_authority_resolver(
+    raw: bytes, config_values_raw: bytes
+) -> types.ModuleType:
+    """Execute only resolver/parser bytes authenticated by trustedCodeDigests."""
+    path = SKILL_DIR / "bin" / "authority_config.py"
+    config_path = SKILL_DIR / "src" / "startup_factory_cli" / "config_values.py"
+    package = types.ModuleType("startup_factory_cli")
+    package.__path__ = [str(config_path.parent)]  # type: ignore[attr-defined]
+    config_module = types.ModuleType("startup_factory_cli.config_values")
+    config_module.__file__ = str(config_path)
+    module = types.ModuleType("startup_factory_release_authority_config")
+    module.__file__ = str(path)
+    previous_package = sys.modules.get("startup_factory_cli")
+    previous_config = sys.modules.get("startup_factory_cli.config_values")
+    try:
+        sys.modules["startup_factory_cli"] = package
+        sys.modules["startup_factory_cli.config_values"] = config_module
+        exec(
+            compile(config_values_raw, str(config_path), "exec"),
+            config_module.__dict__,
+        )
+        exec(compile(raw, str(path), "exec"), module.__dict__)
+    finally:
+        if previous_package is None:
+            sys.modules.pop("startup_factory_cli", None)
+        else:
+            sys.modules["startup_factory_cli"] = previous_package
+        if previous_config is None:
+            sys.modules.pop("startup_factory_cli.config_values", None)
+        else:
+            sys.modules["startup_factory_cli.config_values"] = previous_config
+    return module
+
+
+def trusted_policy_source(environment_name: str, bundled: Path, label: str) -> Path:
+    """Resolve one protected policy file without falling back after an override."""
+    raw = os.environ.get(environment_name)
+    candidate = Path(raw) if raw is not None else bundled
+    if not candidate.is_absolute():
+        raise ReleaseError(f"{environment_name} must name an absolute {label}")
+    lexical = Path(os.path.abspath(candidate))
+    if candidate.is_symlink():
+        raise ReleaseError(f"{label} must be a canonical non-symlink file")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ReleaseError(f"cannot resolve {label}: {exc}") from exc
+    if resolved != lexical:
+        raise ReleaseError(f"{label} must use its canonical non-symlink path")
+    for shared in (Path("/tmp"), Path("/private/tmp")):
+        try:
+            resolved.relative_to(shared)
+        except ValueError:
+            pass
+        else:
+            raise ReleaseError(
+                f"{label} must not live below a shared temporary directory"
+            )
+    current = Path(resolved.anchor)
+    for part in resolved.parent.parts[1:]:
+        current /= part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise ReleaseError(f"cannot inspect {label} parent {current}: {exc}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ReleaseError(f"{label} parent chain must contain non-symlink directories")
+        if info.st_uid not in {0, os.geteuid()} or stat.S_IMODE(info.st_mode) & 0o022:
+            raise ReleaseError(
+                f"{label} parent chain must be executor/root-owned and not group/world writable"
+            )
+    return resolved
+
+
 def trusted_file_specs() -> dict[str, tuple[Path, Path]]:
+    pm_config_source = trusted_policy_source(
+        "STARTUP_FACTORY_PM_CONFIG",
+        (SKILL_DIR / "config" / "project-management.config.md").resolve(),
+        "project-management config",
+    )
+    automation_config_source = trusted_policy_source(
+        "STARTUP_FACTORY_AUTOMATION_CONFIG",
+        (SKILL_DIR / "config" / "automation.config.json").resolve(),
+        "automation config",
+    )
     specs = {
         "release-feature.py": (Path(__file__).resolve(), Path("bin/release-feature.py")),
+        "authority_config.py": ((SKILL_DIR / "bin" / "authority_config.py").resolve(), Path("bin/authority_config.py")),
+        "config-value.py": ((SKILL_DIR / "bin" / "config-value.py").resolve(), Path("bin/config-value.py")),
+        "config_values.py": ((SKILL_DIR / "src" / "startup_factory_cli" / "config_values.py").resolve(), Path("src/startup_factory_cli/config_values.py")),
+        "authority-bootstrap.sh": ((SKILL_DIR / "bin" / "authority-bootstrap.sh").resolve(), Path("bin/authority-bootstrap.sh")),
         "policy-check.py": ((SKILL_DIR / "bin" / "policy-check.py").resolve(), Path("bin/policy-check.py")),
         "tracker-ops.sh": ((SKILL_DIR / "bin" / "tracker-ops.sh").resolve(), Path("bin/tracker-ops.sh")),
         "finalize-integrations.sh": ((SKILL_DIR / "bin" / "finalize-integrations.sh").resolve(), Path("bin/finalize-integrations.sh")),
@@ -765,9 +864,11 @@ def trusted_file_specs() -> dict[str, tuple[Path, Path]]:
         "task-hold.py": ((SKILL_DIR / "bin" / "task-hold.py").resolve(), Path("bin/task-hold.py")),
         "outbox_capability.py": ((SKILL_DIR / "bin" / "outbox_capability.py").resolve(), Path("bin/outbox_capability.py")),
         "broker_evidence.py": ((SKILL_DIR / "bin" / "broker_evidence.py").resolve(), Path("bin/broker_evidence.py")),
+        "delivery_profile.py": ((SKILL_DIR / "bin" / "delivery_profile.py").resolve(), Path("bin/delivery_profile.py")),
         "retrospective.py": ((SKILL_DIR / "bin" / "retrospective.py").resolve(), Path("bin/retrospective.py")),
         "runtime-state.py": ((SKILL_DIR / "bin" / "runtime-state.py").resolve(), Path("bin/runtime-state.py")),
         "ticket_content_security.py": ((SKILL_DIR / "bin" / "ticket_content_security.py").resolve(), Path("bin/ticket_content_security.py")),
+        "secret_safety.py": ((SKILL_DIR / "src" / "startup_factory_cli" / "secret_safety.py").resolve(), Path("src/startup_factory_cli/secret_safety.py")),
         "task_metadata.py": ((SKILL_DIR / "bin" / "task_metadata.py").resolve(), Path("bin/task_metadata.py")),
         "product_acceptance.py": ((SKILL_DIR / "bin" / "product_acceptance.py").resolve(), Path("bin/product_acceptance.py")),
         "teamwork-path.py": ((SKILL_DIR / "bin" / "teamwork-path.py").resolve(), Path("bin/teamwork-path.py")),
@@ -775,27 +876,28 @@ def trusted_file_specs() -> dict[str, tuple[Path, Path]]:
         "statuses.config.json": ((SKILL_DIR / "config" / "statuses.config.json").resolve(), Path("config/statuses.config.json")),
         "guardrails.config.json": ((SKILL_DIR / "config" / "guardrails.config.json").resolve(), Path("config/guardrails.config.json")),
         "team.config.md": ((SKILL_DIR / "config" / "team.config.md").resolve(), Path("config/team.config.md")),
-        "project-management.config.md": ((SKILL_DIR / "config" / "project-management.config.md").resolve(), Path("config/project-management.config.md")),
+        "project-management.config.md": (pm_config_source, Path("config/project-management.config.md")),
+        "automation.config.json": (automation_config_source, Path("config/automation.config.json")),
     }
-    pm_config_path = SKILL_DIR / "config" / "project-management.config.md"
+    pm_config_path = pm_config_source
     try:
-        pm_config_text = pm_config_path.read_text()
-    except OSError as exc:
+        parsed_pm = parse_config_bytes(
+            pm_config_path.read_bytes(), "project-management config"
+        )
+    except (OSError, ConfigValueError) as exc:
         raise ReleaseError(f"cannot read project-management config: {exc}") from exc
-    pm_values: dict[str, str | None] = {}
-    for match in re.finditer(r"^([A-Z_]+)=(.*)$", pm_config_text, re.MULTILINE):
-        name = match.group(1)
-        if name in pm_values:
-            raise ReleaseError(f"duplicate project-management setting {name}")
-        value = match.group(2).split("#", 1)[0].strip().strip('"')
-        pm_values[name] = None if value == "null" else value
-    tracker_adapter = os.environ.get("TRACKER_ADAPTER") or pm_values.get(
-        "PRODUCT_MANAGEMENT_TOOL"
-    )
+    tracker_adapter = value_for(parsed_pm, "PRODUCT_MANAGEMENT_TOOL")
     if not isinstance(tracker_adapter, str) or not re.fullmatch(
         r"[A-Za-z][A-Za-z0-9_-]{0,63}", tracker_adapter
     ):
         raise ReleaseError("trusted code requires a valid configured tracker adapter")
+    if (
+        "TRACKER_ADAPTER" in os.environ
+        and os.environ["TRACKER_ADAPTER"] != tracker_adapter
+    ):
+        raise ReleaseError(
+            "TRACKER_ADAPTER must exactly repeat configured PRODUCT_MANAGEMENT_TOOL"
+        )
     if tracker_adapter not in BUILTIN_TRACKER_ADAPTERS:
         relative = Path("extensions", "tracker-backends", f"{tracker_adapter}.py")
         specs[f"tracker-backend.{tracker_adapter}.py"] = (
@@ -834,6 +936,16 @@ def validate_release_trust(config_path: Path, config: dict, repository: Path) ->
     if not isinstance(trusted, dict):
         raise ReleaseError("enabled deployment requires trustedCodeDigests")
     specs = trusted_file_specs()
+    for name in ("project-management.config.md", "automation.config.json"):
+        policy_path = specs[name][0]
+        try:
+            policy_path.relative_to(repository)
+        except ValueError:
+            pass
+        else:
+            raise ReleaseError(
+                f"trusted {name} must live outside the agent repository"
+            )
     if set(trusted) != set(specs):
         raise ReleaseError(
             "trustedCodeDigests must contain exactly: " + ", ".join(sorted(specs))
@@ -1646,12 +1758,14 @@ def normalize_trusted_base_ref(config: dict) -> str:
     return value
 
 
-def configured_teamwork_root(repository: Path) -> Path:
-    text = skill_path("config/team.config.md").read_text()
-    match = re.search(r"^TEAMWORK_ROOT=(.*)$", text, re.MULTILINE)
-    if not match:
+def configured_teamwork_root(repository: Path, config_bytes: bytes) -> Path:
+    try:
+        values = parse_config_bytes(config_bytes, "trusted team config")
+    except ConfigValueError as exc:
+        raise ReleaseError(str(exc)) from exc
+    value = value_for(values, "TEAMWORK_ROOT")
+    if value is None:
         raise ReleaseError("team config has no TEAMWORK_ROOT")
-    value = match.group(1).split("#", 1)[0].strip().strip('"')
     relative = Path(value)
     if not value or relative.is_absolute() or ".." in relative.parts:
         raise ReleaseError("TEAMWORK_ROOT must be a contained repository-relative path")
@@ -2294,24 +2408,9 @@ def safe_task_key(value: str) -> str:
 
 
 def ignored_task_labels() -> set[str]:
-    raw = os.environ.get(
-        "STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON", '["human-work"]'
-    )
-    try:
-        values = json.loads(raw)
-    except ValueError as exc:
-        raise ReleaseError("ignored-task label policy is invalid JSON") from exc
-    if not isinstance(values, list) or any(
-        not isinstance(item, str) or not item.strip() or item != item.strip()
-        for item in values
-    ):
-        raise ReleaseError(
-            "ignored-task label policy must be a JSON array of canonical strings"
-        )
-    canonical = [item.casefold() for item in values]
-    if len(canonical) != len(set(canonical)):
-        raise ReleaseError("ignored-task label policy contains a duplicate")
-    return set(canonical)
+    if BOUND_IGNORED_TASK_LABELS is None:
+        raise ReleaseError("ignored-task label authority has not been config-bound")
+    return {item.casefold() for item in BOUND_IGNORED_TASK_LABELS}
 
 
 def verify_integrations(
@@ -2751,7 +2850,7 @@ def reconcile_rolling_back(transaction: dict, observed: dict) -> str:
 
 
 def execute(args: argparse.Namespace) -> int:
-    global TRUSTED_SKILL_DIR, PROTECTED_HOOK_ROOT
+    global TRUSTED_SKILL_DIR, PROTECTED_HOOK_ROOT, BOUND_IGNORED_TASK_LABELS
     repository = args.repository.resolve()
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", args.team):
         raise ReleaseError("unsafe team/branch identifier")
@@ -2825,6 +2924,55 @@ def execute(args: argparse.Namespace) -> int:
     deployment_config_digest, captured_trusted_code = validate_release_trust(
         args.config, config, repository
     )
+    authority = captured_authority_resolver(
+        captured_trusted_code["authority_config.py"],
+        captured_trusted_code["config_values.py"],
+    )
+    ambient_lifecycle = (
+        os.environ.get("STARTUP_FACTORY_LIFECYCLE_STATE_ROOT")
+        if "STARTUP_FACTORY_LIFECYCLE_STATE_ROOT" in os.environ
+        else None
+    )
+    try:
+        lifecycle_authority = authority.resolve_lifecycle_root(
+            authority.parse_assignment_bytes(
+                captured_trusted_code["team.config.md"],
+                "BROKER_LIFECYCLE_ROOT",
+                "trusted team config",
+            ),
+            repository,
+            SKILL_DIR,
+            ambient_lifecycle,
+            required=True,
+        )
+        tracker_adapter = authority.resolve_tracker_adapter(
+            authority.parse_assignment_bytes(
+                captured_trusted_code["project-management.config.md"],
+                "PRODUCT_MANAGEMENT_TOOL",
+                "trusted project-management config",
+            ),
+            os.environ.get("TRACKER_ADAPTER")
+            if "TRACKER_ADAPTER" in os.environ
+            else None,
+        )
+        automation_policy = strict_json(
+            captured_trusted_code["automation.config.json"]
+        )
+        if not isinstance(automation_policy, dict) or "ignoredTaskLabels" not in automation_policy:
+            raise ReleaseError(
+                "trusted automation config must explicitly declare ignoredTaskLabels"
+            )
+        configured_ignored_labels = authority.resolve_ignored_labels(
+            automation_policy["ignoredTaskLabels"],
+            os.environ.get("STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON")
+            if "STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON" in os.environ
+            else None,
+        )
+    except RuntimeError as exc:
+        raise ReleaseError(str(exc)) from exc
+    if lifecycle_authority is None:
+        raise ReleaseError("BROKER_LIFECYCLE_ROOT is required for release authority")
+    BOUND_IGNORED_TASK_LABELS = tuple(configured_ignored_labels)
     target = normalize_target(config)
     trusted_base_ref = normalize_trusted_base_ref(config)
     state_root = trusted_state_root(config, repository)
@@ -2834,9 +2982,21 @@ def execute(args: argparse.Namespace) -> int:
         captured_trusted_code,
         config["trustedCodeDigests"],
     )
+    try:
+        authority.resolve_lifecycle_root(
+            str(lifecycle_authority),
+            repository,
+            TRUSTED_SKILL_DIR,
+            str(lifecycle_authority),
+            required=True,
+        )
+    except RuntimeError as exc:
+        raise ReleaseError(str(exc)) from exc
     PROTECTED_HOOK_ROOT = state_root / "trusted-hooks" / deployment_config_digest.removeprefix("sha256:")
 
-    expected_workspace_path = configured_teamwork_root(repository) / args.team
+    expected_workspace_path = configured_teamwork_root(
+        repository, captured_trusted_code["team.config.md"]
+    ) / args.team
     if expected_workspace_path.is_symlink():
         raise ReleaseError("canonical team workspace must not be a symlink")
     expected_workspace = expected_workspace_path.resolve()
@@ -2860,17 +3020,20 @@ def execute(args: argparse.Namespace) -> int:
         raise ReleaseError("feature branch did not resolve to a full commit hash")
 
     tracker_env = read_environment(config, "trackerEnvironmentAllowlist", repository)
-    tracker_env["STARTUP_FACTORY_TEAM_POLICY_SOURCE_ROOT"] = os.environ.get(
-        "STARTUP_FACTORY_TEAM_POLICY_SOURCE_ROOT", str(SKILL_DIR)
+    tracker_env["STARTUP_FACTORY_TEAM_POLICY_SOURCE_ROOT"] = str(TRUSTED_SKILL_DIR)
+    # Internal broker authority is deliberately not a deployment-provider
+    # credential and is never forwarded to hooks. It comes only from the
+    # pinned team config and lets the finalizer honor Blocked holds.
+    tracker_env["STARTUP_FACTORY_LIFECYCLE_STATE_ROOT"] = str(lifecycle_authority)
+    tracker_env["TRACKER_ADAPTER"] = tracker_adapter
+    tracker_env["STARTUP_FACTORY_PM_CONFIG"] = str(
+        skill_path("config/project-management.config.md")
     )
-    lifecycle_authority = os.environ.get("STARTUP_FACTORY_LIFECYCLE_STATE_ROOT")
-    if lifecycle_authority:
-        # Internal broker authority is deliberately not a deployment-provider
-        # credential and is never forwarded to hooks.  It is required by the
-        # pinned integration finalizer to honor Blocked holds during release.
-        tracker_env["STARTUP_FACTORY_LIFECYCLE_STATE_ROOT"] = lifecycle_authority
+    tracker_env["STARTUP_FACTORY_AUTOMATION_CONFIG"] = str(
+        skill_path("config/automation.config.json")
+    )
     tracker_env["STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON"] = json.dumps(
-        sorted(ignored_task_labels()), separators=(",", ":")
+        list(configured_ignored_labels), separators=(",", ":")
     )
     tracker_env.setdefault("TRACKER_PROJECT_ROOT", str(repository))
     tracker_env["STARTUP_FACTORY_RELEASE_EXECUTOR"] = "1"

@@ -296,19 +296,19 @@ All coordination artifacts are comments on the [task], written through the adapt
 beginning with an exact marker. Markers are the machine-readable protocol; never
 invent new ones, never misspell them.
 
-Marker **routing is enforced, but tracker authorship is not a security
-identity**: the board config's `markers` table names the role(s) accepted by the
-workflow (presets may override it), and the integrator refuses a marker whose
-claimed signer is not allowed. These role labels and comment signatures are
-coordination evidence; a tracker comment cannot authenticate an OS principal or
-authorize production. Automatic production therefore additionally requires the
-protected external identity/isolation attestor in `reference/deployment.md`.
-The local outbox broker derives the author from a verified launched-role
-capability and enforces the configured product role (or explicit fallback) for
-its own submission, but the feature-level tracker-text evaluator
-validates only the exact envelope/timeline and does not authenticate a remote
-commenter/signature. Production authenticity comes only from the external
-attestor or exact-manifest verifier.
+Marker routing is enforced, but tracker authorship alone is not a security
+identity: the board config's `markers` table names the role(s) accepted by the
+workflow (presets may override it), and production still requires the protected
+external identity/isolation attestor in `reference/deployment.md`. For the
+integration review, however, the local outbox broker also writes a protected,
+HMAC-authenticated receipt for the exact posted `[review-request]` and each
+required review approval. The receipt binds repository, workspace, team,
+feature, task, attempt, marker, delivery id, target status, launched-role
+capability, review binding, final tracker-body hash, and a protected publication
+timestamp. The integrator verifies those receipts and uses their timestamps for
+request/approval ordering. Role labels and signatures remain human-readable
+coordination evidence; they do not replace the receipt or confer production
+authority.
 Three hold-control markers are stricter: `[dependency-hold]`, `[resume-review]`,
 and `[resume-plan]` are acted on only when the local broker has a matching
 published receipt for the exact feature, task, body fields, delivery, and
@@ -316,14 +316,22 @@ verified launched-role capability. Text copied directly into the
 project-management tool—even with a team-lead signature—has no such receipt and
 cannot stop a dependent or clear a resume barrier. These receipts authenticate
 only the local workflow command; they grant no production authority.
+Likewise, review text copied directly into the tracker is inert even when
+`TRACKER_WRITERS=all`; that mode makes `submit-artifact.sh` synchronously invoke
+the broker rather than authenticating manual writes. Existing in-flight review
+comments created before receipt schema 2 / approval-evidence schema 8 are not
+backfilled or re-signed: publish a fresh review request and every required
+approval through the authenticated outbox. Rotating the protected lifecycle key
+also intentionally invalidates such in-flight review evidence.
 When a marker's only allowed role is the [task]'s own implementer, an
 **independent verifier** from the roster substitutes—no role approves its own
 work; none available → `[andon]`.
 
 **Budgets and supersession.** An agent-authored gate-marker comment is ≤ **25
-lines**; the broker may add three exact review-binding fields, two reviewer
-provenance fields, and two separator lines, keeping the final posted comment ≤
-**32 lines**. Its content is: marker,
+lines**. Before signing and submission, the reviewer adds three exact
+review-binding fields with the prompt-provided helper; the broker adds only two
+verified reviewer-provenance fields. The five fields share two separator lines,
+keeping the final posted comment ≤ **32 lines**. Its content is: marker,
 `round: N`, `supersedes: <comment-id>` (round ≥ 2; Markdown adapter:
 `<marker>-<round>` stands in for the id), verdict, delta since the last round,
 file list, evidence/artifact paths, signature. Full checklists, logs, and long
@@ -346,7 +354,7 @@ pre-v2 comments count as round 0). WIP narration, setup chatter, and restated
 | `[resume-plan]` | team-lead | Revised implementation plan after a `requirements-changed` resume verdict. It must be later than that verdict and followed by both later design approvals before a clean-worktree hold can clear. |
 | `[api-ready]` | backend | Contract available for frontend: endpoints, request/response shapes. Also sent by mailbox. |
 | `[divergence]` | implementer | What was done differently from the [task]/design note and why. Additive — **never edit the original [task] description.** |
-| `[review-request]` | implementer | Ready for review: what changed, list of changed files, an **evidence record per configured validation command** (see *Evidence and re-execution*), its exact baseline comparison, an explicit `NOT validated:` section for anything not run (with reason), and any index-only staging operation performed. Hand-scoped substitutes do not satisfy a broader configured command. A claimed result without its evidence record **is** NOT validated. Written when moving to `[Review]`. `review-package.sh` emits a sibling binding manifest; reviewers read that file and let the broker add bindings instead of retyping hashes. Must carry the **`Files:` evidence line** (see below). |
+| `[review-request]` | implementer | Ready for review: what changed, list of changed files, an **evidence record per configured validation command** (see *Evidence and re-execution*), its exact baseline comparison, an explicit `NOT validated:` section for anything not run (with reason), and any index-only staging operation performed. Hand-scoped substitutes do not satisfy a broader configured command. A claimed result without its evidence record **is** NOT validated. Written when moving to `[Review]`. `review-package.sh` emits a sibling binding manifest; reviewers read that file and run the prompt-provided `bind-producer-approval` helper before signing/submitting instead of retyping hashes. The broker validates and preserves those three binding fields and adds only its two verified provenance fields. Must carry the **`Files:` evidence line** (see below). |
 | `[review-findings]` | reviewer / qa / team-lead / principal-architect / sceptical-architect / security-reviewer | Numbered problems that must be fixed. Task goes back to `[Planned]`/`ToDo` for a fresh attempt. |
 | `[review-approval]` | reviewer / qa | Optional supporting approval carrying the **`Files:` evidence line** (see below). |
 | `[team-lead-approval]` | team-lead | Mandatory independent specification, quality, test, and operability sign-off, carrying the **`Files:` evidence line** (see below). |
@@ -380,10 +388,12 @@ Files: CLAUDE.md, backend/tests/test_widget.py, scripts/deploy.sh
   *"## Files changed"* block is generated from the same diff the integrator
   compares against; every path in it belongs on the line, and nothing else does.
   Recalling the set from what you reviewed is how it drifts.
-- The label may also read `Files approved (exact):` or `Approved files (…):`, and
-  middots or spaces are accepted in place of commas, so a verdict can stay
-  readable as prose. The canonical `Files:` + commas form is still what you should
-  emit when you have the choice.
+- The label may also read `Files approved (exact):` or `Approved files (…):`.
+  Use commas or one consistent explicit middot/bullet separator. Exactly one
+  declaration is allowed: duplicate declarations or paths, mixed separators,
+  an empty line, and an unquoted whitespace-only list all fail closed. The
+  canonical `Files:` + commas form is still what you should emit when you have
+  the choice; backtick a single path when that path itself contains spaces.
 - One line per artifact. The set must be the **whole** reviewed diff, not the
   subset a given reviewer looked hardest at — a reviewer who wants to approve less
   than the diff writes `[review-findings]`, not a shorter list.
@@ -457,29 +467,44 @@ tracker:
   `[progress]`/`[digest]` records. Any value other than the explicit unsafe
   `all` follows this queued/brokered behavior.
 
-  `launch-team.sh` gives each spawned role instance a short-lived HMAC
-  capability whose verifier record is stored under the Git common directory,
-  outside every linked task worktree. `submit-artifact.sh` signs immutable entry
-  fields plus the producer body digest and always uses the launcher-fixed
-  canonical project/workspace, even when called from a linked task worktree.
-  The broker rejects missing, expired, superseded, forged, or cross-role
-  capabilities for protocol gate markers and derives their authoring role from
-  the verified record. Capabilities expire after 24 hours by default; relaunch a
-  long-lived gate role before expiry, which also supersedes that instance's prior
-  capability. Task-mode artifacts retain the canonical execution-record
+  For an enforced launch through a validated external sandbox runner,
+  `launch-team.sh` gives the spawned role only a non-secret locator for a
+  launcher-owned publication supervisor. A manual/unenforced child may still
+  be lifecycle-supervised, but receives no authenticated publication transport
+  or canonical publication-routing context. The HMAC secret and verifier record
+  stay outside every worker sandbox and linked task worktree. On Linux and
+  macOS, the supervisor authenticates a request as a bounded descendant of the
+  exact launched child generation using native stable process identity before
+  admitting it. `submit-artifact.sh` asks that supervisor to sign immutable
+  entry fields plus the producer body digest and always uses the launcher-fixed
+  canonical project/workspace.
+
+  Mint, exact revoke, durable admission, protected hold mutation, and the final
+  tracker effect share one broker authority lock. A task has one stable lane by
+  task id across role/attempt/process changes; a gate has one lane per concrete
+  role. A successor or stop therefore prevents the predecessor from admitting
+  anything new. An exact package durably admitted before that fence may still
+  drain after normal worker exit; any other missing, expired, superseded,
+  revoked, forged, or cross-role package fails closed. Capabilities expire after
+  24 hours by default. Task-mode artifacts retain the canonical execution-record
   check; signed launched-task entries receive both checks.
 
   In `broker` mode, status ownership and marker authorship rules apply to that
   verified **authoring** role, not the deterministic process that writes on its behalf.
   The broker gains no design, review, or production authority from holding the
   credential. The outbox record binds the authoring role, body, requested
-  transition, and attempt.
+  transition, and attempt. The producer schema is closed and immutable with
+  `phase=pending`; broker progression and exact staged/final bytes are kept in
+  protected Git-common storage, re-hashed immediately before each effect, and
+  never trusted from a workspace receipt.
 
   The launcher removes shipped tracker credential environment variables from
   every agent role and, in enforced mode, routes role commands and provisioning
   through the protected external `AGENT_SANDBOX_RUNNER` with an absolute
   workdir. The runner must block credential files/keychains and undeclared
-  network paths. It must also
+  network paths. Its sole publication exception is connect-only access to the
+  exact lifecycle-root socket locator supplied for that launch; the worker must
+  not list, read, create, replace, or remove lifecycle-root entries. It must also
   hide `.git/startup-factory-broker/` (or the equivalent Git common-directory
   path) and other agents' environments from every agent process; owner-only
   modes and environment scrubbing alone are not same-UID security boundaries.
@@ -647,7 +672,13 @@ branches.
    `Review-Request-SHA256`, `Task-Branch-Head`, and
    `Review-Package-SHA256`, all matching that request, plus one concrete
    `Reviewer-Role` and one protected `Reviewer-Context`. All required roles and
-   contexts must each be distinct. `Review-Request-SHA256`
+   contexts must each be distinct. Before submitting an approval, the reviewer
+   runs the prompt-provided `review_evidence.py bind-producer-approval` command
+   against the current snapshot and exact package binding manifest, then submits
+   that bound file. The publication-supervisor signature therefore covers all
+   three exact binding fields. The broker validates and preserves them; it adds
+   only the verified `Reviewer-Role` and `Reviewer-Context` provenance fields.
+   Missing, partial, or stale producer bindings fail closed. `Review-Request-SHA256`
    is SHA-256 over the complete bound request body after normalizing CRLF and
    bare CR to LF; it is not a digest of selected fields. A later commit—even one
    touching only an already approved filename—invalidates the approvals.
@@ -687,6 +718,22 @@ branches.
    its task branch, resolves normally, and must earn a new request plus fresh
    core and declared-gate approvals. History is never rewritten or represented
    as removed.
+   Recovery validation crosses a separate credential boundary:
+   the finalizer starts `bin/recovery_validation.py` through absolute
+   `/usr/bin/python3 -I -B` under a fixed `env -i` bootstrap. The helper passes
+   only configured `PATH`, `TMPDIR`, `LANG`, `LC_ALL`, `TERM`, and `NO_COLOR`
+   values plus its two fixed safety variables; every other allowlist name fails
+   closed. NUL-delimited Git path records become exact `VALIDATE_SCRIPT` argv
+   bytes; the four configured validation strings run in order through fixed
+   `/bin/sh -c`, never `eval`. Validation has a 15-minute deadline, an 8 MiB
+   combined output cap, and TERM/KILL process-group cleanup. When
+   `AGENT_SANDBOX_ENFORCED=true`, the protected external sandbox runner is
+   mandatory; its canonical file and every ancestor must be root-owned, not
+   executor/group/world-writable (including access checks), and their identities
+   are rechecked immediately before launch. With enforcement disabled this
+   boundary scrubs environment values only; it does not claim filesystem,
+   process, or network isolation. The finalizer never evaluates recovery
+   commands in its credentialed environment.
 5. Verify the transaction says `completed`. When every [task] is terminal, tell
    the team-lead and principal-architect; feature resolution still requires the
    Lead's completion checklist.

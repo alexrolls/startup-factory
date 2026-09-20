@@ -19,10 +19,17 @@ FAILURES=0
 
 RUNTIME_SKILL="$TMP/default-profile-skill"
 mkdir -p "$RUNTIME_SKILL"
-cp -R "$ROOT/bin" "$ROOT/config" "$ROOT/reference" "$ROOT/roles" "$ROOT/teams" \
+cp -R "$ROOT/bin" "$ROOT/config" "$ROOT/reference" "$ROOT/roles" "$ROOT/src" "$ROOT/teams" \
   "$RUNTIME_SKILL/"
 cp "$DEFAULT_STATUS_FIXTURE" "$RUNTIME_SKILL/config/statuses.config.json"
 cp "$DEFAULT_PM_FIXTURE" "$RUNTIME_SKILL/config/project-management.config.md"
+BROKER_LIFECYCLE_ROOT="$TMP/broker-lifecycle"
+mkdir -m 700 "$BROKER_LIFECYCLE_ROOT"
+sed_i() {
+  if sed --version >/dev/null 2>&1; then sed -i "$@"; else sed -i '' "$@"; fi
+}
+sed_i "s|^BROKER_LIFECYCLE_ROOT=.*|BROKER_LIFECYCLE_ROOT=\"$BROKER_LIFECYCLE_ROOT\"|" \
+  "$RUNTIME_SKILL/config/team.config.md"
 RELEASE="$RUNTIME_SKILL/bin/release-feature.py"
 
 check() {
@@ -193,6 +200,10 @@ def digest(path):
   return "sha256:"+hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
 trusted={name:digest(pathlib.Path(root)/rel) for name,rel in {
   "release-feature.py":"bin/release-feature.py",
+  "authority_config.py":"bin/authority_config.py",
+  "config-value.py":"bin/config-value.py",
+  "config_values.py":"src/startup_factory_cli/config_values.py",
+  "authority-bootstrap.sh":"bin/authority-bootstrap.sh",
   "policy-check.py":"bin/policy-check.py",
   "tracker-ops.sh":"bin/tracker-ops.sh",
   "finalize-integrations.sh":"bin/finalize-integrations.sh",
@@ -201,15 +212,18 @@ trusted={name:digest(pathlib.Path(root)/rel) for name,rel in {
   "task-hold.py":"bin/task-hold.py",
   "outbox_capability.py":"bin/outbox_capability.py",
   "broker_evidence.py":"bin/broker_evidence.py",
+  "delivery_profile.py":"bin/delivery_profile.py",
   "retrospective.py":"bin/retrospective.py",
   "runtime-state.py":"bin/runtime-state.py",
   "ticket_content_security.py":"bin/ticket_content_security.py",
+  "secret_safety.py":"src/startup_factory_cli/secret_safety.py",
   "task_metadata.py":"bin/task_metadata.py",
   "product_acceptance.py":"bin/product_acceptance.py",
   "statuses.config.json":"config/statuses.config.json",
   "guardrails.config.json":"config/guardrails.config.json",
   "team.config.md":"config/team.config.md",
   "project-management.config.md":"config/project-management.config.md",
+  "automation.config.json":"config/automation.config.json",
   "teamwork-path.py":"bin/teamwork-path.py",
   "review_evidence.py":"bin/review_evidence.py",
 }.items()}
@@ -258,6 +272,205 @@ json.dump({
 },open(path,"w"))
 PY
 
+mint_fixture_gate_capability() { # repo team feature task role output
+  local repo="$1" team="$2" fid="$3" tid="$4" role="$5" output="$6"
+  python3 - "$RUNTIME_SKILL/bin" "$repo" "$team" "$fid" "$tid" "$role" "$output" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+bin_dir, repo_raw, team, feature, task, role, output_raw = sys.argv[1:]
+sys.path.insert(0, bin_dir)
+import outbox_capability
+
+repo = pathlib.Path(repo_raw).resolve(strict=True)
+workspace = (repo / ".teamwork" / team).resolve(strict=True)
+capability = outbox_capability.mint(
+    str(repo), str(workspace), team, feature, role, "gate", "-", 0,
+    "fixture-%s-%s" % (role, hashlib.sha256(task.encode()).hexdigest()[:16]),
+)
+capability["fixtureRole"] = role
+capability["fixtureExecutionKind"] = "gate"
+output = pathlib.Path(output_raw)
+output.write_text(json.dumps(capability, sort_keys=True) + "\n", encoding="utf-8")
+output.chmod(0o600)
+print(capability["id"] + ":" + capability["instance"])
+PY
+}
+
+publish_review_comment() { # repo team feature task marker role delivery body [capability]
+  local repo="$1" team="$2" fid="$3" tid="$4" marker="$5" role="$6"
+  local delivery="$7" body="$8" capability_path="${9:--}"
+  STARTUP_FACTORY_LIFECYCLE_STATE_ROOT="$BROKER_LIFECYCLE_ROOT" \
+    python3 - "$RUNTIME_SKILL/bin" "$repo" "$team" "$fid" "$tid" \
+      "$marker" "$role" "$delivery" "$body" "$capability_path" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+(
+    bin_dir,
+    repo_raw,
+    team,
+    feature,
+    task,
+    marker,
+    role,
+    delivery,
+    body_raw,
+    capability_raw,
+) = sys.argv[1:]
+sys.path.insert(0, bin_dir)
+import broker_evidence
+import outbox_capability
+import review_evidence
+
+repo = pathlib.Path(repo_raw).resolve(strict=True)
+workspace = (repo / ".teamwork" / team).resolve(strict=True)
+body_path = pathlib.Path(body_raw).resolve(strict=True)
+raw = body_path.read_bytes()
+request = marker == "review-request"
+kind = "task" if request else "gate"
+if capability_raw == "-":
+    capability = outbox_capability.mint(
+        str(repo),
+        str(workspace),
+        team,
+        feature,
+        role,
+        kind,
+        task if request else "-",
+        1 if request else 0,
+        "fixture-%s-%s" % (role, delivery.removeprefix("delivery-")),
+    )
+else:
+    capability_path = pathlib.Path(capability_raw).resolve(strict=True)
+    capability = json.loads(capability_path.read_text(encoding="utf-8"))
+    if (
+        capability.get("fixtureRole") != role
+        or capability.get("fixtureExecutionKind") != kind
+    ):
+        raise SystemExit("fixture capability does not match publication role/kind")
+identifier = "entry-" + delivery.removeprefix("delivery-")
+producer_bodies = workspace / "outbox" / "bodies"
+pending = workspace / "outbox" / "pending"
+producer_bodies.mkdir(parents=True, exist_ok=True)
+pending.mkdir(parents=True, exist_ok=True)
+producer_body = producer_bodies / (identifier + ".md")
+producer_body.write_bytes(raw)
+producer_body.chmod(0o600)
+entry = {
+    "schemaVersion": 1,
+    "id": identifier,
+    "team": team,
+    "featureId": feature,
+    "taskId": task,
+    "attempt": 1,
+    "actor": role,
+    "marker": marker,
+    "bodyPath": str(producer_body),
+    "targetStatus": "Review" if request else None,
+    "phase": "pending",
+    "createdAt": "2026-09-19T10:00:00+00:00",
+}
+entry["producerCapability"] = outbox_capability.sign_entry(
+    entry,
+    raw,
+    capability["id"],
+    capability["secret"],
+    capability["instance"],
+    capability["expiresAt"],
+)
+source_entry = pending / (identifier + ".producer.json")
+source_entry_raw = broker_evidence.canonical(entry) + b"\n"
+source_entry.write_bytes(source_entry_raw)
+source_entry.chmod(0o400)
+deliveries = outbox_capability.delivery_directory(repo, workspace, team, feature)
+source = deliveries / (delivery + ".source.md")
+published = deliveries / (delivery + ".publish.md")
+source.write_bytes(raw)
+source.chmod(0o400)
+published.write_bytes(raw)
+published.chmod(0o400)
+if request:
+    parsed = review_evidence.request_binding(raw.decode("utf-8"))
+    binding = {
+        "kind": marker,
+        "base": parsed["base"],
+        "head": parsed["head"],
+        "package": parsed["package"],
+    }
+else:
+    binding = {"kind": marker}
+digest = broker_evidence.sha256(raw)
+entry.update(
+    {
+        "brokerSchemaVersion": 1,
+        "deliveryId": delivery,
+        "brokerAssignedAt": "2026-09-19T10:00:01+00:00",
+        "sourceEntryPath": str(source_entry),
+        "sourceEntrySha256": broker_evidence.sha256(source_entry_raw),
+        "stagedBodyPath": str(source),
+        "stagedBodySha256": digest,
+        "publishBodyPath": str(published),
+        "publishBodySha256": digest,
+        "reviewBinding": binding,
+        "brokerPhase": "published",
+    }
+)
+entry_path = deliveries / (identifier + ".entry.json")
+entry_path.write_bytes(broker_evidence.canonical(entry) + b"\n")
+entry_path.chmod(0o600)
+broker_evidence.record(repo, workspace, entry_path)
+PY
+  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
+    "$RUNTIME_SKILL/bin/tracker-ops.sh" comment-once "$tid" "$delivery" "$body" >/dev/null)
+}
+
+prepare_task_claim() { # repo team feature task role attempt
+  local repo="$1" team="$2" fid="$3" tid="$4" role="$5" attempt="$6"
+  local workspace snapshot target claim_id
+  workspace="$repo/.teamwork/$team"
+  snapshot="$(mktemp "$TMP/claim-snapshot.XXXXXX")"
+  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
+    "$RUNTIME_SKILL/bin/tracker-ops.sh" export "$fid" "$snapshot" >/dev/null)
+  target="$(python3 - "$snapshot" "$tid" <<'PY'
+import json
+import sys
+
+snapshot, task_id = sys.argv[1:]
+matches = [
+    task for task in json.load(open(snapshot, encoding="utf-8")).get("tasks", [])
+    if str(task.get("taskId")) == task_id
+]
+if len(matches) != 1:
+    raise SystemExit("claim fixture task is absent or duplicated")
+status = matches[0].get("status")
+if not isinstance(status, str) or not status.strip():
+    raise SystemExit("claim fixture task has no concrete current status")
+print(status)
+PY
+)"
+  claim_id="$(python3 - "$team" "$fid" "$tid" "$role" "$attempt" "$target" <<'PY'
+import hashlib
+import sys
+
+print("dispatch-" + hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest()[:32])
+PY
+)"
+  python3 "$RUNTIME_SKILL/bin/runtime-state.py" claim \
+    --repo "$repo" --workspace "$workspace" --team "$team" \
+    --feature "$fid" --task "$tid" --role "$role" --attempt "$attempt" \
+    --claim-id "$claim_id" --target "$target" >/dev/null
+  printf '[claim]\nclaim-id: %s\nrole: %s\ntarget-status: %s\n\n— dispatcher\n' \
+    "$claim_id" "$role" "$target" | \
+    (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
+      "$RUNTIME_SKILL/bin/tracker-ops.sh" comment "$tid" - >/dev/null)
+  rm -f "$snapshot"
+}
+
 make_fixture() {
   local repo="$1" team="$2"
   mkdir -p "$repo"
@@ -299,8 +512,9 @@ EOF
   local tid="$fid#1" key branch wt
   key="$(python3 "$RUNTIME_SKILL/bin/runtime-state.py" key "$tid")"
   branch="agent-task/$team/$key"
+  prepare_task_claim "$repo" "$team" "$fid" "$tid" backend 1
   wt="$(cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/launch-team.sh" worktree "$team" backend "$tid" 1 | tail -1)"
+    "$RUNTIME_SKILL/bin/launch-team.sh" worktree "$team" "$fid" backend "$tid" 1 | tail -1)"
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$RUNTIME_SKILL/bin/task-packet.sh" "$team" "$fid" "$tid" backend 1 "$wt" "$branch" >/dev/null)
   printf 'release fixture integrated\n' > "$wt/app.txt"
@@ -309,6 +523,8 @@ EOF
   local package base head package_digest snapshot request_template request_body
   local team_lead_template team_lead_body architecture_template architecture_body
   local sceptical_template sceptical_body security_template security_body
+  local team_lead_cap team_lead_context architecture_cap architecture_context
+  local sceptical_cap sceptical_context security_cap security_context
   package="$(cd "$repo" && "$RUNTIME_SKILL/bin/review-package.sh" "$team" "$tid")"
   base="$(sed -n 's/^Base: //p' "$package")"
   head="$(sed -n 's/^Head: //p' "$package")"
@@ -331,34 +547,50 @@ PY
   printf '[review-request] round: 2\nFiles: app.txt\n\n— backend\n' > "$request_template"
   python3 "$RUNTIME_SKILL/bin/review_evidence.py" bind-request \
     "$request_template" "$base" "$head" "$package_digest" "$request_body"
-  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/tracker-ops.sh" comment "$tid" "$request_body" >/dev/null)
+  publish_review_comment "$repo" "$team" "$fid" "$tid" review-request backend \
+    delivery-11111111111111111111111111111111 "$request_body"
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$RUNTIME_SKILL/bin/tracker-ops.sh" export "$fid" "$snapshot" >/dev/null)
   printf '[team-lead-approval] round: 2\nFiles: app.txt\n\n— team-lead\n' > "$team_lead_template"
   printf '[architecture-approval] round: 2\nFiles: app.txt\n\n— principal-architect\n' > "$architecture_template"
   printf '[sceptical-architecture-approval] round: 2\nFiles: app.txt\n\n— sceptical-architect\n' > "$sceptical_template"
   printf '[security-approval] round: 2\nFiles: app.txt\n\n— senior-security-engineer\n' > "$security_template"
+  team_lead_cap="$TMP/$key-team-lead-capability.json"
+  architecture_cap="$TMP/$key-architecture-capability.json"
+  sceptical_cap="$TMP/$key-sceptical-capability.json"
+  security_cap="$TMP/$key-security-capability.json"
+  team_lead_context="$(mint_fixture_gate_capability "$repo" "$team" "$fid" "$tid" \
+    team-lead "$team_lead_cap")"
+  architecture_context="$(mint_fixture_gate_capability "$repo" "$team" "$fid" "$tid" \
+    principal-architect "$architecture_cap")"
+  sceptical_context="$(mint_fixture_gate_capability "$repo" "$team" "$fid" "$tid" \
+    sceptical-architect "$sceptical_cap")"
+  security_context="$(mint_fixture_gate_capability "$repo" "$team" "$fid" "$tid" \
+    senior-security-engineer "$security_cap")"
   python3 "$RUNTIME_SKILL/bin/review_evidence.py" bind-approval \
     "$team_lead_template" "$snapshot" "$tid" "$team_lead_body" \
-    team-lead "gate:team-lead:$key"
+    team-lead "$team_lead_context"
   python3 "$RUNTIME_SKILL/bin/review_evidence.py" bind-approval \
     "$architecture_template" "$snapshot" "$tid" "$architecture_body" \
-    principal-architect "gate:principal-architect:$key"
+    principal-architect "$architecture_context"
   python3 "$RUNTIME_SKILL/bin/review_evidence.py" bind-approval \
     "$sceptical_template" "$snapshot" "$tid" "$sceptical_body" \
-    sceptical-architect "gate:sceptical-architect:$key"
+    sceptical-architect "$sceptical_context"
   python3 "$RUNTIME_SKILL/bin/review_evidence.py" bind-approval \
     "$security_template" "$snapshot" "$tid" "$security_body" \
-    senior-security-engineer "gate:senior-security-engineer:$key"
-  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/tracker-ops.sh" comment "$tid" "$team_lead_body" >/dev/null)
-  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/tracker-ops.sh" comment "$tid" "$architecture_body" >/dev/null)
-  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/tracker-ops.sh" comment "$tid" "$sceptical_body" >/dev/null)
-  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/tracker-ops.sh" comment "$tid" "$security_body" >/dev/null)
+    senior-security-engineer "$security_context"
+  publish_review_comment "$repo" "$team" "$fid" "$tid" architecture-approval \
+    principal-architect delivery-22222222222222222222222222222222 "$architecture_body" \
+    "$architecture_cap"
+  publish_review_comment "$repo" "$team" "$fid" "$tid" sceptical-architecture-approval \
+    sceptical-architect delivery-33333333333333333333333333333333 "$sceptical_body" \
+    "$sceptical_cap"
+  publish_review_comment "$repo" "$team" "$fid" "$tid" security-approval \
+    senior-security-engineer delivery-44444444444444444444444444444444 "$security_body" \
+    "$security_cap"
+  publish_review_comment "$repo" "$team" "$fid" "$tid" team-lead-approval \
+    team-lead delivery-55555555555555555555555555555555 "$team_lead_body" \
+    "$team_lead_cap"
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$RUNTIME_SKILL/bin/tracker-ops.sh" export "$fid" "$snapshot" >/dev/null)
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
@@ -408,10 +640,13 @@ EOF
   local request_template request_body team_lead_template team_lead_body
   local architecture_template architecture_body sceptical_template sceptical_body
   local security_template security_body
+  local team_lead_cap team_lead_context architecture_cap architecture_context
+  local sceptical_cap sceptical_context security_cap security_context
   key="$(python3 "$RUNTIME_SKILL/bin/runtime-state.py" key "$tid")"
   branch="agent-task/$team/$key"
+  prepare_task_claim "$repo" "$team" "$fid" "$tid" backend 1
   wt="$(cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/launch-team.sh" worktree "$team" backend "$tid" 1 | tail -1)"
+    "$RUNTIME_SKILL/bin/launch-team.sh" worktree "$team" "$fid" backend "$tid" 1 | tail -1)"
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$RUNTIME_SKILL/bin/task-packet.sh" "$team" "$fid" "$tid" backend 1 "$wt" "$branch" >/dev/null)
   printf 'generation two\n' > "$wt/generation-2.txt"
@@ -439,34 +674,50 @@ PY
   printf '[review-request] round: 2\nFiles: generation-2.txt\n\n— backend\n' > "$request_template"
   python3 "$RUNTIME_SKILL/bin/review_evidence.py" bind-request \
     "$request_template" "$base" "$head" "$package_digest" "$request_body"
-  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/tracker-ops.sh" comment "$tid" "$request_body" >/dev/null)
+  publish_review_comment "$repo" "$team" "$fid" "$tid" review-request backend \
+    delivery-66666666666666666666666666666666 "$request_body"
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$RUNTIME_SKILL/bin/tracker-ops.sh" export "$fid" "$snapshot" >/dev/null)
   printf '[team-lead-approval] round: 2\nFiles: generation-2.txt\n\n— team-lead\n' > "$team_lead_template"
   printf '[architecture-approval] round: 2\nFiles: generation-2.txt\n\n— principal-architect\n' > "$architecture_template"
   printf '[sceptical-architecture-approval] round: 2\nFiles: generation-2.txt\n\n— sceptical-architect\n' > "$sceptical_template"
   printf '[security-approval] round: 2\nFiles: generation-2.txt\n\n— senior-security-engineer\n' > "$security_template"
+  team_lead_cap="$TMP/$key-generation-team-lead-capability.json"
+  architecture_cap="$TMP/$key-generation-architecture-capability.json"
+  sceptical_cap="$TMP/$key-generation-sceptical-capability.json"
+  security_cap="$TMP/$key-generation-security-capability.json"
+  team_lead_context="$(mint_fixture_gate_capability "$repo" "$team" "$fid" "$tid" \
+    team-lead "$team_lead_cap")"
+  architecture_context="$(mint_fixture_gate_capability "$repo" "$team" "$fid" "$tid" \
+    principal-architect "$architecture_cap")"
+  sceptical_context="$(mint_fixture_gate_capability "$repo" "$team" "$fid" "$tid" \
+    sceptical-architect "$sceptical_cap")"
+  security_context="$(mint_fixture_gate_capability "$repo" "$team" "$fid" "$tid" \
+    senior-security-engineer "$security_cap")"
   python3 "$RUNTIME_SKILL/bin/review_evidence.py" bind-approval \
     "$team_lead_template" "$snapshot" "$tid" "$team_lead_body" \
-    team-lead "gate:team-lead:$key"
+    team-lead "$team_lead_context"
   python3 "$RUNTIME_SKILL/bin/review_evidence.py" bind-approval \
     "$architecture_template" "$snapshot" "$tid" "$architecture_body" \
-    principal-architect "gate:principal-architect:$key"
+    principal-architect "$architecture_context"
   python3 "$RUNTIME_SKILL/bin/review_evidence.py" bind-approval \
     "$sceptical_template" "$snapshot" "$tid" "$sceptical_body" \
-    sceptical-architect "gate:sceptical-architect:$key"
+    sceptical-architect "$sceptical_context"
   python3 "$RUNTIME_SKILL/bin/review_evidence.py" bind-approval \
     "$security_template" "$snapshot" "$tid" "$security_body" \
-    senior-security-engineer "gate:senior-security-engineer:$key"
-  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/tracker-ops.sh" comment "$tid" "$team_lead_body" >/dev/null)
-  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/tracker-ops.sh" comment "$tid" "$architecture_body" >/dev/null)
-  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/tracker-ops.sh" comment "$tid" "$sceptical_body" >/dev/null)
-  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/tracker-ops.sh" comment "$tid" "$security_body" >/dev/null)
+    senior-security-engineer "$security_context"
+  publish_review_comment "$repo" "$team" "$fid" "$tid" architecture-approval \
+    principal-architect delivery-77777777777777777777777777777777 "$architecture_body" \
+    "$architecture_cap"
+  publish_review_comment "$repo" "$team" "$fid" "$tid" sceptical-architecture-approval \
+    sceptical-architect delivery-88888888888888888888888888888888 "$sceptical_body" \
+    "$sceptical_cap"
+  publish_review_comment "$repo" "$team" "$fid" "$tid" security-approval \
+    senior-security-engineer delivery-99999999999999999999999999999999 "$security_body" \
+    "$security_cap"
+  publish_review_comment "$repo" "$team" "$fid" "$tid" team-lead-approval \
+    team-lead delivery-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$team_lead_body" \
+    "$team_lead_cap"
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$RUNTIME_SKILL/bin/tracker-ops.sh" export "$fid" "$snapshot" >/dev/null)
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
@@ -514,6 +765,36 @@ make_fixture "$SUCCESS_REPO" "$SUCCESS_TEAM"
 SUCCESS_FID="$SUCCESS_REPO/.workspace/task-manager/feat/feature.md"
 SUCCESS_STATE="$TMP/success.state"
 SUCCESS_LOG="$TMP/success.log"
+
+# Release authority is selected by the authenticated installed snapshot. A
+# direct caller may repeat it, but cannot redirect lifecycle state, switch the
+# tracker backend, or weaken the configured human-work exclusion policy.
+FORGED_RELEASE_LIFECYCLE_ROOT="$TMP/forged-release-lifecycle"
+mkdir -m 700 "$FORGED_RELEASE_LIFECYCLE_ROOT"
+for authority_case in lifecycle adapter labels; do
+  case "$authority_case" in
+    lifecycle)
+      authority_env=(env STARTUP_FACTORY_LIFECYCLE_STATE_ROOT="$FORGED_RELEASE_LIFECYCLE_ROOT")
+      authority_error="must exactly repeat canonical BROKER_LIFECYCLE_ROOT"
+      ;;
+    adapter)
+      authority_env=(env TRACKER_ADAPTER=GitHubIssues)
+      authority_error="must exactly repeat configured PRODUCT_MANAGEMENT_TOOL"
+      ;;
+    labels)
+      authority_env=(env STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='[]')
+      authority_error="must exactly repeat configured ignoredTaskLabels"
+      ;;
+  esac
+  refuse "release rejects $authority_case authority override" "$authority_error" \
+    "${authority_env[@]}" TRACKER_PROJECT_ROOT="$SUCCESS_REPO" \
+    FAKE_STATE="$SUCCESS_STATE" FAKE_LOG="$SUCCESS_LOG" \
+    "$RELEASE" --repository "$SUCCESS_REPO" \
+    --workspace "$SUCCESS_REPO/.teamwork/$SUCCESS_TEAM" \
+    --team "$SUCCESS_TEAM" --feature "$SUCCESS_FID" --config "$CONFIG"
+done
+check "release authority overrides fail before provider mutation" test ! -e "$SUCCESS_LOG"
+
 printf 'must never reach release planning\n' > "$SUCCESS_REPO/untracked-only.txt"
 mkdir -p "$SUCCESS_REPO/.teamwork/$SUCCESS_TEAM/deployments/forged"
 printf '{"schemaVersion":1,"phase":"succeeded"}\n' > "$SUCCESS_REPO/.teamwork/$SUCCESS_TEAM/deployments/forged/transaction.json"

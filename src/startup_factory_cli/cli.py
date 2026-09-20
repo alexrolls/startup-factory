@@ -19,6 +19,14 @@ from .installer import (
     validate_bundle,
     verify_installation,
 )
+from .integration_packs import (
+    IntegrationPack,
+    apply_pack_plan,
+    doctor_pack,
+    list_packs,
+    load_plan,
+    preview_pack,
+)
 from .readiness import MODES, diagnose, initialize
 
 
@@ -56,10 +64,30 @@ def _mutation_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _pack_target_arguments(parser: argparse.ArgumentParser) -> None:
+    _target_arguments(parser)
+
+
+def _pack_selection_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("pack", help="validated reference or project integration-pack id")
+    _pack_target_arguments(parser)
+
+
+def _pack_opt_in_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--allow-experimental",
+        action="store_true",
+        help="explicitly allow an experimental pack for this operation",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="startup-factory",
-        description="Install, initialize, and verify a project-scoped Startup Factory skill bundle.",
+        description=(
+            "Install, initialize, verify, and configure a project-scoped "
+            "Startup Factory skill bundle."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     install = subparsers.add_parser("install", help="install a new bundle or repair a SKILL.md-only copy")
@@ -91,6 +119,28 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor", help="inspect offline readiness without mutation")
     _target_arguments(doctor)
     doctor.add_argument("--mode", choices=MODES, required=True)
+    integration_pack = subparsers.add_parser(
+        "integration-pack",
+        help="list, validate, preview, apply, and diagnose data-only integration packs",
+    )
+    pack_commands = integration_pack.add_subparsers(dest="pack_command", required=True)
+    pack_list = pack_commands.add_parser("list", help="list validated reference and project packs")
+    _pack_target_arguments(pack_list)
+    pack_validate = pack_commands.add_parser("validate", help="validate one selected pack")
+    _pack_selection_arguments(pack_validate)
+    pack_preview = pack_commands.add_parser(
+        "preview", help="preview one digest-bound single-target setup plan"
+    )
+    _pack_selection_arguments(pack_preview)
+    _pack_opt_in_argument(pack_preview)
+    pack_apply = pack_commands.add_parser("apply", help="apply one exact saved preview plan")
+    pack_apply.add_argument("plan", type=Path, help="plan JSON emitted by preview --json")
+    _pack_target_arguments(pack_apply)
+    pack_doctor = pack_commands.add_parser(
+        "doctor", help="diagnose configured, detected, and proved readiness"
+    )
+    _pack_selection_arguments(pack_doctor)
+    _pack_opt_in_argument(pack_doctor)
     version = subparsers.add_parser("version", help="print the installer package version")
     version.add_argument("--json", action="store_true", help="emit one machine-readable JSON result")
     return parser
@@ -158,6 +208,9 @@ def _print_result(result: OperationResult, *, as_json: bool) -> None:
             f"{len(result.plan.preserved_configs)} preserved configs, "
             f"{len(result.plan.preserved_extensions)} preserved extensions."
         )
+        for diagnostic in result.migration_diagnostics:
+            print(f"WARNING [{diagnostic.diagnostic_id}]: {diagnostic.message}")
+            print(f"  Remediation: {diagnostic.remediation}")
     if result.dry_run:
         print("Dry run complete; no files were written.")
 
@@ -191,6 +244,124 @@ def _print_doctor_report(report: object, *, as_json: bool) -> None:
             print(f"    {check['remediation']}")
 
 
+def _pack_catalog(target: Path, project: Path) -> tuple[IntegrationPack, ...]:
+    verify_installation(target)
+    return list_packs(
+        target / "extensions" / "integration-packs",
+        project_root=project,
+    )
+
+
+def _select_pack(pack_id: str, target: Path, project: Path) -> IntegrationPack:
+    matches = [pack for pack in _pack_catalog(target, project) if pack.pack_id == pack_id]
+    if len(matches) != 1:
+        raise InstallerError(f"integration pack id is unknown or ambiguous: {pack_id}")
+    return matches[0]
+
+
+def _print_pack_result(action: str, value: object, *, as_json: bool) -> None:
+    if action == "list":
+        packs = value  # type: ignore[assignment]
+        data = {
+            "schemaVersion": 1,
+            "packs": [pack.as_dict() for pack in packs],  # type: ignore[union-attr]
+        }
+    elif action == "validate":
+        pack = value  # type: ignore[assignment]
+        data = {"valid": True, "pack": pack.as_dict()}  # type: ignore[union-attr]
+    else:
+        data = value.as_dict()  # type: ignore[union-attr]
+    if as_json:
+        print(json.dumps(data, sort_keys=True, separators=(",", ":")))
+        return
+
+    if action == "list":
+        print(f"Available integration packs: {len(data['packs'])}")
+        for pack in data["packs"]:
+            compatibility = pack["compatibility"]
+            print(
+                f"  {pack['id']} [{pack['kind']}] - {pack['displayName']} "
+                f"({compatibility['state']}; {', '.join(compatibility['platforms'])})"
+            )
+        print("Next: validate a pack, then preview it before applying any change.")
+        return
+    if action == "validate":
+        pack = data["pack"]
+        print(f"Validated integration pack: {pack['id']} [{pack['kind']}]")
+        print(f"  {pack['displayName']}: {pack['summary']}")
+        print(f"  Source digest: {pack['sourceDigest']}")
+        print("Next: preview the pack against the target project.")
+        return
+    if action == "preview":
+        print(f"Previewed integration pack: {data['packId']} [{data['kind']}]")
+        print(f"  Operation: {data['operation']}")
+        print(f"  Target: {data['targetRoot']}:{data['target']}")
+        print(f"  Plan digest: {data['planDigest']}")
+        print("No files were changed. Re-run with --json to save the exact plan before apply.")
+        return
+    if action == "apply":
+        outcome = "Applied" if data["applied"] else "Already configured"
+        print(f"{outcome} integration pack: {data['packId']} [{data['kind']}]")
+        print(f"  Target: {data['target']}")
+        print(f"  Output digest: {data['outputDigest']}")
+        print("Next: run integration-pack doctor; external proof remains separate.")
+        return
+    if action == "doctor":
+        print(
+            f"Integration-pack doctor: {data['overall']} "
+            f"({data['packId']} [{data['kind']}])"
+        )
+        print(f"  [compatibility] {data['compatibility']['status']}")
+        for level in ("configured", "detected", "proved"):
+            check = data[level]
+            print(f"  [{level}] {check['status']}: {check['message']}")
+        credentials = data["credentials"]
+        print(f"  [credentials] {credentials['status']}: {credentials['message']}")
+        if credentials["missing"]:
+            print("    Missing names: " + ", ".join(credentials["missing"]))
+        print("Operator actions:")
+        for operator_action in data["operatorActions"]:
+            print(f"  - {operator_action}")
+        return
+    raise InstallerError(f"unknown integration-pack operation: {action}")
+
+
+def _run_pack_command(args: argparse.Namespace, target: Path) -> int:
+    project = args.project
+    action = args.pack_command
+    if action == "list":
+        result: object = _pack_catalog(target, project)
+    elif action == "validate":
+        result = _select_pack(args.pack, target, project)
+    elif action == "preview":
+        result = preview_pack(
+            _select_pack(args.pack, target, project),
+            project,
+            runtime_root=target,
+            allow_experimental=bool(args.allow_experimental),
+        )
+    elif action == "apply":
+        verify_installation(target)
+        result = apply_pack_plan(
+            load_plan(args.plan),
+            project_root=project,
+            runtime_root=target,
+        )
+    elif action == "doctor":
+        result = doctor_pack(
+            _select_pack(args.pack, target, project),
+            project,
+            runtime_root=target,
+            allow_experimental=bool(args.allow_experimental),
+        )
+    else:  # pragma: no cover - argparse owns the command enum.
+        raise InstallerError(f"unknown integration-pack operation: {action}")
+    _print_pack_result(action, result, as_json=bool(args.json))
+    if action == "doctor":
+        return 0 if result.ready else 1  # type: ignore[union-attr]
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -208,6 +379,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             agent=args.agent,
             command=args.command,
         )
+        if args.command == "integration-pack":
+            return _run_pack_command(args, target)
         if args.command == "verify":
             result = verify_installation(target)
         elif args.command == "init":
@@ -233,6 +406,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     overwrite_config=bool(args.overwrite_config),
                     dry_run=bool(args.dry_run),
                     allow_downgrade=bool(getattr(args, "allow_downgrade", False)),
+                    project=args.project.expanduser().resolve(strict=True),
                 )
         _print_result(result, as_json=json_output)
         return 0

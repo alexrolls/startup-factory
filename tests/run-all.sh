@@ -33,10 +33,16 @@ esac
 }
 
 FULL_PYTHON_TESTS=(
+  config-values-test.py
+  authority-config-test.py
+  beta-readiness-test.py
   ticket-content-security-test.py
   agent-health-test.py
   pm-agent-health-test.py
   heartbeat-status-test.py
+  integration-pack-test.py
+  claim-lineage-runtime-test.py
+  lineage-migration-test.py
   worker-control-test.py
   protected-control-policy-test.py
   team-context-test.py
@@ -47,6 +53,8 @@ FULL_PYTHON_TESTS=(
   product-acceptance-test.py
   superpowers-planning-test.py
   review-evidence-test.py
+  broker-evidence-test.py
+  recovery-validation-test.py
   published-artifact-parsing-test.py
   delivery-profile-test.py
   evidence-provider-test.py
@@ -55,6 +63,7 @@ FULL_PYTHON_TESTS=(
   heartbeat-status-test.py
   task-hold-test.py
   outbox-capability-supersede-test.py
+  publication-supervisor-test.py
   board-status-test.py
   tracker-change-token-test.py
   custom-tracker-release-snapshot-test.py
@@ -72,10 +81,16 @@ FULL_SHELL_TESTS=(
   deployment-test.sh
 )
 SMOKE_PYTHON_TESTS=(
+  config-values-test.py
+  authority-config-test.py
+  beta-readiness-test.py
   ticket-content-security-test.py
   agent-health-test.py
   pm-agent-health-test.py
   heartbeat-status-test.py
+  integration-pack-test.py
+  claim-lineage-runtime-test.py
+  lineage-migration-test.py
   worker-control-test.py
   protected-control-policy-test.py
   team-context-test.py
@@ -86,6 +101,8 @@ SMOKE_PYTHON_TESTS=(
   product-acceptance-test.py
   superpowers-planning-test.py
   review-evidence-test.py
+  broker-evidence-test.py
+  recovery-validation-test.py
   published-artifact-parsing-test.py
   delivery-profile-test.py
   evidence-provider-test.py
@@ -93,6 +110,7 @@ SMOKE_PYTHON_TESTS=(
   heartbeat-status-test.py
   task-hold-test.py
   outbox-capability-supersede-test.py
+  publication-supervisor-test.py
   board-status-test.py
   tracker-change-token-test.py
 )

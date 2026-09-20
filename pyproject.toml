@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "startup-factory"
-version = "0.1.23"
+version = "0.2.0"
 description = "Agentic orchestration for governed end-to-end product delivery"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
@@ -20,7 +20,7 @@ keywords = [
   "software-delivery",
 ]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Environment :: Console",
   "Intended Audience :: Developers",
   "Operating System :: MacOS",

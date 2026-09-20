@@ -25,21 +25,16 @@ class SafeTurboReadinessTests(unittest.TestCase):
 
         self.lifecycle_root = self.base / "protected-lifecycle"
         self.lifecycle_root.mkdir(mode=0o700)
-        self.runner = self.base / "protected-sandbox-runner"
-        self.runner.write_text(
-            "#!/bin/sh\n"
-            "[ \"$1\" = --workdir ] || exit 91\n"
-            "shift 2\n"
-            "[ \"$1\" = -- ] || exit 92\n"
-            "shift\n"
-            "exec \"$@\"\n",
-            encoding="utf-8",
-        )
-        self.runner.chmod(0o700)
+        # These cases fail before worker execution. Use a real system-owned
+        # executable so the production runner trust check itself stays active;
+        # the offline/preflight paths must never execute it as a runner.
+        self.runner = Path("/usr/bin/env")
 
         self.skill = self.repo / ".claude" / "skills" / "startup-factory"
         self.skill.mkdir(parents=True)
-        for directory in ("bin", "reference", "roles", "teams"):
+        # Mirror the installed runtime layout closely enough that launcher
+        # helpers can load their packaged, shared parser dependencies.
+        for directory in ("bin", "reference", "roles", "src", "teams"):
             shutil.copytree(ROOT / directory, self.skill / directory)
         config = self.skill / "config"
         config.mkdir()
@@ -48,6 +43,8 @@ class SafeTurboReadinessTests(unittest.TestCase):
             config / "statuses.config.json",
         )
         shutil.copy2(ROOT / "config" / "planning.config.md", config)
+        shutil.copy2(ROOT / "config" / "project-management.config.md", config)
+        shutil.copy2(ROOT / "config" / "automation.config.json", config)
         self.config = config / "team.config.md"
         self.config.write_text(
             "```\n"

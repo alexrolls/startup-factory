@@ -2,26 +2,118 @@ name: Release
 
 # Required repository settings:
 # - protect main and require Package CI before changes can be merged;
-# - restrict the pypi environment to main without required reviewers;
+# - protect the release-evidence branch and restrict updates to evidence owners;
+# - require human reviewers on both the release and pypi environments;
+# - restrict trusted publishing to this workflow and the pypi environment;
 # - enable immutable GitHub Releases.
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
+    inputs:
+      release_commit:
+        description: Exact current main commit to build and publish
+        required: true
+        type: string
+      evidence_commit:
+        description: Exact protected release-evidence branch tip
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-main
+  group: release-${{ inputs.release_commit }}
   cancel-in-progress: false
 
 jobs:
+  authorize:
+    name: Authorize and validate exact beta evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: release
+    outputs:
+      source_commit: ${{ steps.identity.outputs.commit }}
+      evidence_commit: ${{ steps.identity.outputs.evidence_commit }}
+      version: ${{ steps.readiness.outputs.version }}
+      release_set_sha256: ${{ steps.readiness.outputs.release_set_sha256 }}
+
+    steps:
+      - name: Check out the requested current main commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: main
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out the protected evidence branch tip
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: release-evidence
+          path: release-evidence
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind both protected branch tips to the requested commits
+        id: identity
+        env:
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+          EVIDENCE_COMMIT: ${{ inputs.evidence_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EVIDENCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$RELEASE_COMMIT" = "$GITHUB_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$RELEASE_COMMIT"
+          test "$(git -C candidate rev-parse origin/main)" = "$RELEASE_COMMIT"
+          git -C release-evidence show-ref --verify --quiet \
+            refs/remotes/origin/release-evidence
+          test "$(git -C release-evidence rev-parse HEAD)" = "$EVIDENCE_COMMIT"
+          test "$(git -C release-evidence rev-parse origin/release-evidence)" = \
+            "$EVIDENCE_COMMIT"
+          {
+            echo "commit=$RELEASE_COMMIT"
+            echo "evidence_commit=$EVIDENCE_COMMIT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Extract only bounded regular secret-free evidence blobs
+        env:
+          EVIDENCE_COMMIT: ${{ inputs.evidence_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 candidate/packaging/extract_release_evidence.py \
+            --source release-evidence \
+            --commit "$EVIDENCE_COMMIT" \
+            --target candidate \
+            --json
+
+      - name: Require exact-commit beta readiness before any publication
+        id: readiness
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 bin/beta-readiness.py \
+            --project . \
+            --evidence .startup-factory/beta-readiness-evidence.json \
+            --json | tee "$RUNNER_TEMP/beta-readiness.json"
+          release_set_sha256="$(python3 -c 'import json,os,pathlib,re; r=json.loads(pathlib.Path(os.environ["RUNNER_TEMP"]).joinpath("beta-readiness.json").read_text()); d=r.get("releaseSetSha256"); assert r.get("ready") is True and isinstance(d,str) and re.fullmatch(r"[0-9a-f]{64}",d); print(d)')"
+          candidate_version="$(python3 -c 'import json,os,pathlib,re; r=json.loads(pathlib.Path(os.environ["RUNNER_TEMP"]).joinpath("beta-readiness.json").read_text()); v=r.get("candidateVersion"); assert isinstance(v,str) and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+",v); print(v)')"
+          {
+            echo "release_set_sha256=$release_set_sha256"
+            echo "version=$candidate_version"
+          } >> "$GITHUB_OUTPUT"
+
   build:
     name: Validate main and build exact release artifacts
+    needs: authorize
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     outputs:
       source_commit: ${{ steps.release.outputs.commit }}
       version: ${{ steps.release.outputs.version }}
@@ -30,7 +122,7 @@ jobs:
       - name: Check out the merged main commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.authorize.outputs.source_commit }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -46,11 +138,11 @@ jobs:
           set -euo pipefail
           version="$(python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
           test -n "$version"
-          test "$GITHUB_REF" = "refs/heads/main"
           commit="$(git rev-parse HEAD)"
-          test "$commit" = "$GITHUB_SHA"
+          test "$commit" = "${{ needs.authorize.outputs.source_commit }}"
           git show-ref --verify --quiet refs/remotes/origin/main
           test "$commit" = "$(git rev-parse origin/main)"
+          test "$version" = "${{ needs.authorize.outputs.version }}"
           if previous_commit="$(git rev-parse -q --verify "refs/tags/v$version^{commit}")"; then
             test "$previous_commit" = "$commit" || {
               echo "v$version already belongs to a different commit; bump project.version" >&2
@@ -68,8 +160,74 @@ jobs:
           set -euo pipefail
           runtime_tmp="$RUNNER_TEMP/startup-factory-runtime"
           install -d -m 700 "$runtime_tmp"
-          /usr/bin/python3 -c 'import sys; assert sys.version_info >= (3, 10)'
-          PATH="/usr/bin:/bin" TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh
+          setup_prefix="$(python -I -S -E -s -c 'import sys; print(sys.base_prefix)')"
+          test "$RUNNER_TOOL_CACHE" = "/opt/hostedtoolcache"
+          case "$setup_prefix" in
+            "$RUNNER_TOOL_CACHE"/Python/3.14.*/x64) ;;
+            *) echo "unexpected setup-python prefix: $setup_prefix" >&2; exit 1 ;;
+          esac
+          version_root="$(dirname "$setup_prefix")"
+          python_root="$(dirname "$version_root")"
+          test "$python_root" = "$RUNNER_TOOL_CACHE/Python"
+          sudo chown root:root /opt "$RUNNER_TOOL_CACHE" "$python_root" "$version_root"
+          sudo chmod go-w /opt "$RUNNER_TOOL_CACHE" "$python_root" "$version_root"
+          sudo chown -R root:root "$setup_prefix"
+          sudo chmod -R go-w "$setup_prefix"
+          protected_python="$setup_prefix/bin/python3"
+          "$protected_python" -I -B -S -E -s - "$setup_prefix" <<'PY'
+          import bz2
+          import ctypes
+          import hashlib
+          import lzma
+          import sqlite3
+          import ssl
+          import stat
+          import sys
+          import sysconfig
+          from pathlib import Path
+
+          root = Path(sys.argv[1]).resolve(strict=True)
+          assert sys.version_info[:2] == (3, 14), sys.version
+          assert Path(sys.executable).resolve(strict=True).is_relative_to(root)
+          assert Path(sys.prefix).resolve(strict=True) == root
+          assert Path(sys.base_prefix).resolve(strict=True) == root
+          assert Path(sysconfig.get_path("stdlib")).resolve(strict=True).is_relative_to(root)
+          current = root
+          while True:
+              info = current.lstat()
+              assert not stat.S_ISLNK(info.st_mode), current
+              assert info.st_uid == 0, current
+              assert not stat.S_IMODE(info.st_mode) & 0o022, current
+              if current == Path("/"):
+                  break
+              current = current.parent
+          for path in (root, *root.rglob("*")):
+              if path.is_symlink():
+                  assert path.resolve(strict=True).is_relative_to(root), path
+                  continue
+              info = path.stat()
+              assert info.st_uid == 0, path
+              assert not stat.S_IMODE(info.st_mode) & 0o022, path
+          maps = Path("/proc/self/maps")
+          assert maps.is_file()
+          mapped = {
+              Path(fields[-1]).resolve(strict=True)
+              for line in maps.read_text(encoding="utf-8").splitlines()
+              if len(fields := line.split(maxsplit=5)) == 6
+              and fields[-1].startswith("/")
+              and Path(fields[-1]).exists()
+          }
+          toolcache = Path("/opt/hostedtoolcache")
+          for path in mapped:
+              if path.is_relative_to(toolcache):
+                  assert path.is_relative_to(root), path
+          assert any(
+              path.name.startswith("libpython3.14") and path.is_relative_to(root)
+              for path in mapped
+          )
+          PY
+          PATH="$setup_prefix/bin:/usr/bin:/bin" \
+            TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh
 
       - name: Run packaging unit tests
         run: python -m unittest discover -s tests/packaging -p "test_*.py" -v
@@ -141,18 +299,55 @@ jobs:
             )
           done
 
-      - name: Install the pinned build toolchain
-        run: >-
-          python -m pip install --disable-pip-version-check
-          build==1.3.0 packaging==26.2 pyproject-hooks==1.2.0
-          setuptools==83.0.0 wheel==0.47.0
-
-      - name: Build wheel and sdist twice from clean trees
+      - name: Build wheel and sdist twice with an isolated pinned toolchain
         shell: bash
         run: |
           set -euo pipefail
-          python -m build --no-isolation --outdir "$PWD/build/dist-a" "$PWD/build/package-a"
-          python -m build --no-isolation --outdir "$PWD/build/dist-b" "$PWD/build/package-b"
+          test "$RUNNER_TOOL_CACHE" = "/opt/hostedtoolcache"
+          shopt -s nullglob
+          setup_prefixes=("$RUNNER_TOOL_CACHE"/Python/3.14.*/x64)
+          test "${#setup_prefixes[@]}" -eq 1
+          setup_prefix="${setup_prefixes[0]}"
+          protected_python="$setup_prefix/bin/python3"
+          "$protected_python" -I -B -S -E -s - "$setup_prefix" <<'PY'
+          import stat
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1]).resolve(strict=True)
+          assert sys.version_info[:2] == (3, 14), sys.version
+          assert Path(sys.executable).resolve(strict=True).is_relative_to(root)
+          assert Path(sys.prefix).resolve(strict=True) == root
+          assert Path(sys.base_prefix).resolve(strict=True) == root
+          current = root
+          while True:
+              info = current.lstat()
+              assert not stat.S_ISLNK(info.st_mode), current
+              assert info.st_uid == 0, current
+              assert not stat.S_IMODE(info.st_mode) & 0o022, current
+              if current == Path("/"):
+                  break
+              current = current.parent
+          PY
+          build_env="$(mktemp -d "$RUNNER_TEMP/startup-factory-build.XXXXXX")"
+          "$protected_python" -I -B -m venv --copies "$build_env"
+          build_python="$build_env/bin/python"
+          "$build_python" -I -B -E -s - "$setup_prefix" "$build_env" <<'PY'
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1]).resolve(strict=True)
+          environment = Path(sys.argv[2]).resolve(strict=True)
+          assert sys.version_info[:2] == (3, 14), sys.version
+          assert Path(sys.executable).resolve(strict=True).is_relative_to(environment)
+          assert Path(sys.prefix).resolve(strict=True) == environment
+          assert Path(sys.base_prefix).resolve(strict=True) == root
+          PY
+          "$build_python" -I -B -m pip install --disable-pip-version-check \
+            build==1.3.0 packaging==26.2 pyproject-hooks==1.2.0 \
+            setuptools==83.0.0 wheel==0.47.0
+          "$build_python" -I -B -m build --no-isolation --outdir "$PWD/build/dist-a" "$PWD/build/package-a"
+          "$build_python" -I -B -m build --no-isolation --outdir "$PWD/build/dist-b" "$PWD/build/package-b"
 
       - name: Normalize sdist container metadata deterministically
         shell: bash
@@ -188,6 +383,20 @@ jobs:
 
       - name: Assemble the immutable release set
         run: cp dist/* release-assets/
+
+      - name: Bind rebuilt artifact names and bytes to approved evidence
+        env:
+          EXPECTED_RELEASE_SET_SHA256: ${{ needs.authorize.outputs.release_set_sha256 }}
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python packaging/verify_release_artifacts.py \
+            --version "$VERSION" \
+            --expected-sha256 "$EXPECTED_RELEASE_SET_SHA256" \
+            --distributions dist \
+            --release-assets release-assets \
+            --json
 
       - name: Upload Python distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -279,10 +488,45 @@ jobs:
           test -f "$project/.agents/skills/startup-factory/SKILL.md"
           test -f "$project/.agents/skills/startup-factory/config/automation.config.json"
           startup-factory verify --agent codex --project "$project" --json
+          startup-factory init \
+            --agent codex \
+            --project "$project" \
+            --mode team \
+            --product-management-tool Markdown \
+            --apply \
+            --json
+          plan="$RUNNER_TEMP/tracker-linear-plan.json"
+          doctor="$RUNNER_TEMP/tracker-linear-doctor.json"
+          startup-factory integration-pack list --agent codex --project "$project"
+          startup-factory integration-pack validate tracker-linear \
+            --agent codex --project "$project"
+          startup-factory integration-pack preview tracker-linear \
+            --agent codex --project "$project" --json > "$plan"
+          startup-factory integration-pack apply "$plan" \
+            --agent codex --project "$project" --json
+          set +e
+          startup-factory integration-pack doctor tracker-linear \
+            --agent codex --project "$project" --json > "$doctor"
+          doctor_status=$?
+          set -e
+          test "$doctor_status" -eq 1
+          python - "$doctor" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert report["configured"]["status"] == "configured"
+          assert report["proved"]["status"] == "unknown"
+          assert report["overall"] == "yellow"
+          assert report["localReady"] is True
+          assert report["ready"] is False
+          PY
 
   publish:
     name: Publish through the protected PyPI environment
     needs:
+      - authorize
       - build
       - attest
       - smoke
@@ -292,19 +536,201 @@ jobs:
       name: pypi
       url: https://pypi.org/project/startup-factory/${{ needs.build.outputs.version }}/
     permissions:
+      contents: read
       id-token: write
 
     steps:
+      - name: Check out the current main tip after publication approval
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: main
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out the current protected evidence tip
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: release-evidence
+          path: release-evidence
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reconfirm both authorized protected tips after approval
+        env:
+          RELEASE_COMMIT: ${{ needs.authorize.outputs.source_commit }}
+          EVIDENCE_COMMIT: ${{ needs.authorize.outputs.evidence_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C candidate rev-parse HEAD)" = "$RELEASE_COMMIT"
+          test "$(git -C candidate rev-parse origin/main)" = "$RELEASE_COMMIT"
+          test "$(git -C release-evidence rev-parse HEAD)" = "$EVIDENCE_COMMIT"
+          test "$(git -C release-evidence rev-parse origin/release-evidence)" = \
+            "$EVIDENCE_COMMIT"
+
+      - name: Freshly extract the exact bounded evidence set
+        env:
+          EVIDENCE_COMMIT: ${{ needs.authorize.outputs.evidence_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 candidate/packaging/extract_release_evidence.py \
+            --source release-evidence \
+            --commit "$EVIDENCE_COMMIT" \
+            --target candidate \
+            --json
+
+      - name: Revalidate freshness and exact release identity after approval
+        env:
+          EXPECTED_COMMIT: ${{ needs.authorize.outputs.source_commit }}
+          EXPECTED_RELEASE_SET_SHA256: ${{ needs.authorize.outputs.release_set_sha256 }}
+          EXPECTED_VERSION: ${{ needs.authorize.outputs.version }}
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/beta-readiness-publish.json"
+          python3 bin/beta-readiness.py \
+            --project . \
+            --evidence .startup-factory/beta-readiness-evidence.json \
+            --json | tee "$report"
+          python3 - "$report" "$EXPECTED_COMMIT" "$EXPECTED_VERSION" \
+            "$EXPECTED_RELEASE_SET_SHA256" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          report_path, expected_commit, expected_version, expected_release_set = sys.argv[1:]
+          result = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
+          expected = {
+              "ok": True,
+              "ready": True,
+              "overall": "ready",
+              "candidateCommit": expected_commit,
+              "candidateVersion": expected_version,
+              "releaseSetSha256": expected_release_set,
+          }
+          mismatches = {
+              key: {"expected": value, "actual": result.get(key)}
+              for key, value in expected.items()
+              if result.get(key) != value
+          }
+          if mismatches:
+              raise SystemExit(f"fresh beta readiness identity mismatch: {mismatches}")
+          PY
+
       - name: Download the exact tested distributions
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: python-distributions
           path: dist
 
+      - name: Download the complete attested release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: github-release-assets
+          path: release-assets
+
+      - name: Rebind downloaded names and bytes to approved evidence
+        env:
+          EXPECTED_RELEASE_SET_SHA256: ${{ needs.authorize.outputs.release_set_sha256 }}
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$VERSION" = "${{ needs.authorize.outputs.version }}"
+          python3 candidate/packaging/verify_release_artifacts.py \
+            --version "$VERSION" \
+            --expected-sha256 "$EXPECTED_RELEASE_SET_SHA256" \
+            --distributions dist \
+            --release-assets release-assets \
+            --json
+
+      - name: Refuse a last-moment protected-tip change
+        env:
+          EVIDENCE_COMMIT: ${{ needs.authorize.outputs.evidence_commit }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_COMMIT: ${{ needs.authorize.outputs.source_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)" = \
+            "$RELEASE_COMMIT"
+          test "$(gh api "repos/$GH_REPO/git/ref/heads/release-evidence" --jq .object.sha)" = \
+            "$EVIDENCE_COMMIT"
+
+      - name: Reconcile exact existing PyPI publication
+        id: pypi-reconcile
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/pypi-reconciliation-before.json"
+          upload_dir="$GITHUB_WORKSPACE/.pypi-upload"
+          python3 candidate/packaging/reconcile_pypi_release.py \
+            --version "$VERSION" \
+            --distributions dist \
+            --prepare-upload "$upload_dir" \
+            --json | tee "$report"
+          state="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["state"])' "$report")"
+          case "$state" in
+            absent|partial-exact)
+              test -d "$upload_dir"
+              test -n "$(find "$upload_dir" -maxdepth 1 -type f -print -quit)"
+              publish_needed=true
+              ;;
+            complete-exact)
+              test ! -e "$upload_dir"
+              publish_needed=false
+              ;;
+            *)
+              echo "unexpected PyPI reconciliation state: $state" >&2
+              exit 1
+              ;;
+          esac
+          {
+            echo "state=$state"
+            echo "publish_needed=$publish_needed"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Publish with PyPI trusted publishing
+        if: steps.pypi-reconcile.outputs.publish_needed == 'true'
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
+          packages-dir: .pypi-upload/
           attestations: true
+
+      - name: Require a complete exact PyPI publication
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/pypi-reconciliation-after.json"
+          for attempt in $(seq 1 18); do
+            set +e
+            python3 candidate/packaging/reconcile_pypi_release.py \
+              --version "$VERSION" \
+              --distributions dist \
+              --require-complete \
+              --retry-transient \
+              --json > "$report"
+            status=$?
+            set -e
+            cat "$report"
+            case "$status" in
+              0) exit 0 ;;
+              1) ;;
+              *) exit "$status" ;;
+            esac
+            printf 'PyPI has not exposed the complete exact release %s (attempt %s/18)\n' \
+              "$VERSION" "$attempt" >&2
+            sleep 10
+          done
+          exit 1
 
   verify-uvx:
     name: Verify the public uvx installation

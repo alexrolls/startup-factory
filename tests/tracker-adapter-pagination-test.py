@@ -24,13 +24,18 @@ def load_definitions(adapter, extra_config=""):
     embedded = source.split("<<'PYEOF'\n", 1)[1].rsplit("\nPYEOF", 1)[0]
     definitions = embedded.split("\nBACKENDS =", 1)[0]
     temp = tempfile.TemporaryDirectory()
-    skill = Path(temp.name)
+    skill = Path(temp.name).resolve()
     (skill / "config").mkdir()
     (skill / "bin").mkdir()
+    shutil.copytree(ROOT / "src", skill / "src")
     shutil.copy(DEFAULT_STATUS_FIXTURE,
                 skill / "config" / "statuses.config.json")
     shutil.copy(ROOT / "bin" / "ticket_content_security.py",
                 skill / "bin" / "ticket_content_security.py")
+    for helper in ("authority_config.py", "delivery_profile.py", "task_metadata.py"):
+        shutil.copy(ROOT / "bin" / helper, skill / "bin" / helper)
+    shutil.copy(ROOT / "config" / "automation.config.json",
+                skill / "config" / "automation.config.json")
     (skill / "config" / "project-management.config.md").write_text(
         "PRODUCT_MANAGEMENT_TOOL=%s\nSTATUS_CONFIG=config/statuses.config.json\n%s"
         % (adapter, extra_config))
@@ -114,6 +119,27 @@ class LinearPaginationTest(unittest.TestCase):
         os.environ["LINEAR_API_KEY"] = "offline-test-key"
         self.ns = load_definitions("Linear", "LINEAR_DEFAULT_TEAM=ENG\n")
         self.linear = self.ns["Linear"]()
+
+    def test_receipt_governed_comment_round_trips_exact_body(self):
+        body = (
+            "[review-request]\n"
+            "Files: app.py\n\n"
+            "— backend\n\n"
+            "delivery-id: delivery-0123456789abcdef0123456789abcdef"
+        )
+        self.linear.issue = lambda _task: {"id": "issue-id"}
+
+        def gql(_query, variables=None):
+            self.assertEqual(body, variables["body"])
+            return {
+                "commentCreate": {
+                    "success": True,
+                    "comment": {"id": "comment-id", "body": variables["body"]},
+                }
+            }
+
+        self.linear.gql = gql
+        self.assertEqual("comment-id", self.linear.comment("ENG-1", body))
 
     def test_export_hydrates_every_connection_and_orders_comments(self):
         project_id = "00000000-0000-0000-0000-000000000001"
@@ -437,6 +463,25 @@ class JiraPaginationTest(unittest.TestCase):
             "Jira", "JIRA_PROJECT_KEY=PROJ\nJIRA_TASK_ISSUE_TYPE=Story\n")
         self.jira = self.ns["Jira"]()
 
+    def test_receipt_governed_comment_round_trips_exact_adf_text(self):
+        body = (
+            "[review-request]\n"
+            "Files: app.py\n\n"
+            "— backend\n\n"
+            "delivery-id: delivery-0123456789abcdef0123456789abcdef"
+        )
+        encoded = self.jira.adf(body)
+        self.assertEqual(body, self.ns["adf_text"](encoded))
+
+        def api(path, payload=None, method=None):
+            self.assertEqual("/rest/api/3/issue/PROJ-1/comment", path)
+            self.assertIsNone(method)
+            self.assertEqual(body, self.ns["adf_text"](payload["body"]))
+            return {"id": "comment-1", "body": payload["body"]}
+
+        self.jira.api = api
+        self.assertEqual("comment-1", self.jira.comment("PROJ-1", body))
+
     @staticmethod
     def issue(key, issue_type="Story", project_key="PROJ", parent=None):
         fields = {
@@ -695,6 +740,31 @@ class GitHubPaginationTest(unittest.TestCase):
     def setUp(self):
         self.ns = load_definitions("GitHubIssues", "GITHUB_REPO=owner/repo\n")
         self.github = self.ns["GitHubIssues"]()
+
+    def test_receipt_governed_comment_round_trips_exact_body(self):
+        body = (
+            "[review-request]\n"
+            "Files: app.py\n\n"
+            "— backend\n\n"
+            "delivery-id: delivery-0123456789abcdef0123456789abcdef"
+        )
+
+        def gh(*args, **kwargs):
+            self.assertEqual(
+                ("issue", "comment", "7", "--body-file", "-"), args
+            )
+            self.assertEqual(body, kwargs["stdin"])
+            return "https://github.test/owner/repo/issues/7#issuecomment-12345\n"
+
+        def raw_gh(*args, **_kwargs):
+            self.assertEqual(
+                ("api", "repos/owner/repo/issues/comments/12345"), args
+            )
+            return json.dumps({"id": 12345, "body": body})
+
+        self.github.gh = gh
+        self.github.raw_gh = raw_gh
+        self.assertEqual("12345", self.github.comment(7, body))
 
     def endpoint(self, args):
         self.assertEqual(("api", "--paginate", "--slurp"), args[:3])

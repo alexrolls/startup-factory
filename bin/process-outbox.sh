@@ -2,45 +2,413 @@
 # Publish queued artifacts idempotently; tracker state remains the durable source of truth.
 set -euo pipefail
 umask 077
+PATH=/usr/bin:/bin
+export PATH
 
-SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+script_directory="${BASH_SOURCE[0]%/*}"
+[ "$script_directory" != "${BASH_SOURCE[0]}" ] || script_directory=.
+SKILL_DIR="$(cd "$script_directory/.." && pwd -P)"
 CONFIG="$SKILL_DIR/config/team.config.md"
+DEFAULT_PM_CONFIG="$SKILL_DIR/config/project-management.config.md"
+DEFAULT_AUTOMATION_CONFIG="$SKILL_DIR/config/automation.config.json"
+ambient_pm_config_set="${STARTUP_FACTORY_PM_CONFIG+x}"
+ambient_pm_config="${STARTUP_FACTORY_PM_CONFIG:-}"
+ambient_automation_config_set="${STARTUP_FACTORY_AUTOMATION_CONFIG+x}"
+ambient_automation_config="${STARTUP_FACTORY_AUTOMATION_CONFIG:-}"
+ambient_ignored_labels_set="${STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON+x}"
+ambient_ignored_labels="${STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON:-}"
+ambient_tracker_adapter_set="${TRACKER_ADAPTER+x}"
+ambient_tracker_adapter="${TRACKER_ADAPTER:-}"
 
-read_key() {
-  local line value _t
-  line="$(grep -m1 "^$1=" "$CONFIG" || true)"
-  value="${line#*=}"
-  if [ "${value#\"}" != "$value" ]; then value="${value#\"}"; value="${value%%\"*}"
-  else value="${value%%[[:space:]]#*}"; _t="${value##*[![:space:]]}"; value="${value%"$_t"}"; fi
-  [ "$value" = "null" ] && value=""
-  printf '%s' "$value"
+# A caller-controlled environment cannot select the HMAC/hold authority.  The
+# configured lifecycle root is the sole binding for this standalone broker; a
+# supervisor may repeat it in the environment, but may not replace it.  The
+# canonical path and its complete ownership/mode chain are checked below, once
+# the trusted Python boundary is established.
+ambient_lifecycle_root="${STARTUP_FACTORY_LIFECYCLE_STATE_ROOT:-}"
+unset STARTUP_FACTORY_LIFECYCLE_STATE_ROOT
+BROKER_LIFECYCLE_VALIDATED=no
+
+# Every Python process in this authority-bearing broker starts from one pinned,
+# canonical Python >=3.10 under an isolated, no-bytecode, fixed environment.
+# Discovery accepts only standard host toolchain roots and never a repository
+# or temporary PATH entry. Caller-provided interpreter overrides are ignored:
+# they are not authenticated authority. The file identity is checked again
+# before every authority-bearing launch.
+canonical_executable() {
+  local candidate="$1" target directory count=0
+  case "$candidate" in /*) ;; *) return 1 ;; esac
+  while [ -L "$candidate" ]; do
+    count=$((count + 1)); [ "$count" -le 32 ] || return 1
+    target="$(/usr/bin/readlink "$candidate")" || return 1
+    case "$target" in
+      /*) candidate="$target" ;;
+      *) candidate="$(/usr/bin/dirname "$candidate")/$target" ;;
+    esac
+  done
+  directory="$(cd -P -- "$(/usr/bin/dirname "$candidate")" 2>/dev/null && pwd -P)" \
+    || return 1
+  printf '%s/%s\n' "$directory" "$(/usr/bin/basename "$candidate")"
 }
 
-# The PM supervisor pins this authority in the process environment. Direct
-# broker invocations must consume the same configured root instead of silently
-# falling back to the agent-writable workspace registry.
-if [ -z "${STARTUP_FACTORY_LIFECYCLE_STATE_ROOT:-}" ]; then
-  configured_lifecycle_root="$(read_key BROKER_LIFECYCLE_ROOT)"
-  if [ -n "$configured_lifecycle_root" ]; then
-    export STARTUP_FACTORY_LIFECYCLE_STATE_ROOT="$configured_lifecycle_root"
+python_file_identity() {
+  local output
+  if output="$(/usr/bin/stat -f '%d:%i:%p:%u:%g:%z:%m:%c' "$1" 2>/dev/null)"; then
+    printf '%s\n' "$output"
+  elif output="$(/usr/bin/stat -c '%d:%i:%f:%u:%g:%s:%Y:%Z' "$1" 2>/dev/null)"; then
+    printf '%s\n' "$output"
+  else
+    return 1
   fi
-fi
+}
+
+select_broker_python() {
+  local candidate canonical identity
+  local candidates=(/opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3)
+  for candidate in "${candidates[@]}"; do
+    canonical="$(canonical_executable "$candidate" 2>/dev/null || true)"
+    [ -n "$canonical" ] && [ -f "$canonical" ] && [ -x "$canonical" ] || continue
+    case "$canonical" in
+      "$SKILL_DIR"/*|/tmp/*|/private/tmp/*) continue ;;
+    esac
+    case "$canonical" in
+      /usr/*|/opt/homebrew/Cellar/*|/opt/hostedtoolcache/*|/Library/Frameworks/Python.framework/*) ;;
+      *) continue ;;
+    esac
+    identity="$(python_file_identity "$canonical" 2>/dev/null || true)"
+    [ -n "$identity" ] || continue
+    if /usr/bin/env -i PATH=/usr/bin:/bin TMPDIR=/tmp LANG=C LC_ALL=C \
+      "$canonical" -I -B -c '
+import os, stat, sys
+path = sys.argv[1]
+info = os.stat(path)
+valid = (
+    sys.version_info >= (3, 10)
+    and os.path.realpath(sys.executable) == path
+    and stat.S_ISREG(info.st_mode)
+    and not info.st_mode & 0o022
+    and info.st_uid in {0, os.geteuid()}
+)
+raise SystemExit(0 if valid else 1)
+' "$canonical"; then
+      printf '%s\t%s\n' "$canonical" "$identity"
+      return 0
+    fi
+  done
+  return 1
+}
+
+broker_python_selection="$(select_broker_python)" || {
+  echo "process-outbox: trusted canonical Python >=3.10 is unavailable in an approved host toolchain root" >&2
+  exit 1
+}
+BROKER_PYTHON="${broker_python_selection%%$'\t'*}"
+BROKER_PYTHON_IDENTITY="${broker_python_selection#*$'\t'}"
+
+verify_broker_python_identity() {
+  local observed
+  [ -f "$BROKER_PYTHON" ] && [ -x "$BROKER_PYTHON" ] && [ ! -L "$BROKER_PYTHON" ] \
+    || { echo "process-outbox: trusted broker Python disappeared or changed type" >&2; return 1; }
+  observed="$(python_file_identity "$BROKER_PYTHON")" \
+    || { echo "process-outbox: cannot inspect trusted broker Python" >&2; return 1; }
+  [ "$observed" = "$BROKER_PYTHON_IDENTITY" ] \
+    || { echo "process-outbox: trusted broker Python identity changed" >&2; return 1; }
+}
+
+broker_python() {
+  local environment=(-i
+    "PATH=/usr/bin:/bin"
+    "TMPDIR=/tmp"
+    "LANG=C"
+    "LC_ALL=C"
+    "AWS_EC2_METADATA_DISABLED=true"
+    "PYTHONDONTWRITEBYTECODE=1")
+  verify_broker_python_identity || return 1
+  if [ "$BROKER_LIFECYCLE_VALIDATED" = yes ]; then
+    environment+=("STARTUP_FACTORY_LIFECYCLE_STATE_ROOT=$STARTUP_FACTORY_LIFECYCLE_STATE_ROOT")
+  fi
+  if [ $# -gt 0 ]; then
+    case "$1" in
+      "$SKILL_DIR"/bin/*.py)
+        local script="$1"
+        shift
+        /usr/bin/env "${environment[@]}" "$BROKER_PYTHON" -I -B -c '
+import runpy, sys
+script, module_dir = sys.argv[1:3]
+sys.argv = [script, *sys.argv[3:]]
+sys.path.insert(0, module_dir)
+runpy.run_path(script, run_name="__main__")
+' "$script" "$SKILL_DIR/bin" "$@"
+        return
+        ;;
+    esac
+  fi
+  /usr/bin/env "${environment[@]}" "$BROKER_PYTHON" -I -B "$@"
+}
+
+# Keep the existing inline-program call sites readable while preventing the
+# shell from consulting ambient PATH for any of them.
+python3() { broker_python "$@"; }
+
+read_key() {
+  python3 "$SKILL_DIR/bin/config-value.py" --config "$CONFIG" \
+    --label "team config" --prefix process-outbox value "$1"
+}
+
+configured_lifecycle_root="$(python3 "$SKILL_DIR/bin/config-value.py" \
+  --config "$CONFIG" --label "team config" --prefix process-outbox \
+  value BROKER_LIFECYCLE_ROOT)" || exit 1
+[ -n "$configured_lifecycle_root" ] || {
+  echo "process-outbox: BROKER_LIFECYCLE_ROOT is required for broker authority" >&2
+  exit 1
+}
+
+repo="$(python3 "$SKILL_DIR/bin/delivery_profile.py" repo-root --path "$PWD")"
+validated_lifecycle_root="$(broker_python - \
+  "$configured_lifecycle_root" "$ambient_lifecycle_root" "$repo" "$SKILL_DIR" <<'PY'
+import os, stat, sys
+from pathlib import Path
+
+configured_raw, ambient_raw, repository_raw, skill_raw = sys.argv[1:]
+configured = Path(configured_raw)
+repository = Path(repository_raw)
+skill = Path(skill_raw)
+
+def fail(message):
+    raise SystemExit("process-outbox: " + message)
+
+if not configured.is_absolute() or Path(os.path.normpath(str(configured))) != configured:
+    fail("BROKER_LIFECYCLE_ROOT must be an absolute normalized path")
+for shared in (Path("/tmp"), Path("/private/tmp")):
+    try:
+        configured.relative_to(shared)
+    except ValueError:
+        pass
+    else:
+        fail("configured lifecycle root must not live below a shared temporary directory")
+try:
+    resolved = configured.resolve(strict=True)
+except OSError as exc:
+    fail("configured lifecycle root is unavailable: %s" % exc)
+if resolved != configured:
+    fail("configured lifecycle root and every parent must be non-symlink paths")
+current = Path(configured.anchor)
+for part in configured.parts[1:]:
+    current /= part
+    try:
+        info = current.lstat()
+    except OSError as exc:
+        fail("cannot inspect lifecycle path component %s: %s" % (current, exc))
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        fail("lifecycle path components must be non-symlink directories: %s" % current)
+    if info.st_uid not in {0, os.geteuid()} or stat.S_IMODE(info.st_mode) & 0o022:
+        fail("lifecycle path components must be broker/root-owned and not group/world-writable: %s" % current)
+if stat.S_IMODE(configured.lstat().st_mode) != 0o700:
+    fail("configured lifecycle root must have mode 0700")
+for boundary, label in ((Path(repository).resolve(strict=True), "repository"),
+                        (Path(skill).resolve(strict=True), "installed skill")):
+    try:
+        common = Path(os.path.commonpath((str(configured), str(boundary))))
+    except ValueError:
+        continue
+    if common in {configured, boundary}:
+        fail("configured lifecycle root must be disjoint from the %s" % label)
+if ambient_raw:
+    ambient = Path(ambient_raw)
+    if not ambient.is_absolute() or Path(os.path.normpath(str(ambient))) != ambient:
+        fail("STARTUP_FACTORY_LIFECYCLE_STATE_ROOT must repeat the configured canonical root")
+    try:
+        ambient_resolved = ambient.resolve(strict=True)
+    except OSError as exc:
+        fail("environment lifecycle root is unavailable: %s" % exc)
+    if ambient_resolved != configured:
+        fail("STARTUP_FACTORY_LIFECYCLE_STATE_ROOT does not match BROKER_LIFECYCLE_ROOT")
+print(configured)
+PY
+)" || exit 1
+export STARTUP_FACTORY_LIFECYCLE_STATE_ROOT="$validated_lifecycle_root"
+BROKER_LIFECYCLE_VALIDATED=yes
+
+policy_args=(policy-source --default-config "$DEFAULT_PM_CONFIG" --repo "$repo" --skill "$SKILL_DIR" --label "project-management config")
+[ -z "$ambient_pm_config_set" ] || policy_args+=(--ambient "$ambient_pm_config")
+PM_CONFIG="$(broker_python "$SKILL_DIR/bin/authority_config.py" "${policy_args[@]}")" \
+  || { echo "process-outbox: project-management policy source is unavailable" >&2; exit 1; }
+
+policy_args=(policy-source --default-config "$DEFAULT_AUTOMATION_CONFIG" --repo "$repo" --skill "$SKILL_DIR" --label "automation config")
+[ -z "$ambient_automation_config_set" ] || policy_args+=(--ambient "$ambient_automation_config")
+AUTOMATION_CONFIG="$(broker_python "$SKILL_DIR/bin/authority_config.py" "${policy_args[@]}")" \
+  || { echo "process-outbox: automation policy source is unavailable" >&2; exit 1; }
+
+policy_args=(tracker-adapter --pm-config "$PM_CONFIG")
+[ -z "$ambient_tracker_adapter_set" ] || policy_args+=(--ambient "$ambient_tracker_adapter")
+BROKER_TRACKER_ADAPTER="$(broker_python "$SKILL_DIR/bin/authority_config.py" "${policy_args[@]}")" \
+  || { echo "process-outbox: configured tracker adapter authority is unavailable" >&2; exit 1; }
+
+policy_args=(ignored-labels --automation-config "$AUTOMATION_CONFIG")
+[ -z "$ambient_ignored_labels_set" ] || policy_args+=(--ambient "$ambient_ignored_labels")
+BROKER_IGNORED_TASK_LABELS_JSON="$(
+  broker_python "$SKILL_DIR/bin/authority_config.py" "${policy_args[@]}"
+)" || { echo "process-outbox: configured human-work label policy is unavailable" >&2; exit 1; }
+
+# Snapshot the non-secret broker tool policy from the authenticated automation
+# source. Caller values above were accepted only as exact protected sources or
+# exact-repeat assertions. trustedPath canonicalizes root-owned OS aliases.
+broker_policy="$(broker_python - "$AUTOMATION_CONFIG" "$SKILL_DIR" <<'PY'
+import json, os, stat, sys
+from pathlib import Path
+
+config_path, skill = map(Path, sys.argv[1:])
+
+def fail(message):
+    raise SystemExit("process-outbox: " + message)
+
+def object_from_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail("automation config contains duplicate JSON key")
+        result[key] = value
+    return result
+
+try:
+    info = config_path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+        fail("automation config must be a bounded non-symlink regular file")
+    config = json.loads(config_path.read_text(), object_pairs_hook=object_from_pairs)
+except (OSError, UnicodeError, ValueError) as exc:
+    fail("cannot read automation config: %s" % exc)
+if not isinstance(config, dict) or config.get("schemaVersion") != 1:
+    fail("automation config has an unsupported schema")
+
+trusted = config.get("trustedPath", "/usr/bin:/bin")
+entries = trusted.split(":") if isinstance(trusted, str) else []
+if not trusted or any(not item.startswith("/") or item in {"/", ".", ".."} for item in entries):
+    fail("trustedPath must contain only non-root absolute directory entries")
+canonical = []
+skill = skill.resolve(strict=True)
+for item in entries:
+    directory = Path(item)
+    current = Path(directory.anchor)
+    for part in directory.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            fail("trustedPath directory is unavailable: %s: %s" % (directory, exc))
+        if stat.S_ISLNK(metadata.st_mode):
+            if metadata.st_uid != 0:
+                fail("trustedPath symlink components must be root-owned: %s" % directory)
+            continue
+        if not stat.S_ISDIR(metadata.st_mode):
+            fail("trustedPath entry is not a directory: %s" % directory)
+        if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+            fail("trustedPath components must be root-owned and not group/world-writable: %s" % directory)
+    try:
+        resolved = directory.resolve(strict=True)
+    except OSError as exc:
+        fail("trustedPath directory is unavailable: %s: %s" % (directory, exc))
+    current = Path(resolved.anchor)
+    for part in resolved.parts[1:]:
+        current /= part
+        metadata = current.lstat()
+        if (stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != 0
+                or stat.S_IMODE(metadata.st_mode) & 0o022):
+            fail("trustedPath canonical chain is writable or unsafe: %s" % resolved)
+    try:
+        resolved.relative_to(skill)
+    except ValueError:
+        pass
+    else:
+        fail("trustedPath must live outside the installed skill")
+    if resolved not in canonical:
+        canonical.append(resolved)
+
+print(":".join(str(path) for path in canonical))
+PY
+)" || exit 1
+BROKER_TOOL_PATH="$broker_policy"
+[ -n "$BROKER_TOOL_PATH" ] && [ -n "$BROKER_IGNORED_TASK_LABELS_JSON" ] || {
+  echo "process-outbox: configured broker policy is incomplete" >&2
+  exit 1
+}
+
+broker_child() {
+  verify_broker_python_identity || return 1
+  /usr/bin/env \
+    -u BASH_ENV -u ENV -u CDPATH -u GLOBIGNORE \
+    -u PYTHONHOME -u PYTHONPATH -u PYTHONSTARTUP -u PYTHONINSPECT \
+    -u PYTHONUSERBASE -u PYTHONBREAKPOINT \
+    -u LD_PRELOAD -u DYLD_INSERT_LIBRARIES -u DYLD_LIBRARY_PATH \
+    -u STARTUP_FACTORY_BROKER_PYTHON -u STARTUP_FACTORY_PINNED_PYTHON \
+    -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON -u TRACKER_ADAPTER \
+    "PATH=$BROKER_TOOL_PATH" \
+    "STARTUP_FACTORY_PINNED_PYTHON=$BROKER_PYTHON" \
+    "PYTHONNOUSERSITE=1" \
+    "PYTHONSAFEPATH=1" \
+    "PYTHONDONTWRITEBYTECODE=1" \
+    "$@"
+}
+
+# Tracker adapters need their own credentials, but never lifecycle/HMAC state
+# or caller-selected policy.  They discover the configured adapter from the
+# installed project-management config and tools only from trustedPath.
+broker_tracker() {
+  broker_child /usr/bin/env \
+    -u STARTUP_FACTORY_LIFECYCLE_STATE_ROOT \
+    -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
+    -u STARTUP_FACTORY_BROKER_PYTHON \
+    -u STARTUP_FACTORY_RELEASE_EXECUTOR \
+    -u STARTUP_FACTORY_PM_SUPERVISOR \
+    -u STARTUP_FACTORY_INTEGRATION_BROKER \
+    -u STARTUP_FACTORY_AUTOMATION_CONFIG -u STARTUP_FACTORY_PM_CONFIG \
+    -u TRACKER_ADAPTER \
+    "TRACKER_PROJECT_ROOT=$repo" \
+    "STARTUP_FACTORY_AUTOMATION_CONFIG=$AUTOMATION_CONFIG" \
+    "STARTUP_FACTORY_PM_CONFIG=$PM_CONFIG" \
+    "STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON=$BROKER_IGNORED_TASK_LABELS_JSON" \
+    "TRACKER_ADAPTER=$BROKER_TRACKER_ADAPTER" \
+    "$@"
+}
+
+broker_tracker_effect() { # entry operation args...
+  local effect_entry="$1" digest effect_delivery
+  shift
+  digest="$(python3 - "$effect_entry" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1]))
+capability=value.get("producerCapability")
+print(capability.get("bodySha256", "") if isinstance(capability, dict) else "")
+PY
+)" || return 1
+  effect_delivery="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["deliveryId"])' "$effect_entry")" \
+    || return 1
+  # One broker-wide lock spans the final exact-capability/hold check and the
+  # tracker child. Mint, revoke, task hold, and external effect therefore have
+  # one fail-closed order for signed and manual queue entries alike.
+  broker_tracker "$BROKER_PYTHON" -I -B "$SKILL_DIR/bin/outbox_capability.py" \
+    locked-tracker-effect --repo "$repo" --workspace "$workspace" \
+    --lifecycle-root "$STARTUP_FACTORY_LIFECYCLE_STATE_ROOT" \
+    --entry "$effect_entry" --delivery-id "$effect_delivery" \
+    --body-digest "${digest:--}" -- "$@"
+}
 
 [ $# -ge 2 ] && [ $# -le 3 ] || { echo "usage: process-outbox.sh <team> <featureId> [entry.json]" >&2; exit 2; }
 team="$1"; feature="$2"; only="${3:-}"
-repo="$(git rev-parse --show-toplevel)"
 root="$(read_key TEAMWORK_ROOT)"; root="${root:-.teamwork}"
 workspace="$(python3 "$SKILL_DIR/bin/teamwork-path.py" workspace --repo "$repo" --root "$root" --team "$team")"
 pending="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative outbox/pending)"
 bodies="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative outbox/bodies)"
-staged="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative outbox/staged)"
+staged="$(python3 "$SKILL_DIR/bin/outbox_capability.py" delivery-root \
+  --repo "$repo" --workspace "$workspace" --team "$team" --feature "$feature")" \
+  || { echo "process-outbox: protected delivery storage is unavailable" >&2; exit 1; }
 authority="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative outbox/authoritative)"
 done="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative outbox/done)"
 failed="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative outbox/failed)"
 locks="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative outbox/locks)"
 preset_file="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative preset.env)"
 python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative events.ndjson >/dev/null
-mkdir -p "$pending" "$bodies" "$staged" "$authority" "$done" "$failed" "$locks"
+mkdir -p "$pending" "$bodies" "$authority" "$done" "$failed" "$locks"
 
 trusted_policy_file=""
 trusted_policy_digest=""
@@ -75,6 +443,8 @@ if [ "$team_context_required" = yes ]; then
 fi
 
 current_snapshot=""
+authorized_actor=""
+authorized_reviewer_context=""
 cleanup_snapshot() {
   if [ -n "$current_snapshot" ] && [ -f "$current_snapshot" ] && [ ! -L "$current_snapshot" ]; then
     rm -f -- "$current_snapshot"
@@ -100,7 +470,7 @@ refresh_authority() {
   local entry="$1" validation_output=""
   cleanup_snapshot
   current_snapshot="$(mktemp "$authority/snapshot.XXXXXXXX")"
-  if ! "$SKILL_DIR/bin/tracker-ops.sh" export "$feature" "$current_snapshot" >/dev/null; then
+  if ! broker_tracker "$SKILL_DIR/bin/tracker-ops.sh" export "$feature" "$current_snapshot" >/dev/null; then
     cleanup_snapshot
     # An unavailable authoritative source says nothing about the queued
     # artifact's validity. Keep it pending and stop this broker pass so a later
@@ -125,16 +495,23 @@ PY
     return 1
   fi
   if ! validation_output="$(python3 - "$entry" "$workspace" "$team" "$feature" \
-      "$SKILL_DIR/config/statuses.config.json" "$SKILL_DIR/config/project-management.config.md" \
-      "$trusted_policy_file" "$trusted_policy_digest" "$pending" "$bodies" "$staged" "$current_snapshot" "$repo" "$SKILL_DIR" <<'PY'
+      "$SKILL_DIR/config/statuses.config.json" "$BROKER_TRACKER_ADAPTER" \
+      "$trusted_policy_file" "$trusted_policy_digest" "$pending" "$bodies" "$staged" "$current_snapshot" "$repo" "$SKILL_DIR" \
+      "$BROKER_IGNORED_TASK_LABELS_JSON" <<'PY'
 import hashlib, json, os, re, stat, sys
 from pathlib import Path
 
-(entry, workspace, expected_team, expected_feature, board_path, pm_path,
- policy_file, policy_digest, pending, bodies, staged, snapshot_path, repository, skill_dir) = sys.argv[1:]
+(entry, workspace, expected_team, expected_feature, board_path, configured_adapter,
+ policy_file, policy_digest, pending, bodies, staged, snapshot_path, repository,
+ skill_dir, ignored_labels_json) = sys.argv[1:]
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(skill_dir, "bin"))
+sys.path.insert(0, os.path.join(skill_dir, "src"))
+from outbox_capability import CapabilityError, producer_envelope
+from startup_factory_cli.secret_safety import contains_secret_like, redact_secret_like
 
 def fail(message):
-    print("process-outbox: " + message, file=sys.stderr)
+    print("process-outbox: " + redact_secret_like(message), file=sys.stderr)
     raise SystemExit(1)
 
 def regular_file(path, root, label):
@@ -159,7 +536,17 @@ def read_json_regular(path, label):
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags)
         try:
-            return json.loads(os.read(descriptor, 2 * 1024 * 1024).decode())
+            def unique_object(pairs):
+                value = {}
+                for key, item in pairs:
+                    if key in value:
+                        fail("%s contains duplicate JSON key" % label)
+                    value[key] = item
+                return value
+            return json.loads(
+                os.read(descriptor, 2 * 1024 * 1024).decode(),
+                object_pairs_hook=unique_object,
+            )
         finally:
             os.close(descriptor)
     except (OSError, UnicodeError, ValueError) as exc:
@@ -232,18 +619,26 @@ def task_hold_state(task_id):
     return None if record is None else record.get("state")
 
 try:
+    entry_lexical = os.path.abspath(entry)
     entry_real = os.path.realpath(entry)
-    if os.path.commonpath([os.path.realpath(pending), entry_real]) != os.path.realpath(pending):
-        fail("entry escapes pending directory")
+    allowed_parents = {os.path.realpath(pending), os.path.realpath(staged)}
+    if entry_lexical != entry_real or os.path.dirname(entry_real) not in allowed_parents:
+        fail("entry escapes its exact producer/protected delivery directory")
 except ValueError:
-    fail("entry escapes pending directory")
+    fail("entry escapes its exact producer/protected delivery directory")
 data = read_json_regular(entry, "entry")
-if data.get("schemaVersion") != 1:
-    fail("unsupported entry schema")
+try:
+    producer_envelope(data)
+except CapabilityError as exc:
+    fail("invalid closed producer/broker schema: %s" % exc)
 if data.get("team") != expected_team or data.get("featureId") != expected_feature:
     fail("entry team/feature does not match this dispatcher")
-if data.get("phase") not in {"pending", "commented", "transitioned", "published"}:
-    fail("invalid entry phase")
+if data.get("phase") != "pending":
+    fail("producer phase is immutable and must remain pending")
+if data.get("brokerSchemaVersion") is not None and data.get("brokerPhase") not in {
+    "pending", "commented", "transitioned", "published"
+}:
+    fail("invalid protected broker phase")
 for key, pattern in {
     "id": r"[A-Za-z0-9._:-]{8,128}",
     "actor": r"[a-z0-9-]{2,80}",
@@ -296,13 +691,7 @@ else:
 text = effective.read_text(errors="replace")
 if not text.startswith("[%s]" % data["marker"]):
     fail("body marker does not match entry")
-secret_patterns = (
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
-    r"\bAKIA[0-9A-Z]{16}\b",
-    r"\b(?:sk|ghp|github_pat)_[A-Za-z0-9_-]{20,}\b",
-    r"(?i)\b(?:password|secret|api[_-]?key|authorization)\s*[:=]\s*\S{8,}",
-)
-if any(re.search(pattern, text) for pattern in secret_patterns):
+if contains_secret_like(text):
     fail("body appears to contain a credential/secret; keep it out of tracker and artifacts")
 
 board = read_json_regular(board_path, "status board")
@@ -324,12 +713,6 @@ if data["marker"] in {"production-approval", "deployment"}:
 snapshot = read_json_regular(snapshot_path, "authoritative feature export")
 if str(snapshot.get("featureId")) != expected_feature:
     fail("authoritative export featureId does not exactly match the dispatcher feature")
-try:
-    pm_text = Path(pm_path).read_text()
-except OSError as exc:
-    fail("cannot read project-management scope: %s" % exc)
-configured = re.search(r"(?m)^PRODUCT_MANAGEMENT_TOOL=([^\s#]+)", pm_text)
-configured_adapter = (os.environ.get("TRACKER_ADAPTER") or (configured.group(1).strip('"') if configured else ""))
 if not configured_adapter or snapshot.get("adapter") != configured_adapter:
     fail("authoritative export adapter does not match configured tracker scope")
 tasks = snapshot.get("tasks")
@@ -349,11 +732,10 @@ if len(blocked_statuses) != 1:
     fail("status board must define exactly one semantic blocked task status")
 if authoritative_task.get("status") == blocked_statuses[0]:
     fail("task is authoritatively Blocked; every agent publication is stopped")
-raw_ignored = os.environ.get("STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON")
 try:
-    ignored_labels = json.loads(raw_ignored if raw_ignored is not None else '["human-work"]')
+    ignored_labels = json.loads(ignored_labels_json)
 except ValueError:
-    fail("STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON is not valid JSON")
+    fail("configured ignoredTaskLabels policy is not valid JSON")
 if not isinstance(ignored_labels, list) or any(
     not isinstance(label, str) or not label.strip() for label in ignored_labels
 ):
@@ -412,6 +794,7 @@ if security_reviewer in set(review_board_roles):
 marker_spec = (board.get("markers") or {}).get(data["marker"])
 verified_capability = None
 if data.get("producerCapability") is not None:
+    sys.dont_write_bytecode = True
     sys.path.insert(0, os.path.join(skill_dir, "bin"))
     try:
         from outbox_capability import CapabilityError, verify_entry
@@ -420,6 +803,11 @@ if data.get("producerCapability") is not None:
         fail("verified launched-role capability rejected: %s" % exc)
 
 gate_owned = marker_spec is not None or data["marker"] in {"handoff", "escalation"}
+if data["marker"] == "review-request":
+    if verified_capability is None:
+        fail("verified launched-role capability is required for [review-request]")
+    if verified_capability.get("executionKind") != "task":
+        fail("[review-request] requires a task-role capability")
 if gate_owned:
     if verified_capability is None:
         fail("verified launched-role capability is required for protocol gate markers")
@@ -511,11 +899,36 @@ if hold_state == "resume-review-pending":
         or verified_capability.get("executionKind") != "gate"
     ):
         fail("resume barrier marker requires an authenticated gate-role capability")
+context = "-"
+if verified_capability is not None:
+    context = str(data["producerCapability"]["id"]) + ":" + str(verified_capability["instance"])
+print(effective_actor + "\t" + context)
 PY
   )"; then
     [ -z "$validation_output" ] || printf '%s\n' "$validation_output" >&2
     cleanup_snapshot
     return 1
+  fi
+  authorized_actor="${validation_output%%	*}"
+  authorized_reviewer_context="${validation_output#*	}"
+  case "$authorized_actor" in
+    ''|*[!a-z0-9-]*)
+      echo "process-outbox: authority check did not return one valid effective actor" >&2
+      cleanup_snapshot
+      return 1
+      ;;
+  esac
+  if [ "$authorized_reviewer_context" != - ]; then
+    if ! python3 - "$authorized_reviewer_context" <<'PY'
+import re,sys
+value=sys.argv[1]
+raise SystemExit(0 if len(value)<=256 and re.fullmatch(r"cap-[0-9a-f]{32}:[^\s]+",value) else 1)
+PY
+    then
+      echo "process-outbox: authority check returned an invalid verified reviewer context" >&2
+      cleanup_snapshot
+      return 1
+    fi
   fi
   return 0
 }
@@ -530,183 +943,295 @@ stop_for_authority_outage() {
 }
 
 broker_stage() {
-  python3 - "$1" "$bodies" "$staged" <<'PY'
-import hashlib, json, os, secrets, stat, sys
+  python3 - "$1" "$pending" "$bodies" "$staged" "$repo" "$workspace" "$SKILL_DIR/bin" <<'PY'
+import hashlib, json, os, stat, sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-entry, bodies, staged = map(Path, sys.argv[1:])
+entry, pending, bodies, staged, repository, workspace = map(Path, sys.argv[1:7])
+sys.path.insert(0, sys.argv[7])
+from outbox_capability import (
+    CapabilityError, OUTBOX_CAPABILITY_FIELD, OUTBOX_PRODUCER_FIELDS,
+    _canonical, _fsync_directory, _read_protected, _verify_entry,
+    _write_exclusive, authority_lock, producer_envelope, strict_json,
+)
 
 def fail(message):
     raise SystemExit("process-outbox: " + message)
 
-def contained(path, root):
+def canonical_child(path, root):
     try:
-        return os.path.commonpath([os.path.realpath(root), os.path.realpath(path)]) == os.path.realpath(root)
-    except ValueError:
-        return False
+        lexical = Path(os.path.abspath(path))
+        resolved = path.resolve(strict=True)
+        root_resolved = root.resolve(strict=True)
+        if lexical != resolved or resolved.parent != root_resolved:
+            fail("path escapes its exact broker directory")
+        return resolved
+    except (OSError, ValueError) as exc:
+        fail("cannot resolve broker path: %s" % exc)
 
-try:
-    data = json.loads(entry.read_text())
-except (OSError, ValueError) as exc:
-    fail("invalid entry while assigning delivery: %s" % exc)
-existing = data.get("deliveryId")
-if existing is not None:
-    required = (data.get("stagedBodyPath"), data.get("stagedBodySha256"), data.get("brokerAssignedAt"))
-    if not all(required):
-        fail("incomplete existing broker delivery")
-    path = Path(data["stagedBodyPath"])
-    if not contained(path, staged) or path.is_symlink() or not path.is_file():
-        fail("existing staged body is unsafe")
-    actual = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
-    if actual != data.get("stagedBodySha256"):
-        fail("existing staged body digest mismatch")
-    print(existing)
-    raise SystemExit(0)
-
-source = Path(str(data.get("bodyPath") or ""))
-if not contained(source, bodies):
-    fail("producer body escapes outbox/bodies")
-flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-try:
-    descriptor = os.open(source, flags)
+def secure_read(path, label, maximum):
     try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_size <= 0 or info.st_size > 65536:
-            fail("producer body must be a 1..65536 byte regular file")
-        content = b""
-        while len(content) <= 65536:
-            block = os.read(descriptor, 65537 - len(content))
-            if not block:
-                break
-            content += block
-        if len(content) > 65536:
-            fail("producer body exceeds 64 KiB")
-    finally:
-        os.close(descriptor)
-except OSError as exc:
-    fail("cannot securely read producer body: %s" % exc)
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            fail("%s must be a non-symlink regular file" % label)
+        if before.st_size <= 0 or before.st_size > maximum:
+            fail("%s has an invalid size" % label)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                fail("%s changed before secure open" % label)
+            chunks = []
+            size = 0
+            while size <= maximum:
+                block = os.read(fd, min(65536, maximum + 1 - size))
+                if not block:
+                    break
+                chunks.append(block)
+                size += len(block)
+            value = b"".join(chunks)
+            after = os.fstat(fd)
+            if len(value) != opened.st_size or (after.st_dev, after.st_ino, after.st_size) != (
+                opened.st_dev, opened.st_ino, opened.st_size
+            ):
+                fail("%s changed while it was read" % label)
+            return value
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        fail("cannot securely read %s: %s" % (label, exc))
 
-delivery = "delivery-" + secrets.token_hex(16)
-target = staged / (delivery + ".source.md")
-staged.mkdir(parents=True, exist_ok=True)
-write_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-descriptor = os.open(target, write_flags, 0o400)
+def signed_package(value):
+    envelope = producer_envelope(value)
+    package = dict(envelope)
+    if value.get(OUTBOX_CAPABILITY_FIELD) is not None:
+        package[OUTBOX_CAPABILITY_FIELD] = value[OUTBOX_CAPABILITY_FIELD]
+    return _canonical(package) + b"\n"
+
+def write_or_verify(path, content, label):
+    if path.exists() or path.is_symlink():
+        if secure_read(path, label, max(len(content), 1)) != content:
+            fail("%s identity changed" % label)
+        if stat.S_IMODE(path.lstat().st_mode) != 0o400:
+            fail("%s must be immutable owner-read-only storage" % label)
+        return
+    _write_exclusive(path, content, 0o400)
+
 try:
-    with os.fdopen(descriptor, "wb") as handle:
-        descriptor = -1
-        handle.write(content)
-        handle.flush()
-        os.fsync(handle.fileno())
-finally:
-    if descriptor >= 0:
-        os.close(descriptor)
-digest = "sha256:" + hashlib.sha256(content).hexdigest()
-data.update({
-    "deliveryId": delivery,
-    "brokerSchemaVersion": 1,
-    "brokerAssignedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    "stagedBodyPath": str(target),
-    "stagedBodySha256": digest,
-})
-temporary = entry.with_name(".%s.tmp.%s.%s" % (entry.name, os.getpid(), secrets.token_hex(8)))
-fd = os.open(temporary, write_flags, 0o600)
-try:
-    with os.fdopen(fd, "w") as handle:
-        fd = -1
-        json.dump(data, handle, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, entry)
-finally:
-    if fd >= 0:
-        os.close(fd)
-    try: temporary.unlink()
-    except FileNotFoundError: pass
-print(delivery)
+    canonical_entry = canonical_child(entry, pending)
+    entry_raw = secure_read(canonical_entry, "producer entry", 1024 * 1024)
+    data = strict_json(entry_raw, "producer entry")
+    if not isinstance(data, dict) or set(data) not in {
+        frozenset(OUTBOX_PRODUCER_FIELDS),
+        frozenset(OUTBOX_PRODUCER_FIELDS | {OUTBOX_CAPABILITY_FIELD}),
+    }:
+        fail("producer entry contains broker-owned or unknown fields")
+    envelope = producer_envelope(data)
+    source = canonical_child(Path(str(envelope["bodyPath"])), bodies)
+    if source.name != str(envelope["id"]) + ".md":
+        fail("producer body identity does not match its entry")
+    content = secure_read(source, "producer body", 65536)
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    canonical_package = signed_package(data)
+    source_digest = "sha256:" + hashlib.sha256(canonical_package).hexdigest()
+    record_key = hashlib.sha256(
+        _canonical({
+            "schemaVersion": 1,
+            "workspace": str(workspace),
+            "producerEntrySha256": source_digest,
+            "producerBodySha256": digest,
+        })
+    ).hexdigest()
+    record_path = staged / (record_key + ".entry.json")
+    delivery = "delivery-" + record_key[:32]
+    protected_entry = staged / (delivery + ".producer.json")
+    target = staged / (delivery + ".source.md")
+    with authority_lock(repository):
+        verified_capability = None
+        if isinstance(data.get("producerCapability"), dict):
+            verified_capability = _verify_entry(
+                str(repository), str(workspace), data, digest,
+                require_active=True, authority_locked=True,
+            )
+        if record_path.exists() or record_path.is_symlink():
+            existing = strict_json(
+                _read_protected(record_path, "protected broker delivery", 2 * 1024 * 1024),
+                "protected broker delivery",
+            )
+            producer_envelope(existing)
+            if (
+                existing.get("deliveryId") != delivery
+                or existing.get("sourceEntryPath") != str(protected_entry)
+                or existing.get("sourceEntrySha256") != source_digest
+                or existing.get("stagedBodySha256") != digest
+                or signed_package(existing) != canonical_package
+            ):
+                fail("protected broker delivery binding changed")
+            # An admitted package may finish its first durable broker pass after
+            # its producer exits.  Once that protected delivery is published,
+            # however, a fenced generation cannot consume the admission again:
+            # copied or reserialized pending aliases fail closed instead of
+            # turning a recovery receipt into durable replay authority.
+            if (
+                verified_capability is not None
+                and verified_capability.get("admissionRecovery") is True
+                and existing.get("brokerPhase") == "published"
+            ):
+                fail("fenced producer package was already consumed")
+            if secure_read(
+                canonical_child(protected_entry, staged),
+                "protected producer entry",
+                1024 * 1024,
+            ) != canonical_package:
+                fail("protected producer entry digest mismatch")
+            staged_body = Path(str(existing.get("stagedBodyPath") or ""))
+            if canonical_child(staged_body, staged) != staged_body:
+                fail("protected staged body is unsafe")
+            if "sha256:" + hashlib.sha256(secure_read(staged_body, "staged body", 65536)).hexdigest() != digest:
+                fail("protected staged body digest mismatch")
+            print(json.dumps({"deliveryId": existing["deliveryId"], "entryPath": str(record_path)}, separators=(",", ":")))
+            raise SystemExit(0)
+
+        write_or_verify(protected_entry, canonical_package, "protected producer entry")
+        write_or_verify(target, content, "protected producer body")
+        protected = dict(data)
+        protected.setdefault("producerCapability", None)
+        protected.update({
+            "brokerSchemaVersion": 1,
+            "deliveryId": delivery,
+            "brokerAssignedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "sourceEntryPath": str(protected_entry),
+            "sourceEntrySha256": source_digest,
+            "stagedBodyPath": str(target),
+            "stagedBodySha256": digest,
+            "publishBodyPath": None,
+            "publishBodySha256": None,
+            "reviewBinding": None,
+            "brokerPhase": "pending",
+        })
+        producer_envelope(protected)
+        _write_exclusive(record_path, _canonical(protected) + b"\n")
+        _fsync_directory(staged)
+    print(json.dumps({"deliveryId": delivery, "entryPath": str(record_path)}, separators=(",", ":")))
+except (CapabilityError, OSError, ValueError) as exc:
+    fail("protected delivery assignment failed: %s" % exc)
 PY
 }
 
 commit_publish_body() {
   # commit_publish_body <entry> <candidate-or--> <binding-json>
-  python3 - "$1" "$2" "$3" "$staged" <<'PY'
-import hashlib, json, os, secrets, sys
+  python3 - "$1" "$2" "$3" "$staged" "$repo" "$SKILL_DIR/bin" <<'PY'
+import hashlib, json, os, stat, sys
 from pathlib import Path
 
-entry, candidate_arg, binding_arg, staged = sys.argv[1:]
+entry, candidate_arg, binding_arg, staged, repository = sys.argv[1:6]
+sys.path.insert(0, sys.argv[6])
+from outbox_capability import (
+    _canonical, _fsync_directory, _read_protected, _replace_owner_only,
+    _write_exclusive, authority_lock, producer_envelope, strict_json,
+)
 entry, staged = Path(entry), Path(staged)
-data = json.loads(entry.read_text())
-delivery = data["deliveryId"]
-source = Path(data["stagedBodyPath"])
-candidate = source if candidate_arg == "-" else Path(candidate_arg)
-if candidate.is_symlink() or not candidate.is_file():
-    raise SystemExit("process-outbox: candidate publish body is unsafe")
-try:
-    if os.path.commonpath([os.path.realpath(staged), os.path.realpath(candidate)]) != os.path.realpath(staged):
-        raise SystemExit("process-outbox: candidate publish body escapes broker staging")
-except ValueError:
-    raise SystemExit("process-outbox: candidate publish body escapes broker staging")
-content = candidate.read_bytes()
-if not content or len(content) > 65536:
-    raise SystemExit("process-outbox: candidate publish body must contain 1..65536 bytes")
-digest = "sha256:" + hashlib.sha256(content).hexdigest()
-destination = staged / (delivery + ".publish.md")
-if data.get("publishBodyPath"):
-    current = Path(data["publishBodyPath"])
-    if current != destination or current.is_symlink() or not current.is_file():
-        raise SystemExit("process-outbox: stored publish body path is unsafe")
-    if current.read_bytes() != content or data.get("publishBodySha256") != digest:
-        raise SystemExit("process-outbox: review binding changed after delivery assignment; manual reconciliation required")
-    if candidate != source and candidate != current:
-        candidate.unlink()
-    print(current)
-    raise SystemExit(0)
-if candidate == source:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(destination, flags, 0o400)
+
+def protected_file(path, label, maximum=65536):
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = -1
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-    finally:
-        if descriptor >= 0: os.close(descriptor)
-else:
-    os.chmod(candidate, 0o400)
-    os.replace(candidate, destination)
-data["publishBodyPath"] = str(destination)
-data["publishBodySha256"] = digest
-if binding_arg != "-":
-    data["reviewBinding"] = json.loads(binding_arg)
-temporary = entry.with_name(".%s.tmp.%s.%s" % (entry.name, os.getpid(), secrets.token_hex(8)))
-flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-fd = os.open(temporary, flags, 0o600)
-try:
-    with os.fdopen(fd, "w") as handle:
-        fd = -1
-        json.dump(data, handle, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, entry)
-finally:
-    if fd >= 0: os.close(fd)
-    try: temporary.unlink()
-    except FileNotFoundError: pass
-print(destination)
+        lexical = Path(os.path.abspath(path))
+        resolved = path.resolve(strict=True)
+        if lexical != resolved or resolved.parent != staged.resolve(strict=True):
+            raise SystemExit("process-outbox: %s escapes protected delivery storage" % label)
+        before = resolved.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= maximum:
+            raise SystemExit("process-outbox: %s is unsafe" % label)
+        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(fd)
+            content = b""
+            while len(content) <= maximum:
+                block = os.read(fd, maximum + 1 - len(content))
+                if not block:
+                    break
+                content += block
+            after = os.fstat(fd)
+            if len(content) != opened.st_size or (opened.st_dev, opened.st_ino, opened.st_size) != (after.st_dev, after.st_ino, after.st_size):
+                raise SystemExit("process-outbox: %s changed during secure read" % label)
+            return resolved, content
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise SystemExit("process-outbox: cannot securely read %s: %s" % (label, exc))
+
+with authority_lock(repository):
+    data = strict_json(
+        _read_protected(entry, "protected broker delivery", 2 * 1024 * 1024),
+        "protected broker delivery",
+    )
+    producer_envelope(data)
+    delivery = data["deliveryId"]
+    source, _source_content = protected_file(Path(data["stagedBodyPath"]), "staged body")
+    candidate = source if candidate_arg == "-" else Path(candidate_arg)
+    candidate, content = protected_file(candidate, "candidate publish body")
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    destination = staged / (delivery + ".publish.md")
+    if data.get("publishBodyPath"):
+        current, current_content = protected_file(Path(data["publishBodyPath"]), "stored publish body")
+        if current != destination or current_content != content or data.get("publishBodySha256") != digest:
+            raise SystemExit("process-outbox: review binding changed after delivery assignment; manual reconciliation required")
+        print(current)
+        raise SystemExit(0)
+    _write_exclusive(destination, content, 0o400)
+    data["publishBodyPath"] = str(destination)
+    data["publishBodySha256"] = digest
+    if binding_arg != "-":
+        try:
+            data["reviewBinding"] = strict_json(binding_arg, "review binding")
+        except Exception as exc:
+            raise SystemExit("process-outbox: invalid review binding") from exc
+    _replace_owner_only(entry, _canonical(data) + b"\n")
+    _fsync_directory(staged)
+    print(destination)
+PY
+}
+
+advance_delivery() { # protected-entry expected-phase next-phase
+  python3 - "$1" "$2" "$3" "$repo" "$SKILL_DIR/bin" <<'PY'
+import sys
+from pathlib import Path
+
+entry, expected, target, repository = sys.argv[1:5]
+sys.path.insert(0, sys.argv[5])
+from outbox_capability import (
+    _canonical, _fsync_directory, _read_protected, _replace_owner_only,
+    authority_lock, producer_envelope, strict_json,
+)
+
+allowed = {("pending", "commented"), ("commented", "transitioned"),
+           ("commented", "published"), ("transitioned", "published")}
+if (expected, target) not in allowed:
+    raise SystemExit("process-outbox: invalid broker progression")
+path = Path(entry)
+with authority_lock(repository):
+    data = strict_json(
+        _read_protected(path, "protected broker delivery", 2 * 1024 * 1024),
+        "protected broker delivery",
+    )
+    producer_envelope(data)
+    if data.get("brokerPhase") != expected:
+        raise SystemExit("process-outbox: broker delivery phase changed")
+    data["brokerPhase"] = target
+    _replace_owner_only(path, _canonical(data) + b"\n")
+    _fsync_directory(path.parent)
 PY
 }
 
 prepare_publish_body() {
   local entry="$1" marker="$2" task="$3" delivery="$4" staged_body="$5"
-  local candidate package binding base head package_digest reviewer_context review_gates
+  local verified_actor="$6" reviewer_context="$7"
+  local candidate package binding base head package_digest review_gates
   candidate="$staged/$delivery.candidate.$$.md"
   rm -f -- "$candidate"
   case "$marker" in
     review-request)
-      if ! package="$("$SKILL_DIR/bin/review-package.sh" "$team" "$task")"; then return 1; fi
+      if ! package="$(broker_child "$SKILL_DIR/bin/review-package.sh" "$team" "$task")"; then return 1; fi
       if ! binding="$(python3 - "$package" <<'PY'
 import hashlib, re, sys
 from pathlib import Path
@@ -720,10 +1245,12 @@ PY
       read -r base head package_digest <<EOF
 $binding
 EOF
-      review_gates="$(python3 - "$current_snapshot" "$task" "$SKILL_DIR/bin" "$trusted_policy_file" "$trusted_policy_digest" <<'PY'
+      review_gates="$(python3 - "$current_snapshot" "$task" "$SKILL_DIR/bin" "$trusted_policy_file" "$trusted_policy_digest" "$repo" "$base" "$head" "$staged_body" <<'PY'
 import hashlib, json, os, sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, sys.argv[3])
+from delivery_profile import DeliveryProfileError, _git as safe_git, assess_review_diff
+from review_evidence import EvidenceError, required_files_evidence
 from task_metadata import effective_review_gates, parse_task_metadata
 snapshot = json.load(open(sys.argv[1]))
 task = next((item for item in snapshot.get("tasks") or [] if str(item.get("taskId")) == sys.argv[2]), None)
@@ -731,6 +1258,7 @@ if task is None:
     raise SystemExit("process-outbox: review task disappeared from the authoritative snapshot")
 preset = sys.argv[4]
 expected_digest = sys.argv[5]
+repo, base, head, staged_body = sys.argv[6:10]
 preset_text = ""
 if preset:
     if not os.path.lexists(preset):
@@ -741,13 +1269,43 @@ if preset:
     if "sha256:" + hashlib.sha256(policy_bytes).hexdigest() != expected_digest:
         raise SystemExit("process-outbox: trusted team policy changed after broker verification")
     preset_text = policy_bytes.decode("utf-8")
+decision = assess_review_diff(repo, base, head, task)
+try:
+    declared_files = required_files_evidence(
+        open(staged_body, encoding="utf-8").read(), "review-request"
+    )
+    raw_files = safe_git(
+        os.path.realpath(repo),
+        "diff", "--name-only", "-z", "--no-ext-diff", "--no-textconv",
+        "--ignore-submodules=none",
+        base, head, "--", max_output_bytes=8 * 1024 * 1024,
+        timeout_seconds=30.0,
+    )
+    exact_files = {
+        value.decode("utf-8", "strict")
+        for value in raw_files.split(b"\0")
+        if value
+    }
+except (DeliveryProfileError, EvidenceError, OSError, UnicodeError) as exc:
+    raise SystemExit("process-outbox: review request file evidence is unusable: %s" % exc)
+if declared_files != exact_files:
+    raise SystemExit(
+        "process-outbox: review request Files evidence does not equal the exact committed diff"
+    )
+try:
+    task_metadata = parse_task_metadata(task.get("description"), task.get("title"))
+except ValueError:
+    # The exact-diff assessor already elevated malformed metadata.  Preserve
+    # any trustworthy preset gates while forcing QA+Security from the profile.
+    task_metadata = parse_task_metadata("", task.get("title"))
 print(",".join(effective_review_gates(
-    parse_task_metadata(task.get("description"), task.get("title")),
+    task_metadata,
     preset_text,
+    decision,
 )))
 PY
 )" || return 1
-      "$SKILL_DIR/bin/review_evidence.py" bind-request \
+      broker_python "$SKILL_DIR/bin/review_evidence.py" bind-request \
         "$staged_body" "$base" "$head" "$package_digest" "$candidate" \
         --review-gates "$review_gates" || return 1
       if ! binding="$(python3 - "$base" "$head" "$package_digest" <<'PY'
@@ -757,26 +1315,14 @@ PY
 )"; then return 1; fi
       ;;
     review-approval|team-lead-approval|architecture-approval|sceptical-architecture-approval|security-approval)
-      reviewer_context="$(python3 - "$entry" <<'PY'
-import json, re, sys
-data = json.load(open(sys.argv[1]))
-capability = data.get("producerCapability") or {}
-capability_id = str(capability.get("id") or "")
-instance = str(capability.get("instance") or "")
-value = capability_id + ":" + instance
-if (
-    not re.fullmatch(r"cap-[0-9a-f]{32}", capability_id)
-    or not instance
-    or len(value) > 256
-    or re.search(r"\s", value)
-):
-    raise SystemExit("process-outbox: approval lacks a bounded verified reviewer context")
-print(value)
-PY
-)" || return 1
-      "$SKILL_DIR/bin/review_evidence.py" bind-approval \
+      [ "$reviewer_context" != - ] \
+        || { echo "process-outbox: approval lacks a verified reviewer context" >&2; return 1; }
+      # The supervisor signature already covers the exact request/head/package
+      # fields.  The broker may validate and add verified provenance, but must
+      # never synthesize or replace those producer-authored bindings.
+      broker_python "$SKILL_DIR/bin/review_evidence.py" finalize-approval \
         "$staged_body" "$current_snapshot" "$task" "$candidate" \
-        "$actor" "$reviewer_context" || return 1
+        "$verified_actor" "$reviewer_context" || return 1
       if ! binding="$(python3 - "$marker" <<'PY'
 import json,sys
 print(json.dumps({'kind':sys.argv[1]}, separators=(',',':')))
@@ -799,6 +1345,7 @@ fi
 
 for entry in "$@"; do
   [ -f "$entry" ] || continue
+  source_entry="$entry"
   authority_status=0
   refresh_authority "$entry" || authority_status=$?
   if [ "$authority_status" -eq 75 ]; then
@@ -857,13 +1404,18 @@ PY
     if [ -n "$only" ]; then exit 1; fi
     continue
   fi
-  if ! delivery="$(broker_stage "$entry")"; then
+  if ! staged_assignment="$(broker_stage "$source_entry")"; then
     rm -f "$owner_file"; rmdir "$lock" 2>/dev/null || true
-    reject_entry "$entry"
+    reject_entry "$source_entry"
     if [ -n "$only" ]; then exit 1; fi
     continue
   fi
+  delivery="$(printf '%s' "$staged_assignment" | python3 -c 'import json,sys; print(json.load(sys.stdin)["deliveryId"])')" \
+    || { rm -f "$owner_file"; rmdir "$lock" 2>/dev/null || true; reject_entry "$source_entry"; [ -z "$only" ] || exit 1; continue; }
+  entry="$(printf '%s' "$staged_assignment" | python3 -c 'import json,sys; print(json.load(sys.stdin)["entryPath"])')" \
+    || { rm -f "$owner_file"; rmdir "$lock" 2>/dev/null || true; reject_entry "$source_entry"; [ -z "$only" ] || exit 1; continue; }
   staged_body="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["stagedBodyPath"])' "$entry")"
+  phase="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["brokerPhase"])' "$entry")"
 
   if [ "$phase" = "pending" ]; then
     # Author once, then export and author/compare once more immediately before
@@ -878,7 +1430,7 @@ PY
     elif [ "$authority_status" -ne 0 ]; then
       publish_ok=no
     fi
-    [ "$publish_ok" = yes ] && prepare_publish_body "$entry" "$marker" "$task" "$delivery" "$staged_body" || publish_ok=no
+    [ "$publish_ok" = yes ] && prepare_publish_body "$entry" "$marker" "$task" "$delivery" "$staged_body" "$authorized_actor" "$authorized_reviewer_context" || publish_ok=no
     if [ "$publish_ok" = yes ]; then
       cleanup_snapshot
       authority_status=0
@@ -889,7 +1441,7 @@ PY
         publish_ok=no
       fi
     fi
-    [ "$publish_ok" = yes ] && prepare_publish_body "$entry" "$marker" "$task" "$delivery" "$staged_body" || publish_ok=no
+    [ "$publish_ok" = yes ] && prepare_publish_body "$entry" "$marker" "$task" "$delivery" "$staged_body" "$authorized_actor" "$authorized_reviewer_context" || publish_ok=no
     if [ "$publish_ok" = yes ]; then
       # Body preparation can run validation tooling and build a review package;
       # do not let an intervening Blocked move race the actual publication.
@@ -905,22 +1457,52 @@ PY
     # Rebind/compare once more against that last fresh snapshot. The final
     # authority refresh is not useful unless the exact publish bytes are also
     # proven unchanged before comment-once.
-    [ "$publish_ok" = yes ] && prepare_publish_body "$entry" "$marker" "$task" "$delivery" "$staged_body" || publish_ok=no
+    [ "$publish_ok" = yes ] && prepare_publish_body "$entry" "$marker" "$task" "$delivery" "$staged_body" "$authorized_actor" "$authorized_reviewer_context" || publish_ok=no
     if [ "$publish_ok" != yes ]; then
       cleanup_snapshot
       rm -f "$owner_file"; rmdir "$lock" 2>/dev/null || true
-      reject_entry "$entry"
+      reject_entry "$source_entry"
       if [ -n "$only" ]; then exit 1; fi
       continue
     fi
-    body="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["publishBodyPath"])' "$entry")"
-    "$SKILL_DIR/bin/tracker-ops.sh" comment-once "$task" "$delivery" "$body"
+    case "$marker" in
+      review-request|review-approval|team-lead-approval|architecture-approval|sceptical-architecture-approval|security-approval)
+        # A governed review comment is inert without its protected receipt.
+        # Prove that the external HMAC authority is available before creating
+        # any tracker-side artifact; the exact receipt is written after the
+        # idempotent comment succeeds.
+        python3 "$SKILL_DIR/bin/broker_evidence.py" \
+          --repo "$repo" --workspace "$workspace" --preflight-review >/dev/null \
+          || publish_ok=no
+        ;;
+    esac
+    if [ "$publish_ok" != yes ]; then
+      cleanup_snapshot
+      rm -f "$owner_file"; rmdir "$lock" 2>/dev/null || true
+      reject_entry "$source_entry"
+      if [ -n "$only" ]; then exit 1; fi
+      continue
+    fi
+    # Re-prove hold/status/package authority at the last boundary before the
+    # serialized tracker effect. The capability is reverified again under the
+    # broker authority lock by broker_tracker_effect.
     cleanup_snapshot
-    python3 - "$entry" <<'PY'
-import json, os, sys
-p=sys.argv[1]; d=json.load(open(p)); d['phase']='commented'
-t=p+'.tmp'; open(t,'w').write(json.dumps(d, indent=2)+'\n'); os.replace(t,p)
-PY
+    authority_status=0
+    refresh_authority "$entry" || authority_status=$?
+    if [ "$authority_status" -eq 75 ]; then
+      stop_for_authority_outage "$owner_file" "$lock"
+    elif [ "$authority_status" -ne 0 ]; then
+      rm -f "$owner_file"; rmdir "$lock" 2>/dev/null || true
+      reject_entry "$source_entry"
+      if [ -n "$only" ]; then exit 1; fi
+      continue
+    fi
+    prepare_publish_body "$entry" "$marker" "$task" "$delivery" "$staged_body" "$authorized_actor" "$authorized_reviewer_context" \
+      || { rm -f "$owner_file"; rmdir "$lock" 2>/dev/null || true; reject_entry "$source_entry"; [ -z "$only" ] || exit 1; continue; }
+    body="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["publishBodyPath"])' "$entry")"
+    broker_tracker_effect "$entry" comment-once "$task" "$delivery" "$body"
+    cleanup_snapshot
+    advance_delivery "$entry" pending commented
     phase=commented
   fi
   if [ "$phase" = "commented" ] && [ -n "$target" ]; then
@@ -931,17 +1513,13 @@ PY
     elif [ "$authority_status" -ne 0 ]; then
       cleanup_snapshot
       rm -f "$owner_file"; rmdir "$lock" 2>/dev/null || true
-      reject_entry "$entry"
+      reject_entry "$source_entry"
       if [ -n "$only" ]; then exit 1; fi
       continue
     fi
-    "$SKILL_DIR/bin/tracker-ops.sh" state "$task" "$target"
+    broker_tracker_effect "$entry" state "$task" "$target"
     cleanup_snapshot
-    python3 - "$entry" <<'PY'
-import json, os, sys
-p=sys.argv[1]; d=json.load(open(p)); d['phase']='transitioned'
-t=p+'.tmp'; open(t,'w').write(json.dumps(d, indent=2)+'\n'); os.replace(t,p)
-PY
+    advance_delivery "$entry" commented transitioned
     phase=transitioned
   fi
   if [ "$phase" != "published" ]; then
@@ -955,27 +1533,24 @@ PY
     elif [ "$authority_status" -ne 0 ]; then
       cleanup_snapshot
       rm -f "$owner_file"; rmdir "$lock" 2>/dev/null || true
-      reject_entry "$entry"
+      reject_entry "$source_entry"
       if [ -n "$only" ]; then exit 1; fi
       continue
     fi
     body="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("publishBodyPath") or d["stagedBodyPath"])' "$entry")"
     python3 "$SKILL_DIR/bin/runtime-state.py" emit --workspace "$workspace" --team "$team" \
-      --feature "$feature" --task "$task" --attempt "$attempt" --actor "$actor" \
+      --feature "$feature" --task "$task" --attempt "$attempt" --actor "$authorized_actor" \
       --type artifact.published --stage "${target:-artifact-published}" \
       --summary "[$marker] published to tracker" --artifact "$body" >/dev/null
-    python3 - "$entry" <<'PY'
-import json, os, sys
-p=sys.argv[1]; d=json.load(open(p)); d['phase']='published'
-t=p+'.tmp'; open(t,'w').write(json.dumps(d, indent=2)+'\n'); os.replace(t,p)
-PY
+    advance_delivery "$entry" "$phase" published
   fi
   # Workspace receipts are not authorization. Bind the exact successful
   # tracker publication into the protected external broker ledger first.
   python3 "$SKILL_DIR/bin/broker_evidence.py" \
     --repo "$repo" --workspace "$workspace" --entry "$entry" >/dev/null
   destination="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "outbox/done/$id.json")"
-  [ ! -f "$entry" ] || mv "$entry" "$destination"
+  cp "$entry" "$destination"
+  rm -f -- "$source_entry"
   rm -f "$owner_file"
   rmdir "$lock" 2>/dev/null || true
   echo "published [$marker] for $task ($delivery)"
