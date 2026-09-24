@@ -6,6 +6,15 @@ stale, malformed, reused, or commit-mismatched evidence is not ready. The
 checker does not publish, deploy, merge, authenticate a human, or grant release
 authority.
 
+The release workflow separately checks the live GitHub `release` and `pypi`
+environments before building and again before publication. Both must have a
+non-empty required-human-reviewer rule, self-review prevention, and
+administrator bypass disabled. Merely naming an environment in workflow YAML
+is not protection: GitHub can create a
+missing environment without protection rules. Configure these rules with
+repository administration authority before requesting a release; a tracker
+comment or evidence JSON cannot substitute for them.
+
 ## Documented product criteria
 
 - A security policy defines a private disclosure and coordinated response path.
@@ -236,14 +245,16 @@ The release workflow transports those exact bytes through a dedicated protected
    `main` as the workflow ref. The requested release hash must also be the exact
    `GITHUB_SHA` from which that dispatch runs.
 4. The protected `release` environment requires a human reviewer. The workflow
-   proves that the first hash is still `origin/main` and the second is still the
+   checks the live protections on both release environments, proves that the
+   first hash is still `origin/main` and the second is still the
    `release-evidence` tip, reads only allowlisted bounded regular Git blobs, and
    runs this checker before building, attesting, or publishing anything. The
    checker exports the validated canonical release-set digest; after rebuilding
    twice, the workflow recomputes the digest from the actual bundle, wheel, and
    sdist names and bytes and refuses any mismatch before artifact upload.
 5. The protected `pypi` environment requires a separate human approval. After
-   that approval, the publish job rechecks both `main` and `release-evidence`,
+   that approval, the publish job rechecks both `main` and `release-evidence`
+   and both live environment protections,
    freshly extracts the same bounded evidence commit, reruns this checker for
    freshness and exact commit/version/release-set identity, and verifies the
    downloaded bundle, checksum sidecar, wheel, and sdist against the authorized

@@ -184,6 +184,20 @@ COMPOUND_SECURITY_PATHS = (
     "src/refreshTokens.py",
     "src/tenantauthtokens.py",
     "src/platformsessiontokens.py",
+    "src/userauth.py",
+    "src/appauth.py",
+    "src/orgauth.py",
+    "src/tenantauth.py",
+    "src/userroles.py",
+    "src/rolepolicy.py",
+    "src/userRoles.ts",
+    "src/user_roles.ts",
+    "src/roleGuard.py",
+    "src/roleValidator.py",
+    "src/keyRotation.ts",
+    "src/key_rotation.py",
+    "src/tokenrotation.py",
+    "src/refreshTokenRotation.test.ts",
 )
 
 CONFUSABLE_ORDINARY_PATHS = (
@@ -267,6 +281,14 @@ CONFUSABLE_ORDINARY_PATHS = (
     "src/platformcerts.py",
     "src/platformmigrations.py",
     "src/platformschemas.py",
+    "src/appauthorship.py",
+    "src/orgauthor.py",
+    "src/userroleplay.ts",
+    "src/userRolePlay.ts",
+    "src/user_role_play.py",
+    "src/rolepolicymaker.py",
+    "src/keyboardRotation.ts",
+    "src/tokenrotationgame.py",
 )
 
 
@@ -1002,6 +1024,29 @@ class DiffAssessmentTests(unittest.TestCase):
                     )
                 finally:
                     fixture.close()
+
+    def test_fused_auth_module_boolean_change_forces_security_gate(self):
+        fixture = GitFixture()
+        try:
+            fixture.write("src/userauth.py", "def allowed():\n    return False\n")
+            fixture.commit("seed auth module")
+            base = fixture.head
+            fixture.write("src/userauth.py", "def allowed():\n    return True\n")
+            fixture.commit("change auth decision")
+            decision = assess_diff(
+                fixture.root,
+                base,
+                fixture.head,
+                task("files: src/userauth.py\ndelivery-profile: micro", "Adjust check"),
+            )
+            self.assertEqual("high-risk", decision["effectiveProfile"])
+            self.assertIn("control-plane-path:src/userauth.py", decision["reasons"])
+            self.assertEqual(
+                ["qa", "security"],
+                decision["authority"]["profileForcedReviewGates"],
+            )
+        finally:
+            fixture.close()
 
     def test_exact_diff_keeps_similar_ordinary_product_paths_standard(self):
         cases = (

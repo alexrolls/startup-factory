@@ -3,7 +3,8 @@ name: Release
 # Required repository settings:
 # - protect main and require Package CI before changes can be merged;
 # - protect the release-evidence branch and restrict updates to evidence owners;
-# - require human reviewers on both the release and pypi environments;
+# - require human reviewers, prevent self-review, and disable administrator
+#   bypass on both environments; the workflow verifies live rules before release;
 # - restrict trusted publishing to this workflow and the pypi environment;
 # - enable immutable GitHub Releases.
 
@@ -23,7 +24,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.release_commit }}
+  # One release run at a time: overlapping versions would make the older
+  # run's public @latest verification fail after its PyPI upload.
+  group: release-main
   cancel-in-progress: false
 
 jobs:
@@ -33,6 +36,9 @@ jobs:
     timeout-minutes: 10
     environment:
       name: release
+    permissions:
+      contents: read
+      actions: read
     outputs:
       source_commit: ${{ steps.identity.outputs.commit }}
       evidence_commit: ${{ steps.identity.outputs.evidence_commit }}
@@ -79,6 +85,18 @@ jobs:
             echo "commit=$RELEASE_COMMIT"
             echo "evidence_commit=$EVIDENCE_COMMIT"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Require live independent release environment reviewers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in release pypi; do
+            gh api "repos/$GH_REPO/environments/$name" |
+              python3 candidate/packaging/check_release_environment.py --name "$name"
+          done
 
       - name: Extract only bounded regular secret-free evidence blobs
         env:
@@ -537,6 +555,7 @@ jobs:
       url: https://pypi.org/project/startup-factory/${{ needs.build.outputs.version }}/
     permissions:
       contents: read
+      actions: read
       id-token: write
 
     steps:
@@ -568,6 +587,18 @@ jobs:
           test "$(git -C release-evidence rev-parse HEAD)" = "$EVIDENCE_COMMIT"
           test "$(git -C release-evidence rev-parse origin/release-evidence)" = \
             "$EVIDENCE_COMMIT"
+
+      - name: Reconfirm live independent reviewers before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in release pypi; do
+            gh api "repos/$GH_REPO/environments/$name" |
+              python3 candidate/packaging/check_release_environment.py --name "$name"
+          done
 
       - name: Freshly extract the exact bounded evidence set
         env:

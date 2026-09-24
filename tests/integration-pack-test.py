@@ -227,6 +227,41 @@ class IntegrationPackTest(unittest.TestCase):
         with self.assertRaisesRegex(IntegrationPackError, "bounded|exceeds"):
             validate_pack(oversize)
 
+    def test_escaped_unicode_surrogates_fail_validation_and_cli_cleanly(self) -> None:
+        cases = []
+        display_name = self._document()
+        display_name["displayName"] = "invalid\ud800"
+        cases.append(("display-name", display_name))
+
+        check_name = self._document("ci/github-actions-exact-commit.json")
+        check_name["capability"]["template"]["requiredChecks"] = [  # type: ignore[index]
+            "Check\udfff"
+        ]
+        cases.append(("required-check", check_name))
+
+        invalid_key = self._document()
+        invalid_key["invalid\ud800"] = True
+        cases.append(("key", invalid_key))
+
+        for name, document in cases:
+            with self.subTest(name=name):
+                path = self._write_pack(f"surrogate-{name}.json", document)
+                with self.assertRaisesRegex(IntegrationPackError, "invalid Unicode surrogate"):
+                    validate_pack(path)
+                command = "preview" if name == "required-check" else "validate"
+                argv = [sys.executable, str(SCRIPT), command, str(path)]
+                if command == "preview":
+                    argv.extend(("--project-root", str(self.project)))
+                completed = subprocess.run(
+                    argv,
+                    cwd=ROOT,
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertIn("invalid Unicode surrogate", completed.stderr)
+                self.assertNotIn("Traceback", completed.stderr)
+
     def test_exact_schema_versions_states_and_capabilities_fail_closed(self) -> None:
         cases: list[tuple[dict[str, object], str]] = []
         unknown = self._document()

@@ -359,7 +359,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "          ref: ${{ needs.authorize.outputs.source_commit }}", workflow
         )
         self.assertIn("bump project.version", workflow)
-        self.assertIn("  group: release-${{ inputs.release_commit }}", workflow)
+        self.assertIn("  group: release-main", workflow)
 
         binding = workflow.index(
             "      - name: Bind rebuilt artifact names and bytes to approved evidence"

@@ -133,6 +133,13 @@ def _reject_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON number is not allowed: {value}")
 
 
+def _reject_surrogates(value: str, label: str) -> None:
+    # JSON permits escaped lone surrogates, but UTF-8 output and canonical
+    # plan rendering do not. Reject them at the shared manifest/plan boundary.
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        raise IntegrationPackError(f"{label} contains an invalid Unicode surrogate")
+
+
 def _decode_json_object(raw: bytes, label: str) -> dict[str, Any]:
     def reject_duplicates(pairs: Iterable[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -157,13 +164,16 @@ def _decode_json_object(raw: bytes, label: str) -> dict[str, Any]:
         item = pending.pop()
         if isinstance(item, dict):
             for key, child in item.items():
+                _reject_surrogates(key, label)
                 if contains_secret_like(key):
                     raise IntegrationPackError(f"{label} contains secret-like material")
                 pending.append(child)
         elif isinstance(item, list):
             pending.extend(item)
-        elif isinstance(item, str) and contains_secret_like(item):
-            raise IntegrationPackError(f"{label} contains secret-like material")
+        elif isinstance(item, str):
+            _reject_surrogates(item, label)
+            if contains_secret_like(item):
+                raise IntegrationPackError(f"{label} contains secret-like material")
     return value
 
 

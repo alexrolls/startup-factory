@@ -354,6 +354,29 @@ SECURITY_TERMINAL_TOKEN_QUALIFIERS = (
     "api",
     "jwt",
 )
+# An auth module can be named for its subject without a conventional component
+# suffix (``userauth.py``).  Only explicit, high-confidence subject prefixes
+# qualify here: an arbitrary prefix would turn ordinary words such as
+# ``authorship`` into a security match.
+SECURITY_TERMINAL_AUTH_SUBJECTS = (
+    "account",
+    "app",
+    "client",
+    "customer",
+    "internal",
+    "member",
+    "org",
+    "service",
+    "tenant",
+    "user",
+)
+SECURITY_TERMINAL_ROLE_SUBJECTS = (
+    "account",
+    "admin",
+    "member",
+    "tenant",
+    "user",
+)
 SECURITY_COMPOUND_TOKEN_RE = re.compile(
     rf"(?:(?:{'|'.join(map(re.escape, SECURITY_COMPOUND_SUBJECT_PREFIXES))}))?"
     r"(?:"
@@ -388,8 +411,24 @@ SECURITY_TERMINAL_COMPOUND_TOKEN_RE = re.compile(
     rf"[a-z0-9]+(?:{'|'.join(map(re.escape, SECURITY_TERMINAL_PLURAL_ROOTS))})"
     r"|"
     rf"[a-z0-9]*(?:{'|'.join(map(re.escape, SECURITY_TERMINAL_TOKEN_QUALIFIERS))})tokens"
+    r"|"
+    rf"(?:{'|'.join(map(re.escape, SECURITY_TERMINAL_AUTH_SUBJECTS))})auth(?:n|z)?"
+    r"|"
+    rf"(?:{'|'.join(map(re.escape, SECURITY_TERMINAL_ROLE_SUBJECTS))})roles?"
+    r"|role(?:guard|policy|validator)"
     r")"
     r"(?:v[0-9]+)?",
+    re.I,
+)
+SECURITY_ROTATION_STEM_RE = re.compile(
+    r"(?:(?:access|api|auth|encryption|hmac|private|refresh|secret|signing))?"
+    r"(?:key|token)rotation(?:v[0-9]+)?(?:\.(?:test|spec))?",
+    re.I,
+)
+SECURITY_ROLE_STEM_RE = re.compile(
+    rf"(?:(?:{'|'.join(map(re.escape, SECURITY_TERMINAL_ROLE_SUBJECTS))})roles?"
+    r"|role(?:guard|policy|validator))"
+    r"(?:v[0-9]+)?(?:\.(?:test|spec))?",
     re.I,
 )
 DEPENDENCY_MANIFEST_NAMES = {
@@ -613,6 +652,15 @@ def _is_security_surface(path: PurePosixPath) -> bool:
     lowered_parts = tuple(part.casefold() for part in path.parts)
     name = lowered_parts[-1]
     tokens = _path_tokens(path)
+    # Key/token rotation is a security operation even without another security
+    # qualifier. Match the whole stem, not an arbitrary suffix of words such
+    # as ``keyboardRotation`` or ``tokenrotationgame``.
+    compact_stem = re.sub(r"[-_]", "", PurePosixPath(name).stem)
+    if (
+        SECURITY_ROTATION_STEM_RE.fullmatch(compact_stem)
+        or SECURITY_ROLE_STEM_RE.fullmatch(compact_stem)
+    ):
+        return True
     # A directory literally named ``session`` is conventionally an auth state
     # boundary.  A compound identifier such as ``workshopSessionCard`` is not;
     # it needs another security term before it can raise the risk floor.
