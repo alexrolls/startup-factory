@@ -14,7 +14,15 @@ TMP="$(mktemp -d)"
 TMP="$(cd "$TMP" && pwd -P)"
 LIFECYCLE_ROOT="$(mktemp -d "$HOME/.sf-launcher-lifecycle.XXXXXXXX")"
 LIFECYCLE_ROOT="$(cd "$LIFECYCLE_ROOT" && pwd -P)"
-trap 'rm -rf "$TMP" "$LIFECYCLE_ROOT"' EXIT
+cleanup_launcher_test() {
+  if [ -n "${RELEASE_CONTROLLER_PID:-}" ]; then
+    if mkdir -m 700 "$RELEASE_CONTROLLER_CANCEL" 2>/dev/null; then
+      wait "$RELEASE_CONTROLLER_PID" 2>/dev/null || true
+    fi
+  fi
+  rm -rf "$TMP" "$LIFECYCLE_ROOT"
+}
+trap cleanup_launcher_test EXIT
 FAILURES=0
 check() { # check <desc> <cmd...>
   local desc="$1"; shift
@@ -3873,19 +3881,31 @@ python3 .claude/skills/pm/bin/outbox_capability.py mint \
   --team "$RELEASE_FENCE_TEAM" --feature FEAT-RELEASE-STOP --role backend \
   --kind gate --task - --attempt 0 --instance backend >/dev/null
 RELEASE_RECORDS_READY="$TMP/release-records-lock-ready"
-python3 - "$LIFECYCLE_ROOT/records.lock" "$RELEASE_RECORDS_READY" <<'PY' &
-import fcntl, pathlib, sys, time
+RELEASE_RECORDS_RELEASE="$TMP/release-records-lock-release"
+python3 - "$LIFECYCLE_ROOT/records.lock" "$RELEASE_RECORDS_READY" "$RELEASE_RECORDS_RELEASE" <<'PY' &
+import fcntl, os, pathlib, sys, time
+parent = os.getppid()
 with open(sys.argv[1], "a+b") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     pathlib.Path(sys.argv[2]).touch()
-    time.sleep(30)
+    while not pathlib.Path(sys.argv[3]).exists() and os.getppid() == parent:
+        time.sleep(0.02)
 PY
 RELEASE_RECORDS_HOLDER=$!
 for _i in $(seq 1 100); do [ -e "$RELEASE_RECORDS_READY" ] && break; sleep 0.02; done
 check "release fixture holds lifecycle registration before go" test -e "$RELEASE_RECORDS_READY"
-RELEASE_FENCE_VARS="$(python3 - "$PWD" "$LIFECYCLE_ROOT" "$RELEASE_FENCE_TEAM" "$TMP/release-command-witness" <<'PY'
-import hashlib, importlib.util, json, pathlib, subprocess, sys
-repo, root, team, witness = sys.argv[1:]
+RELEASE_CONTROLLER_READY="$TMP/release-controller-ready"
+RELEASE_CONTROLLER_RESUME="$TMP/release-controller-resume"
+RELEASE_CONTROLLER_CANCEL="$TMP/release-controller-cancel"
+python3 - "$PWD" "$LIFECYCLE_ROOT" "$RELEASE_FENCE_TEAM" \
+  "$TMP/release-command-witness" "$RELEASE_CONTROLLER_RESUME" \
+  "$RELEASE_CONTROLLER_CANCEL" \
+  >"$RELEASE_CONTROLLER_READY" 2>"$TMP/release-controller.err" <<'PY' &
+import hashlib, importlib.util, json, os, pathlib, signal, subprocess, sys, time
+repo, root, team, witness, resume_raw, cancel_raw = sys.argv[1:]
+parent_pid = os.getppid()
+resume = pathlib.Path(resume_raw)
+cancel = pathlib.Path(cancel_raw)
 worker = pathlib.Path(repo, ".claude/skills/pm/bin/release-worker.py")
 spec = importlib.util.spec_from_file_location("release_fixture_worker", worker)
 module = importlib.util.module_from_spec(spec)
@@ -3904,17 +3924,82 @@ result.write_text(json.dumps({"schemaVersion": 1, "identity": identity,
                               "state": "launching", "createdAt": "2026-09-24T00:00:00+00:00"},
                              sort_keys=True, separators=(",", ":")) + "\n")
 result.chmod(0o600)
-with (directory / "worker.log").open("w") as log:
-    process = subprocess.Popen([sys.executable, str(worker), "--result", str(result),
-        "--log", str(directory / "release.log"), "--timeout", "60",
-        "--identity-json", json.dumps(identity, separators=(",", ":")),
-        "--lifecycle-root", root, "--repository", repo, "--", *command],
-        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-        start_new_session=True)
-print(process.pid, identity["jobId"])
+process = None
+def stop_child():
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    process.send_signal(signal.SIGCONT)
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2)
+
+try:
+    with (directory / "worker.log").open("w") as log:
+        process = subprocess.Popen([sys.executable, str(worker), "--result", str(result),
+            "--log", str(directory / "release.log"), "--timeout", "60",
+            "--identity-json", json.dumps(identity, separators=(",", ":")),
+            "--lifecycle-root", root, "--repository", repo, "--", *command],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True)
+    deadline = time.monotonic() + 10
+    while True:
+        if cancel.exists() or os.getppid() != parent_pid:
+            raise RuntimeError("release fixture controller was cancelled")
+        if process.poll() is not None:
+            raise RuntimeError("release fixture worker exited before team-fence readiness")
+        if next(pathlib.Path(root).glob(".release-team-fence.*/ready"), None):
+            process.send_signal(signal.SIGSTOP)
+            while True:
+                try:
+                    stopped_pid, stopped_status = os.waitpid(process.pid, os.WUNTRACED)
+                    break
+                except InterruptedError:
+                    continue
+            if stopped_pid != process.pid or not os.WIFSTOPPED(stopped_status):
+                raise RuntimeError("release fixture worker exited before it stopped")
+            if os.WSTOPSIG(stopped_status) != signal.SIGSTOP:
+                raise RuntimeError("release fixture worker stopped for an unexpected signal")
+            print(process.pid, identity["jobId"], flush=True)
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError("release fixture worker did not acquire the team fence")
+        time.sleep(0.02)
+    deadline = time.monotonic() + 20
+    while not resume.exists():
+        if cancel.exists() or os.getppid() != parent_pid:
+            raise RuntimeError("release fixture controller was cancelled")
+        if process.poll() is not None:
+            raise RuntimeError("paused release fixture worker exited unexpectedly")
+        if time.monotonic() >= deadline:
+            raise RuntimeError("release fixture worker was not resumed")
+        time.sleep(0.02)
+    process.send_signal(signal.SIGCONT)
+    deadline = time.monotonic() + 75
+    while process.poll() is None:
+        if cancel.exists() or os.getppid() != parent_pid:
+            raise RuntimeError("release fixture controller was cancelled")
+        if time.monotonic() >= deadline:
+            raise RuntimeError("release fixture worker did not finish")
+        time.sleep(0.02)
+    if process.returncode != 0:
+        raise RuntimeError("release fixture worker failed")
+finally:
+    stop_child()
 PY
-)"
-read -r RELEASE_FENCE_WORKER_PID RELEASE_FENCE_JOB_ID <<< "$RELEASE_FENCE_VARS"
+RELEASE_CONTROLLER_PID=$!
+for _i in $(seq 1 500); do
+  [ -s "$RELEASE_CONTROLLER_READY" ] && break
+  sleep 0.02
+done
+if [ ! -s "$RELEASE_CONTROLLER_READY" ]; then
+  echo "release fixture controller failed before pausing the worker:" >&2
+  sed -n '1,12p' "$TMP/release-controller.err" >&2 || true
+fi
+check "release controller pauses the still-owned worker" test -s "$RELEASE_CONTROLLER_READY"
+read -r RELEASE_FENCE_WORKER_PID RELEASE_FENCE_JOB_ID < "$RELEASE_CONTROLLER_READY"
 for _i in $(seq 1 150); do
   RELEASE_FENCE_READY="$(find "$LIFECYCLE_ROOT" -maxdepth 2 -path '*/.release-team-fence.*/ready' -print -quit)"
   [ -n "$RELEASE_FENCE_READY" ] && break
@@ -3927,13 +4012,11 @@ fi
 check "release worker holds the shared team fence before registration" test -n "$RELEASE_FENCE_READY"
 check "release command has not crossed the registration barrier" \
   test ! -e "$TMP/release-command-witness"
-# Freeze only the worker after its shared fence is ready.  Keeping records.lock
-# held while starting stop also stalls stop's config preflight, so it cannot
-# prove that stop reached the exclusive fence before the release completes.
-check "release worker pauses while retaining its shared team fence" \
-  kill -STOP "$RELEASE_FENCE_WORKER_PID"
-kill "$RELEASE_RECORDS_HOLDER" 2>/dev/null || true
-wait "$RELEASE_RECORDS_HOLDER" 2>/dev/null || true
+# The controller owns the unreaped worker throughout pause/resume.  Keeping
+# records.lock held while starting stop also stalls stop's config preflight,
+# so it cannot prove that stop reached the exclusive fence before release.
+mkdir -m 700 "$RELEASE_RECORDS_RELEASE"
+wait "$RELEASE_RECORDS_HOLDER"
 RELEASE_STOP_BARRIERS_BEFORE="$TMP/release-stop-barriers-before"
 find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' -print \
   | sort > "$RELEASE_STOP_BARRIERS_BEFORE"
@@ -3950,8 +4033,12 @@ check "team stop reaches the exclusive release fence" \
 check "team stop queues behind release admission" kill -0 "$RELEASE_FENCE_STOP_PID"
 check "queued stop cannot start the release command" \
   test ! -e "$TMP/release-command-witness"
-check "release worker resumes after stop is queued" \
-  kill -CONT "$RELEASE_FENCE_WORKER_PID"
+if mkdir -m 700 "$RELEASE_CONTROLLER_RESUME"; then
+  echo "ok: release worker resumes after stop is queued"
+else
+  echo "FAIL: release worker could not be resumed after stop was queued" >&2
+  exit 1
+fi
 for _i in $(seq 1 150); do
   [ -e "$TMP/release-command-witness" ] && break
   sleep 0.02
@@ -3989,6 +4076,13 @@ for _i in $(seq 1 100); do
 done
 check "release worker retires its exact lifecycle record" \
   test "$RELEASE_FENCE_RECORD_COUNT" -eq 0
+if wait "$RELEASE_CONTROLLER_PID"; then
+  echo "ok: release fixture controller reaps its exact worker"
+else
+  echo "FAIL: release fixture controller failed: $(sed -n '1,12p' "$TMP/release-controller.err")"
+  FAILURES=$((FAILURES+1))
+fi
+RELEASE_CONTROLLER_PID=""
 "$LAUNCH" stop "$RELEASE_FENCE_TEAM" >/dev/null
 
 # -- status + stop --------------------------------------------------------------
