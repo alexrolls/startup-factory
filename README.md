@@ -433,11 +433,12 @@ This release candidate introduces three improvements:
   filenames are treated as high risk. See
   [`reference/delivery-profiles.md`](reference/delivery-profiles.md).
 - **Guided integration packs:** `validate → preview → apply → doctor` covers the
-  shipped Markdown, GitHub Issues, Jira, and Linear trackers; GitHub Actions
-  exact-commit checks; and inactive Docker Compose and Kubernetes deployment
-  descriptors. Packs are validated data, saved plans bind their source and
-  target, and credentials stay outside repository config. Malformed pack JSON
-  fails validation; apply never executes commands or activates a deployment.
+  shipped Markdown, GitHub Issues, Jira, and Linear trackers, plus inactive
+  boundary descriptors for GitHub Actions exact-commit verification, Docker
+  Compose, and Kubernetes. Packs are validated data, saved plans bind their
+  source and target, and credentials stay outside repository config. Malformed
+  pack JSON fails validation; apply never executes commands or activates CI or
+  deployment.
   Doctor reports local setup without authenticating a provider. See
   [`extensions/integration-packs/README.md`](extensions/integration-packs/README.md).
 - **Objective beta readiness:** [`SECURITY.md`](SECURITY.md) defines disclosure;
