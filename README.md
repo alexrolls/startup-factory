@@ -420,35 +420,42 @@ Read the full contracts before enabling unattended or production operation:
 
 ## What's new in 0.2.0
 
-This release candidate makes governed delivery faster without weakening its
-authority boundaries. One monotonic policy selects `micro`, `standard`, or
-`high-risk` from both declared scope and the exact committed diff. A requested
-profile can raise rigor but never lower it; high-risk work forces strong-model,
-exclusive implementation plus QA and Security, while the core review board,
-its checklists and preset `REVIEW_MODE`, exact-package evidence, immutable deny
-rules, integration, and release authority remain unchanged. See
-[`reference/delivery-profiles.md`](reference/delivery-profiles.md).
+This release candidate introduces three improvements:
 
-The first integration-pack catalog adds guided, validated setup for Markdown,
-GitHub Issues, Jira, Linear, GitHub Actions exact-commit verification, Docker
-Compose, and Kubernetes. Manifests are strict data rather than executable
-configuration, credentials remain outside repository config, saved plans bind
-their source and target identities, CI verification requires a non-empty set of
-real provider check names, and deployment templates are inactive until separately
-configured and approved.
+- **Risk-based delivery:** `micro` covers small, declared documentation changes;
+  `standard` covers ordinary code and tests; `high-risk` covers unknown scope,
+  security, control-plane, and release work. A requested profile cannot lower
+  inferred risk; the exact committed diff is checked again before review and
+  can add gates. High-risk work uses a strong-model floor, exclusive
+  implementation, and QA and Security gates. The core review board, exact
+  package evidence, immutable deny rules, integration authority, and production
+  authority do not change. Common fused auth, role, and key/token-rotation
+  filenames are treated as high risk. See
+  [`reference/delivery-profiles.md`](reference/delivery-profiles.md).
+- **Guided integration packs:** `validate → preview → apply → doctor` covers the
+  shipped Markdown, GitHub Issues, Jira, and Linear trackers; GitHub Actions
+  exact-commit checks; and inactive Docker Compose and Kubernetes deployment
+  descriptors. Packs are validated data, saved plans bind their source and
+  target, and credentials stay outside repository config. Malformed pack JSON
+  fails validation; apply never executes commands or activates a deployment.
+  Doctor reports local setup without authenticating a provider. See
+  [`extensions/integration-packs/README.md`](extensions/integration-packs/README.md).
+- **Objective beta readiness:** [`SECURITY.md`](SECURITY.md) defines disclosure;
+  a shorter [quickstart](reference/quickstart.md),
+  [compatibility boundaries](reference/compatibility.md), a reproducible
+  walkthrough, and [benchmark and usage methodology](reference/benchmarks.md)
+  make evaluation repeatable. Native Windows is unsupported and WSL remains
+  experimental and untested. The exact-release-set checker reports **not ready**
+  until fresh protected validation, package, review, disclosure, compatibility,
+  walkthrough, benchmark, and usage evidence is supplied. The under-15-minute
+  delivery target is not yet a measured result.
 
-Beta preparation now includes [`SECURITY.md`](SECURITY.md), a shorter governed
-quickstart, explicit platform support, a reproducible walkthrough, benchmark and
-usage methodology, and a fail-closed exact-release-set readiness checker. No
-benchmark result is fabricated: documentation alone reports **not ready** until
-fresh protected validation, review, disclosure, benchmark, and usage evidence
-for the exact bundle, wheel, and sdist is supplied.
-
-Merging to `main` no longer publishes automatically. After repository owners
-configure the required branch and environment protections, release owners must
-invoke the manual workflow with the exact current-main commit and exact tip of
-the protected, evidence-only branch; readiness runs before any publication, and
-PyPI requires its separate protected-environment approval.
+Release is manual and fail-closed: merging to `main` does not publish. The
+workflow binds the exact current-main and protected evidence-branch commits,
+serializes release runs, and checks live `release` and `pypi` environments for
+required reviewers, self-review prevention, and disabled administrator bypass.
+The separate PyPI approval and exact bundle, wheel, and sdist checks remain
+mandatory. These safeguards do not themselves authorize a production release.
 
 **0.1.x upgrade action:** project configuration is preserved during updates.
 Before restarting autonomous or release services, update the protected
