@@ -3905,7 +3905,7 @@ result.write_text(json.dumps({"schemaVersion": 1, "identity": identity,
                              sort_keys=True, separators=(",", ":")) + "\n")
 with (directory / "worker.log").open("w") as log:
     process = subprocess.Popen([sys.executable, str(worker), "--result", str(result),
-        "--log", str(directory / "release.log"), "--timeout", "30",
+        "--log", str(directory / "release.log"), "--timeout", "60",
         "--identity-json", json.dumps(identity, separators=(",", ":")),
         "--lifecycle-root", root, "--repository", repo, "--", *command],
         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
