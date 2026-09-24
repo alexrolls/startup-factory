@@ -3927,6 +3927,13 @@ fi
 check "release worker holds the shared team fence before registration" test -n "$RELEASE_FENCE_READY"
 check "release command has not crossed the registration barrier" \
   test ! -e "$TMP/release-command-witness"
+# Freeze only the worker after its shared fence is ready.  Keeping records.lock
+# held while starting stop also stalls stop's config preflight, so it cannot
+# prove that stop reached the exclusive fence before the release completes.
+check "release worker pauses while retaining its shared team fence" \
+  kill -STOP "$RELEASE_FENCE_WORKER_PID"
+kill "$RELEASE_RECORDS_HOLDER" 2>/dev/null || true
+wait "$RELEASE_RECORDS_HOLDER" 2>/dev/null || true
 RELEASE_STOP_BARRIERS_BEFORE="$TMP/release-stop-barriers-before"
 find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' -print \
   | sort > "$RELEASE_STOP_BARRIERS_BEFORE"
@@ -3941,8 +3948,10 @@ done
 check "team stop reaches the exclusive release fence" \
   test -n "$RELEASE_STOP_NEW_BARRIER"
 check "team stop queues behind release admission" kill -0 "$RELEASE_FENCE_STOP_PID"
-kill "$RELEASE_RECORDS_HOLDER" 2>/dev/null || true
-wait "$RELEASE_RECORDS_HOLDER" 2>/dev/null || true
+check "queued stop cannot start the release command" \
+  test ! -e "$TMP/release-command-witness"
+check "release worker resumes after stop is queued" \
+  kill -CONT "$RELEASE_FENCE_WORKER_PID"
 for _i in $(seq 1 150); do
   [ -e "$TMP/release-command-witness" ] && break
   sleep 0.02
@@ -3973,8 +3982,13 @@ PY
 done
 check "release worker reaches a durable terminal result" \
   test "$RELEASE_FENCE_RESULT_STATE" = completed
+for _i in $(seq 1 100); do
+  RELEASE_FENCE_RECORD_COUNT="$(record_count "$RELEASE_FENCE_TEAM" "$RELEASE_FENCE_JOB_ID")"
+  [ "$RELEASE_FENCE_RECORD_COUNT" -eq 0 ] && break
+  sleep 0.05
+done
 check "release worker retires its exact lifecycle record" \
-  test "$(record_count "$RELEASE_FENCE_TEAM" "$RELEASE_FENCE_JOB_ID")" -eq 0
+  test "$RELEASE_FENCE_RECORD_COUNT" -eq 0
 "$LAUNCH" stop "$RELEASE_FENCE_TEAM" >/dev/null
 
 # -- status + stop --------------------------------------------------------------
