@@ -3927,16 +3927,19 @@ fi
 check "release worker holds the shared team fence before registration" test -n "$RELEASE_FENCE_READY"
 check "release command has not crossed the registration barrier" \
   test ! -e "$TMP/release-command-witness"
-RELEASE_STOP_BARRIERS_BEFORE="$(find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' | wc -l | tr -d ' ')"
+RELEASE_STOP_BARRIERS_BEFORE="$TMP/release-stop-barriers-before"
+find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' -print \
+  | sort > "$RELEASE_STOP_BARRIERS_BEFORE"
 "$LAUNCH" stop "$RELEASE_FENCE_TEAM" >"$TMP/release-stop-refusal.out" 2>&1 &
 RELEASE_FENCE_STOP_PID=$!
-for _i in $(seq 1 100); do
-  RELEASE_STOP_BARRIERS_NOW="$(find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' | wc -l | tr -d ' ')"
-  [ "$RELEASE_STOP_BARRIERS_NOW" -gt "$RELEASE_STOP_BARRIERS_BEFORE" ] && break
+for _i in $(seq 1 500); do
+  RELEASE_STOP_NEW_BARRIER="$(comm -13 "$RELEASE_STOP_BARRIERS_BEFORE" \
+    <(find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' -print | sort))"
+  [ -n "$RELEASE_STOP_NEW_BARRIER" ] && break
   sleep 0.02
 done
 check "team stop reaches the exclusive release fence" \
-  test "$RELEASE_STOP_BARRIERS_NOW" -gt "$RELEASE_STOP_BARRIERS_BEFORE"
+  test -n "$RELEASE_STOP_NEW_BARRIER"
 check "team stop queues behind release admission" kill -0 "$RELEASE_FENCE_STOP_PID"
 kill "$RELEASE_RECORDS_HOLDER" 2>/dev/null || true
 wait "$RELEASE_RECORDS_HOLDER" 2>/dev/null || true
