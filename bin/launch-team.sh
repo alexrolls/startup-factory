@@ -745,7 +745,7 @@ remove_launch_barrier() {
 forget_background_generation() { # team category instance launch-token [created-at]
   local args=(--root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT"
     --team "$1" --category "$2" --instance "$3"
-    --expect-token-stdin --allow-identity-mismatch)
+    --expect-token-stdin)
   [ -z "${5:-}" ] || args+=(--expected-created-at "$5")
   printf '%s\n' "$4" | python3 "$SKILL_DIR/bin/process-lifecycle.py" forget \
     "${args[@]}" >/dev/null
@@ -753,7 +753,7 @@ forget_background_generation() { # team category instance launch-token [created-
 
 retire_background_launch() { # reaper-pid team category instance created-at launch-token
   local reaper_pid="$1" team="$2" category="$3" instance="$4" created_at="$5"
-  local launch_token="$6" rc=0 i live=yes
+  local launch_token="$6" rc=0 i live=yes saw_leaderless=no
   # After self-registration, only the authenticated lifecycle record may
   # select a signal target.  The wrapper PID is never signalled: Bash may have
   # already reaped and released it for reuse.  The trusted wrapper exits only
@@ -791,17 +791,25 @@ retire_background_launch() { # reaper-pid team category instance created-at laun
     if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" verify \
         --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
         --team "$team" --category "$category" --instance "$instance" \
-        --expected-created-at "$created_at" --expect-token-stdin >/dev/null; then
+        --expected-created-at "$created_at" --expect-token-stdin \
+        --report-leaderless >/dev/null; then
       sleep 0.05
       continue
     else
       rc=$?
+    fi
+    if [ "$rc" -eq 4 ]; then
+      saw_leaderless=yes
+      sleep 0.05
+      continue
     fi
     [ "$rc" -eq 3 ] \
       || die "protected background generation became invalid while stopping"
     live=no
     break
   done
+  [ "$saw_leaderless" = no ] || [ "$live" = no ] \
+    || die "protected background identity mismatch persisted after leader exit; no further signal was sent"
   if [ "$live" = yes ]; then
     if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" signal \
         --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
@@ -827,11 +835,17 @@ retire_background_launch() { # reaper-pid team category instance created-at laun
       if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" verify \
           --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
           --team "$team" --category "$category" --instance "$instance" \
-          --expected-created-at "$created_at" --expect-token-stdin >/dev/null; then
+          --expected-created-at "$created_at" --expect-token-stdin \
+          --report-leaderless >/dev/null; then
         sleep 0.05
         continue
       else
         rc=$?
+      fi
+      if [ "$rc" -eq 4 ]; then
+        saw_leaderless=yes
+        sleep 0.05
+        continue
       fi
       [ "$rc" -eq 3 ] \
         || die "protected background generation became invalid after KILL"
@@ -839,6 +853,8 @@ retire_background_launch() { # reaper-pid team category instance created-at laun
       break
     done
   fi
+  [ "$saw_leaderless" = no ] || [ "$live" = no ] \
+    || die "protected background identity mismatch persisted after leader exit; no further signal was sent"
   [ "$live" = no ] \
     || die "verified background generation did not stop after identity-bound SIGKILL"
   wait "$reaper_pid" 2>/dev/null || true
@@ -1542,15 +1558,26 @@ PY
 
 lifecycle_wait_and_retire() { # team category instance attempts launch-token created-at -> 0 gone+retired, 3 still live
   local team="$1" category="$2" instance="$3" attempts="$4" launch_token="$5" created_at="$6" rc i
+  local saw_leaderless=no
   for i in $(seq 1 "$attempts"); do
     if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" verify \
         --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
         --team "$team" --category "$category" --instance "$instance" \
-        --expected-created-at "$created_at" --expect-token-stdin >/dev/null; then
+        --expected-created-at "$created_at" --expect-token-stdin \
+        --report-leaderless >/dev/null; then
       sleep 0.05
       continue
     else
       rc=$?
+    fi
+    if [ "$rc" -eq 4 ]; then
+      # Darwin can hide an exited but not yet reaped leader from proc_pidinfo
+      # while its dedicated PGID still exists.  This state grants no signal
+      # authority.  Wait only for verified disappearance; never escalate to
+      # SIGKILL after even one leaderless observation.
+      saw_leaderless=yes
+      sleep 0.05
+      continue
     fi
     if [ "$rc" -eq 3 ]; then
       # Exact verification distinguishes a dead group from an identity
@@ -1560,12 +1587,14 @@ lifecycle_wait_and_retire() { # team category instance attempts launch-token cre
         --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
         --team "$team" --category "$category" --instance "$instance" \
         --expected-created-at "$created_at" \
-        --expect-token-stdin --allow-identity-mismatch >/dev/null \
+        --expect-token-stdin >/dev/null \
         || die "could not retire stopped lifecycle record $team/$instance"
       return 0
     fi
     die "protected lifecycle state became invalid while stopping $team/$instance"
   done
+  [ "$saw_leaderless" = no ] \
+    || die "protected lifecycle identity mismatch persisted after leader exit for $team/$instance; no further signal was sent"
   return 3
 }
 

@@ -31,6 +31,7 @@ from typing import Any
 
 
 NOT_LIVE = 3
+LEADERLESS_GROUP = 4
 IDENTIFIER = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
 RECORD_KEYS_V1 = {
     "schemaVersion",
@@ -1044,6 +1045,10 @@ def cmd_any_live(args: argparse.Namespace) -> int:
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
+    if args.report_leaderless and (
+        not args.expect_token_stdin or args.expected_created_at is None
+    ):
+        fail("leaderless reporting requires an exact token and creation time")
     _, records, key, repository_id = base_context(args)
     found = find_record(
         records, key, repository_id, args.team, args.category, args.instance
@@ -1056,6 +1061,17 @@ def cmd_verify(args: argparse.Namespace) -> int:
     if state == "dead":
         return NOT_LIVE
     if state == "identity-mismatch":
+        if args.report_leaderless and record["schemaVersion"] in {2, 3}:
+            # This opt-in result is only for a post-signal convergence wait.
+            # It never grants signalling authority and leaves default verify,
+            # probe, list, and replacement semantics unchanged.
+            current = process_identity(record["pid"])
+            if current is None:
+                if not group_exists(record["processGroupId"]):
+                    return NOT_LIVE
+                # The bounded caller reports a single final diagnostic if
+                # this state persists; each poll must remain quiet.
+                return LEADERLESS_GROUP
         fail(
             f"refusing lifecycle authority for {args.team}/{args.instance}: process identity mismatch"
         )
@@ -1134,6 +1150,8 @@ def parser() -> argparse.ArgumentParser:
         child.add_argument("--instance", required=True)
         child.add_argument("--expect-token-stdin", action="store_true")
         child.add_argument("--expected-created-at")
+        if name == "verify":
+            child.add_argument("--report-leaderless", action="store_true")
         child.set_defaults(handler=handler)
 
     inspect = common("inspect")

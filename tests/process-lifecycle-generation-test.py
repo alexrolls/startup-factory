@@ -409,6 +409,91 @@ time.sleep(60)
                 lifecycle.safe_signal_group(record, signal.SIGTERM)
             killpg.assert_not_called()
 
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin zombie identity boundary")
+    def test_unreaped_leader_converges_only_after_group_disappears(self) -> None:
+        process = self.spawn_session_leader()
+        record = self.register(process)
+        common = (
+            "--team", "replacement-team", "--category", "task",
+            "--instance", "backend--task--a1", "--expected-created-at",
+            str(record["createdAt"]), "--expect-token-stdin", "--report-leaderless",
+        )
+        token = str(record["launchToken"]) + "\n"
+        os.killpg(process.pid, signal.SIGTERM)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            # Deliberately do not poll() or wait(): on Darwin this exited
+            # session leader has no proc_pidinfo identity but still owns PGID.
+            pending = self.command("verify", *common, input_text=token)
+            if pending.returncode == 4:
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("unreaped Darwin leader never exposed leaderless group")
+        self.assertEqual("", pending.stdout)
+        self.assertEqual(1, len(self.record_paths()))
+        process.wait(timeout=5)
+        dead = self.command("verify", *common, input_text=token)
+        self.assertEqual(3, dead.returncode, dead.stderr)
+
+    def test_opt_in_leaderless_result_preserves_live_mismatch_failure(self) -> None:
+        process = self.spawn_session_leader()
+        record = self.register(process)
+        self.resign_record({"processIdentity": "forged-generation-identity"})
+        result = self.command(
+            "verify", "--team", "replacement-team", "--category", "task",
+            "--instance", "backend--task--a1", "--expected-created-at",
+            str(record["createdAt"]), "--expect-token-stdin",
+            "--report-leaderless", input_text=str(record["launchToken"]) + "\n",
+        )
+        self.assertEqual(1, result.returncode)
+        self.assertIn("process identity mismatch", result.stderr)
+        self.assertIsNone(process.poll())
+
+    def test_leaderless_reporting_requires_exact_generation_binding(self) -> None:
+        process = self.spawn_session_leader()
+        record = self.register(process)
+        common = (
+            "--team", "replacement-team", "--category", "task",
+            "--instance", "backend--task--a1", "--report-leaderless",
+        )
+        no_token = self.command(
+            "verify", *common, "--expected-created-at", str(record["createdAt"])
+        )
+        self.assertEqual(1, no_token.returncode)
+        self.assertIn("exact token and creation time", no_token.stderr)
+        no_created = self.command(
+            "verify", *common, "--expect-token-stdin",
+            input_text=str(record["launchToken"]) + "\n",
+        )
+        self.assertEqual(1, no_created.returncode)
+        self.assertIn("exact token and creation time", no_created.stderr)
+        self.assertIsNone(process.poll())
+
+    def test_persistent_leaderless_descendant_has_no_signal_authority(self) -> None:
+        process, child_pid = self.spawn_leader_with_surviving_child()
+        record = self.register(process)
+        os.kill(process.pid, signal.SIGTERM)
+        process.wait(timeout=5)
+        common = (
+            "--team", "replacement-team", "--category", "task",
+            "--instance", "backend--task--a1", "--expected-created-at",
+            str(record["createdAt"]), "--expect-token-stdin",
+        )
+        token = str(record["launchToken"]) + "\n"
+        pending = self.command(
+            "verify", *common, "--report-leaderless", input_text=token
+        )
+        self.assertEqual(4, pending.returncode, pending.stderr)
+        self.assertEqual("", pending.stdout)
+        rejected = self.command(
+            "signal", *common, "--signal", "KILL", input_text=token
+        )
+        self.assertEqual(1, rejected.returncode)
+        self.assertIn("protected leader identity changed", rejected.stderr)
+        os.kill(child_pid, 0)
+        self.assertEqual(1, len(self.record_paths()))
+
     def test_identity_mismatch_cannot_be_probed_scanned_or_replaced(self) -> None:
         original_process, child_pid = self.spawn_leader_with_surviving_child()
         original = self.register(original_process)

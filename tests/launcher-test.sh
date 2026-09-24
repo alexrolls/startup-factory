@@ -3853,6 +3853,165 @@ kill -KILL -- "-$STOP_TASK_LEADERLESS_PID" 2>/dev/null || true
 rm -f "$(record_for "$STOP_TASK_LEADERLESS_TEAM" "$STOP_TASK_LEADERLESS_INSTANCE")" \
   ".teamwork/$STOP_TASK_LEADERLESS_TEAM/pids/tasks/$STOP_TASK_LEADERLESS_INSTANCE.pid"
 
+# The leader is authenticated when stop sends TERM, then exits while a child
+# ignores TERM.  Reap the leader deliberately before stop's next observation:
+# the transient leaderless result must never authorize a follow-up SIGKILL.
+POST_TERM_LEADERLESS="$TMP/post-term-leaderless.py"
+cat > "$POST_TERM_LEADERLESS" <<'PY'
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+ready, term_seen, release = map(Path, sys.argv[1:])
+os.setsid()
+child_ready = Path(str(ready) + ".child")
+child = subprocess.Popen([
+    sys.executable, "-c",
+    "import pathlib,signal,sys,time; "
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    "pathlib.Path(sys.argv[1]).touch(); time.sleep(30)",
+    str(child_ready),
+])
+for _ in range(200):
+    if child_ready.exists():
+        break
+    time.sleep(0.01)
+else:
+    child.kill()
+    raise SystemExit("child did not install its TERM handler")
+
+def on_term(_signum, _frame):
+    term_seen.touch()
+    while not release.exists():
+        time.sleep(0.01)
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, on_term)
+ready.write_text(f"{os.getpid()} {child.pid}\n", encoding="ascii")
+while True:
+    signal.pause()
+PY
+POST_TERM_TEAM=post-term-leaderless
+POST_TERM_READY="$TMP/post-term-leaderless.ready"
+POST_TERM_SEEN="$TMP/post-term-leaderless.term"
+POST_TERM_RELEASE="$TMP/post-term-leaderless.release"
+python3 "$POST_TERM_LEADERLESS" "$POST_TERM_READY" "$POST_TERM_SEEN" "$POST_TERM_RELEASE" &
+POST_TERM_LEADER_PID=$!
+for _i in $(seq 1 200); do [ -s "$POST_TERM_READY" ] && break; sleep 0.02; done
+check "post-TERM leaderless fixture becomes ready" test -s "$POST_TERM_READY"
+read -r POST_TERM_LEADER_PID POST_TERM_CHILD_PID < "$POST_TERM_READY"
+register_lifecycle_process "$POST_TERM_TEAM" gate backend "$POST_TERM_LEADER_PID"
+mkdir -p ".teamwork/$POST_TERM_TEAM/pids"
+printf 'managed\n' > ".teamwork/$POST_TERM_TEAM/pids/backend.pid"
+"$LAUNCH" stop "$POST_TERM_TEAM" >"$TMP/post-term-leaderless-stop.out" 2>&1 &
+POST_TERM_STOP_PID=$!
+for _i in $(seq 1 200); do [ -e "$POST_TERM_SEEN" ] && break; sleep 0.02; done
+check "post-TERM leaderless fixture receives authenticated TERM" test -e "$POST_TERM_SEEN"
+touch "$POST_TERM_RELEASE"
+wait "$POST_TERM_LEADER_PID" 2>/dev/null || true
+if wait "$POST_TERM_STOP_PID"; then
+  echo "FAIL: stop accepted a persistent leaderless group"; FAILURES=$((FAILURES+1))
+elif grep -q 'identity mismatch persisted after leader exit' "$TMP/post-term-leaderless-stop.out"; then
+  echo "ok: post-TERM leaderless group fails without SIGKILL"
+else
+  echo "FAIL: post-TERM leaderless stop returned wrong error: $(cat "$TMP/post-term-leaderless-stop.out")"; FAILURES=$((FAILURES+1))
+fi
+check "post-TERM leaderless stop never SIGKILLs surviving child" \
+  kill -0 "$POST_TERM_CHILD_PID"
+check "post-TERM leaderless stop retains protected evidence" \
+  test "$(record_count "$POST_TERM_TEAM" backend)" -eq 1
+check "post-TERM leaderless stop retains workspace marker" \
+  test -e ".teamwork/$POST_TERM_TEAM/pids/backend.pid"
+kill -KILL -- "-$POST_TERM_LEADER_PID" 2>/dev/null || true
+rm -f "$(record_for "$POST_TERM_TEAM" backend)" \
+  ".teamwork/$POST_TERM_TEAM/pids/backend.pid"
+
+# Hold an exited leader as a zombie in an out-of-group controller.  Darwin's
+# proc_pidinfo cannot identify it while killpg still sees its PGID.  The stop
+# call must observe this read-only leaderless state, wait without signalling,
+# then retire the exact generation only after the controller reaps the leader.
+TRANSIENT_REAPER="$TMP/transient-leader-reaper.py"
+cat > "$TRANSIENT_REAPER" <<'PY'
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+ready, term_seen, release = map(Path, sys.argv[1:])
+leader = os.fork()
+if leader == 0:
+    os.setsid()
+    def on_term(_signum, _frame):
+        term_seen.touch()
+        os._exit(0)
+    signal.signal(signal.SIGTERM, on_term)
+    ready.write_text(str(os.getpid()) + "\n", encoding="ascii")
+    while True:
+        signal.pause()
+
+deadline = time.monotonic() + 15
+while not release.exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+if not release.exists():
+    try:
+        os.killpg(leader, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+os.waitpid(leader, 0)
+PY
+TRANSIENT_TEAM=transient-leaderless-stop
+TRANSIENT_READY="$TMP/transient-leaderless.ready"
+TRANSIENT_TERM="$TMP/transient-leaderless.term"
+TRANSIENT_RELEASE="$TMP/transient-leaderless.release"
+python3 "$TRANSIENT_REAPER" "$TRANSIENT_READY" "$TRANSIENT_TERM" "$TRANSIENT_RELEASE" &
+TRANSIENT_CONTROLLER_PID=$!
+for _i in $(seq 1 200); do [ -s "$TRANSIENT_READY" ] && break; sleep 0.02; done
+check "transient leaderless fixture becomes ready" test -s "$TRANSIENT_READY"
+TRANSIENT_LEADER_PID="$(cat "$TRANSIENT_READY")"
+register_lifecycle_process "$TRANSIENT_TEAM" gate backend "$TRANSIENT_LEADER_PID"
+TRANSIENT_RECORD="$(record_for "$TRANSIENT_TEAM" backend)"
+TRANSIENT_CREATED="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["createdAt"])' "$TRANSIENT_RECORD")"
+TRANSIENT_TOKEN="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["launchToken"])' "$TRANSIENT_RECORD")"
+mkdir -p ".teamwork/$TRANSIENT_TEAM/pids"
+printf 'managed\n' > ".teamwork/$TRANSIENT_TEAM/pids/backend.pid"
+"$LAUNCH" stop "$TRANSIENT_TEAM" >"$TMP/transient-leaderless-stop.out" 2>&1 &
+TRANSIENT_STOP_PID=$!
+for _i in $(seq 1 200); do [ -e "$TRANSIENT_TERM" ] && break; sleep 0.02; done
+check "transient leaderless fixture receives authenticated TERM" test -e "$TRANSIENT_TERM"
+if [ "$(uname -s)" = Darwin ]; then
+  TRANSIENT_VERIFY_RC=0
+  for _i in $(seq 1 20); do
+    if printf '%s\n' "$TRANSIENT_TOKEN" | python3 .claude/skills/pm/bin/process-lifecycle.py verify \
+        --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$TRANSIENT_TEAM" \
+        --category gate --instance backend --expected-created-at "$TRANSIENT_CREATED" \
+        --expect-token-stdin --report-leaderless >/dev/null 2>&1; then
+      TRANSIENT_VERIFY_RC=0
+    else
+      TRANSIENT_VERIFY_RC=$?
+    fi
+    [ "$TRANSIENT_VERIFY_RC" -eq 4 ] && break
+    sleep 0.01
+  done
+  check "unreaped Darwin leader has read-only leaderless result" \
+    test "$TRANSIENT_VERIFY_RC" -eq 4
+fi
+sleep 0.1
+touch "$TRANSIENT_RELEASE"
+wait "$TRANSIENT_CONTROLLER_PID"
+if wait "$TRANSIENT_STOP_PID"; then
+  echo "ok: transient leaderless stop converges after exact reap"
+else
+  echo "FAIL: transient leaderless stop did not converge: $(cat "$TMP/transient-leaderless-stop.out")"; FAILURES=$((FAILURES+1))
+fi
+check "transient leaderless stop retires exact lifecycle evidence" \
+  test "$(record_count "$TRANSIENT_TEAM" backend)" -eq 0
+check "transient leaderless stop removes only its marker" \
+  test ! -e ".teamwork/$TRANSIENT_TEAM/pids/backend.pid"
+
 # Refuse the whole task stop before signalling if any matching protected
 # identity has changed, so one forged record cannot produce a partial stop.
 STOP_TASK_BAD_TEAM=stop-task-identity
