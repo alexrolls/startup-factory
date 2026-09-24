@@ -168,25 +168,76 @@ def publish_ready(
         "socketDevice": endpoint_identity[0],
         "socketInode": endpoint_identity[1],
     }
-    descriptor = os.open(
-        path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
+    # Build the receipt under a private sibling name, then publish it with one
+    # atomic rename.  Creating the final path before writing lets a polling
+    # launcher observe an empty or partial JSON document and reject an
+    # otherwise healthy supervisor under scheduler or I/O pressure.
+    pending_name = ".%s.pending" % path.name
+    directory = -1
+    descriptor = -1
+    pending_created = False
     try:
+        # Pin the verified directory before publication.  The launcher owns
+        # the one-shot receipt and may unlink it and rmdir its barrier as soon
+        # as the rename becomes visible; the held descriptor keeps the final
+        # durability fsync valid across that retirement.
+        directory = os.open(
+            parent,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(directory)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o700
+        ):
+            raise SupervisorError(
+                "protected supervisor-ready directory changed while being opened"
+            )
+        descriptor = os.open(
+            pending_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory,
+        )
+        pending_created = True
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = -1
             handle.write(canonical(value) + b"\n")
             handle.flush()
             os.fsync(handle.fileno())
+        try:
+            os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise SupervisorError("protected supervisor-ready receipt already exists")
+        os.replace(
+            pending_name,
+            path.name,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        pending_created = False
+        os.fsync(directory)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    directory = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+        if directory >= 0 and pending_created:
+            try:
+                os.unlink(pending_name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+        if directory >= 0:
+            os.close(directory)
 
 
 def receive_exact(connection: socket.socket, size: int, deadline: float) -> bytes:
@@ -244,6 +295,105 @@ def process_start_identity(pid: int) -> str:
             info.pbi_pid,
         )
     raise SupervisorError("publication transport is unsupported on this platform")
+
+
+_WORKER_EXEC_GATE = r"""
+import os
+import signal
+import sys
+
+gate_fd = int(sys.argv[1])
+status_fd = int(sys.argv[2])
+command = sys.argv[3:]
+try:
+    if os.read(gate_fd, 1) != b"1":
+        raise OSError("worker exec gate was not released")
+    os.close(gate_fd)
+    # Successful exec closes this descriptor and gives the supervisor an EOF.
+    # A failed exec writes one opaque byte instead; command details stay local.
+    os.set_inheritable(status_fd, False)
+    # Match subprocess.Popen(restore_signals=True).  Python ignores these
+    # signals while its runtime is active; the final non-Python worker must not
+    # inherit that interpreter-specific disposition through this exec gate.
+    for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+        number = getattr(signal, name, None)
+        if number is not None:
+            signal.signal(number, signal.SIG_DFL)
+    os.execvpe(command[0], command, os.environ)
+except BaseException:
+    try:
+        os.write(status_fd, b"1")
+    finally:
+        os._exit(127)
+"""
+
+
+def spawn_identified_worker(
+    command: list[str],
+) -> tuple[subprocess.Popen[bytes], ProcessIdentity]:
+    """Start one worker without racing its process-generation lookup.
+
+    The trusted Python gate has the same PID and process start identity as the
+    eventual worker after exec.  Holding it until that identity is captured
+    keeps even an immediate-exit command from disappearing first.  The second
+    pipe preserves Popen's exec-success boundary before a ready receipt can be
+    published.
+    """
+    if not command:
+        raise SupervisorError("publication supervisor command is absent")
+    gate_read, gate_write = os.pipe()
+    try:
+        status_read, status_write = os.pipe()
+    except BaseException:
+        os.close(gate_read)
+        os.close(gate_write)
+        raise
+    child: subprocess.Popen[bytes] | None = None
+    try:
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                _WORKER_EXEC_GATE,
+                str(gate_read),
+                str(status_write),
+                *command,
+            ],
+            close_fds=True,
+            pass_fds=(gate_read, status_write),
+        )
+    except BaseException:
+        os.close(gate_write)
+        os.close(status_read)
+        raise
+    finally:
+        os.close(gate_read)
+        os.close(status_write)
+    try:
+        identity = ProcessIdentity(child.pid, process_start_identity(child.pid))
+        if os.write(gate_write, b"1") != 1:
+            raise SupervisorError("worker exec gate could not be released")
+        os.close(gate_write)
+        gate_write = -1
+        if os.read(status_read, 1):
+            child.wait(timeout=2)
+            raise SupervisorError("worker command could not be executed")
+        return child, identity
+    except BaseException:
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+        raise
+    finally:
+        if gate_write >= 0:
+            os.close(gate_write)
+        os.close(status_read)
 
 
 def parent_pid(pid: int) -> int:
@@ -640,10 +790,7 @@ def run_supervisor(args: argparse.Namespace) -> int:
         endpoint_identity = (endpoint.st_dev, endpoint.st_ino)
         listener.listen(16)
         listener.settimeout(POLL_SECONDS)
-        child = subprocess.Popen(args.command, close_fds=True)
-        child_identity = ProcessIdentity(
-            child.pid, process_start_identity(child.pid)
-        )
+        child, child_identity = spawn_identified_worker(args.command)
         publish_ready(
             args.ready_file,
             args.lifecycle_root,
@@ -681,7 +828,7 @@ def run_supervisor(args: argparse.Namespace) -> int:
             current = locator.lstat()
         except FileNotFoundError:
             pass
-        except OSError as exc:
+        except OSError:
             cleanup_error = SupervisorError(
                 "publication transport endpoint cannot be inspected"
             )

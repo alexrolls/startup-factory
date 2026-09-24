@@ -65,6 +65,7 @@ for required_file in \
   bin/heartbeat-status.py \
   bin/integration_pack.py \
   bin/lineage-migration.py \
+  bin/launch-lane-lock.py \
   bin/launch-team.sh \
   bin/outbox_capability.py \
   bin/process-lifecycle.py \
@@ -73,6 +74,7 @@ for required_file in \
   bin/pm-agent.py \
   bin/policy-check.py \
   bin/release-feature.py \
+  bin/release-worker.py \
   bin/recovery_validation.py \
   bin/retrospective.py \
   bin/runtime-state.py \
@@ -105,6 +107,9 @@ for required_file in \
   src/startup_factory_cli/secret_safety.py \
   tests/claim-lineage-runtime-test.py \
   tests/lineage-migration-test.py \
+  tests/launch-lane-lock-test.py \
+  tests/release-worker-test.py \
+  tests/run-all.sh \
   teams/_PLAYBOOK.md
 do
   printf 'fixture:%s\n' "$required_file" > "$UPSTREAM/$required_file"
@@ -115,10 +120,14 @@ cp "$ROOT/src/startup_factory_cli/config_values.py" \
 chmod 755 \
   "$UPSTREAM/bin/config-value.py" \
   "$UPSTREAM/bin/lineage-migration.py" \
+  "$UPSTREAM/bin/launch-lane-lock.py" \
+  "$UPSTREAM/bin/release-worker.py" \
   "$UPSTREAM/bin/team-context.py" \
   "$UPSTREAM/bin/worker-control.py" \
   "$UPSTREAM/tests/claim-lineage-runtime-test.py" \
-  "$UPSTREAM/tests/lineage-migration-test.py"
+  "$UPSTREAM/tests/lineage-migration-test.py" \
+  "$UPSTREAM/tests/launch-lane-lock-test.py" \
+  "$UPSTREAM/tests/run-all.sh"
 printf 'fixture\n' > "$UPSTREAM/tests/.fixture"
 
 CONFIG_FILES=(
@@ -621,12 +630,17 @@ done
 for required_release_file in \
   SECURITY.md \
   bin/publication-supervisor.py \
+  bin/release-worker.py \
+  bin/launch-lane-lock.py \
   bin/lineage-migration.py \
   bin/outbox_capability.py \
   bin/team-context.py \
   bin/worker-control.py \
   tests/claim-lineage-runtime-test.py \
-  tests/lineage-migration-test.py
+  tests/lineage-migration-test.py \
+  tests/launch-lane-lock-test.py \
+  tests/release-worker-test.py \
+  tests/run-all.sh
 do
   release_name="${required_release_file##*/}"
   release_stem="${release_name%.*}"

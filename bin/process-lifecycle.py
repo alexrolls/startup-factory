@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import errno
+import fcntl
 import hashlib
 import hmac
 import json
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -51,6 +53,7 @@ RECORD_KEYS_V2 = RECORD_KEYS_V1 | {
     "tmuxPanePid",
 }
 RECORD_KEYS_V3 = RECORD_KEYS_V2 | {"repositoryId"}
+COMPLETED_BACKGROUND_KIND = "completed-background"
 
 
 class LifecycleError(RuntimeError):
@@ -59,6 +62,18 @@ class LifecycleError(RuntimeError):
 
 def fail(message: str) -> None:
     raise LifecycleError(message)
+
+
+def write_all(descriptor: int, data: bytes, label: str) -> None:
+    offset = 0
+    while offset < len(data):
+        try:
+            written = os.write(descriptor, data[offset:])
+        except InterruptedError:
+            continue
+        if written <= 0:
+            fail(f"{label} write made no progress")
+        offset += written
 
 
 def canonical(payload: dict[str, Any]) -> bytes:
@@ -178,35 +193,85 @@ def read_secure(path: Path, *, expected_mode: int, maximum: int) -> bytes:
 def initialize(raw_root: str, repository: str) -> tuple[Path, Path, bytes]:
     root = validate_root(raw_root, repository)
     records = root / "records"
-    if not records.exists():
-        try:
-            records.mkdir(mode=0o700)
-        except OSError as exc:
-            fail(f"cannot create protected lifecycle records directory: {exc}")
+    try:
+        records.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        fail(f"cannot create protected lifecycle records directory: {exc}")
     validate_directory_component(records, leaf=True)
 
     key_path = root / "record-auth.key"
     if not key_path.exists():
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        temporary_path: Path | None = None
         try:
-            descriptor = os.open(key_path, flags, 0o600)
-        except FileExistsError:
-            pass
-        except OSError as exc:
-            fail(f"cannot create lifecycle authentication key: {exc}")
-        else:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".record-auth-", dir=root
+            )
+            temporary_path = Path(temporary_name)
             try:
                 key = secrets.token_bytes(32)
-                os.write(descriptor, key)
+                write_all(descriptor, key, "lifecycle authentication key")
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
+            try:
+                os.link(temporary_path, key_path, follow_symlinks=False)
+            except FileExistsError:
+                pass
+            else:
+                flags = os.O_RDONLY
+                if hasattr(os, "O_DIRECTORY"):
+                    flags |= os.O_DIRECTORY
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                directory = os.open(root, flags)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+        except OSError as exc:
+            fail(f"cannot create lifecycle authentication key: {exc}")
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
     key = read_secure(key_path, expected_mode=0o600, maximum=32)
     if len(key) != 32:
         fail("lifecycle authentication key must contain exactly 32 bytes")
     return root, records, key
+
+
+@contextmanager
+def lifecycle_lock(root: Path):
+    path = root / "records.lock"
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        fail(f"cannot open lifecycle authority lock: {exc}")
+    try:
+        opened = os.fstat(descriptor)
+        named = path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(named.st_mode)
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+            or opened.st_uid not in {0, os.geteuid()}
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_nlink != 1
+        ):
+            fail("lifecycle authority lock has unsafe identity or permissions")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    except OSError as exc:
+        fail(f"cannot hold lifecycle authority lock: {exc}")
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def project_identity(repository_raw: str) -> str:
@@ -313,7 +378,7 @@ def validate_record(record: dict[str, Any], path: Path, records: Path) -> None:
         validate_identifier(label, value)
     if record["category"] not in {"gate", "task", "release"}:
         fail(f"lifecycle record has an invalid category: {path}")
-    if record["kind"] not in {"background", "tmux"}:
+    if record["kind"] not in {"background", "tmux", COMPLETED_BACKGROUND_KIND}:
         fail(f"lifecycle record has an invalid process kind: {path}")
     if not isinstance(record["pid"], int) or isinstance(record["pid"], bool) or record["pid"] <= 1:
         fail(f"lifecycle record has an unsafe PID: {path}")
@@ -482,7 +547,11 @@ def group_exists(process_group_id: int) -> bool:
 
 def leader_matches_group(record: dict[str, Any], identity: str | None) -> bool:
     if identity is None:
-        return True
+        # A numeric PGID/SID can be reused after the original leader has been
+        # reaped.  Without the authenticated leader identity there is no safe
+        # way to distinguish surviving descendants from an unrelated later
+        # leaderless group, so process-group authority must fail closed.
+        return False
     if not hmac.compare_digest(identity, record["processIdentity"]):
         return False
     try:
@@ -491,16 +560,28 @@ def leader_matches_group(record: dict[str, Any], identity: str | None) -> bool:
             and os.getsid(record["pid"]) == record["sessionId"]
         )
     except ProcessLookupError:
-        # The leader exited between its start-identity and group checks.  The
-        # dedicated group remains authoritative while any child still exists.
-        return True
+        # The leader exited between the identity and group checks.  Do not
+        # authorize a PGID-only fallback across that race.
+        return False
     except OSError as exc:
         fail(f"cannot verify protected process-group leader: {exc}")
 
 
 def record_state(record: dict[str, Any]) -> str:
+    if record["kind"] == COMPLETED_BACKGROUND_KIND:
+        return "dead"
     current = process_identity(record["pid"])
     if record["schemaVersion"] in {2, 3}:
+        if current is None:
+            # A vanished leader plus a vanished group is an ordinary completed
+            # generation.  A vanished leader plus an extant numeric group is
+            # ambiguous: it may be an original descendant or a later reused
+            # PGID, and therefore has no signalling authority.
+            return (
+                "identity-mismatch"
+                if group_exists(record["processGroupId"])
+                else "dead"
+            )
         if not leader_matches_group(record, current):
             return "identity-mismatch"
         return "live" if group_exists(record["processGroupId"]) else "dead"
@@ -524,7 +605,7 @@ def atomic_write(path: Path, record: dict[str, Any]) -> None:
     try:
         descriptor, temporary = tempfile.mkstemp(prefix=".record-", dir=path.parent)
         os.fchmod(descriptor, 0o600)
-        os.write(descriptor, data)
+        write_all(descriptor, data, "lifecycle record")
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = -1
@@ -631,9 +712,9 @@ def safe_signal_group(record: dict[str, Any], signal_number: int) -> None:
     if process_group_id != record["pid"] or session_id != record["pid"]:
         fail("refusing non-dedicated process-group authority")
 
-    # A process group belongs to exactly one session for its entire lifetime.
-    # Binding a newly created group and session to the authenticated leader PID
-    # therefore continues to identify descendants after the leader exits.
+    # A live leader with its authenticated start identity binds the dedicated
+    # process group and session.  Once that identity is unavailable, numeric
+    # PGID/SID values alone are not authority because the kernel may reuse them.
     current = process_identity(record["pid"])
     if not leader_matches_group(record, current):
         fail("refusing to signal process group: protected leader identity changed")
@@ -681,6 +762,14 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_register(args: argparse.Namespace) -> int:
+    if args.launch_token_stdin:
+        if args.kind != "tmux":
+            fail("pre-issued launch tokens are supported only for tmux registration")
+        launch_token = sys.stdin.readline().strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", launch_token):
+            fail("pre-issued tmux launch token on stdin is malformed")
+    else:
+        launch_token = secrets.token_hex(32)
     _, records, key, repository_id = base_context(args)
     validate_identifier("team", args.team)
     validate_identifier("instance", args.instance)
@@ -705,9 +794,15 @@ def cmd_register(args: argparse.Namespace) -> int:
         )
     if existing_records:
         existing_path, existing = existing_records[0]
-        if record_state(existing) == "live":
+        existing_state = record_state(existing)
+        if existing_state == "live":
             fail(
                 f"refusing to replace a live lifecycle record for {args.team}/{args.instance}"
+            )
+        if existing_state == "identity-mismatch":
+            fail(
+                f"refusing to replace {args.team}/{args.instance}: "
+                "process identity mismatch"
             )
         if existing_path != path:
             fail(
@@ -757,7 +852,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         "kind": args.kind,
         "pid": args.pid,
         "processIdentity": identity,
-        "launchToken": secrets.token_hex(32),
+        "launchToken": launch_token,
         "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "tmuxSession": args.tmux_session,
         "tmuxWindow": args.tmux_window,
@@ -781,9 +876,98 @@ def cmd_probe(args: argparse.Namespace) -> int:
         return NOT_LIVE
     _, record = found
     enforce_expected_generation(record, args)
-    if record_state(record) != "live":
+    state = record_state(record)
+    if state == "dead":
         return NOT_LIVE
+    if state == "identity-mismatch":
+        fail(
+            f"refusing lifecycle probe for {args.team}/{args.instance}: "
+            "process identity mismatch"
+        )
     print(json.dumps(record, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+def cmd_inspect(args: argparse.Namespace) -> int:
+    """Return one repository-bound release record without liveness filtering."""
+    _, records, key, repository_id = base_context(args)
+    found = find_record(
+        records, key, repository_id, args.team, args.category, args.instance
+    )
+    if found is None:
+        return NOT_LIVE
+    _, record = found
+    if record["schemaVersion"] != 3 or not hmac.compare_digest(
+        record["repositoryId"], repository_id
+    ):
+        fail("release inspection requires a repository-bound lifecycle record")
+    if record["category"] != "release":
+        fail("protected lifecycle inspection is restricted to release generations")
+    if record["kind"] not in {"background", COMPLETED_BACKGROUND_KIND}:
+        fail("protected release inspection requires a background lifecycle generation")
+    # Unlike list/project-list this command intentionally returns the signed
+    # launchToken.  Access is therefore limited to the protected exact-record
+    # path and remains serialized by main()'s lifecycle authority lock.
+    print(json.dumps(record, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+def cmd_complete(args: argparse.Namespace) -> int:
+    _, records, key, repository_id = base_context(args)
+    found = find_record(
+        records, key, repository_id, args.team, args.category, args.instance
+    )
+    if found is None:
+        return NOT_LIVE
+    path, record = found
+    enforce_expected_generation(record, args)
+    if record["kind"] == COMPLETED_BACKGROUND_KIND:
+        return 0
+    if record["kind"] != "background":
+        fail("only a background lifecycle generation can be completed")
+    current = process_identity(record["pid"])
+    if current is not None and hmac.compare_digest(current, record["processIdentity"]):
+        fail("refusing to complete a live lifecycle generation")
+    if group_exists(record["processGroupId"]):
+        # The authenticated leader may have exited while a descendant remains,
+        # or the numeric PGID may already belong to an unrelated later group.
+        # Neither case may be converted into apparently completed evidence.
+        fail("refusing to complete a lifecycle generation while its process group exists")
+    payload = dict(record)
+    del payload["auth"]
+    payload["kind"] = COMPLETED_BACKGROUND_KIND
+    atomic_write(path, signed(payload, key))
+    return 0
+
+
+def cmd_terminate(args: argparse.Namespace) -> int:
+    """Atomically terminate one exact release generation and retire its authority."""
+    _, records, key, repository_id = base_context(args)
+    found = find_record(
+        records, key, repository_id, args.team, args.category, args.instance
+    )
+    if found is None:
+        # Absence is not idempotent success: without the authenticated tombstone
+        # there is no evidence that this exact generation was terminated.
+        return NOT_LIVE
+    path, record = found
+    enforce_expected_generation(record, args)
+    if record["category"] != "release":
+        fail("atomic lifecycle termination is restricted to release generations")
+    if record["kind"] == COMPLETED_BACKGROUND_KIND:
+        return 0
+    if record["kind"] != "background":
+        fail("atomic release termination requires a background lifecycle generation")
+
+    # main() holds records.lock across both operations.  safe_signal_group()
+    # performs the two live-leader/dedicated-group checks immediately before
+    # SIGKILL; any verification or signalling failure leaves the signed record
+    # unchanged.  Only a successfully delivered SIGKILL retires signal authority.
+    safe_signal_group(record, signal.SIGKILL)
+    payload = dict(record)
+    del payload["auth"]
+    payload["kind"] = COMPLETED_BACKGROUND_KIND
+    atomic_write(path, signed(payload, key))
     return 0
 
 
@@ -840,6 +1024,7 @@ def cmd_project_list(args: argparse.Namespace) -> int:
 def cmd_any_live(args: argparse.Namespace) -> int:
     _, records, key, repository_id = base_context(args)
     needle = f"--{args.task_key}--a" if args.task_key else None
+    found_live = False
     for _, record in all_records(records, key):
         if record["team"] != args.team or record["category"] != args.category:
             continue
@@ -847,9 +1032,15 @@ def cmd_any_live(args: argparse.Namespace) -> int:
             continue
         if needle is not None and needle not in record["instance"]:
             continue
-        if record_state(record) == "live":
-            return 0
-    return NOT_LIVE
+        state = record_state(record)
+        if state == "identity-mismatch":
+            fail(
+                f"refusing lifecycle scan for {args.team}/{record['instance']}: "
+                "process identity mismatch"
+            )
+        if state == "live":
+            found_live = True
+    return 0 if found_live else NOT_LIVE
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -933,6 +1124,7 @@ def parser() -> argparse.ArgumentParser:
     register.add_argument("--tmux-window")
     register.add_argument("--tmux-pane")
     register.add_argument("--tmux-pane-pid", type=int)
+    register.add_argument("--launch-token-stdin", action="store_true")
     register.set_defaults(handler=cmd_register)
 
     for name, handler in (("probe", cmd_probe), ("verify", cmd_verify)):
@@ -941,7 +1133,30 @@ def parser() -> argparse.ArgumentParser:
         child.add_argument("--category", required=True, choices=("gate", "task", "release"))
         child.add_argument("--instance", required=True)
         child.add_argument("--expect-token-stdin", action="store_true")
+        child.add_argument("--expected-created-at")
         child.set_defaults(handler=handler)
+
+    inspect = common("inspect")
+    inspect.add_argument("--team", required=True)
+    inspect.add_argument("--category", required=True, choices=("release",))
+    inspect.add_argument("--instance", required=True)
+    inspect.set_defaults(handler=cmd_inspect)
+
+    complete = common("complete")
+    complete.add_argument("--team", required=True)
+    complete.add_argument("--category", required=True, choices=("gate", "task", "release"))
+    complete.add_argument("--instance", required=True)
+    complete.add_argument("--expect-token-stdin", action="store_true")
+    complete.add_argument("--expected-created-at")
+    complete.set_defaults(handler=cmd_complete)
+
+    terminate = common("terminate")
+    terminate.add_argument("--team", required=True)
+    terminate.add_argument("--category", required=True, choices=("release",))
+    terminate.add_argument("--instance", required=True)
+    terminate.add_argument("--expect-token-stdin", action="store_true", required=True)
+    terminate.add_argument("--expected-created-at", required=True)
+    terminate.set_defaults(handler=cmd_terminate)
 
     listing = common("list")
     listing.add_argument("--team", required=True)
@@ -960,6 +1175,7 @@ def parser() -> argparse.ArgumentParser:
     signalling.add_argument("--category", required=True, choices=("gate", "task", "release"))
     signalling.add_argument("--instance", required=True)
     signalling.add_argument("--expect-token-stdin", action="store_true")
+    signalling.add_argument("--expected-created-at")
     signalling.add_argument(
         "--signal", dest="signal_name", choices=("TERM", "KILL"), default="TERM"
     )
@@ -979,7 +1195,9 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
-        return int(args.handler(args))
+        root, _, _ = initialize(args.root, args.repo)
+        with lifecycle_lock(root):
+            return int(args.handler(args))
     except LifecycleError as exc:
         print(f"process-lifecycle: {exc}", file=sys.stderr)
         return 1

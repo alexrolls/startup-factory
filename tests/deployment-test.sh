@@ -225,6 +225,7 @@ trusted={name:digest(pathlib.Path(root)/rel) for name,rel in {
   "project-management.config.md":"config/project-management.config.md",
   "automation.config.json":"config/automation.config.json",
   "teamwork-path.py":"bin/teamwork-path.py",
+  "launch-lane-lock.py":"bin/launch-lane-lock.py",
   "review_evidence.py":"bin/review_evidence.py",
 }.items()}
 json.dump({
@@ -471,6 +472,36 @@ PY
   rm -f "$snapshot"
 }
 
+complete_prepared_integration() {
+  local repo="$1" team="$2" fid="$3" tid="$4" key="$5"
+  local preparation="$repo/.teamwork/$team/integrations/.prepared/$key.json"
+  local attempt output="$TMP/$key-integration-attempt.out"
+  # Authorization is a five-minute reach-commit lease. A suspended or heavily
+  # contended fixture may safely cross that boundary, so retry that exact
+  # fail-closed result once with fresh broker evidence.
+  for attempt in 1 2; do
+    (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
+      "$RUNTIME_SKILL/bin/finalize-integrations.sh" --authorize-prepared "$team" "$fid" \
+      "$preparation" >/dev/null)
+    if (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
+      "$RUNTIME_SKILL/bin/integrate-task.sh" "$team" "$fid" "$tid" backend 1 \
+      >/dev/null 2>"$output"); then
+      cat "$output" >&2
+      rm -f "$output"
+      return 0
+    fi
+    if [ "$attempt" -eq 1 ] && \
+      grep -Fq 'integrate-task: broker authorization expired before commit; merge safely aborted for fresh authorization' \
+        "$output"; then
+      echo "deployment fixture: integration authorization expired; retrying with fresh authorization" >&2
+      continue
+    fi
+    cat "$output" >&2
+    rm -f "$output"
+    return 1
+  done
+}
+
 make_fixture() {
   local repo="$1" team="$2"
   mkdir -p "$repo"
@@ -595,11 +626,7 @@ PY
     "$RUNTIME_SKILL/bin/tracker-ops.sh" export "$fid" "$snapshot" >/dev/null)
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$RUNTIME_SKILL/bin/integrate-task.sh" "$team" "$fid" "$tid" backend 1 >/dev/null)
-  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/finalize-integrations.sh" --authorize-prepared "$team" "$fid" \
-    "$repo/.teamwork/$team/integrations/.prepared/$key.json" >/dev/null)
-  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/integrate-task.sh" "$team" "$fid" "$tid" backend 1 >/dev/null)
+  complete_prepared_integration "$repo" "$team" "$fid" "$tid" "$key"
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$RUNTIME_SKILL/bin/finalize-integrations.sh" "$team" "$fid" >/dev/null)
 }
@@ -722,11 +749,7 @@ PY
     "$RUNTIME_SKILL/bin/tracker-ops.sh" export "$fid" "$snapshot" >/dev/null)
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$RUNTIME_SKILL/bin/integrate-task.sh" "$team" "$fid" "$tid" backend 1 >/dev/null)
-  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/finalize-integrations.sh" --authorize-prepared "$team" "$fid" \
-    "$repo/.teamwork/$team/integrations/.prepared/$key.json" >/dev/null)
-  (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
-    "$RUNTIME_SKILL/bin/integrate-task.sh" "$team" "$fid" "$tid" backend 1 >/dev/null)
+  complete_prepared_integration "$repo" "$team" "$fid" "$tid" "$key"
   (cd "$repo" && env TRACKER_ADAPTER=Markdown TRACKER_PROJECT_ROOT="$repo" \
     "$RUNTIME_SKILL/bin/finalize-integrations.sh" "$team" "$fid" >/dev/null)
 }

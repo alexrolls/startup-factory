@@ -248,6 +248,7 @@ setting `enabled`):
     "task_metadata.py": "sha256:<64 lowercase hex>",
     "product_acceptance.py": "sha256:<64 lowercase hex>",
     "teamwork-path.py": "sha256:<64 lowercase hex>",
+    "launch-lane-lock.py": "sha256:<64 lowercase hex>",
     "review_evidence.py": "sha256:<64 lowercase hex>",
     "statuses.config.json": "sha256:<64 lowercase hex>",
     "guardrails.config.json": "sha256:<64 lowercase hex>",

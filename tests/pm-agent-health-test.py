@@ -648,6 +648,7 @@ class HealthPublisherTest(unittest.TestCase):
             required = (
                 "release-worker.py",
                 "process-lifecycle.py",
+                "launch-lane-lock.py",
                 "agent-health.py",
                 "heartbeat-status.py",
                 "teamwork-path.py",
@@ -689,6 +690,7 @@ class HealthPublisherTest(unittest.TestCase):
                 "pm-agent.py",
                 "release-worker.py",
                 "process-lifecycle.py",
+                "launch-lane-lock.py",
                 "agent-health.py",
                 "board-status.py",
                 "heartbeat-status.py",

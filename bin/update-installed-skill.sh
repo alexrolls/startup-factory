@@ -714,6 +714,7 @@ for required_file in \
   bin/heartbeat-status.py \
   bin/integration_pack.py \
   bin/lineage-migration.py \
+  bin/launch-lane-lock.py \
   bin/launch-team.sh \
   bin/outbox_capability.py \
   bin/process-lifecycle.py \
@@ -722,6 +723,7 @@ for required_file in \
   bin/pm-agent.py \
   bin/policy-check.py \
   bin/release-feature.py \
+  bin/release-worker.py \
   bin/recovery_validation.py \
   bin/retrospective.py \
   bin/runtime-state.py \
@@ -762,6 +764,9 @@ for required_file in \
   src/startup_factory_cli/secret_safety.py \
   tests/claim-lineage-runtime-test.py \
   tests/lineage-migration-test.py \
+  tests/launch-lane-lock-test.py \
+  tests/release-worker-test.py \
+  tests/run-all.sh \
   teams/_PLAYBOOK.md
 do
   [ -f "$checkout/$required_file" ] && [ ! -L "$checkout/$required_file" ] || \

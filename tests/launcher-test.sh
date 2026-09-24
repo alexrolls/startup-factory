@@ -116,11 +116,181 @@ check "managed tmux launch pins the verified authority interpreter" \
   grep -Fq 'printf -v quoted_python '\''%q'\'' "$AUTHORITY_PYTHON"' "$LAUNCH"
 check "managed tmux wrapper isolates the pinned interpreter" \
   grep -Fq 'shell_cmd="exec $quoted_python -I -B $quoted_wrapper' "$LAUNCH"
+check "tmux ready-failure cleanup carries its exact lifecycle generation and token" \
+  python3 - "$LAUNCH" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+tmux = source.split("spawn_managed_tmux()", 1)[1].split(
+    "lifecycle_wait_and_retire()", 1
+)[0]
+assert 'launch_token="$(python3 -c' in tmux
+assert tmux.index('launch_token="$(python3 -c') < tmux.index('pane_info="$(tmux_cmd new-window')
+assert 'shell_cmd=": sfgen-$generation_tag; $shell_cmd"' in tmux
+assert tmux.index('shell_cmd=": sfgen-$generation_tag; $shell_cmd"') < tmux.index('pane_info="$(tmux_cmd new-window')
+assert tmux.index('pane_info="$(tmux_cmd new-window') < tmux.index('lifecycle_register "$team"')
+assert '"$pane_pid" "$launch_token"' in tmux
+assert tmux.count('tmux_cmd set-option') == 0
+assert re.search(
+    r'lifecycle_stop_instance\s+\\?\s*\n?\s*"\$team" "\$category" "\$instance"\s+\\?\s*\n?\s*'
+    r'"\$LAST_LAUNCH_CREATED_AT" "\$LAST_LAUNCH_TOKEN"',
+    tmux,
+)
+stop = source.split("lifecycle_stop_instance()", 1)[1].split(
+    "prepare_execution()", 1
+)[0]
+assert 'expected_created="$4"' in stop
+assert '--expected-created-at "$expected_created"' in stop
+assert 'verify_args+=(--expect-token-stdin)' in stop
+PY
 if grep -Eq 'quoted_python=.*command -v python3' "$LAUNCH"; then
   echo "FAIL: managed tmux launch resolves ambient python3"; FAILURES=$((FAILURES+1))
 else
   echo "ok: managed tmux launch never resolves ambient python3"
 fi
+TMUX_RETIRE_FUNCTION="$(python3 - "$LAUNCH" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+tag_start = source.index("tmux_generation_tag() {")
+tag_end = source.index("\nacquire_launch_lane_lock() {", tag_start)
+start = source.index("lifecycle_retire_tmux_pane() {")
+end = source.index("\nlifecycle_stop_instance() {", start)
+function = source[start:end]
+assert function.count("tmux_cmd ") == 1
+assert "tmux_cmd if-shell -F" in function
+assert "display-message" not in function
+assert "#{pane_start_command}" in function
+assert '"$launch_token"' in function
+print(source[tag_start:tag_end] + "\n" + function)
+PY
+)"
+TMUX_RESTART_WITNESS="$TMP/tmux-restarted-server-wrong-pane"
+if bash -c '
+set -eu
+eval "$1"
+witness="$2"
+calls=0
+tmux_cmd() {
+  calls=$((calls + 1))
+  case "$1" in
+    if-shell)
+      # The old server accepted this one request and then disappeared.  A safe
+      # client never reconnects to apply the pane id to the successor server.
+      return 1
+      ;;
+    display-message)
+      printf "%s\n" "4242|team-race|worker|%1|0"
+      ;;
+    kill-pane)
+      : > "$witness"
+      ;;
+  esac
+}
+lifecycle_retire_tmux_pane 4242 team-race worker %1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+[ "$calls" -eq 1 ]
+[ ! -e "$witness" ]
+' _ "$TMUX_RETIRE_FUNCTION" "$TMUX_RESTART_WITNESS"; then
+  echo "ok: tmux pane retirement cannot cross a server-restart command boundary"
+else
+  echo "FAIL: tmux pane retirement can target a reused pane after server restart"
+  FAILURES=$((FAILURES+1))
+fi
+if command -v tmux >/dev/null 2>&1; then
+  TMUX_RESTART_SOCKET="$TMP/tmux-generation-restart.sock"
+  if bash -c '
+set -euo pipefail
+eval "$1"
+socket="$2"
+tmux_cmd() { tmux -S "$socket" "$@"; }
+trap "tmux_cmd kill-server >/dev/null 2>&1 || true" EXIT
+tmux_cmd new-session -d -s team-race -n _hub "sleep 60"
+token=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+tag="$(tmux_generation_tag "$token")"
+duplicate="$(tmux_cmd new-window -d -P -F "#{pane_id}" -t team-race -n worker "sleep 60")"
+old="$(tmux_cmd new-window -d -P -F "#{pane_id}|#{pane_pid}" -t team-race -n worker ": sfgen-$tag; exec sleep 60")"
+old_pane="${old%%|*}"
+old_pid="${old#*|}"
+[ "$old_pane" != "$duplicate" ]
+tmux_cmd display-message -p -t "$old_pane" "#{m:*sfgen-$tag*,#{pane_start_command}}" | grep -Fxq 1
+tmux_cmd display-message -p -t "$duplicate" "#{m:*sfgen-$tag*,#{pane_start_command}}" | grep -Fxq 0
+tmux_cmd kill-server
+tmux_cmd new-session -d -s team-race -n _hub "sleep 60"
+tmux_cmd set-option -g remain-on-exit on
+tmux_cmd new-window -d -t team-race -n worker "sleep 60"
+new_pane="$(tmux_cmd new-window -d -P -F "#{pane_id}" -t team-race -n worker "true")"
+[ "$new_pane" = "$old_pane" ]
+for _ in $(seq 1 50); do
+  [ "$(tmux_cmd display-message -p -t "$new_pane" "#{pane_dead}")" = 1 ] && break
+  sleep 0.02
+done
+[ "$(tmux_cmd display-message -p -t "$new_pane" "#{pane_dead}")" = 1 ]
+lifecycle_retire_tmux_pane "$old_pid" team-race worker "$old_pane" "$token"
+tmux_cmd list-panes -a -F "#{pane_id}" | grep -Fqx "$new_pane"
+# Positive control: an original dead pane still reports its own pane PID and
+# is retired, while the untagged replacement above remains live.
+tagged_info="$(tmux_cmd new-window -d -P -F "#{pane_id}|#{pane_pid}" -t team-race -n worker ": sfgen-$tag; true")"
+tagged_pane="${tagged_info%%|*}"
+tagged_pid="${tagged_info#*|}"
+for _ in $(seq 1 50); do
+  [ "$(tmux_cmd display-message -p -t "$tagged_pane" "#{pane_dead}")" = 1 ] && break
+  sleep 0.02
+done
+[ "$(tmux_cmd display-message -p -t "$tagged_pane" "#{pane_dead}")" = 1 ]
+lifecycle_retire_tmux_pane "$tagged_pid" team-race worker "$tagged_pane" "$token"
+for _ in $(seq 1 50); do
+  ! tmux_cmd list-panes -a -F "#{pane_id}" | grep -Fqx "$tagged_pane" && break
+  sleep 0.02
+done
+! tmux_cmd list-panes -a -F "#{pane_id}" | grep -Fqx "$tagged_pane"
+tmux_cmd list-panes -a -F "#{pane_id}" | grep -Fqx "$new_pane"
+# A no-argument respawn keeps the pane id and start command.  It must not let
+# stale cleanup delete the successor after its different PID exits.
+respawn_info="$(tmux_cmd new-window -d -P -F "#{pane_id}|#{pane_pid}" -t team-race -n worker ": sfgen-$tag; true")"
+respawn_pane="${respawn_info%%|*}"
+respawn_old_pid="${respawn_info#*|}"
+for _ in $(seq 1 50); do
+  [ "$(tmux_cmd display-message -p -t "$respawn_pane" "#{pane_dead}")" = 1 ] && break
+  sleep 0.02
+done
+tmux_cmd respawn-pane -t "$respawn_pane"
+for _ in $(seq 1 50); do
+  respawn_new_pid="$(tmux_cmd display-message -p -t "$respawn_pane" "#{pane_pid}")"
+  [ "$respawn_new_pid" != "$respawn_old_pid" ] \
+    && [ "$(tmux_cmd display-message -p -t "$respawn_pane" "#{pane_dead}")" = 1 ] && break
+  sleep 0.02
+done
+[ "$respawn_new_pid" != "$respawn_old_pid" ]
+lifecycle_retire_tmux_pane "$respawn_old_pid" team-race worker "$respawn_pane" "$token"
+tmux_cmd list-panes -a -F "#{pane_id}" | grep -Fqx "$respawn_pane"
+' _ "$TMUX_RETIRE_FUNCTION" "$TMUX_RESTART_SOCKET"; then
+    echo "ok: restarted tmux server cannot retire a reused dead pane without its generation tag"
+  else
+    echo "FAIL: restarted tmux server retired a reused dead pane or generation tag failed"
+    FAILURES=$((FAILURES+1))
+  fi
+fi
+check "task launch and restart share one stable task-key transaction" \
+  python3 - "$LAUNCH" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+launch = source.split("launch_task() {", 1)[1].split("\nrestart_task() {", 1)[0]
+restart = source.split("restart_task() {", 1)[1].split("\nretire_role() {", 1)[0]
+assert 'task_lane="$(task_key "$task")"' in launch
+assert 'acquire_launch_lane_lock "$team" task "$task_lane"' in launch
+assert 'LAUNCH_LANE_LOCK_INSTANCE" = "$task_lane"' in launch
+acquire = restart.index('acquire_launch_lane_lock "$team" task "$key"')
+observe = restart.index('record="$(python3 "$SKILL_DIR/bin/process-lifecycle.py" list')
+revoke = restart.index('outbox_capability.py" revoke-task')
+successor = restart.index('launch_task "$team" "$feature"')
+release = restart.rindex("release_launch_lane_lock")
+assert acquire < observe < revoke < successor < release
+PY
 
 printf 'TRACKER_WRITERS=all\n' >> .claude/skills/pm/config/team.config.md
 if "$LAUNCH" status test-feature >duplicate-config.out 2>&1; then
@@ -1435,11 +1605,122 @@ QUARANTINE_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$QUARANTIN
 QUARANTINE_SOURCE="$PWD/.teamwork/$QUARANTINE_TEAM/worktrees/backend#1-$QUARANTINE_KEY"
 QUARANTINE_SUFFIX="$(python3 -c 'import hashlib; print(hashlib.sha256(b"attempt-2").hexdigest()[:12])')"
 QUARANTINE_MANIFEST="$PWD/.teamwork/$QUARANTINE_TEAM/quarantine/$QUARANTINE_KEY/attempt-1-$QUARANTINE_SUFFIX.json"
+READY_HANDSHAKE_ENV="$TMP/ready-handshake-races.bash"
+READY_EXIT_RACE_WITNESS="$TMP/ready-exit-race.witness"
+READY_CREATED_MISMATCH_WITNESS="$TMP/ready-created-mismatch.witness"
+cat > "$READY_HANDSHAKE_ENV" <<'EOF'
+kill() {
+  local _sf_i _sf_ready _sf_mode="${STARTUP_FACTORY_TEST_READY_HANDSHAKE:-}"
+  if [ -n "$_sf_mode" ] \
+      && [ "${1:-}" = -0 ] && [ "$#" -eq 2 ]; then
+    if [ "$_sf_mode" = ready-exit-final ] \
+        && [ -n "${_STARTUP_FACTORY_TEST_READY_HELD:-}" ]; then
+      _STARTUP_FACTORY_TEST_READY_KILLS=$(( ${_STARTUP_FACTORY_TEST_READY_KILLS:-1} + 1 ))
+      return 0
+    fi
+    # BASH_ENV affects only this test launcher; the worker's env -i boundary
+    # does not inherit these controls.
+    _sf_ready="${LAUNCH_READY_FILE:-}"
+    [ -n "$_sf_ready" ] || return 125
+    for _sf_i in $(seq 1 400); do
+      [ ! -L "$_sf_ready" ] && [ -f "$_sf_ready" ] && break
+      sleep 0.01
+    done
+    [ ! -L "$_sf_ready" ] && [ -f "$_sf_ready" ] || return 125
+    if [ "$_sf_mode" = created-mismatch ]; then
+      "$AUTHORITY_PYTHON" -I -B - "$_sf_ready" \
+          "$STARTUP_FACTORY_TEST_READY_HANDSHAKE_WITNESS" <<'PY_READY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+value = json.loads(path.read_text(encoding="utf-8"))
+# This remains syntactically valid and ends in Z, so the old shape-only check
+# accepts it.  Only exact binding to the authenticated registration rejects it.
+value["lifecycleCreatedAt"] = "1970-01-01T00:00:00Z"
+with path.open("w", encoding="utf-8") as handle:
+    json.dump(value, handle, sort_keys=True, separators=(",", ":"))
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+Path(sys.argv[2]).write_text("mismatched-created-at\n", encoding="ascii")
+PY_READY
+      builtin kill "$@"
+      return $?
+    fi
+    [ "$_sf_mode" = ready-exit-final ] || return 125
+    # Force the precise ordering that used to fail: the launcher has already
+    # observed no receipt, then the supervisor publishes it and exits.  Hide
+    # the durable receipt while kill -0 is made to report live for all 200
+    # polls; the sleep hook restores it only after the last in-loop probe.
+    _STARTUP_FACTORY_TEST_READY_ORIGINAL="$_sf_ready"
+    _STARTUP_FACTORY_TEST_READY_HELD="${_sf_ready}.held"
+    command mv "$_sf_ready" "$_STARTUP_FACTORY_TEST_READY_HELD" || return 125
+    for _sf_i in $(seq 1 400); do
+      if ! builtin kill -0 "$2" 2>/dev/null; then
+        _STARTUP_FACTORY_TEST_READY_KILLS=1
+        return 0
+      fi
+      command sleep 0.01
+    done
+    return 125
+  fi
+  builtin kill "$@"
+}
+
+sleep() {
+  if [ "${STARTUP_FACTORY_TEST_READY_HANDSHAKE:-}" = ready-exit-final ] \
+      && [ "$#" -eq 1 ] && [ "${1:-}" = 0.05 ]; then
+    _STARTUP_FACTORY_TEST_READY_SLEEPS=$(( ${_STARTUP_FACTORY_TEST_READY_SLEEPS:-0} + 1 ))
+    if [ "$_STARTUP_FACTORY_TEST_READY_SLEEPS" -eq 200 ]; then
+      command mv "$_STARTUP_FACTORY_TEST_READY_HELD" \
+        "$_STARTUP_FACTORY_TEST_READY_ORIGINAL" || return 125
+      printf 'ready-then-dead-at-final-probe\n' \
+        > "$STARTUP_FACTORY_TEST_READY_HANDSHAKE_WITNESS"
+    fi
+    return 0
+  fi
+  command sleep "$@"
+}
+EOF
 git branch "$QUARANTINE_TEAM"
 mkdir -p "$PWD/.teamwork/$QUARANTINE_TEAM"
 prepare_task_claim "$QUARANTINE_TEAM" "$QUARANTINE_FID" "$QUARANTINE_TASK" backend 1
-TEAM_RUNNER=background "$LAUNCH" start-task \
-  "$QUARANTINE_TEAM" "$QUARANTINE_FID" backend "$QUARANTINE_TASK" 1 >/dev/null
+if BASH_ENV="$READY_HANDSHAKE_ENV" \
+    STARTUP_FACTORY_TEST_READY_HANDSHAKE=created-mismatch \
+    STARTUP_FACTORY_TEST_READY_HANDSHAKE_WITNESS="$READY_CREATED_MISMATCH_WITNESS" \
+    TEAM_RUNNER=background "$LAUNCH" start-task \
+      "$QUARANTINE_TEAM" "$QUARANTINE_FID" backend "$QUARANTINE_TASK" 1 \
+      >"$TMP/quarantine-ready-created-mismatch.out" 2>&1; then
+  echo "FAIL: quarantine launch accepted a ready receipt for another lifecycle generation"
+  FAILURES=$((FAILURES+1))
+elif grep -q 'publication supervisor failed its protected ready handshake' \
+      "$TMP/quarantine-ready-created-mismatch.out" \
+    && grep -qx 'mismatched-created-at' "$READY_CREATED_MISMATCH_WITNESS"; then
+  echo "ok: quarantine launch rejects a ready receipt for another lifecycle generation"
+else
+  echo "FAIL: lifecycle-generation mismatch did not exercise the protected ready validator"
+  cat "$TMP/quarantine-ready-created-mismatch.out" >&2
+  FAILURES=$((FAILURES+1))
+fi
+if ! BASH_ENV="$READY_HANDSHAKE_ENV" \
+    STARTUP_FACTORY_TEST_READY_HANDSHAKE=ready-exit-final \
+    STARTUP_FACTORY_TEST_READY_HANDSHAKE_WITNESS="$READY_EXIT_RACE_WITNESS" \
+    TEAM_RUNNER=background "$LAUNCH" start-task \
+      "$QUARANTINE_TEAM" "$QUARANTINE_FID" backend "$QUARANTINE_TASK" 1 \
+      >"$TMP/quarantine-ready-exit-race.out" 2>&1; then
+  cat "$TMP/quarantine-ready-exit-race.out" >&2
+  for path in "$PWD/.teamwork/$QUARANTINE_TEAM/pids/tasks/"*.log; do
+    [ -f "$path" ] || continue
+    echo "--- $path" >&2
+    sed -n '1,200p' "$path" >&2
+  done
+  exit 1
+fi
+check "quarantine launch exercises ready-publication versus supervisor-exit race" \
+  grep -qx 'ready-then-dead-at-final-probe' "$READY_EXIT_RACE_WITNESS"
 check "quarantine fixture attempt exits" wait_task_exit \
   "$QUARANTINE_TEAM" backend "$QUARANTINE_TASK" 1
 QUARANTINE_DEST="$(python3 .claude/skills/pm/bin/quarantine-attempt.py destination \
@@ -1639,6 +1920,10 @@ if command -v tmux >/dev/null 2>&1 && tmux new-session -d -s "$tmux_probe" 'slee
   tmux kill-session -t "$tmux_probe" 2>/dev/null || true
 fi
 if [ "${TEAM_RUNNER:-auto}" != "background" ] && [ "$tmux_usable" = yes ]; then
+  TMUX_STOP_SOCKET="$TMP/tmux-stop-isolated.sock"
+  TMUX_STOP_PREVIOUS="${TMUX-}"
+  TMUX_STOP_HAD_PREVIOUS="${TMUX+x}"
+  export TMUX="$TMUX_STOP_SOCKET,0,0"
   TL_TEAM="tmux-liveness"
   tmux kill-session -t "team-$TL_TEAM" 2>/dev/null || true
   rm -rf ".teamwork/$TL_TEAM"
@@ -1734,24 +2019,32 @@ def launch_once(previous_generation):
         if len(rows) != 1:
             raise SystemExit(72)
         generation = rows[0]["createdAt"]
-        if generation == previous_generation or rows[0]["state"] == "live":
+        if generation == previous_generation:
+            raise SystemExit(73)
+        if rows[0]["state"] == "live":
             time.sleep(0.02)
             continue
-        if rows[0]["state"] != "dead":
-            raise SystemExit(73)
+        if rows[0]["state"] == "dead" and rows[0]["kind"] == "background":
+            # waitpid() and the exact, lock-protected completion transition are
+            # separate operations. A reader may briefly observe the verified-
+            # dead source record before it becomes non-authoritative evidence.
+            time.sleep(0.02)
+            continue
+        if rows[0]["state"] != "dead" or rows[0]["kind"] != "completed-background":
+            raise SystemExit(74)
         contents = log.read_text(encoding="utf-8")
         if "Traceback" in contents or "AttributeError" in contents:
-            raise SystemExit(74)
+            raise SystemExit(75)
         return generation
-    raise SystemExit(75)
+    raise SystemExit(76)
 
 
 first = launch_once("")
 second = launch_once(first)
 if first == second:
-    raise SystemExit(76)
+    raise SystemExit(77)
 PY
-set_config_line BACKEND_CMD '"true"'
+set_config_line BACKEND_CMD '"sleep 1"'
 if python3 "$PORTABLE_REAPER_HELPER" "$PWD/$LAUNCH" \
     "$PWD/.claude/skills/pm/bin/process-lifecycle.py" \
     "$LIFECYCLE_ROOT" "$PWD" lifecycle-portable-reaper; then
@@ -1827,14 +2120,24 @@ while time.monotonic() < deadline:
     rows = [json.loads(line) for line in observed.stdout.splitlines() if line.strip()]
     if len(rows) != 1:
         raise SystemExit(74)
+    if first_created and rows[0]["createdAt"] != first_created:
+        raise SystemExit(76)
     managed_pid = rows[0]["pid"]
     first_created = rows[0]["createdAt"]
     if rows[0]["state"] == "dead":
+        if rows[0]["kind"] == "background":
+            time.sleep(0.02)
+            continue
+        if rows[0]["kind"] != "completed-background":
+            raise SystemExit(75)
         break
     if rows[0]["state"] != "live":
         raise SystemExit(75)
     time.sleep(0.02)
 else:
+    raise SystemExit(76)
+
+if not first_created:
     raise SystemExit(76)
 
 children_path = Path(f"/proc/{os.getpid()}/task/{os.getpid()}/children")
@@ -1905,10 +2208,16 @@ while time.monotonic() < deadline:
     if len(rows) != 1:
         raise SystemExit(81)
     if rows[0]["createdAt"] == first_created:
-        time.sleep(0.02)
-        continue
+        raise SystemExit(82)
+    if second_pid and rows[0]["pid"] != second_pid:
+        raise SystemExit(83)
     second_pid = rows[0]["pid"]
     if rows[0]["state"] == "dead":
+        if rows[0]["kind"] == "background":
+            time.sleep(0.02)
+            continue
+        if rows[0]["kind"] != "completed-background":
+            raise SystemExit(82)
         break
     if rows[0]["state"] != "live":
         raise SystemExit(82)
@@ -1945,7 +2254,7 @@ PY
 if [ "$(uname -s)" = Linux ]; then
   # Keep the managed child alive just long enough for its launcher parent to
   # exit, so the outer reaper is deterministically adopted by our subreaper.
-  set_config_line BACKEND_CMD '"sleep 0.2"'
+  set_config_line BACKEND_CMD '"sleep 1"'
   if python3 "$LINUX_REAPER_HELPER" "$PWD/$LAUNCH" \
       "$PWD/.claude/skills/pm/bin/process-lifecycle.py" \
       "$LIFECYCLE_ROOT" "$PWD" lifecycle-background-reaper; then
@@ -2222,6 +2531,38 @@ import sys
 import time
 
 os.setsid()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child_ready = pathlib.Path(str(sys.argv[1]) + ".child")
+child_code = """
+import pathlib, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+pathlib.Path(sys.argv[1]).touch()
+time.sleep(30)
+"""
+child = subprocess.Popen([sys.executable, "-c", child_code, str(child_ready)])
+for _ in range(200):
+    if child_ready.exists():
+        break
+    time.sleep(0.01)
+else:
+    child.kill()
+    raise SystemExit("child did not install its TERM handler")
+pathlib.Path(sys.argv[1]).write_text(
+    f"{os.getpid()} {child.pid}\n", encoding="ascii"
+)
+time.sleep(30)
+PY
+
+LEADER_EXIT_CHILD_SURVIVES="$TMP/leader-exit-child-survives.py"
+cat > "$LEADER_EXIT_CHILD_SURVIVES" <<'PY'
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+os.setsid()
 child_ready = pathlib.Path(str(sys.argv[1]) + ".child")
 child_code = """
 import pathlib, signal, sys, time
@@ -2290,6 +2631,295 @@ for pointer in active.glob("*.id"):
 print(count)
 PY
 }
+
+# Two real launchers are queued behind a deliberately held lane.  Releasing
+# the holder makes them contend from the same deterministic starting point:
+# exactly one may pass the absent check, mint, and register; the other must see
+# that registered generation before it can mint a superseding capability.
+SIMULTANEOUS_TEAM=simultaneous-launch-lane
+SIMULTANEOUS_BARRIER="$(mktemp -d "$LIFECYCLE_ROOT/.simultaneous-lane.XXXXXXXX")"
+chmod 700 "$SIMULTANEOUS_BARRIER"
+PYTHONDONTWRITEBYTECODE=1 python3 -I -B \
+  .claude/skills/pm/bin/launch-lane-lock.py \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$SIMULTANEOUS_TEAM" \
+  --category gate --instance backend --barrier "$SIMULTANEOUS_BARRIER" \
+  2>"$TMP/simultaneous-lane-holder.err" &
+SIMULTANEOUS_HOLDER=$!
+for _i in $(seq 1 200); do
+  [ -s "$SIMULTANEOUS_BARRIER/ready" ] && break
+  /bin/kill -0 "$SIMULTANEOUS_HOLDER" 2>/dev/null || break
+  sleep 0.02
+done
+check "simultaneous-launch fixture holds the exact gate lane" \
+  test -s "$SIMULTANEOUS_BARRIER/ready"
+TEAM_RUNNER=background "$LAUNCH" start \
+  "$SIMULTANEOUS_TEAM" FEAT-SIMULTANEOUS backend \
+  >"$TMP/simultaneous-launch-a.out" 2>&1 &
+SIMULTANEOUS_A=$!
+TEAM_RUNNER=background "$LAUNCH" start \
+  "$SIMULTANEOUS_TEAM" FEAT-SIMULTANEOUS backend \
+  >"$TMP/simultaneous-launch-b.out" 2>&1 &
+SIMULTANEOUS_B=$!
+SIMULTANEOUS_WAITERS=0
+for _i in $(seq 1 400); do
+  SIMULTANEOUS_WAITERS="$(python3 -c \
+    'import pathlib,sys; print(sum(path.is_dir() for path in pathlib.Path(sys.argv[1]).glob(".launch-lane.*")))' \
+    "$LIFECYCLE_ROOT")"
+  [ "$SIMULTANEOUS_WAITERS" -ge 2 ] && break
+  sleep 0.02
+done
+check "both launchers reach the protected lane before release" \
+  test "$SIMULTANEOUS_WAITERS" -ge 2
+mkdir -m 700 "$SIMULTANEOUS_BARRIER/release"
+wait "$SIMULTANEOUS_HOLDER"
+if wait "$SIMULTANEOUS_A" && wait "$SIMULTANEOUS_B"; then
+  echo "ok: simultaneous same-lane launcher calls converge"
+else
+  echo "FAIL: simultaneous same-lane launcher call failed"
+  sed -n '1,80p' "$TMP/simultaneous-launch-a.out" >&2
+  sed -n '1,80p' "$TMP/simultaneous-launch-b.out" >&2
+  FAILURES=$((FAILURES+1))
+fi
+check "one simultaneous launcher wins and one observes the live generation" \
+  python3 - "$TMP/simultaneous-launch-a.out" "$TMP/simultaneous-launch-b.out" <<'PY'
+from pathlib import Path
+import sys
+
+outputs = [Path(path).read_text(encoding="utf-8") for path in sys.argv[1:]]
+assert sum("launched backend in background" in value for value in outputs) == 1
+assert sum("role instance already live: backend" in value for value in outputs) == 1
+PY
+check "live simultaneous winner retains the lane's active capability" \
+  python3 - "$PWD" "$LIFECYCLE_ROOT" "$SIMULTANEOUS_TEAM" <<'PY'
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+repo, lifecycle_root, team = sys.argv[1:]
+lifecycle = Path(repo, ".claude/skills/pm/bin/process-lifecycle.py")
+listed = subprocess.run(
+    [sys.executable, str(lifecycle), "list", "--root", lifecycle_root,
+     "--repo", repo, "--team", team],
+    text=True, capture_output=True, check=True,
+)
+rows = [json.loads(line) for line in listed.stdout.splitlines() if line.strip()]
+matches = [row for row in rows if row.get("category") == "gate"
+           and row.get("instance") == "backend"]
+assert len(matches) == 1 and matches[0].get("state") == "live", matches
+command = subprocess.check_output(
+    ["ps", "-p", str(matches[0]["pid"]), "-o", "command="], text=True
+)
+common = Path(subprocess.check_output(
+    ["git", "-C", repo, "rev-parse", "--git-common-dir"], text=True
+).strip())
+if not common.is_absolute():
+    common = Path(repo, common)
+broker = common.resolve() / "startup-factory-broker"
+records = broker / "outbox-capabilities"
+active_ids = []
+for pointer in (broker / "outbox-active").glob("*.id"):
+    capability_id = pointer.read_text(encoding="ascii").strip()
+    record = json.loads((records / (capability_id + ".json")).read_text())
+    if (record.get("team") == team and record.get("executionKind") == "gate"
+            and record.get("role") == "backend"):
+        active_ids.append(capability_id)
+assert len(active_ids) == 1, active_ids
+assert "--handle " + active_ids[0] in command, (active_ids[0], command)
+PY
+"$LAUNCH" stop "$SIMULTANEOUS_TEAM" >/dev/null
+rm -f "$SIMULTANEOUS_BARRIER/ready" "$TMP/simultaneous-lane-holder.err"
+rmdir "$SIMULTANEOUS_BARRIER/release" "$SIMULTANEOUS_BARRIER"
+
+# Queue an authorized successor ahead of a stale start while a broker-held
+# stable task lane is blocked.  The stale caller packetizes attempt one before
+# release, but it must observe attempt two after the successor's mint/register
+# transaction and must never replace attempt two's active capability pointer.
+TASK_LANE_TEAM=stable-task-lane-race
+TASK_LANE_FEATURE=stable-task-lane-feature.md
+TASK_LANE_TASK="$TASK_LANE_FEATURE#1"
+TASK_LANE_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$TASK_LANE_TASK")"
+TASK_LANE_CONTROL=control-66666666666666666666666666666666
+TASK_LANE_WORKSPACE="$PWD/.teamwork/$TASK_LANE_TEAM"
+cat > "$TASK_LANE_FEATURE" <<'EOF'
+# Stable task lane fixture [Active]
+
+## 1 Serialize successor authority [Active]
+
+**Assignee:** backend
+
+A stale attempt must not mint after an authorized successor.
+EOF
+git branch "$TASK_LANE_TEAM"
+prepare_task_claim \
+  "$TASK_LANE_TEAM" "$TASK_LANE_FEATURE" "$TASK_LANE_TASK" backend 1
+STARTUP_FACTORY_LLM_RUNTIME=other "$LAUNCH" compose-task \
+  "$TASK_LANE_TEAM" "$TASK_LANE_FEATURE" backend "$TASK_LANE_TASK" 1 \
+  >/dev/null
+python3 .claude/skills/pm/bin/control-grant.py issue \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" \
+  --team "$TASK_LANE_TEAM" --feature "$TASK_LANE_FEATURE" \
+  --action restart-task --target "$TASK_LANE_TASK" --attempt 1 \
+  --generation - --control-id "$TASK_LANE_CONTROL" --reason authorized \
+  >/dev/null
+TASK_LANE_BARRIER="$(mktemp -d "$LIFECYCLE_ROOT/.stable-task-lane.XXXXXXXX")"
+chmod 700 "$TASK_LANE_BARRIER"
+PYTHONDONTWRITEBYTECODE=1 python3 -I -B \
+  .claude/skills/pm/bin/launch-lane-lock.py \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$TASK_LANE_TEAM" \
+  --category task --instance "$TASK_LANE_KEY" --barrier "$TASK_LANE_BARRIER" \
+  2>"$TMP/stable-task-lane-holder.err" &
+TASK_LANE_HOLDER=$!
+for _i in $(seq 1 200); do
+  [ -s "$TASK_LANE_BARRIER/ready" ] && break
+  /bin/kill -0 "$TASK_LANE_HOLDER" 2>/dev/null || break
+  sleep 0.02
+done
+check "stable-task race fixture holds the task-key lane" \
+  test -s "$TASK_LANE_BARRIER/ready"
+TEAM_RUNNER=background STARTUP_FACTORY_CONTROL_BROKER=1 \
+  STARTUP_FACTORY_CONTROL_REASON=authorized \
+  STARTUP_FACTORY_EXPECTED_LIFECYCLE_CREATED_AT=- \
+  "$LAUNCH" restart-task "$TASK_LANE_TEAM" "$TASK_LANE_FEATURE" \
+    "$TASK_LANE_TASK" 1 "$TASK_LANE_CONTROL" \
+    >"$TMP/stable-task-successor.out" 2>&1 &
+TASK_LANE_SUCCESSOR=$!
+for _i in $(seq 1 400); do
+  TASK_LANE_WAITERS="$(python3 -c \
+    'import pathlib,sys; print(sum(path.is_dir() for path in pathlib.Path(sys.argv[1]).glob(".launch-lane.*")))' \
+    "$LIFECYCLE_ROOT")"
+  [ "$TASK_LANE_WAITERS" -ge 1 ] && break
+  sleep 0.02
+done
+check "authorized successor queues first on the stable task lane" \
+  test "$TASK_LANE_WAITERS" -ge 1
+TASK_LANE_STALE_PROMPT="$TASK_LANE_WORKSPACE/prompts/tasks/backend--$TASK_LANE_KEY--a1.md"
+rm -f "$TASK_LANE_STALE_PROMPT"
+TEAM_RUNNER=background "$LAUNCH" start-task \
+  "$TASK_LANE_TEAM" "$TASK_LANE_FEATURE" backend "$TASK_LANE_TASK" 1 \
+  >"$TMP/stable-task-stale.out" 2>&1 &
+TASK_LANE_STALE=$!
+for _i in $(seq 1 400); do
+  TASK_LANE_WAITERS="$(python3 -c \
+    'import pathlib,sys; print(sum(path.is_dir() for path in pathlib.Path(sys.argv[1]).glob(".launch-lane.*")))' \
+    "$LIFECYCLE_ROOT")"
+  [ "$TASK_LANE_WAITERS" -ge 2 ] && [ -s "$TASK_LANE_STALE_PROMPT" ] && break
+  sleep 0.02
+done
+check "stale attempt reaches the same task lane before release" \
+  python3 -c \
+    'import pathlib,sys; assert int(sys.argv[1]) >= 2; assert pathlib.Path(sys.argv[2]).stat().st_size > 0' \
+    "$TASK_LANE_WAITERS" "$TASK_LANE_STALE_PROMPT"
+mkdir -m 700 "$TASK_LANE_BARRIER/release"
+wait "$TASK_LANE_HOLDER"
+if wait "$TASK_LANE_SUCCESSOR"; then
+  echo "ok: authorized successor completes under the stable task lane"
+else
+  echo "FAIL: authorized successor failed under stable task lane"
+  sed -n '1,120p' "$TMP/stable-task-successor.out" >&2
+  FAILURES=$((FAILURES+1))
+fi
+if wait "$TASK_LANE_STALE"; then
+  echo "FAIL: stale attempt launched after the authorized successor"
+  FAILURES=$((FAILURES+1))
+elif grep -qi 'stale\|lineage\|attempt' "$TMP/stable-task-stale.out"; then
+  echo "ok: stale attempt is rejected after the successor transaction"
+else
+  echo "FAIL: stale attempt returned an unexpected error"
+  sed -n '1,120p' "$TMP/stable-task-stale.out" >&2
+  FAILURES=$((FAILURES+1))
+fi
+check "successor retains the stable task capability pointer" \
+  python3 - "$PWD" "$TASK_LANE_TEAM" "$TASK_LANE_TASK" <<'PY'
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+repo, team, task = sys.argv[1:]
+common = Path(subprocess.check_output(
+    ["git", "-C", repo, "rev-parse", "--git-common-dir"], text=True
+).strip())
+if not common.is_absolute():
+    common = Path(repo, common)
+broker = common.resolve() / "startup-factory-broker"
+records = broker / "outbox-capabilities"
+matches = []
+for pointer in (broker / "outbox-active").glob("*.id"):
+    capability = pointer.read_text(encoding="ascii").strip()
+    record = json.loads((records / (capability + ".json")).read_text())
+    if (record.get("team") == team and record.get("executionKind") == "task"
+            and record.get("taskId") == task):
+        matches.append(record)
+assert len(matches) == 1, matches
+assert matches[0]["attempt"] == 2, matches
+PY
+"$LAUNCH" stop-task "$TASK_LANE_TEAM" "$TASK_LANE_TASK" >/dev/null
+rm -f "$TASK_LANE_BARRIER/ready" "$TMP/stable-task-lane-holder.err"
+rmdir "$TASK_LANE_BARRIER/release" "$TASK_LANE_BARRIER"
+
+# Packetization can finish before a dispatcher records a durable human hold.
+# The queued start must recheck that hold under the stable task lane before
+# minting a capability, even though its earlier preflight was valid.
+HOLD_LANE_TEAM=hold-after-packetization
+HOLD_LANE_FEATURE=hold-after-packetization-feature.md
+HOLD_LANE_TASK="$HOLD_LANE_FEATURE#1"
+HOLD_LANE_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$HOLD_LANE_TASK")"
+cat > "$HOLD_LANE_FEATURE" <<'EOF'
+# Hold lane fixture [Active]
+
+## 1 Fence queued launch [Active]
+
+**Assignee:** backend
+
+The protected hold must win before authority is minted.
+EOF
+git branch "$HOLD_LANE_TEAM"
+prepare_task_claim "$HOLD_LANE_TEAM" "$HOLD_LANE_FEATURE" "$HOLD_LANE_TASK" backend 1
+STARTUP_FACTORY_LLM_RUNTIME=other "$LAUNCH" compose-task \
+  "$HOLD_LANE_TEAM" "$HOLD_LANE_FEATURE" backend "$HOLD_LANE_TASK" 1 >/dev/null
+HOLD_LANE_BARRIER="$(mktemp -d "$LIFECYCLE_ROOT/.hold-task-lane.XXXXXXXX")"
+chmod 700 "$HOLD_LANE_BARRIER"
+python3 .claude/skills/pm/bin/launch-lane-lock.py \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$HOLD_LANE_TEAM" \
+  --category task --instance "$HOLD_LANE_KEY" --barrier "$HOLD_LANE_BARRIER" \
+  >"$TMP/hold-task-lane-holder.out" 2>&1 &
+HOLD_LANE_HOLDER=$!
+for _i in $(seq 1 100); do [ -s "$HOLD_LANE_BARRIER/ready" ] && break; sleep 0.02; done
+check "hold race fixture owns the stable task lane" test -s "$HOLD_LANE_BARRIER/ready"
+HOLD_LANE_PROMPT="$PWD/.teamwork/$HOLD_LANE_TEAM/prompts/tasks/backend--$HOLD_LANE_KEY--a1.md"
+rm -f "$HOLD_LANE_PROMPT"
+TEAM_RUNNER=background "$LAUNCH" start-task \
+  "$HOLD_LANE_TEAM" "$HOLD_LANE_FEATURE" backend "$HOLD_LANE_TASK" 1 \
+  >"$TMP/hold-lane-start.out" 2>&1 &
+HOLD_LANE_START=$!
+for _i in $(seq 1 200); do [ -s "$HOLD_LANE_PROMPT" ] && break; sleep 0.02; done
+check "queued start passes preflight and reaches the held lane" test -s "$HOLD_LANE_PROMPT"
+python3 - "$TMP/hold-lane-blocked.json" "$HOLD_LANE_FEATURE" "$HOLD_LANE_TASK" <<'PY'
+import json,pathlib,sys
+path,feature,task=sys.argv[1:]
+pathlib.Path(path).write_text(json.dumps({"featureId":feature,"tasks":[{
+  "taskId":task,"title":"fixture","description":"fixture","status":"Blocked",
+  "statusRaw":"Blocked","assignee":"backend","blockedBy":[],"labels":[],
+  "comments":[],"attachments":[]}]})+"\n")
+PY
+python3 .claude/skills/pm/bin/task-hold.py sync \
+  --repo "$PWD" --workspace "$PWD/.teamwork/$HOLD_LANE_TEAM" \
+  --tasks "$TMP/hold-lane-blocked.json" --feature "$HOLD_LANE_FEATURE" \
+  --team "$HOLD_LANE_TEAM" --blocked-status Blocked --queued-status Planned \
+  --inflight-status Planned --inflight-status Active --inflight-status Review \
+  --ignored-labels-json '["human-work"]' >/dev/null
+mkdir -m 700 "$HOLD_LANE_BARRIER/release"
+wait "$HOLD_LANE_HOLDER"
+if wait "$HOLD_LANE_START"; then
+  echo "FAIL: queued start minted after a durable task hold"; FAILURES=$((FAILURES+1))
+elif grep -q 'became held while waiting' "$TMP/hold-lane-start.out"; then
+  echo "ok: queued start rechecks the durable hold under its task lane"
+else
+  echo "FAIL: queued held start returned the wrong error: $(cat "$TMP/hold-lane-start.out")"; FAILURES=$((FAILURES+1))
+fi
+check "held queued start mints no publication capability" \
+  test "$(active_capability_count "$HOLD_LANE_TEAM" task "$HOLD_LANE_TASK")" -eq 0
 
 # Public worktree creation and compose-task share one lineage-gated mutation
 # path. A tampered claim must fail before either entry point creates a task
@@ -2695,23 +3325,26 @@ PY
   TMUX_STOP_SESSION="team-$TMUX_STOP_TEAM"
   TMUX_STOP_READY="$TMP/tmux-stop-ready"
   tmux kill-session -t "$TMUX_STOP_SESSION" 2>/dev/null || true
-  tmux new-session -d -s "$TMUX_STOP_SESSION" -n _hub
+  tmux -S "$TMUX_STOP_SOCKET" new-session -d -s "$TMUX_STOP_SESSION" -n _hub
   printf -v _tmux_python_q '%q' "$(command -v python3)"
   printf -v _tmux_wrapper_q '%q' "$TMUX_GROUP_WRAPPER"
   printf -v _tmux_ignorer_q '%q' "$TERM_IGNORER"
   printf -v _tmux_ready_q '%q' "$TMUX_STOP_READY"
+  TMUX_STOP_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  TMUX_STOP_TAG="$(printf '%s' "$TMUX_STOP_TOKEN" | python3 -c 'import hashlib,sys; print("sf-" + hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
   tmux_stop_pane_info="$(tmux new-window -d -P -F '#{pane_id}|#{pane_pid}' \
     -t "$TMUX_STOP_SESSION" -n "$TMUX_STOP_INSTANCE" \
-    "exec $_tmux_python_q $_tmux_wrapper_q $_tmux_ignorer_q $_tmux_ready_q")"
+    ": sfgen-$TMUX_STOP_TAG; exec $_tmux_python_q $_tmux_wrapper_q $_tmux_ignorer_q $_tmux_ready_q")"
   TMUX_STOP_PANE="${tmux_stop_pane_info%%|*}"
   TMUX_STOP_PANE_PID="${tmux_stop_pane_info#*|}"
   for _i in $(seq 1 100); do [ -s "$TMUX_STOP_READY" ] && break; sleep 0.02; done
   read -r TMUX_STOP_LEADER_PID TMUX_STOP_CHILD_PID < "$TMUX_STOP_READY"
-  python3 .claude/skills/pm/bin/process-lifecycle.py register \
+  printf '%s\n' "$TMUX_STOP_TOKEN" | python3 .claude/skills/pm/bin/process-lifecycle.py register \
     --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$TMUX_STOP_TEAM" \
     --category task --instance "$TMUX_STOP_INSTANCE" --kind tmux --pid "$TMUX_STOP_LEADER_PID" \
     --tmux-session "$TMUX_STOP_SESSION" --tmux-window "$TMUX_STOP_INSTANCE" \
-    --tmux-pane "$TMUX_STOP_PANE" --tmux-pane-pid "$TMUX_STOP_PANE_PID" >/dev/null
+    --tmux-pane "$TMUX_STOP_PANE" --tmux-pane-pid "$TMUX_STOP_PANE_PID" \
+    --launch-token-stdin >/dev/null
   mkdir -p ".teamwork/$TMUX_STOP_TEAM/pids/tasks"
   printf 'managed\n' > ".teamwork/$TMUX_STOP_TEAM/pids/tasks/$TMUX_STOP_INSTANCE.pid"
   "$LAUNCH" stop-task "$TMUX_STOP_TEAM" "$TMUX_STOP_TASK" >/dev/null
@@ -2723,13 +3356,57 @@ PY
   check "tmux stop-task terminates dedicated task group leader" bash -c "! kill -0 '$TMUX_STOP_LEADER_PID' 2>/dev/null"
   check "tmux stop-task SIGKILL terminates TERM-resistant child" bash -c "! kill -0 '$TMUX_STOP_CHILD_PID' 2>/dev/null"
   check "tmux stop-task retires protected group lifecycle" test "$(record_count "$TMUX_STOP_TEAM" "$TMUX_STOP_INSTANCE")" -eq 0
-  tmux_stop_observed_pane="$(tmux display-message -p -t "$TMUX_STOP_PANE" '#{pane_id}' 2>/dev/null || true)"
-  if [ "$tmux_stop_observed_pane" = "$TMUX_STOP_PANE" ]; then
+  if tmux list-panes -a -F '#{pane_id}' | grep -Fqx "$TMUX_STOP_PANE"; then
     echo "FAIL: tmux stop-task left its verified pane live"; FAILURES=$((FAILURES+1))
   else
     echo "ok: tmux stop-task retires its verified pane"
   fi
-  tmux kill-session -t "$TMUX_STOP_SESSION" 2>/dev/null || true
+  # A restarted tmux server may reuse the exact pane id and window name while
+  # the authenticated child group survives.  Stop must still contain that
+  # group, but must leave the successor server's unrelated pane intact.
+  tmux kill-server
+  tmux -S "$TMUX_STOP_SOCKET" new-session -d -s "$TMUX_STOP_SESSION" -n _hub
+  TMUX_RESTART_TASK='T-tmux-restarted-server'
+  TMUX_RESTART_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$TMUX_RESTART_TASK")"
+  TMUX_RESTART_INSTANCE="backend--$TMUX_RESTART_KEY--a1"
+  TMUX_RESTART_READY="$TMP/tmux-restart-ready"
+  printf -v _tmux_restart_ready_q '%q' "$TMUX_RESTART_READY"
+  TMUX_RESTART_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  TMUX_RESTART_TAG="$(printf '%s' "$TMUX_RESTART_TOKEN" | python3 -c 'import hashlib,sys; print("sf-" + hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+  tmux_restart_info="$(tmux new-window -d -P -F '#{pane_id}|#{pane_pid}' \
+    -t "$TMUX_STOP_SESSION" -n "$TMUX_RESTART_INSTANCE" \
+    ": sfgen-$TMUX_RESTART_TAG; exec $_tmux_python_q $_tmux_wrapper_q $_tmux_ignorer_q $_tmux_restart_ready_q")"
+  TMUX_RESTART_PANE="${tmux_restart_info%%|*}"
+  TMUX_RESTART_PANE_PID="${tmux_restart_info#*|}"
+  for _i in $(seq 1 100); do [ -s "$TMUX_RESTART_READY" ] && break; sleep 0.02; done
+  read -r TMUX_RESTART_LEADER_PID TMUX_RESTART_CHILD_PID < "$TMUX_RESTART_READY"
+  printf '%s\n' "$TMUX_RESTART_TOKEN" | python3 .claude/skills/pm/bin/process-lifecycle.py register \
+    --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$TMUX_STOP_TEAM" \
+    --category task --instance "$TMUX_RESTART_INSTANCE" --kind tmux --pid "$TMUX_RESTART_LEADER_PID" \
+    --tmux-session "$TMUX_STOP_SESSION" --tmux-window "$TMUX_RESTART_INSTANCE" \
+    --tmux-pane "$TMUX_RESTART_PANE" --tmux-pane-pid "$TMUX_RESTART_PANE_PID" \
+    --launch-token-stdin >/dev/null
+  mkdir -p ".teamwork/$TMUX_STOP_TEAM/pids/tasks"
+  printf 'managed\n' > ".teamwork/$TMUX_STOP_TEAM/pids/tasks/$TMUX_RESTART_INSTANCE.pid"
+  tmux kill-server
+  tmux -S "$TMUX_STOP_SOCKET" new-session -d -s "$TMUX_STOP_SESSION" -n _hub
+  TMUX_RESTART_SUCCESSOR="$(tmux new-window -d -P -F '#{pane_id}' \
+    -t "$TMUX_STOP_SESSION" -n "$TMUX_RESTART_INSTANCE" "sleep 60")"
+  check "tmux restart reuses the recorded pane id" test "$TMUX_RESTART_SUCCESSOR" = "$TMUX_RESTART_PANE"
+  "$LAUNCH" stop-task "$TMUX_STOP_TEAM" "$TMUX_RESTART_TASK" >/dev/null
+  for _i in $(seq 1 80); do
+    if ! kill -0 "$TMUX_RESTART_LEADER_PID" 2>/dev/null \
+        && ! kill -0 "$TMUX_RESTART_CHILD_PID" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  check "tmux restart stop contains authenticated surviving group" \
+    bash -c "! kill -0 '$TMUX_RESTART_LEADER_PID' 2>/dev/null && ! kill -0 '$TMUX_RESTART_CHILD_PID' 2>/dev/null"
+  check "tmux restart stop retires exact lifecycle record" \
+    test "$(record_count "$TMUX_STOP_TEAM" "$TMUX_RESTART_INSTANCE")" -eq 0
+  check "tmux restart stop preserves successor pane" \
+    bash -c 'tmux list-panes -a -F "#{pane_id}" | grep -Fqx "$1"' _ "$TMUX_RESTART_SUCCESSOR"
+  tmux kill-server 2>/dev/null || true
+  if [ "$TMUX_STOP_HAD_PREVIOUS" = x ]; then export TMUX="$TMUX_STOP_PREVIOUS"; else unset TMUX; fi
 else
   echo "skip: tmux task process-group stop test"
 fi
@@ -2810,6 +3487,17 @@ else
   echo "FAIL: identity mismatch returned wrong error: $(cat lifecycle-identity-stop.out)"; FAILURES=$((FAILURES+1))
 fi
 check "identity mismatch never signals recorded PID" kill -0 "$identity_agent_pid"
+if TEAM_RUNNER=background "$LAUNCH" start lifecycle-identity FEAT-LIFE backend \
+    >lifecycle-identity-relaunch.out 2>&1; then
+  echo "FAIL: start replaced an identity-mismatched lifecycle generation"; FAILURES=$((FAILURES+1))
+elif grep -q 'identity-mismatch\|identity mismatch' lifecycle-identity-relaunch.out; then
+  echo "ok: start refuses to replace identity-mismatched lifecycle evidence"
+else
+  echo "FAIL: identity-mismatched start returned wrong error: $(cat lifecycle-identity-relaunch.out)"; FAILURES=$((FAILURES+1))
+fi
+check "failed identity-mismatched start leaves the prior process untouched" kill -0 "$identity_agent_pid"
+check "failed identity-mismatched start preserves the prior lifecycle record" \
+  test "$(record_count lifecycle-identity backend)" -eq 1
 kill "$identity_agent_pid" 2>/dev/null || true
 wait "$identity_agent_pid" 2>/dev/null || true
 rm -f "$identity_record"
@@ -2836,19 +3524,27 @@ restart_role_first="$(TEAM_RUNNER=background STARTUP_FACTORY_CONTROL_BROKER=1 ST
 echo "$restart_role_first" | grep -q 'restarted role team-lead' \
   && echo "ok: restart-role launches one authorized replacement" \
   || { echo "FAIL: restart-role did not launch its replacement: $restart_role_first"; FAILURES=$((FAILURES+1)); }
-for _i in $(seq 1 40); do
-  restart_role_state="$(python3 .claude/skills/pm/bin/process-lifecycle.py list \
-    --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$RESTART_ROLE_TEAM" | \
-    python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin if line.strip()]; print(rows[0]["state"] if len(rows)==1 else "")')"
-  [ "$restart_role_state" = dead ] && break
-  sleep 0.05
-done
-restart_role_replacement_record="$(record_for "$RESTART_ROLE_TEAM" team-lead)"
-restart_role_replacement_created="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["createdAt"])' "$restart_role_replacement_record")"
+restart_role_policy="$(python3 .claude/skills/pm/bin/restart-policy.py check \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" \
+  --team "$RESTART_ROLE_TEAM" --feature "$RESTART_ROLE_FEATURE" \
+  --category gate --target team-lead --attempt 0 --generation "$restart_role_original_created" \
+  --control-id "$RESTART_ROLE_CONTROL" --reason authorized)"
+restart_role_replacement_created="$(printf '%s' "$restart_role_policy" | \
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["completedGeneration"])')"
 check "restart-role replacement has a distinct lifecycle generation" \
   test "$restart_role_replacement_created" != "$restart_role_original_created"
-check "restart-role short-lived replacement is retained as protected evidence" \
-  test "$restart_role_state" = dead
+for _i in $(seq 1 40); do
+  restart_role_replacement_record="$(record_for "$RESTART_ROLE_TEAM" team-lead 2>/dev/null || true)"
+  if [ -n "$restart_role_replacement_record" ] && python3 -c \
+      'import json,sys; value=json.load(open(sys.argv[1])); raise SystemExit(value["kind"] != "completed-background")' \
+      "$restart_role_replacement_record"; then
+    break
+  fi
+  sleep 0.05
+done
+check "restart-role short-lived replacement retires process-group authority" \
+  python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value["kind"] == "completed-background"; assert value["createdAt"] == sys.argv[2]' \
+    "$restart_role_replacement_record" "$restart_role_replacement_created"
 
 restart_role_replay="$(TEAM_RUNNER=background STARTUP_FACTORY_CONTROL_BROKER=1 STARTUP_FACTORY_CONTROL_REASON=authorized \
   "$LAUNCH" restart-role "$RESTART_ROLE_TEAM" "$RESTART_ROLE_FEATURE" team-lead \
@@ -2856,24 +3552,23 @@ restart_role_replay="$(TEAM_RUNNER=background STARTUP_FACTORY_CONTROL_BROKER=1 S
 echo "$restart_role_replay" | grep -q 'already completed with protected replacement generation' \
   && echo "ok: restart-role dead-replacement replay converges from protected completion" \
   || { echo "FAIL: restart-role dead-replacement replay did not converge: $restart_role_replay"; FAILURES=$((FAILURES+1)); }
-check "restart-role replay preserves the exact replacement generation" \
-  test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["createdAt"])' "$(record_for "$RESTART_ROLE_TEAM" team-lead)")" = "$restart_role_replacement_created"
-
-restart_role_policy="$(python3 .claude/skills/pm/bin/restart-policy.py check \
+restart_role_replay_policy="$(python3 .claude/skills/pm/bin/restart-policy.py check \
   --root "$LIFECYCLE_ROOT" --repo "$PWD" \
   --team "$RESTART_ROLE_TEAM" --feature "$RESTART_ROLE_FEATURE" \
   --category gate --target team-lead --attempt 0 --generation "$restart_role_original_created" \
   --control-id "$RESTART_ROLE_CONTROL" --reason authorized)"
+check "restart-role replay preserves the exact replacement generation" \
+  test "$(printf '%s' "$restart_role_replay_policy" | python3 -c 'import json,sys; print(json.load(sys.stdin)["completedGeneration"])')" = "$restart_role_replacement_created"
 check "restart-role policy records one spend and the exact completed generation" python3 -c \
   'import json,sys; p=json.loads(sys.argv[1]); assert p["authorizedCount"] == 1; assert p["completedControlId"] == sys.argv[2]; assert p["completedGeneration"] == sys.argv[3]' \
   "$restart_role_policy" "$RESTART_ROLE_CONTROL" "$restart_role_replacement_created"
 
-# Simulate a later queue activation reaping the exited generation and crashing
-# before it can register another. The old control receipt must still prevent a
-# third launch even when no lifecycle record remains.
+# The old control receipt must still prevent a third launch after a later queue
+# activation reaps the completed, non-authoritative lifecycle evidence.
 python3 .claude/skills/pm/bin/process-lifecycle.py forget \
   --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$RESTART_ROLE_TEAM" \
-  --category gate --instance team-lead --expected-created-at "$restart_role_replacement_created" >/dev/null
+  --category gate --instance team-lead \
+  --expected-created-at "$restart_role_replacement_created" >/dev/null
 restart_role_absent_replay="$(TEAM_RUNNER=background STARTUP_FACTORY_CONTROL_BROKER=1 STARTUP_FACTORY_CONTROL_REASON=authorized \
   "$LAUNCH" restart-role "$RESTART_ROLE_TEAM" "$RESTART_ROLE_FEATURE" team-lead \
   "$restart_role_original_created" "$RESTART_ROLE_CONTROL")"
@@ -2884,6 +3579,88 @@ check "restart-role completed-control replay remains at-most-once with no lifecy
   test "$(record_count "$RESTART_ROLE_TEAM" team-lead)" -eq 0
 
 # -- task-scoped stop: exact collision-safe task selection, stale retirement, idempotence --
+CROSS_WORKTREE_TEAM=cross-worktree-stop
+CROSS_WORKTREE_TASK='T-linked-capability'
+CROSS_WORKTREE_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$CROSS_WORKTREE_TASK")"
+CROSS_WORKTREE_INSTANCE="backend--$CROSS_WORKTREE_KEY--a1"
+CROSS_WORKTREE_PID="$(spawn_lifecycle_sleep)"
+register_lifecycle_process \
+  "$CROSS_WORKTREE_TEAM" task "$CROSS_WORKTREE_INSTANCE" "$CROSS_WORKTREE_PID"
+mkdir -p ".teamwork/$CROSS_WORKTREE_TEAM"
+CROSS_WORKTREE_CAPABILITY="$(python3 .claude/skills/pm/bin/outbox_capability.py mint \
+  --repo "$PWD" --workspace "$PWD/.teamwork/$CROSS_WORKTREE_TEAM" \
+  --team "$CROSS_WORKTREE_TEAM" --feature FEAT-LINKED --role backend \
+  --kind task --task "$CROSS_WORKTREE_TASK" --attempt 1 \
+  --instance "$CROSS_WORKTREE_INSTANCE")"
+CROSS_WORKTREE_CAPABILITY_ID="$(printf '%s' "$CROSS_WORKTREE_CAPABILITY" | \
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+CROSS_WORKTREE_LAUNCH="$PWD/$LAUNCH"
+CROSS_WORKTREE_CHECKOUT="$(cd "$T42_WT" && pwd -P)"
+if (cd "$CROSS_WORKTREE_CHECKOUT" && \
+    "$CROSS_WORKTREE_LAUNCH" stop-task \
+      "$CROSS_WORKTREE_TEAM" "$CROSS_WORKTREE_TASK" >/dev/null); then
+  echo "ok: linked-worktree stop authenticates and stops the shared lifecycle generation"
+else
+  echo "FAIL: linked-worktree stop could not fence the sibling checkout generation"
+  FAILURES=$((FAILURES+1))
+fi
+for _i in $(seq 1 40); do
+  kill -0 "$CROSS_WORKTREE_PID" 2>/dev/null || break
+  sleep 0.05
+done
+check "linked-worktree stop terminates the original checkout process" \
+  bash -c "! kill -0 '$CROSS_WORKTREE_PID' 2>/dev/null"
+check "linked-worktree stop revokes the exact original capability" \
+  python3 - "$PWD" "$CROSS_WORKTREE_CAPABILITY_ID" <<'PY'
+from pathlib import Path
+import subprocess
+import sys
+
+repo, capability = sys.argv[1:]
+common = Path(subprocess.check_output(
+    ["git", "-C", repo, "rev-parse", "--git-common-dir"], text=True
+).strip())
+if not common.is_absolute():
+    common = Path(repo, common)
+tombstone = common.resolve() / "startup-factory-broker" / "outbox-revoked" / (
+    capability + ".revoked"
+)
+assert tombstone.read_text(encoding="ascii").strip() == capability
+PY
+
+FENCE_LINKED_TEAM=cross-worktree-fence
+FENCE_LINKED_TASK='T-linked-fallback'
+FENCE_LINKED_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$FENCE_LINKED_TASK")"
+FENCE_LINKED_INSTANCE="backend--$FENCE_LINKED_KEY--a1"
+FENCE_LINKED_PID="$(spawn_lifecycle_sleep)"
+register_lifecycle_process "$FENCE_LINKED_TEAM" task "$FENCE_LINKED_INSTANCE" "$FENCE_LINKED_PID"
+mkdir -p ".teamwork/$FENCE_LINKED_TEAM"
+FENCE_LINKED_CAPABILITY="$(python3 .claude/skills/pm/bin/outbox_capability.py mint \
+  --repo "$PWD" --workspace "$PWD/.teamwork/$FENCE_LINKED_TEAM" \
+  --team "$FENCE_LINKED_TEAM" --feature FEAT-LINKED --role backend \
+  --kind task --task "$FENCE_LINKED_TASK" --attempt 1 \
+  --instance "$FENCE_LINKED_INSTANCE")"
+FENCE_LINKED_ID="$(printf '%s' "$FENCE_LINKED_CAPABILITY" | \
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+if (cd "$CROSS_WORKTREE_CHECKOUT" && \
+    "$CROSS_WORKTREE_LAUNCH" fence-task "$FENCE_LINKED_TEAM" "$FENCE_LINKED_TASK" >/dev/null); then
+  echo "ok: linked-worktree fallback fence completes under the task lane"
+else
+  echo "FAIL: linked-worktree fallback fence failed"; FAILURES=$((FAILURES+1))
+fi
+check "linked-worktree fallback fence revokes original checkout capability" \
+  python3 - "$PWD" "$FENCE_LINKED_ID" <<'PY'
+from pathlib import Path
+import subprocess,sys
+repo, capability = sys.argv[1:]
+common = Path(subprocess.check_output(["git", "-C", repo, "rev-parse", "--git-common-dir"], text=True).strip())
+if not common.is_absolute(): common = Path(repo, common)
+assert (common.resolve() / "startup-factory-broker" / "outbox-revoked" / (capability + ".revoked")).read_text().strip() == capability
+PY
+check "publication-only fallback does not signal the held task process" \
+  kill -0 "$FENCE_LINKED_PID"
+"$LAUNCH" stop-task "$FENCE_LINKED_TEAM" "$FENCE_LINKED_TASK" >/dev/null
+
 STOP_TASK_TEAM=stop-task-scope
 STOP_TASK_ID='T/blocked 42'
 STOP_TASK_SIBLING_ID='T blocked 42'
@@ -2971,6 +3748,38 @@ check "repeated stop-task still leaves sibling live" kill -0 "$STOP_TASK_SIBLING
 check "repeated stop-task still leaves gate live" kill -0 "$STOP_TASK_GATE_PID"
 "$LAUNCH" stop "$STOP_TASK_TEAM" >/dev/null
 
+# If TERM removes the authenticated group leader while a descendant survives,
+# stop must retain the exact record and refuse any PGID-only SIGKILL authority.
+STOP_TASK_LEADERLESS_TEAM=stop-task-leaderless
+STOP_TASK_LEADERLESS_ID='T-leaderless-stop'
+STOP_TASK_LEADERLESS_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$STOP_TASK_LEADERLESS_ID")"
+STOP_TASK_LEADERLESS_INSTANCE="backend--$STOP_TASK_LEADERLESS_KEY--a1"
+STOP_TASK_LEADERLESS_READY="$TMP/stop-task-leaderless-ready"
+STOP_TASK_LEADERLESS_PID="$(/bin/sh -c '"$1" "$2" "$3" </dev/null >/dev/null 2>&1 & printf "%s\n" "$!"' \
+  lifecycle-leaderless "$(command -v python3)" "$LEADER_EXIT_CHILD_SURVIVES" "$STOP_TASK_LEADERLESS_READY")"
+for _i in $(seq 1 80); do [ -s "$STOP_TASK_LEADERLESS_READY" ] && break; sleep 0.05; done
+read -r STOP_TASK_LEADERLESS_PID STOP_TASK_LEADERLESS_CHILD_PID < "$STOP_TASK_LEADERLESS_READY"
+register_lifecycle_process "$STOP_TASK_LEADERLESS_TEAM" task \
+  "$STOP_TASK_LEADERLESS_INSTANCE" "$STOP_TASK_LEADERLESS_PID"
+mkdir -p ".teamwork/$STOP_TASK_LEADERLESS_TEAM/pids/tasks"
+printf 'managed\n' > ".teamwork/$STOP_TASK_LEADERLESS_TEAM/pids/tasks/$STOP_TASK_LEADERLESS_INSTANCE.pid"
+if "$LAUNCH" stop-task "$STOP_TASK_LEADERLESS_TEAM" "$STOP_TASK_LEADERLESS_ID" \
+    >stop-task-leaderless.out 2>&1; then
+  echo "FAIL: stop-task accepted leaderless process-group authority"; FAILURES=$((FAILURES+1))
+elif grep -q 'identity mismatch' stop-task-leaderless.out; then
+  echo "ok: stop-task fails closed after its authenticated group leader exits"
+else
+  echo "FAIL: leaderless stop returned wrong error: $(cat stop-task-leaderless.out)"; FAILURES=$((FAILURES+1))
+fi
+check "leaderless stop never SIGKILLs the surviving descendant" kill -0 "$STOP_TASK_LEADERLESS_CHILD_PID"
+check "leaderless stop retains protected lifecycle evidence" \
+  test "$(record_count "$STOP_TASK_LEADERLESS_TEAM" "$STOP_TASK_LEADERLESS_INSTANCE")" -eq 1
+check "leaderless stop retains its task marker" \
+  test -e ".teamwork/$STOP_TASK_LEADERLESS_TEAM/pids/tasks/$STOP_TASK_LEADERLESS_INSTANCE.pid"
+kill -KILL -- "-$STOP_TASK_LEADERLESS_PID" 2>/dev/null || true
+rm -f "$(record_for "$STOP_TASK_LEADERLESS_TEAM" "$STOP_TASK_LEADERLESS_INSTANCE")" \
+  ".teamwork/$STOP_TASK_LEADERLESS_TEAM/pids/tasks/$STOP_TASK_LEADERLESS_INSTANCE.pid"
+
 # Refuse the whole task stop before signalling if any matching protected
 # identity has changed, so one forged record cannot produce a partial stop.
 STOP_TASK_BAD_TEAM=stop-task-identity
@@ -3013,6 +3822,152 @@ for _i in $(seq 1 40); do
   sleep 0.05
 done
 rm -f "$stop_task_good_record" "$stop_task_bad_record"
+
+# A stop must wait for an in-flight launch's shared team fence before taking
+# its protected snapshot.  Registering a process while stop waits models the
+# mint/register interval that the old one-time snapshot could miss.
+FENCED_TEAM=team-stop-fence
+mkdir -p ".teamwork/$FENCED_TEAM"
+FENCED_BARRIER="$LIFECYCLE_ROOT/.team-stop-test"
+mkdir -m 700 "$FENCED_BARRIER"
+python3 .claude/skills/pm/bin/launch-lane-lock.py \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$FENCED_TEAM" \
+  --category team --instance all --mode shared --barrier "$FENCED_BARRIER" \
+  >"$TMP/team-fence-holder.out" 2>&1 &
+FENCED_HOLDER=$!
+for _i in $(seq 1 100); do [ -s "$FENCED_BARRIER/ready" ] && break; sleep 0.02; done
+check "test launch holds the protected team fence" test -s "$FENCED_BARRIER/ready"
+FENCED_BARRIERS_BEFORE="$(find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' | wc -l | tr -d ' ')"
+"$LAUNCH" stop "$FENCED_TEAM" >"$TMP/team-stop-fenced.out" 2>&1 &
+FENCED_STOP=$!
+for _i in $(seq 1 100); do
+  FENCED_BARRIERS_NOW="$(find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' | wc -l | tr -d ' ')"
+  [ "$FENCED_BARRIERS_NOW" -gt "$FENCED_BARRIERS_BEFORE" ] && break
+  sleep 0.02
+done
+check "team stop reaches protected team-fence wait" \
+  test "$FENCED_BARRIERS_NOW" -gt "$FENCED_BARRIERS_BEFORE"
+check "team stop waits for an in-flight launch before snapshot" kill -0 "$FENCED_STOP"
+FENCED_PID="$(spawn_lifecycle_sleep)"
+register_lifecycle_process "$FENCED_TEAM" gate backend "$FENCED_PID"
+mkdir -m 700 "$FENCED_BARRIER/release"
+wait "$FENCED_HOLDER"
+if wait "$FENCED_STOP"; then
+  echo "ok: team stop completes after the in-flight generation is registered"
+else
+  echo "FAIL: fenced team stop failed: $(cat "$TMP/team-stop-fenced.out")"; FAILURES=$((FAILURES+1))
+fi
+check "team stop retires generation registered before its snapshot" \
+  test "$(record_count "$FENCED_TEAM" backend)" -eq 0
+
+# A detached release worker shares admission through register + go.  A team
+# stop queued while that fence is held must see the resulting release record
+# and refuse before touching an unrelated gate.  Generic stop is never a
+# substitute for the release supervisor's cancel/reconciliation protocol.
+RELEASE_FENCE_TEAM=release-stop-fence
+RELEASE_FENCE_GATE_PID="$(spawn_lifecycle_sleep)"
+register_lifecycle_process "$RELEASE_FENCE_TEAM" gate backend "$RELEASE_FENCE_GATE_PID"
+mkdir -p ".teamwork/$RELEASE_FENCE_TEAM"
+python3 .claude/skills/pm/bin/outbox_capability.py mint \
+  --repo "$PWD" --workspace "$PWD/.teamwork/$RELEASE_FENCE_TEAM" \
+  --team "$RELEASE_FENCE_TEAM" --feature FEAT-RELEASE-STOP --role backend \
+  --kind gate --task - --attempt 0 --instance backend >/dev/null
+RELEASE_RECORDS_READY="$TMP/release-records-lock-ready"
+python3 - "$LIFECYCLE_ROOT/records.lock" "$RELEASE_RECORDS_READY" <<'PY' &
+import fcntl, pathlib, sys, time
+with open(sys.argv[1], "a+b") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    pathlib.Path(sys.argv[2]).touch()
+    time.sleep(30)
+PY
+RELEASE_RECORDS_HOLDER=$!
+for _i in $(seq 1 100); do [ -e "$RELEASE_RECORDS_READY" ] && break; sleep 0.02; done
+check "release fixture holds lifecycle registration before go" test -e "$RELEASE_RECORDS_READY"
+RELEASE_FENCE_VARS="$(python3 - "$PWD" "$LIFECYCLE_ROOT" "$RELEASE_FENCE_TEAM" "$TMP/release-command-witness" <<'PY'
+import hashlib, importlib.util, json, pathlib, subprocess, sys
+repo, root, team, witness = sys.argv[1:]
+worker = pathlib.Path(repo, ".claude/skills/pm/bin/release-worker.py")
+spec = importlib.util.spec_from_file_location("release_fixture_worker", worker)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+command = [sys.executable, "-c", "from pathlib import Path; import time; Path(%r).touch(); time.sleep(5)" % witness]
+identity = {"repository": repo, "runId": "run-release-stop-fence", "team": team,
+            "featureId": "release-stop-feature", "attempt": 1,
+            "commandDigest": module.digest_command(command)}
+identity["jobId"] = "release-" + hashlib.sha256(json.dumps(
+    identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+).encode()).hexdigest()[:32]
+directory = pathlib.Path(root, identity["jobId"])
+directory.mkdir(mode=0o700)
+result = directory / "result.json"
+result.write_text(json.dumps({"schemaVersion": 1, "identity": identity,
+                              "state": "launching", "createdAt": "2026-09-24T00:00:00+00:00"},
+                             sort_keys=True, separators=(",", ":")) + "\n")
+with (directory / "worker.log").open("w") as log:
+    process = subprocess.Popen([sys.executable, str(worker), "--result", str(result),
+        "--log", str(directory / "release.log"), "--timeout", "30",
+        "--identity-json", json.dumps(identity, separators=(",", ":")),
+        "--lifecycle-root", root, "--repository", repo, "--", *command],
+        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True)
+print(process.pid, identity["jobId"])
+PY
+)"
+read -r RELEASE_FENCE_WORKER_PID RELEASE_FENCE_JOB_ID <<< "$RELEASE_FENCE_VARS"
+for _i in $(seq 1 150); do
+  RELEASE_FENCE_READY="$(find "$LIFECYCLE_ROOT" -maxdepth 2 -path '*/.release-team-fence.*/ready' -print -quit)"
+  [ -n "$RELEASE_FENCE_READY" ] && break
+  sleep 0.02
+done
+check "release worker holds the shared team fence before registration" test -n "$RELEASE_FENCE_READY"
+check "release command has not crossed the registration barrier" \
+  test ! -e "$TMP/release-command-witness"
+RELEASE_STOP_BARRIERS_BEFORE="$(find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' | wc -l | tr -d ' ')"
+"$LAUNCH" stop "$RELEASE_FENCE_TEAM" >"$TMP/release-stop-refusal.out" 2>&1 &
+RELEASE_FENCE_STOP_PID=$!
+for _i in $(seq 1 100); do
+  RELEASE_STOP_BARRIERS_NOW="$(find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' | wc -l | tr -d ' ')"
+  [ "$RELEASE_STOP_BARRIERS_NOW" -gt "$RELEASE_STOP_BARRIERS_BEFORE" ] && break
+  sleep 0.02
+done
+check "team stop reaches the exclusive release fence" \
+  test "$RELEASE_STOP_BARRIERS_NOW" -gt "$RELEASE_STOP_BARRIERS_BEFORE"
+check "team stop queues behind release admission" kill -0 "$RELEASE_FENCE_STOP_PID"
+kill "$RELEASE_RECORDS_HOLDER" 2>/dev/null || true
+wait "$RELEASE_RECORDS_HOLDER" 2>/dev/null || true
+for _i in $(seq 1 150); do
+  [ -e "$TMP/release-command-witness" ] && break
+  sleep 0.02
+done
+check "release command begins only after authenticated registration" \
+  test -e "$TMP/release-command-witness"
+if wait "$RELEASE_FENCE_STOP_PID"; then
+  echo "FAIL: generic team stop accepted an active production release"; FAILURES=$((FAILURES+1))
+elif grep -q 'protected release job exists' "$TMP/release-stop-refusal.out"; then
+  echo "ok: generic team stop refuses an authenticated release before signalling"
+else
+  echo "FAIL: team stop returned the wrong release error: $(cat "$TMP/release-stop-refusal.out")"; FAILURES=$((FAILURES+1))
+fi
+check "release refusal leaves unrelated gate process live" kill -0 "$RELEASE_FENCE_GATE_PID"
+check "release refusal does not revoke unrelated gate publication" \
+  test "$(active_capability_count "$RELEASE_FENCE_TEAM" gate -)" -eq 1
+check "release refusal leaves exact release lifecycle evidence" \
+  test "$(record_count "$RELEASE_FENCE_TEAM" "$RELEASE_FENCE_JOB_ID")" -eq 1
+for _i in $(seq 1 160); do
+  RELEASE_FENCE_RESULT_STATE="$(python3 - "$LIFECYCLE_ROOT/$RELEASE_FENCE_JOB_ID/result.json" <<'PY'
+import json,sys
+try: print(json.load(open(sys.argv[1]))["state"])
+except (OSError, ValueError, KeyError): print("unavailable")
+PY
+)"
+  [ "$RELEASE_FENCE_RESULT_STATE" = completed ] && break
+  sleep 0.05
+done
+check "release worker reaches a durable terminal result" \
+  test "$RELEASE_FENCE_RESULT_STATE" = completed
+check "release worker retires its exact lifecycle record" \
+  test "$(record_count "$RELEASE_FENCE_TEAM" "$RELEASE_FENCE_JOB_ID")" -eq 0
+"$LAUNCH" stop "$RELEASE_FENCE_TEAM" >/dev/null
 
 # -- status + stop --------------------------------------------------------------
 # Capture first (grep -q closes the pipe early → SIGPIPE on the writer under pipefail).

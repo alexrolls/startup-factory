@@ -48,7 +48,8 @@ RELEASE_WORKER_HEARTBEAT_STALE_SECONDS = 10
 # active provider hook in its own session.  Stale-worker recovery must let that
 # trusted SIGTERM handler finish before it escalates the outer release group.
 RELEASE_ORPHAN_TERM_GRACE_SECONDS = 10
-RELEASE_ORPHAN_KILL_GRACE_SECONDS = 2
+RELEASE_RESULT_LOCK_TIMEOUT_SECONDS = 2.0
+RELEASE_RESULT_LOCK_POLL_SECONDS = 0.02
 ACTIVE_TRUSTED_PATH = "/usr/bin:/bin"
 TRUSTED_GIT = "/usr/bin/git"
 RELEASE_WORKER = Path(__file__).resolve().with_name("release-worker.py")
@@ -127,6 +128,7 @@ RELEASE_SNAPSHOT_FILES = {
     "task_metadata.py": Path("bin/task_metadata.py"),
     "product_acceptance.py": Path("bin/product_acceptance.py"),
     "teamwork-path.py": Path("bin/teamwork-path.py"),
+    "launch-lane-lock.py": Path("bin/launch-lane-lock.py"),
     "review_evidence.py": Path("bin/review_evidence.py"),
     "statuses.config.json": Path("config/statuses.config.json"),
     "guardrails.config.json": Path("config/guardrails.config.json"),
@@ -1189,6 +1191,7 @@ def validate_supervisor_install(project: Path) -> Path:
     capture_protected_file(worker, "detached release worker")
     for filename, label in (
         ("process-lifecycle.py", "release lifecycle supervisor"),
+        ("launch-lane-lock.py", "release team admission fence"),
         ("agent-health.py", "agent health collector"),
         ("heartbeat-status.py", "agent heartbeat classifier"),
         ("teamwork-path.py", "agent health path policy"),
@@ -1916,14 +1919,96 @@ def validate_release_job_identity(
     return validated
 
 
+def acquire_release_result_lock(directory: int) -> None:
+    """Bound writer serialization so a stopped worker cannot wedge the monitor."""
+    deadline = time.monotonic() + RELEASE_RESULT_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except (BlockingIOError, InterruptedError) as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MonitorError(
+                    "timed out acquiring the release result writer fence"
+                ) from exc
+            time.sleep(min(RELEASE_RESULT_LOCK_POLL_SECONDS, remaining))
+
+
 def atomic_private_json(path: Path, value: dict) -> None:
-    if path.is_symlink():
-        raise MonitorError(f"refusing to replace protected symlink {path}")
-    atomic_json(path, value)
+    is_release_result = (
+        path.name == "result.json"
+        and re.fullmatch(r"release-[0-9a-f]{32}", path.parent.name) is not None
+    )
+    data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    descriptor = -1
+    directory = -1
+    temporary = ""
     try:
-        path.chmod(0o600)
+        directory = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        if is_release_result:
+            info = os.fstat(directory)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid not in {0, os.geteuid()}
+                or stat.S_IMODE(info.st_mode) != 0o700
+            ):
+                raise MonitorError("release job directory must be private mode 0700")
+            candidate_identity = value.get("identity") if isinstance(value, dict) else None
+            if not isinstance(candidate_identity, dict):
+                raise MonitorError("release job result has no protected identity")
+            validate_release_job_result(value, candidate_identity)
+            # result.json is atomically replaced, so its inode cannot be the
+            # stable lock target.  The private job-directory inode persists for
+            # the whole attempt and is the shared PM/worker writer fence.
+            acquire_release_result_lock(directory)
+
+        if path.is_symlink():
+            raise MonitorError(f"refusing to replace protected symlink {path}")
+        if is_release_result and path.exists():
+            current = validate_release_job_result(
+                load_private_json(path, "current release job result"),
+                value["identity"],
+            )
+            if (
+                current["state"] in {"completed", "cancelled"}
+                and current != value
+            ):
+                raise MonitorError(
+                    "refusing to replace an existing terminal release job result"
+                )
+
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{path.name}.", dir=path.parent
+        )
+        os.fchmod(descriptor, 0o600)
+        offset = 0
+        while offset < len(data):
+            offset += os.write(descriptor, data[offset:])
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        temporary = ""
+        os.fsync(directory)
     except OSError as exc:
         raise MonitorError(f"cannot protect release job state {path}: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+        if directory >= 0:
+            os.close(directory)
 
 
 def load_private_json(path: Path, label: str) -> dict:
@@ -2031,6 +2116,41 @@ def read_release_job_result(job_dir: Path, identity: dict) -> dict:
             result = dict(result)
             result.setdefault("authorityRevokedAt", cancellation["requestedAt"])
     return result
+
+
+def reestablish_terminal_release_result_durability(
+    job_dir: Path, identity: dict, expected: dict
+) -> dict:
+    """Make crash-visible terminal evidence durable before tombstone retirement."""
+    validate_release_job_directory(job_dir, identity)
+    # Keep the immutable on-disk result distinct from the read-time authority
+    # view, which may add cancellation evidence from cancel.json.  Durability
+    # recovery must republish the exact terminal value that won, never turn a
+    # derived view into a second terminal writer.
+    raw_result = validate_release_job_result(
+        load_private_json(job_dir / "result.json", "release job result"), identity
+    )
+    revalidated = read_release_job_result(job_dir, identity)
+    if (
+        revalidated != expected
+        or not terminal_release_result_proves_cleanup(raw_result)
+    ):
+        raise MonitorError(
+            "terminal release job result changed before durability recovery"
+        )
+    # A prior writer may have renamed these exact terminal bytes into place and
+    # then crashed (or received an error) before the parent-directory fsync.
+    # Republishing the raw value fsyncs its inode and the job directory
+    # again.  Any error is deliberately raised before the retained lifecycle
+    # tombstone can be forgotten, so a later restart can retry this boundary.
+    atomic_private_json(job_dir / "result.json", raw_result)
+    validate_release_job_directory(job_dir, identity)
+    persisted = read_release_job_result(job_dir, identity)
+    if persisted != revalidated:
+        raise MonitorError(
+            "terminal release job result changed during durability recovery"
+        )
+    return persisted
 
 
 def validate_release_job_directory(
@@ -2163,8 +2283,11 @@ def release_lifecycle_command(
     lifecycle_root: Path,
     repository: Path,
     identity: dict,
+    generation: dict | None = None,
     signal_name: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if action not in {"inspect", "probe", "signal", "terminate", "forget"}:
+        raise MonitorError("invalid release lifecycle action")
     argv = [
         str(Path(sys.executable).resolve()),
         "-I", "-S", "-E", "-s",
@@ -2176,80 +2299,250 @@ def release_lifecycle_command(
         "--category", "release",
         "--instance", identity["jobId"],
     ]
+    input_text: str | None = None
+    if generation is not None:
+        created_at = generation.get("createdAt")
+        launch_token = generation.get("launchToken")
+        if (
+            not isinstance(created_at, str)
+            or not created_at.endswith("Z")
+            or not isinstance(launch_token, str)
+            or re.fullmatch(r"[0-9a-f]{64}", launch_token) is None
+        ):
+            raise MonitorError("invalid exact release lifecycle generation")
+        argv += ["--expected-created-at", created_at, "--expect-token-stdin"]
+        input_text = launch_token + "\n"
+    elif action not in {"inspect", "probe"}:
+        raise MonitorError("release lifecycle mutation requires an exact generation")
     if action == "signal":
-        if signal_name not in {"TERM", "KILL"}:
+        if signal_name != "TERM":
             raise MonitorError("invalid release lifecycle signal")
         argv += ["--signal", signal_name]
+    elif signal_name is not None:
+        raise MonitorError("release lifecycle signal supplied for a non-signal action")
     try:
-        return subprocess.run(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env={
+        options = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "env": {
                 "PATH": ACTIVE_TRUSTED_PATH,
                 "PYTHONNOUSERSITE": "1",
                 "PYTHONSAFEPATH": "1",
             },
-            timeout=10,
-            check=False,
-        )
+            "timeout": 10,
+            "check": False,
+        }
+        if input_text is None:
+            options["stdin"] = subprocess.DEVNULL
+        else:
+            options["input"] = input_text
+        return subprocess.run(argv, **options)
     except (OSError, subprocess.SubprocessError) as exc:
         raise MonitorError("protected release lifecycle command failed") from exc
 
 
-def stop_orphan_release_group(
-    lifecycle_root: Path, repository: Path, identity: dict
-) -> None:
-    probe = release_lifecycle_command(
-        "probe", lifecycle_root=lifecycle_root, repository=repository, identity=identity
-    )
-    if probe.returncode not in {0, 3}:
-        raise MonitorError("protected release lifecycle record is invalid")
-    if probe.returncode == 0:
-        term = release_lifecycle_command(
-            "signal", lifecycle_root=lifecycle_root, repository=repository,
-            identity=identity, signal_name="TERM"
+RELEASE_LIFECYCLE_RECORD_KEYS = {
+    "schemaVersion", "repositoryId", "team", "category", "instance", "kind",
+    "pid", "processIdentity", "launchToken", "createdAt", "tmuxSession",
+    "tmuxWindow", "tmuxPane", "processGroupId", "sessionId", "tmuxPanePid",
+    "auth",
+}
+
+
+def exact_release_lifecycle_generation(
+    inspected: subprocess.CompletedProcess[str], identity: dict, release_pid: int
+) -> tuple[dict, str]:
+    if len(inspected.stdout.encode("utf-8")) > 4096:
+        raise MonitorError("protected release lifecycle record is too large")
+    try:
+        record = strict_json(inspected.stdout)
+    except (UnicodeError, ValueError) as exc:
+        raise MonitorError("protected release lifecycle record is malformed") from exc
+    if (
+        not isinstance(record, dict)
+        or set(record) != RELEASE_LIFECYCLE_RECORD_KEYS
+        or record.get("schemaVersion") != 3
+        or record.get("team") != identity["team"]
+        or record.get("category") != "release"
+        or record.get("instance") != identity["jobId"]
+        or record.get("kind") not in {"background", "completed-background"}
+        or record.get("pid") != release_pid
+        or record.get("processGroupId") != release_pid
+        or record.get("sessionId") != release_pid
+        or not isinstance(record.get("processIdentity"), str)
+        or not record["processIdentity"]
+        or not isinstance(record.get("repositoryId"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", record["repositoryId"]) is None
+        or not isinstance(record.get("launchToken"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", record["launchToken"]) is None
+        or not isinstance(record.get("createdAt"), str)
+        or not record["createdAt"].endswith("Z")
+        or not isinstance(record.get("auth"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", record["auth"]) is None
+        or any(
+            record.get(name) is not None
+            for name in ("tmuxSession", "tmuxWindow", "tmuxPane", "tmuxPanePid")
         )
-        if term.returncode not in {0, 3}:
-            raise MonitorError("could not terminate stale release process group")
-        deadline = time.monotonic() + RELEASE_ORPHAN_TERM_GRACE_SECONDS
-        while time.monotonic() < deadline:
-            probe = release_lifecycle_command(
-                "probe", lifecycle_root=lifecycle_root,
-                repository=repository, identity=identity
-            )
-            if probe.returncode == 3:
-                break
-            if probe.returncode != 0:
-                raise MonitorError("protected release lifecycle record became invalid")
-            time.sleep(0.05)
-        if probe.returncode == 0:
-            killed = release_lifecycle_command(
-                "signal", lifecycle_root=lifecycle_root, repository=repository,
-                identity=identity, signal_name="KILL"
-            )
-            if killed.returncode not in {0, 3}:
-                raise MonitorError("could not kill stale release process group")
-            deadline = time.monotonic() + RELEASE_ORPHAN_KILL_GRACE_SECONDS
-            while time.monotonic() < deadline:
-                probe = release_lifecycle_command(
-                    "probe", lifecycle_root=lifecycle_root,
-                    repository=repository, identity=identity
-                )
-                if probe.returncode == 3:
-                    break
-                if probe.returncode != 0:
-                    raise MonitorError("protected release lifecycle record became invalid")
-                time.sleep(0.05)
-            if probe.returncode == 0:
-                raise MonitorError("stale release process group survived SIGKILL")
+    ):
+        raise MonitorError(
+            "protected release lifecycle record does not match its release PID anchor"
+        )
+    return (
+        {
+            "createdAt": record["createdAt"],
+            "launchToken": record["launchToken"],
+            "pid": record["pid"],
+        },
+        record["kind"],
+    )
+
+
+def terminal_release_result_proves_cleanup(result: dict) -> bool:
+    return (
+        result.get("state") in {"completed", "cancelled"}
+        and type(result.get("exitCode")) is int
+        and isinstance(result.get("completedAt"), str)
+        and bool(result["completedAt"])
+    )
+
+
+def forget_release_generation(
+    lifecycle_root: Path, repository: Path, identity: dict, generation: dict
+) -> None:
     forgotten = release_lifecycle_command(
-        "forget", lifecycle_root=lifecycle_root, repository=repository, identity=identity
+        "forget", lifecycle_root=lifecycle_root, repository=repository,
+        identity=identity, generation=generation
     )
     if forgotten.returncode:
-        raise MonitorError("could not retire stale release lifecycle record")
+        raise MonitorError("could not retire exact stale release lifecycle record")
+
+
+def confirm_inspected_release_generation(
+    lifecycle_root: Path,
+    repository: Path,
+    identity: dict,
+    result: dict,
+    generation: dict,
+    release_pid: int,
+) -> str | None:
+    """Disambiguate exact probe rc=3 without treating record absence as death."""
+    inspected = release_lifecycle_command(
+        "inspect", lifecycle_root=lifecycle_root, repository=repository,
+        identity=identity
+    )
+    if inspected.returncode == 3:
+        if terminal_release_result_proves_cleanup(result):
+            return None
+        raise MonitorError(
+            "protected release lifecycle record disappeared before exact recovery"
+        )
+    if inspected.returncode != 0:
+        raise MonitorError("protected release lifecycle record is invalid")
+    observed, kind = exact_release_lifecycle_generation(
+        inspected, identity, release_pid
+    )
+    if observed != generation:
+        raise MonitorError(
+            "exact protected release lifecycle generation changed while stopping"
+        )
+    return kind
+
+
+def stop_orphan_release_group(
+    lifecycle_root: Path, repository: Path, identity: dict, result: dict,
+    *, retain_record: bool = False,
+) -> dict | None:
+    inspected = release_lifecycle_command(
+        "inspect", lifecycle_root=lifecycle_root, repository=repository,
+        identity=identity
+    )
+    if inspected.returncode == 3:
+        # A missing record is safe only before the worker durably admitted that
+        # the launch barrier may have opened.  release-worker persists the PID
+        # before registration and persists releaseMayHaveStartedAt before the
+        # go write, so this covers a crash in the PID -> register window without
+        # weakening fail-closed recovery after launch authorization.
+        if (
+            result.get("releaseMayHaveStartedAt")
+            and not terminal_release_result_proves_cleanup(result)
+        ):
+            raise MonitorError(
+                "protected release lifecycle record disappeared before exact recovery"
+            )
+        return None
+    if inspected.returncode != 0:
+        raise MonitorError("protected release lifecycle record is invalid")
+    release_pid = result.get("releasePid")
+    if type(release_pid) is not int or release_pid <= 1:
+        raise MonitorError(
+            "protected release lifecycle record has no release PID anchor"
+        )
+    generation, kind = exact_release_lifecycle_generation(
+        inspected, identity, release_pid
+    )
+    if kind == "background":
+        probe = release_lifecycle_command(
+            "probe", lifecycle_root=lifecycle_root, repository=repository,
+            identity=identity, generation=generation
+        )
+        if probe.returncode not in {0, 3}:
+            raise MonitorError(
+                "protected release lifecycle identity changed before exact recovery"
+            )
+        generation_live = probe.returncode == 0
+        if not generation_live:
+            kind = confirm_inspected_release_generation(
+                lifecycle_root, repository, identity, result, generation, release_pid
+            )
+            if kind is None:
+                return None
+        if generation_live:
+            term = release_lifecycle_command(
+                "signal", lifecycle_root=lifecycle_root, repository=repository,
+                identity=identity, generation=generation, signal_name="TERM"
+            )
+            if term.returncode not in {0, 3}:
+                raise MonitorError("could not terminate exact stale release process group")
+            deadline = time.monotonic() + RELEASE_ORPHAN_TERM_GRACE_SECONDS
+            generation_live = term.returncode == 0
+            if not generation_live:
+                kind = confirm_inspected_release_generation(
+                    lifecycle_root, repository, identity, result,
+                    generation, release_pid
+                )
+                if kind is None:
+                    return None
+            while generation_live and time.monotonic() < deadline:
+                probe = release_lifecycle_command(
+                    "probe", lifecycle_root=lifecycle_root, repository=repository,
+                    identity=identity, generation=generation
+                )
+                if probe.returncode == 3:
+                    generation_live = False
+                    kind = confirm_inspected_release_generation(
+                        lifecycle_root, repository, identity, result,
+                        generation, release_pid
+                    )
+                    if kind is None:
+                        return None
+                    break
+                if probe.returncode != 0:
+                    raise MonitorError(
+                        "exact protected release lifecycle generation changed while stopping"
+                    )
+                time.sleep(0.05)
+        if generation_live:
+            terminated = release_lifecycle_command(
+                "terminate", lifecycle_root=lifecycle_root, repository=repository,
+                identity=identity, generation=generation
+            )
+            if terminated.returncode != 0:
+                raise MonitorError("could not terminate exact stale release process group")
+    if retain_record:
+        return generation
+    forget_release_generation(lifecycle_root, repository, identity, generation)
+    return None
 
 
 def result_age_seconds(result: dict) -> float:
@@ -2280,7 +2573,12 @@ def recover_stale_release_job(
     if not stale:
         return result
     request_release_job_cancel(job_dir, identity, "run-paused")
-    stop_orphan_release_group(lifecycle_root, repository, identity)
+    # Keep the authenticated dead/completed record until the recovered terminal
+    # result is durable.  If this monitor dies at either boundary, the next pass
+    # can recover from the tombstone or trust the already-terminal result.
+    generation = stop_orphan_release_group(
+        lifecycle_root, repository, identity, result, retain_record=True
+    )
     release_may_have_started = bool(result.get("releaseMayHaveStartedAt"))
     recovered = {
         "schemaVersion": 1,
@@ -2299,7 +2597,16 @@ def recover_stale_release_job(
         recovered["authorityRevokedAt"] = iso_now()
     else:
         recovered["cancelledAt"] = iso_now()
+    if "releasePid" in result:
+        # Preserve the private PID anchor in the durable terminal result.  If
+        # this monitor dies before exact forget, the next pass can still bind
+        # the retained authenticated tombstone to the same guardian.
+        recovered["releasePid"] = result["releasePid"]
     atomic_private_json(job_dir / "result.json", recovered)
+    if generation is not None:
+        forget_release_generation(
+            lifecycle_root, repository, identity, generation
+        )
     entry["releaseJobState"] = "recovered-stale-worker"
     return recovered
 
@@ -2321,9 +2628,21 @@ def active_release_job(entry: dict, repository: Path, lifecycle_root: Path) -> t
     job_dir = release_job_directory(lifecycle_root, identity)
     validate_release_job_directory(job_dir, identity)
     result = read_release_job_result(job_dir, identity)
-    result = recover_stale_release_job(
-        entry, repository, lifecycle_root, identity, job_dir, result
-    )
+    if terminal_release_result_proves_cleanup(result):
+        # A visible terminal result may come from a writer that crashed after
+        # rename but before its parent-directory fsync.  Revalidate and
+        # identically republish it before completing idempotent retirement in
+        # the terminal-result -> forget window.
+        result = reestablish_terminal_release_result_durability(
+            job_dir, identity, result
+        )
+        stop_orphan_release_group(
+            lifecycle_root, repository, identity, result
+        )
+    else:
+        result = recover_stale_release_job(
+            entry, repository, lifecycle_root, identity, job_dir, result
+        )
     return identity, job_dir, result
 
 

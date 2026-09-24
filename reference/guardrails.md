@@ -291,6 +291,18 @@ markers only: its contents are never passed to `kill`, `kill -0`, or tmux. A mis
 modified, unauthenticated, or process-identity-mismatched protected record fails closed
 without signalling. If protected lifecycle state is not configured, manual launches
 remain unmanaged and `stop` deliberately refuses to signal processes.
+`stop <team>` is a point-in-time operation: its exclusive protected team fence
+waits for launches and control operations already holding the shared fence,
+then snapshots, revokes, and stops those generations before reporting success.
+A new launch that acquires the shared fence after stop may run; `stop` is not a
+persistent administrative shutdown or cancellation of queued future launches.
+Roster preflight and doctor run before the shared fence and can therefore
+finish after a concurrent stop, then launch as a later operation.
+Detached production release admission uses the same shared team fence through
+its authenticated guardian registration and launch decision. If any protected
+release lifecycle record exists, generic `stop <team>` refuses before revoking
+or signalling anything; use the release supervisor's authenticated
+cancel/reconciliation path and confirm its durable terminal result first.
 An authenticated stop sends bounded TERM→KILL to the launcher-managed process
 group/session, but ordinary process groups cannot contain a descendant that
 deliberately calls `setsid`, double-forks, or delegates to an external

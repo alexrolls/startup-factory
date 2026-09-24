@@ -203,13 +203,12 @@ task_any_live() { # task_any_live <team> <taskId> -> any role/attempt process fo
 }
 
 stop_task_or_quarantine() { # <team> <workspace> <taskId>
-  local stop_team="$1" stop_workspace="$2" stop_task="$3"
+  local stop_team="$1" stop_task="$3"
   if "$SKILL_DIR/bin/launch-team.sh" stop-task "$stop_team" "$stop_task"; then
     return 0
   fi
-  echo "dispatch: task $stop_task could not be fully signaled; revoking publication authority and continuing isolated work" >&2
-  python3 "$SKILL_DIR/bin/outbox_capability.py" revoke-task \
-    --repo "$REPO_ROOT" --workspace "$stop_workspace" --team "$stop_team" --task "$stop_task" >/dev/null \
+  echo "dispatch: task $stop_task could not be fully signaled; fencing cross-worktree publication authority and continuing isolated work" >&2
+  "$SKILL_DIR/bin/launch-team.sh" fence-task "$stop_team" "$stop_task" >/dev/null \
     || die "task $stop_task stop failed and publication authority could not be revoked"
 }
 

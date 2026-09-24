@@ -1162,19 +1162,47 @@ def verify_published_entry(
     )
 
 
-def _revoke_scope(repository: str, workspace: str, matches) -> int:
+def _revoke_scope(
+    repository: str,
+    workspace: str | None,
+    matches,
+    *,
+    all_worktrees: bool = False,
+) -> int:
     repo = _repo(repository)
-    workspace_path = Path(workspace)
-    if not workspace_path.is_absolute():
-        raise CapabilityError("canonical workspace path must be absolute")
-    workspace_real = Path(os.path.realpath(workspace_path))
-    if workspace_real != workspace_path or not workspace_real.is_dir():
-        raise CapabilityError("canonical workspace must be a non-symlink directory")
+    workspace_real: Path | None = None
+    if all_worktrees:
+        if workspace is not None:
+            # The caller still supplies its local scope as an explicit reminder
+            # that this is a cross-worktree broker operation.  Validate it even
+            # though matching is intentionally against the whole Git-common
+            # authority below.  The local team directory need not exist: a
+            # linked checkout may stop a generation launched by its sibling.
+            workspace_path = Path(workspace)
+            if not workspace_path.is_absolute():
+                raise CapabilityError("canonical workspace path must be absolute")
+            workspace_real = Path(os.path.realpath(workspace_path))
+            if workspace_real != workspace_path:
+                raise CapabilityError("canonical workspace must be a non-symlink path")
+    else:
+        if workspace is None:
+            raise CapabilityError("canonical workspace path is required")
+        workspace_path = Path(workspace)
+        if not workspace_path.is_absolute():
+            raise CapabilityError("canonical workspace path must be absolute")
+        workspace_real = Path(os.path.realpath(workspace_path))
+        if workspace_real != workspace_path or not workspace_real.is_dir():
+            raise CapabilityError("canonical workspace must be a non-symlink directory")
     records, active, revoked_dir = state_directories(repo)
     with authority_lock(repo):
         scoped = lambda record: (
-            record.get("canonicalRepo") == str(repo)
-            and record.get("canonicalWorkspace") == str(workspace_real)
+            (
+                all_worktrees
+                or (
+                    record.get("canonicalRepo") == str(repo)
+                    and record.get("canonicalWorkspace") == str(workspace_real)
+                )
+            )
             and matches(record)
         )
         _revoke_matching_records(records, revoked_dir, scoped)
@@ -1223,7 +1251,14 @@ def _revoke_scope(repository: str, workspace: str, matches) -> int:
     return revoked
 
 
-def revoke_task(repository: str, workspace: str, team: str, task: str) -> int:
+def revoke_task(
+    repository: str,
+    workspace: str,
+    team: str,
+    task: str,
+    *,
+    all_worktrees: bool = False,
+) -> int:
     """Revoke every producer generation bound to one task."""
     _safe_text(team, "team", 63)
     _safe_text(task, "taskId")
@@ -1235,10 +1270,18 @@ def revoke_task(repository: str, workspace: str, team: str, task: str) -> int:
             and record.get("executionKind") == "task"
             and record.get("taskId") == task
         ),
+        all_worktrees=all_worktrees,
     )
 
 
-def revoke_role(repository: str, workspace: str, team: str, role: str) -> int:
+def revoke_role(
+    repository: str,
+    workspace: str,
+    team: str,
+    role: str,
+    *,
+    all_worktrees: bool = False,
+) -> int:
     """Revoke every gate generation for one exact concrete role."""
     _safe_text(team, "team", 63)
     if not ROLE.fullmatch(role):
@@ -1251,16 +1294,24 @@ def revoke_role(repository: str, workspace: str, team: str, role: str) -> int:
             and record.get("executionKind") == "gate"
             and record.get("role") == role
         ),
+        all_worktrees=all_worktrees,
     )
 
 
-def revoke_team(repository: str, workspace: str, team: str) -> int:
+def revoke_team(
+    repository: str,
+    workspace: str,
+    team: str,
+    *,
+    all_worktrees: bool = False,
+) -> int:
     """Revoke every task and gate generation for one exact team workspace."""
     _safe_text(team, "team", 63)
     return _revoke_scope(
         repository,
         workspace,
         lambda record: record.get("team") == team,
+        all_worktrees=all_worktrees,
     )
 
 
@@ -1463,6 +1514,7 @@ def main() -> int:
     revoke_parser.add_argument("--workspace", required=True)
     revoke_parser.add_argument("--team", required=True)
     revoke_parser.add_argument("--task", required=True)
+    revoke_parser.add_argument("--all-worktrees", action="store_true")
     revoke_exact_parser = subparsers.add_parser("revoke-exact")
     revoke_exact_parser.add_argument("--repo", required=True)
     revoke_exact_parser.add_argument("--workspace", required=True)
@@ -1472,10 +1524,12 @@ def main() -> int:
     revoke_role_parser.add_argument("--workspace", required=True)
     revoke_role_parser.add_argument("--team", required=True)
     revoke_role_parser.add_argument("--role", required=True)
+    revoke_role_parser.add_argument("--all-worktrees", action="store_true")
     revoke_team_parser = subparsers.add_parser("revoke-team")
     revoke_team_parser.add_argument("--repo", required=True)
     revoke_team_parser.add_argument("--workspace", required=True)
     revoke_team_parser.add_argument("--team", required=True)
+    revoke_team_parser.add_argument("--all-worktrees", action="store_true")
     delivery_root_parser = subparsers.add_parser("delivery-root")
     delivery_root_parser.add_argument("--repo", required=True)
     delivery_root_parser.add_argument("--workspace", required=True)
@@ -1505,7 +1559,13 @@ def main() -> int:
             print(json.dumps(result, sort_keys=True, separators=(",", ":")))
             return 0
         if args.command == "revoke-task":
-            count = revoke_task(args.repo, args.workspace, args.team, args.task)
+            count = revoke_task(
+                args.repo,
+                args.workspace,
+                args.team,
+                args.task,
+                all_worktrees=args.all_worktrees,
+            )
             print(json.dumps({"revoked": count}, sort_keys=True, separators=(",", ":")))
             return 0
         if args.command == "revoke-exact":
@@ -1513,11 +1573,22 @@ def main() -> int:
             print(json.dumps({"revoked": count}, sort_keys=True, separators=(",", ":")))
             return 0
         if args.command == "revoke-role":
-            count = revoke_role(args.repo, args.workspace, args.team, args.role)
+            count = revoke_role(
+                args.repo,
+                args.workspace,
+                args.team,
+                args.role,
+                all_worktrees=args.all_worktrees,
+            )
             print(json.dumps({"revoked": count}, sort_keys=True, separators=(",", ":")))
             return 0
         if args.command == "revoke-team":
-            count = revoke_team(args.repo, args.workspace, args.team)
+            count = revoke_team(
+                args.repo,
+                args.workspace,
+                args.team,
+                all_worktrees=args.all_worktrees,
+            )
             print(json.dumps({"revoked": count}, sort_keys=True, separators=(",", ":")))
             return 0
         if args.command == "delivery-root":

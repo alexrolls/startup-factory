@@ -872,6 +872,7 @@ def trusted_file_specs() -> dict[str, tuple[Path, Path]]:
         "task_metadata.py": ((SKILL_DIR / "bin" / "task_metadata.py").resolve(), Path("bin/task_metadata.py")),
         "product_acceptance.py": ((SKILL_DIR / "bin" / "product_acceptance.py").resolve(), Path("bin/product_acceptance.py")),
         "teamwork-path.py": ((SKILL_DIR / "bin" / "teamwork-path.py").resolve(), Path("bin/teamwork-path.py")),
+        "launch-lane-lock.py": ((SKILL_DIR / "bin" / "launch-lane-lock.py").resolve(), Path("bin/launch-lane-lock.py")),
         "review_evidence.py": ((SKILL_DIR / "bin" / "review_evidence.py").resolve(), Path("bin/review_evidence.py")),
         "statuses.config.json": ((SKILL_DIR / "config" / "statuses.config.json").resolve(), Path("config/statuses.config.json")),
         "guardrails.config.json": ((SKILL_DIR / "config" / "guardrails.config.json").resolve(), Path("config/guardrails.config.json")),

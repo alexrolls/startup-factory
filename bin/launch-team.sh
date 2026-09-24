@@ -22,6 +22,7 @@
 #   launch-team.sh health        [--json] [--watch]              # current-project managed agents
 #   launch-team.sh stop          <team>
 #   launch-team.sh stop-task     <team> <taskId>                 # stop only protected workers for one task
+#   launch-team.sh fence-task    <team> <taskId>                 # revoke task publication across worktrees without signalling
 set -euo pipefail
 umask 077
 STARTUP_FACTORY_CALLER_PATH="${PATH:-/usr/bin:/bin}"
@@ -57,11 +58,20 @@ LIFECYCLE_STATE_ROOT=""
 LIFECYCLE_ENABLED=false
 PUBLICATION_AUTHORITY_ENABLED=false
 LAUNCHED_PID=""
+LAST_LAUNCH_CREATED_AT=""
+LAST_LAUNCH_TOKEN=""
 LAUNCH_BARRIER_DIR=""
 LAUNCH_BARRIER_FIFO=""
 LAUNCH_GROUP_FILE=""
 LAUNCH_TMUX_WRAPPER=""
 LAUNCH_READY_FILE=""
+LAUNCH_LANE_LOCK_DIR=""
+LAUNCH_LANE_LOCK_PID=""
+LAUNCH_LANE_LOCK_TEAM=""
+LAUNCH_LANE_LOCK_CATEGORY=""
+LAUNCH_LANE_LOCK_INSTANCE=""
+TEAM_FENCE_DIR=""
+TEAM_FENCE_PID=""
 SUPERPOWERS_ENABLED=""
 TMUX_BIN=""
 TMUX_BIN_IDENTITY=""
@@ -466,12 +476,166 @@ lifecycle_any_live() { # team category [task-key]
 lifecycle_register() { # team category instance kind pid [session window pane pane-pid]
   local team="$1" category="$2" instance="$3" kind="$4" pid="$5"
   shift 5
+  local registration tmux_token=""
   local args=(register --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT"
     --team "$team" --category "$category" --instance "$instance" --kind "$kind" --pid "$pid")
   if [ "$kind" = tmux ]; then
     args+=(--tmux-session "$1" --tmux-window "$2" --tmux-pane "$3" --tmux-pane-pid "$4")
+    tmux_token="${5:-}"
+    [ -z "$tmux_token" ] || args+=(--launch-token-stdin)
   fi
-  python3 "$SKILL_DIR/bin/process-lifecycle.py" "${args[@]}" >/dev/null
+  if [ -n "$tmux_token" ]; then
+    registration="$(printf '%s\n' "$tmux_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" "${args[@]}")" \
+      || return $?
+  else
+    registration="$(python3 "$SKILL_DIR/bin/process-lifecycle.py" "${args[@]}")" \
+      || return $?
+  fi
+  local generation_fields
+  generation_fields="$(printf '%s' "$registration" | python3 -c '
+import json,re,sys
+value=json.load(sys.stdin)
+created=value.get("createdAt")
+token=value.get("launchToken")
+assert isinstance(created,str) and created.endswith("Z")
+assert isinstance(token,str) and re.fullmatch(r"[0-9a-f]{64}",token)
+print(created+"\x1f"+token)')" || return $?
+  IFS=$'\x1f' read -r LAST_LAUNCH_CREATED_AT LAST_LAUNCH_TOKEN \
+    <<< "$generation_fields"
+  [ -z "$tmux_token" ] || [ "$LAST_LAUNCH_TOKEN" = "$tmux_token" ]
+}
+
+tmux_generation_tag() { # protected launch token -> non-secret pane generation tag
+  printf '%s' "$1" | python3 -c 'import hashlib,sys; print("sf-" + hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
+}
+
+acquire_launch_lane_lock() { # team category instance [shared|exclusive]
+  local team="$1" category="$2" instance="$3" mode="${4:-exclusive}" ready holder acknowledged
+  [ "$LIFECYCLE_ENABLED" = true ] || return 0
+  [ -z "$LAUNCH_LANE_LOCK_DIR$LAUNCH_LANE_LOCK_PID" ] \
+    || die "internal launch error: a protected launch lane is already held"
+  LAUNCH_LANE_LOCK_DIR="$(mktemp -d "$LIFECYCLE_STATE_ROOT/.launch-lane.XXXXXXXX")" \
+    || die "could not allocate a protected launch-lane barrier"
+  chmod 700 "$LAUNCH_LANE_LOCK_DIR" \
+    || die "could not protect the launch-lane barrier"
+  ready="$LAUNCH_LANE_LOCK_DIR/ready"
+  verify_authority_python \
+    || die "trusted Python changed before launch-lane acquisition"
+  # Invoke the pinned interpreter directly, rather than through the shell
+  # helper function: $! must be the actual holder PID and the holder's parent
+  # must be this broker process for parent-death release to be reliable.
+  PYTHONDONTWRITEBYTECODE=1 "$AUTHORITY_PYTHON" -I -B \
+    "$SKILL_DIR/bin/launch-lane-lock.py" \
+    --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
+    --team "$team" --category "$category" --instance "$instance" \
+    --mode "$mode" \
+    --barrier "$LAUNCH_LANE_LOCK_DIR" \
+    2>"$LAUNCH_LANE_LOCK_DIR/error" &
+  holder=$!
+  LAUNCH_LANE_LOCK_PID="$holder"
+  # Valid contention can exceed ten seconds (worktree setup, TERM grace, or
+  # a full role restart).  The holder polls parent death and exits if this
+  # broker is interrupted, so wait for acquisition rather than timing out and
+  # leaving an abandoned kernel-lock waiter behind.
+  while :; do
+    [ -s "$ready" ] && break
+    /bin/kill -0 "$holder" 2>/dev/null \
+      || { wait "$holder" 2>/dev/null || true; acknowledged=no; break; }
+    sleep 0.02
+  done
+  acknowledged="$("$AUTHORITY_PYTHON" -I -B - "$ready" "$holder" <<'PY' 2>/dev/null || true
+import os
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expected = sys.argv[2] + "\n"
+before = path.lstat()
+if (stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid() or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_nlink != 1 or before.st_size != len(expected)):
+    raise SystemExit(1)
+descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    value = os.read(descriptor, len(expected) + 1).decode("ascii")
+    opened = os.fstat(descriptor)
+finally:
+    os.close(descriptor)
+if ((opened.st_dev, opened.st_ino, opened.st_size, opened.st_nlink)
+        != (before.st_dev, before.st_ino, before.st_size, before.st_nlink)):
+    raise SystemExit(1)
+if value != expected:
+    raise SystemExit(1)
+print("yes")
+PY
+)"
+  if [ "$acknowledged" != yes ] || ! /bin/kill -0 "$holder" 2>/dev/null; then
+    [ ! -s "$LAUNCH_LANE_LOCK_DIR/error" ] \
+      || sed -n '1,20p' "$LAUNCH_LANE_LOCK_DIR/error" >&2
+    LAUNCH_LANE_LOCK_PID=""
+    rm -f "$ready" "$LAUNCH_LANE_LOCK_DIR/error"
+    rmdir "$LAUNCH_LANE_LOCK_DIR" 2>/dev/null || true
+    LAUNCH_LANE_LOCK_DIR=""
+    die "could not acquire the protected launch lane for $team/$instance"
+  fi
+  LAUNCH_LANE_LOCK_TEAM="$team"
+  LAUNCH_LANE_LOCK_CATEGORY="$category"
+  LAUNCH_LANE_LOCK_INSTANCE="$instance"
+}
+
+release_launch_lane_lock() {
+  local holder="$LAUNCH_LANE_LOCK_PID" directory="$LAUNCH_LANE_LOCK_DIR"
+  [ -n "$holder$directory" ] || return 0
+  [ -n "$holder" ] && [ -n "$directory" ] \
+    || die "internal launch error: protected launch-lane identity is incomplete"
+  mkdir -m 700 "$directory/release" \
+    || die "could not release the protected launch lane"
+  if ! wait "$holder"; then
+    [ ! -s "$directory/error" ] || sed -n '1,20p' "$directory/error" >&2
+    die "protected launch-lane holder failed during release"
+  fi
+  rm -f "$directory/ready" "$directory/error"
+  rmdir "$directory/release" "$directory" \
+    || die "could not retire the protected launch-lane barrier"
+  LAUNCH_LANE_LOCK_PID=""; LAUNCH_LANE_LOCK_DIR=""
+  LAUNCH_LANE_LOCK_TEAM=""; LAUNCH_LANE_LOCK_CATEGORY=""
+  LAUNCH_LANE_LOCK_INSTANCE=""
+}
+
+acquire_team_fence() { # team shared|exclusive
+  local team="$1" mode="$2"
+  [ "$LIFECYCLE_ENABLED" = true ] || return 0
+  [ -z "$TEAM_FENCE_DIR$TEAM_FENCE_PID" ] \
+    || die "internal launch error: a protected team fence is already held"
+  # This uses a separate, stable team lock key.  Every launch/control command
+  # takes it shared before any per-role/task lane; stop takes it exclusive
+  # before its lifecycle snapshot.  Distinct launches remain parallel.
+  acquire_launch_lane_lock "$team" team all "$mode"
+  TEAM_FENCE_DIR="$LAUNCH_LANE_LOCK_DIR"
+  TEAM_FENCE_PID="$LAUNCH_LANE_LOCK_PID"
+  LAUNCH_LANE_LOCK_DIR=""; LAUNCH_LANE_LOCK_PID=""
+  LAUNCH_LANE_LOCK_TEAM=""; LAUNCH_LANE_LOCK_CATEGORY=""
+  LAUNCH_LANE_LOCK_INSTANCE=""
+  trap 'release_team_fence || exit 1' EXIT
+}
+
+release_team_fence() {
+  local holder="$TEAM_FENCE_PID" directory="$TEAM_FENCE_DIR" result=0
+  [ -n "$holder$directory" ] || return 0
+  [ -n "$holder" ] && [ -n "$directory" ] || return 1
+  if ! mkdir -m 700 "$directory/release" 2>/dev/null; then
+    # Called only from EXIT: return failure without waiting or signalling a
+    # possibly reaped/reused PID.  The holder observes parent death and drops
+    # its lock even when this private barrier cannot be cleaned up.
+    TEAM_FENCE_PID=""; TEAM_FENCE_DIR=""
+    return 1
+  fi
+  wait "$holder" 2>/dev/null || result=1
+  rm -f "$directory/ready" "$directory/error" || result=1
+  rmdir "$directory/release" "$directory" 2>/dev/null || result=1
+  TEAM_FENCE_PID=""; TEAM_FENCE_DIR=""
+  return "$result"
 }
 
 create_launch_barrier() {
@@ -594,22 +758,22 @@ retire_background_launch() { # reaper-pid team category instance created-at laun
   # select a signal target.  The wrapper PID is never signalled: Bash may have
   # already reaped and released it for reuse.  The trusted wrapper exits only
   # after waitpid() has reaped the managed session leader.
-  if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" probe \
+  if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" verify \
       --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
       --team "$team" --category "$category" --instance "$instance" \
-      --expect-token-stdin >/dev/null; then
+      --expected-created-at "$created_at" --expect-token-stdin >/dev/null; then
     if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" signal \
         --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
         --team "$team" --category "$category" --instance "$instance" \
-        --expect-token-stdin --signal TERM; then
+        --expected-created-at "$created_at" --expect-token-stdin --signal TERM; then
       :
     else
       rc=$?
       [ "$rc" -eq 3 ] || {
-        if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" probe \
+        if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" verify \
           --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
           --team "$team" --category "$category" --instance "$instance" \
-          --expect-token-stdin >/dev/null; then
+          --expected-created-at "$created_at" --expect-token-stdin >/dev/null; then
           rc=0
         else
           rc=$?
@@ -624,10 +788,10 @@ retire_background_launch() { # reaper-pid team category instance created-at laun
       || die "protected background generation is invalid before cleanup"
   fi
   for i in $(seq 1 40); do
-    if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" probe \
+    if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" verify \
         --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
         --team "$team" --category "$category" --instance "$instance" \
-        --expect-token-stdin >/dev/null; then
+        --expected-created-at "$created_at" --expect-token-stdin >/dev/null; then
       sleep 0.05
       continue
     else
@@ -642,15 +806,15 @@ retire_background_launch() { # reaper-pid team category instance created-at laun
     if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" signal \
         --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
         --team "$team" --category "$category" --instance "$instance" \
-        --expect-token-stdin --signal KILL; then
+        --expected-created-at "$created_at" --expect-token-stdin --signal KILL; then
       :
     else
       rc=$?
       [ "$rc" -eq 3 ] || {
-        if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" probe \
+        if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" verify \
           --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
           --team "$team" --category "$category" --instance "$instance" \
-          --expect-token-stdin >/dev/null; then
+          --expected-created-at "$created_at" --expect-token-stdin >/dev/null; then
           rc=0
         else
           rc=$?
@@ -660,10 +824,10 @@ retire_background_launch() { # reaper-pid team category instance created-at laun
       }
     fi
     for i in $(seq 1 40); do
-      if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" probe \
+      if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" verify \
           --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
           --team "$team" --category "$category" --instance "$instance" \
-          --expect-token-stdin >/dev/null; then
+          --expected-created-at "$created_at" --expect-token-stdin >/dev/null; then
         sleep 0.05
         continue
       else
@@ -683,17 +847,16 @@ retire_background_launch() { # reaper-pid team category instance created-at laun
     || die "could not retire the exact failed background lifecycle generation"
 }
 
-wait_publication_supervisor_ready() { # supervisor-pid
-  local supervisor_pid="$1" i
-  [ "$PUBLICATION_AUTHORITY_ENABLED" = true ] || return 0
-  for i in $(seq 1 200); do
-    if [ -f "$LAUNCH_READY_FILE" ] && [ ! -L "$LAUNCH_READY_FILE" ]; then
-      if "$AUTHORITY_PYTHON" -I -B - "$LAUNCH_READY_FILE" "$supervisor_pid" \
-          "$OUTBOX_CAPABILITY_ID" "$OUTBOX_TRANSPORT_LOCATOR" <<'PY'
+accept_publication_supervisor_ready_receipt() { # supervisor-pid lifecycle-created-at -> 0 accepted, 3 absent, 1 invalid
+  local supervisor_pid="$1" expected_created_at="$2"
+  [ -f "$LAUNCH_READY_FILE" ] && [ ! -L "$LAUNCH_READY_FILE" ] || return 3
+  if "$AUTHORITY_PYTHON" -I -B - "$LAUNCH_READY_FILE" "$supervisor_pid" \
+      "$OUTBOX_CAPABILITY_ID" "$OUTBOX_TRANSPORT_LOCATOR" \
+      "$expected_created_at" <<'PY'
 import json, os, stat, sys
 from pathlib import Path
 
-path, expected_pid, expected_capability, socket_path = sys.argv[1:]
+path, expected_pid, expected_capability, socket_path, expected_created_at = sys.argv[1:]
 before = Path(path).lstat()
 if (stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode)
         or before.st_uid != os.geteuid() or stat.S_IMODE(before.st_mode) != 0o600
@@ -735,7 +898,7 @@ valid = (
     isinstance(value, dict) and set(value) == required and value.get("schemaVersion") == 1
     and value.get("capabilityId") == expected_capability
     and value.get("supervisorPid") == int(expected_pid)
-    and isinstance(value.get("lifecycleCreatedAt"), str) and value["lifecycleCreatedAt"].endswith("Z")
+    and value.get("lifecycleCreatedAt") == expected_created_at
     and isinstance(value.get("childPid"), int) and value["childPid"] > 1
     and isinstance(value.get("childStart"), str) and bool(value["childStart"])
     and isinstance(value.get("socketDevice"), int) and value["socketDevice"] > 0
@@ -744,18 +907,46 @@ valid = (
 )
 raise SystemExit(0 if valid else 1)
 PY
-      then
-        rm -f "$LAUNCH_READY_FILE"
-        rmdir "$LAUNCH_BARRIER_DIR" 2>/dev/null \
-          || die "could not retire protected supervisor-ready barrier"
-        LAUNCH_READY_FILE=""; LAUNCH_BARRIER_DIR=""
-        return 0
-      fi
-      return 1
+  then
+    rm -f "$LAUNCH_READY_FILE"
+    rmdir "$LAUNCH_BARRIER_DIR" 2>/dev/null \
+      || die "could not retire protected supervisor-ready barrier"
+    LAUNCH_READY_FILE=""; LAUNCH_BARRIER_DIR=""
+    return 0
+  fi
+  return 1
+}
+
+wait_publication_supervisor_ready() { # supervisor-pid lifecycle-created-at
+  local supervisor_pid="$1" expected_created_at="$2" i supervisor_live ready_rc
+  [ "$PUBLICATION_AUTHORITY_ENABLED" = true ] || return 0
+  [ -n "$expected_created_at" ] || return 1
+  for i in $(seq 1 200); do
+    # Sample liveness before the receipt.  If the supervisor exits after this
+    # probe, the next iteration observes its durable receipt.  If it was
+    # already gone, the following file probe is the final race-free state: no
+    # process remains that could publish a later receipt.
+    supervisor_live=yes
+    kill -0 "$supervisor_pid" 2>/dev/null || supervisor_live=no
+    if accept_publication_supervisor_ready_receipt \
+        "$supervisor_pid" "$expected_created_at"; then
+      return 0
+    else
+      ready_rc=$?
     fi
-    kill -0 "$supervisor_pid" 2>/dev/null || return 1
+    [ "$ready_rc" -eq 3 ] || return 1
+    [ "$supervisor_live" = yes ] || return 1
     sleep 0.05
   done
+  # Pair the final live/no-receipt sample with one observation after its sleep.
+  # Otherwise publication during iteration 200's sleep is another lost wakeup.
+  if accept_publication_supervisor_ready_receipt \
+      "$supervisor_pid" "$expected_created_at"; then
+    return 0
+  else
+    ready_rc=$?
+  fi
+  [ "$ready_rc" -eq 3 ] || return 1
   return 1
 }
 
@@ -881,7 +1072,7 @@ def terminate_owned_child(group_ready):
     return child_exit_status(managed_child)
 
 
-def forget_exact(token):
+def forget_exact(token, created):
     result = subprocess.run(
         [
             authority_python,
@@ -899,8 +1090,42 @@ def forget_exact(token):
             category,
             "--instance",
             instance,
+            "--expected-created-at",
+            created,
             "--expect-token-stdin",
             "--allow-identity-mismatch",
+        ],
+        input=(token + "\n").encode("ascii"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=10,
+        check=False,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+    )
+    return result.returncode == 0
+
+
+def complete_exact(token, created):
+    result = subprocess.run(
+        [
+            authority_python,
+            "-I",
+            "-B",
+            lifecycle,
+            "complete",
+            "--root",
+            lifecycle_root,
+            "--repo",
+            repository,
+            "--team",
+            team,
+            "--category",
+            category,
+            "--instance",
+            instance,
+            "--expected-created-at",
+            created,
+            "--expect-token-stdin",
         ],
         input=(token + "\n").encode("ascii"),
         stdout=subprocess.DEVNULL,
@@ -1042,11 +1267,18 @@ try:
     write_private(group_file, published)
 except OSError:
     terminate_owned_child(True)
-    if not forget_exact(token):
+    if not forget_exact(token, created):
         raise SystemExit(1)
     raise
 
 status = child_exit_status(child)
+if not complete_exact(token, created):
+    print(
+        f"[launch-team] {instance} could not complete its exact lifecycle generation",
+        file=sys.stderr,
+        flush=True,
+    )
+    raise SystemExit(1)
 if os.WIFEXITED(status):
     code = os.WEXITSTATUS(status)
 else:
@@ -1165,7 +1397,9 @@ if not (
     die "could not release protected background launch barrier"
   fi
   LAUNCHED_PID="$pid"
-  if ! wait_publication_supervisor_ready "$pid"; then
+  LAST_LAUNCH_CREATED_AT="$created_at"
+  LAST_LAUNCH_TOKEN="$launch_token"
+  if ! wait_publication_supervisor_ready "$pid" "$created_at"; then
     python3 "$SKILL_DIR/bin/outbox_capability.py" revoke-exact \
       --repo "$REPO_ROOT" --workspace "$OUTBOX_CANONICAL_WORKSPACE" \
       --handle "$OUTBOX_CAPABILITY_ID" >/dev/null 2>&1 || true
@@ -1180,7 +1414,7 @@ if not (
 spawn_managed_tmux() { # workdir marker team category instance env-command
   local workdir="$1" marker="$2" team="$3" category="$4" instance="$5" env_cmd="$6"
   local session="team-$team" quoted_workdir quoted_marker quoted_barrier quoted_group_file
-  local quoted_wrapper quoted_python quoted_ready shell_cmd pane_info pane pane_pid pid i rc
+  local quoted_wrapper quoted_python quoted_ready shell_cmd pane_info pane pane_pid pid i rc generation_tag launch_token
   printf -v quoted_workdir '%q' "$workdir"
   printf -v quoted_marker '%q' "$marker"
   create_launch_barrier
@@ -1233,12 +1467,21 @@ PY
   verify_authority_python \
     || { remove_launch_barrier; die "trusted Python changed before managed launch"; }
   printf -v quoted_python '%q' "$AUTHORITY_PYTHON"
+  launch_token="$(python3 -c 'import secrets; print(secrets.token_hex(32))')" \
+    || { remove_launch_barrier; die "could not create protected tmux launch generation"; }
+  generation_tag="$(tmux_generation_tag "$launch_token")" \
+    || { remove_launch_barrier; die "could not derive protected tmux pane generation"; }
   tmux_cmd has-session -t "$session" 2>/dev/null || tmux_cmd new-session -d -s "$session" -n _hub
   shell_cmd="exec $quoted_python -I -B $quoted_wrapper $quoted_group_file $quoted_barrier $quoted_workdir $quoted_marker $instance $env_cmd"
+  # The pane start command is recorded by the new-window request.  A respawn
+  # may retain it, so cleanup also requires the original pane PID.  Embedding
+  # a non-secret tag avoids a later tmux command that could reconnect after a
+  # server restart or target a duplicate name.
+  shell_cmd=": sfgen-$generation_tag; $shell_cmd"
   pane_info="$(tmux_cmd new-window -d -P -F '#{pane_id}|#{pane_pid}' -t "$session" -n "$instance" "$shell_cmd")" \
-    || { remove_launch_barrier; die "could not create tmux pane for $instance"; }
+    || { remove_launch_barrier; die "could not create generation-bound tmux pane for $instance"; }
   pane="${pane_info%%|*}"; pane_pid="${pane_info#*|}"
-  case "$pane_pid" in ''|*[!0-9]*) tmux_cmd kill-pane -t "$pane" 2>/dev/null || true; remove_launch_barrier; die "tmux returned an unsafe pane PID" ;; esac
+  case "$pane_pid" in ''|*[!0-9]*) lifecycle_retire_tmux_pane - "$session" "$instance" "$pane" "$launch_token"; remove_launch_barrier; die "tmux returned an unsafe pane PID" ;; esac
   for i in $(seq 1 100); do
     [ -s "$LAUNCH_GROUP_FILE" ] && break
     if ! tmux_cmd display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then
@@ -1248,24 +1491,30 @@ PY
     sleep 0.01
   done
   [ -s "$LAUNCH_GROUP_FILE" ] \
-    || { tmux_cmd kill-pane -t "$pane" 2>/dev/null || true; remove_launch_barrier; die "timed out binding tmux process group for $instance"; }
+    || { lifecycle_retire_tmux_pane "$pane_pid" "$session" "$instance" "$pane" "$launch_token"; remove_launch_barrier; die "timed out binding tmux process group for $instance"; }
   pid="$(cat "$LAUNCH_GROUP_FILE")"
-  case "$pid" in ''|*[!0-9]*) tmux_cmd kill-pane -t "$pane" 2>/dev/null || true; remove_launch_barrier; die "tmux wrapper returned an unsafe process-group leader PID" ;; esac
-  if ! lifecycle_register "$team" "$category" "$instance" tmux "$pid" "$session" "$instance" "$pane" "$pane_pid"; then
+  case "$pid" in ''|*[!0-9]*) lifecycle_retire_tmux_pane "$pane_pid" "$session" "$instance" "$pane" "$launch_token"; remove_launch_barrier; die "tmux wrapper returned an unsafe process-group leader PID" ;; esac
+  if ! lifecycle_register "$team" "$category" "$instance" tmux "$pid" "$session" "$instance" "$pane" "$pane_pid" "$launch_token"; then
     kill -KILL "$pid" 2>/dev/null || true
-    tmux_cmd kill-pane -t "$pane" 2>/dev/null || true
+    lifecycle_retire_tmux_pane "$pane_pid" "$session" "$instance" "$pane" "$launch_token"
     remove_launch_barrier
     die "could not bind the tmux process group and pane to protected lifecycle state"
   fi
   printf 'managed\n' > "$marker"
   release_launch_barrier
   LAUNCHED_PID="$pid"
-  if ! wait_publication_supervisor_ready "$pid"; then
+  if ! wait_publication_supervisor_ready "$pid" "$LAST_LAUNCH_CREATED_AT"; then
     python3 "$SKILL_DIR/bin/outbox_capability.py" revoke-exact \
       --repo "$REPO_ROOT" --workspace "$OUTBOX_CANONICAL_WORKSPACE" \
       --handle "$OUTBOX_CAPABILITY_ID" >/dev/null 2>&1 || true
     rc=0
-    lifecycle_stop_instance "$team" "$category" "$instance" || rc=$?
+    # Cleanup belongs to the generation whose ready handshake failed.  If it
+    # exited and a successor registered while cleanup was paused, the retained
+    # creation identity makes lifecycle_stop_instance refuse before signalling
+    # that successor.
+    lifecycle_stop_instance \
+      "$team" "$category" "$instance" \
+      "$LAST_LAUNCH_CREATED_AT" "$LAST_LAUNCH_TOKEN" || rc=$?
     [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] \
       || die "protected tmux launch failed while retiring an unready supervisor"
     rm -f "$marker"
@@ -1274,26 +1523,27 @@ PY
   fi
 }
 
-lifecycle_wait_and_retire() { # team category instance attempts launch-token -> 0 gone+retired, 3 still live
-  local team="$1" category="$2" instance="$3" attempts="$4" launch_token="$5" rc i
+lifecycle_wait_and_retire() { # team category instance attempts launch-token created-at -> 0 gone+retired, 3 still live
+  local team="$1" category="$2" instance="$3" attempts="$4" launch_token="$5" created_at="$6" rc i
   for i in $(seq 1 "$attempts"); do
-    if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" probe \
+    if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" verify \
         --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
         --team "$team" --category "$category" --instance "$instance" \
-        --expect-token-stdin >/dev/null; then
+        --expected-created-at "$created_at" --expect-token-stdin >/dev/null; then
       sleep 0.05
       continue
     else
       rc=$?
     fi
     if [ "$rc" -eq 3 ]; then
-      # probe deliberately maps both dead and identity-mismatch to NOT_LIVE.
-      # forget performs the authoritative distinction and refuses to retire a
-      # PID whose protected start identity no longer matches.
+      # Exact verification distinguishes a dead group from an identity
+      # mismatch.  The latter fails closed above and retains its evidence;
+      # only a verified-dead generation reaches this exact compare-and-delete.
       printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" forget \
         --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
         --team "$team" --category "$category" --instance "$instance" \
-        --expect-token-stdin >/dev/null \
+        --expected-created-at "$created_at" \
+        --expect-token-stdin --allow-identity-mismatch >/dev/null \
         || die "could not retire stopped lifecycle record $team/$instance"
       return 0
     fi
@@ -1302,61 +1552,80 @@ lifecycle_wait_and_retire() { # team category instance attempts launch-token -> 
   return 3
 }
 
-lifecycle_retire_tmux_pane() { # pane-pid session window pane -> kill only while identity remains exact
-  local pane_pid="$1" session="$2" window="$3" pane="$4" current
-  current="$(tmux_cmd display-message -p -t "$pane" '#{pane_pid}|#{session_name}|#{window_name}|#{pane_id}|#{pane_dead}' 2>/dev/null)" \
+lifecycle_retire_tmux_pane() { # pane-pid session window pane launch-token
+  local pane_pid="$1" session="$2" window="$3" pane="$4" launch_token="$5"
+  local pane_number condition kill_command generation_tag
+  # A pane may be respawned with the same id and start command, including
+  # after it has died.  tmux retains pane_pid for the original dead pane, so
+  # require the recorded PID for both live and dead cases.  If tmux supplied
+  # no safe PID before registration, leave presentation cleanup to an operator.
+  case "$pane_pid" in ''|*[!0-9]*) return 0 ;; esac
+  case "$session" in ''|*[!A-Za-z0-9._-]*) return 0 ;; esac
+  case "$window" in ''|*[!A-Za-z0-9._-]*) return 0 ;; esac
+  case "$pane" in %*) pane_number="${pane#%}" ;; *) return 0 ;; esac
+  case "$pane_number" in ''|*[!0-9]*) return 0 ;; esac
+  case "$launch_token" in ''|*[!0-9a-f]*) return 0 ;; esac
+  [ "${#launch_token}" -eq 64 ] || return 0
+  generation_tag="$(tmux_generation_tag "$launch_token")" || return 0
+  # tmux pane ids are server-local and may be reused after a restart.  Check
+  # the start-command discriminator and original pane PID in the same server
+  # request that queues kill-pane; a reused id or respawned pane cannot pass.
+  condition="#{&&:#{m:*sfgen-$generation_tag*,#{pane_start_command}},#{&&:#{==:#{session_name},$session},#{&&:#{==:#{window_name},$window},#{==:#{pane_pid},$pane_pid}}}}"
+  kill_command="kill-pane -t $pane"
+  # A pane which exited before cleanup is already retired.  Failure of the
+  # single server request is likewise non-authoritative and must never be
+  # retried by pane id against a possibly new server generation.
+  tmux_cmd if-shell -F -t "$pane" "$condition" "$kill_command" 2>/dev/null \
     || return 0
-  [ "$current" != "||||" ] || return 0
-  if [ "$current" != "$pane_pid|$session|$window|$pane|0" ] \
-      && [ "${current#*|}" != "$session|$window|$pane|1" ]; then
-    # The task group is already gone.  A missing/reused pane must never turn
-    # stale UI metadata into authority over an unrelated pane.  A dead pane
-    # may report PID 0, but its server-unique pane/session/window identity is
-    # still safe to retire.
-    echo "launch-team: tmux pane $pane changed identity after task stop; leaving it untouched" >&2
-    return 0
-  fi
-  tmux_cmd kill-pane -t "$pane" || die "could not stop verified tmux pane $pane"
 }
 
-lifecycle_stop_instance() { # team category instance [expected-created-at] -> exact-generation TERM/KILL
-  local team="$1" category="$2" instance="$3" expected_created="${4:-}"
-  local record rc fields kind pid session window pane pane_pid created launch_token current
-  if record="$(python3 "$SKILL_DIR/bin/process-lifecycle.py" verify \
-      --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
-      --team "$team" --category "$category" --instance "$instance")"; then
+lifecycle_stop_instance() { # team category instance expected-created-at [expected-token] -> exact-generation TERM/KILL
+  local team="$1" category="$2" instance="$3" expected_created="$4"
+  local expected_token="${5:-}"
+  local record rc fields kind pid session window pane pane_pid created launch_token
+  local -a verify_args=(verify --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT"
+    --team "$team" --category "$category" --instance "$instance"
+    --expected-created-at "$expected_created")
+  [ -z "$expected_token" ] || verify_args+=(--expect-token-stdin)
+  if [ -n "$expected_token" ]; then
+    record="$(printf '%s\n' "$expected_token" | \
+      python3 "$SKILL_DIR/bin/process-lifecycle.py" "${verify_args[@]}")" && rc=0 || rc=$?
+  else
+    record="$(python3 "$SKILL_DIR/bin/process-lifecycle.py" "${verify_args[@]}")" \
+      && rc=0 || rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
     :
   else
-    rc=$?
     [ "$rc" -eq 3 ] && return 3
     die "protected lifecycle verification failed for $team/$instance"
   fi
   fields="$(printf '%s' "$record" | python3 -c 'import json,sys; r=json.load(sys.stdin); print("\x1f".join(str(r.get(k) or "") for k in ("kind","pid","tmuxSession","tmuxWindow","tmuxPane","tmuxPanePid","createdAt","launchToken")))')"
   IFS=$'\x1f' read -r kind pid session window pane pane_pid created launch_token <<< "$fields"
-  [ -z "$expected_created" ] || [ "$created" = "$expected_created" ] \
+  [ "$created" = "$expected_created" ] \
     || die "protected lifecycle generation changed for $team/$instance; no process was signaled"
+  [ -z "$expected_token" ] || [ "$launch_token" = "$expected_token" ] \
+    || die "protected lifecycle token changed for $team/$instance; no process was signaled"
   case "$kind" in
-    background) ;;
-    tmux)
-    current="$(tmux_cmd display-message -p -t "$pane" '#{pane_pid}|#{session_name}|#{window_name}|#{pane_id}' 2>/dev/null)" \
-      || current=""
-    [ -z "$current" ] || [ "$current" = "$pane_pid|$session|$window|$pane" ] \
-      || die "refusing tmux stop: protected pane identity no longer matches $team/$instance"
-    ;;
+    background|tmux) ;;
     *) die "protected lifecycle record has unsupported kind '$kind'" ;;
   esac
+
+  # Pane metadata is presentation state and may belong to a successor tmux
+  # server.  It must never veto authenticated process-group containment; only
+  # the generation-bound retire helper may decide whether a pane is removed.
 
   if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" signal \
       --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
       --team "$team" --category "$category" --instance "$instance" \
-      --expect-token-stdin --signal TERM; then
+      --expected-created-at "$created" --expect-token-stdin --signal TERM; then
     :
   else
     rc=$?
     [ "$rc" -eq 3 ] || die "refusing to signal unverified lifecycle process group $team/$instance"
   fi
-  if lifecycle_wait_and_retire "$team" "$category" "$instance" 40 "$launch_token"; then
-    [ "$kind" != tmux ] || lifecycle_retire_tmux_pane "$pane_pid" "$session" "$window" "$pane"
+  if lifecycle_wait_and_retire "$team" "$category" "$instance" 40 "$launch_token" "$created"; then
+    [ "$kind" != tmux ] || lifecycle_retire_tmux_pane "$pane_pid" "$session" "$window" "$pane" "$launch_token"
     return 0
   else
     rc=$?
@@ -1370,15 +1639,15 @@ lifecycle_stop_instance() { # team category instance [expected-created-at] -> ex
   if printf '%s\n' "$launch_token" | python3 "$SKILL_DIR/bin/process-lifecycle.py" signal \
       --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
       --team "$team" --category "$category" --instance "$instance" \
-      --expect-token-stdin --signal KILL; then
+      --expected-created-at "$created" --expect-token-stdin --signal KILL; then
     :
   else
     rc=$?
     [ "$rc" -eq 3 ] \
       || die "refusing SIGKILL because protected lifecycle group identity changed for $team/$instance"
   fi
-  if lifecycle_wait_and_retire "$team" "$category" "$instance" 40 "$launch_token"; then
-    [ "$kind" != tmux ] || lifecycle_retire_tmux_pane "$pane_pid" "$session" "$window" "$pane"
+  if lifecycle_wait_and_retire "$team" "$category" "$instance" 40 "$launch_token" "$created"; then
+    [ "$kind" != tmux ] || lifecycle_retire_tmux_pane "$pane_pid" "$session" "$window" "$pane" "$launch_token"
     return 0
   fi
   die "verified process group $team/$instance did not stop after identity-bound SIGKILL"
@@ -2752,7 +3021,9 @@ PY
 }
 
 launch_one() { # launch_one <team> <featureId> <role> [preset]
-  local team="$1" fid="$2" role="$3" preset="${4:-}"
+  local team="$1" fid="$2" role="$3" preset="${4:-}" owns_lane=no
+  LAST_LAUNCH_CREATED_AT=""
+  LAST_LAUNCH_TOKEN=""
   validate_team_id "$team"; validate_role_id "$role"
   preset="$(team_preset_of "$team" "$preset")" || return $?
   safe_readiness_receipt verify "$team" "$preset"
@@ -2772,6 +3043,18 @@ launch_one() { # launch_one <team> <featureId> <role> [preset]
   dir="$(teamroot "$team")" || die "unsafe team workspace"
   pidfile="$(team_path "$dir" "pids/$role.pid")" || die "unsafe role pid path"
   logfile="$(team_path "$dir" "pids/$role.log")" || die "unsafe role log path"
+  # Serialize the complete authority transition for this logical lane.  A
+  # concurrent launcher cannot pass the absent check and mint a superseding
+  # capability before the winning process generation is registered.
+  if [ -n "$LAUNCH_LANE_LOCK_PID" ]; then
+    [ "$LAUNCH_LANE_LOCK_TEAM" = "$team" ] \
+      && [ "$LAUNCH_LANE_LOCK_CATEGORY" = gate ] \
+      && [ "$LAUNCH_LANE_LOCK_INSTANCE" = "$role" ] \
+      || die "internal launch error: another protected lane is held"
+  else
+    acquire_launch_lane_lock "$team" gate "$role"
+    owns_lane=yes
+  fi
   if [ "$LIFECYCLE_ENABLED" = true ]; then
     existing_role_record="$(python3 "$SKILL_DIR/bin/process-lifecycle.py" list \
       --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" --team "$team" | \
@@ -2783,6 +3066,7 @@ print(json.dumps(matches[0],sort_keys=True,separators=(",",":")) if matches else
       existing_role_state="$(printf '%s' "$existing_role_record" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])')"
       existing_role_created="$(printf '%s' "$existing_role_record" | python3 -c 'import json,sys; print(json.load(sys.stdin)["createdAt"])')"
       if [ "$existing_role_state" = live ]; then
+        [ "$owns_lane" != yes ] || release_launch_lane_lock
         echo "role instance already live: $role"
         return 0
       fi
@@ -2827,6 +3111,7 @@ print(json.dumps(matches[0],sort_keys=True,separators=(",",":")) if matches else
       echo "launched $role in unmanaged background mode (pid $LAUNCHED_PID; status/stop disabled)"
     fi
   fi
+  [ "$owns_lane" != yes ] || release_launch_lane_lock
 }
 
 retire_attempt_worktree() { # team workspace task role attempt control-id
@@ -3041,6 +3326,7 @@ launch_task() { # team feature role task attempt [preset] [broker-restart contro
   local key; key="$(role_cmd_key "$role")"
   key_is_null "$key" && die "role '$role' is disabled ($key=null)"
   local dir; dir="$(teamroot "$team")" || die "unsafe team workspace"
+  local task_lane; task_lane="$(task_key "$task")"
   preset="$(team_preset_of "$team" "$preset")" || return $?
   safe_readiness_receipt verify "$team" "$preset"
   team_context_receipt verify "$team" "$fid" "$preset"
@@ -3103,8 +3389,34 @@ launch_task() { # team feature role task attempt [preset] [broker-restart contro
   logfile="$(team_path "$dir" "pids/tasks/$instance.log")" || die "unsafe task log path"
   pids_tasks="$(team_path "$dir" pids/tasks)" || die "unsafe task pid path"
   mkdir -p "$pids_tasks"
+  # Capability authority is stable for the task across attempts and roles, so
+  # lifecycle launch serialization must use the same stable task key.  A
+  # broker restart may already hold this exact lane across predecessor revoke,
+  # stop, retirement, and the successor transition; ordinary starts acquire it
+  # here after packetization and before their final observation/mint/register.
+  local task_lane_acquired=no
+  if [ -n "$LAUNCH_LANE_LOCK_PID" ]; then
+    [ "$LAUNCH_LANE_LOCK_TEAM" = "$team" ] \
+      && [ "$LAUNCH_LANE_LOCK_CATEGORY" = task ] \
+      && [ "$LAUNCH_LANE_LOCK_INSTANCE" = "$task_lane" ] \
+      || die "internal launch error: another protected launch lane is already held"
+  else
+    acquire_launch_lane_lock "$team" task "$task_lane"
+    task_lane_acquired=yes
+  fi
+  # A dispatcher hold/fence may have arrived while packetization or lane
+  # contention was in progress.  Recheck under the stable task lane before
+  # any heartbeat, capability, or process effect; a queued stale start may
+  # never mint fresh authority after the broker fenced the held task.
+  hold_rc=0
+  python3 "$SKILL_DIR/bin/task-hold.py" check \
+    --repo "$REPO_ROOT" --workspace "$dir" --team "$team" --feature "$fid" --task "$task" \
+    >/dev/null || hold_rc=$?
+  [ "$hold_rc" -eq 0 ] \
+    || die "task '$task' became held while waiting for its protected launch lane"
   if [ "$LIFECYCLE_ENABLED" = true ]; then
     if lifecycle_probe "$team" task "$instance"; then
+      [ "$task_lane_acquired" != yes ] || release_launch_lane_lock
       echo "task instance already live: $instance"
       return 0
     else
@@ -3145,6 +3457,7 @@ launch_task() { # team feature role task attempt [preset] [broker-restart contro
       echo "launched task $task as $instance in unmanaged background mode (pid $LAUNCHED_PID; status/stop disabled)"
     fi
   fi
+  [ "$task_lane_acquired" != yes ] || release_launch_lane_lock
 }
 
 restart_task() { # team feature task expected-attempt control-id [preset]
@@ -3159,6 +3472,11 @@ restart_task() { # team feature task expected-attempt control-id [preset]
   dir="$(teamroot "$team")" || die "unsafe team workspace"
   [ "$LIFECYCLE_ENABLED" = true ] || die "restart-task requires protected lifecycle supervision"
   key="$(task_key "$task")"
+  # Hold the stable task capability lane across the complete predecessor to
+  # successor transaction.  launch_task recognizes and reuses this exact lock,
+  # so no stale attempt can mint after the successor or slip between revoke,
+  # stop, packetization, mint, and lifecycle registration.
+  acquire_launch_lane_lock "$team" task "$key"
   execution="$(team_path "$dir" "executions/$key.json")" || die "unsafe execution path"
   [ -f "$execution" ] && [ ! -L "$execution" ] || die "restart-task has no durable execution for $task"
   fields="$(python3 - "$execution" "$feature" "$task" "$key" <<'PY'
@@ -3185,6 +3503,7 @@ PY
   [ "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$worktree")" = "$expected_worktree" ] \
     || die "restart-task execution record points outside its task worktree slot"
   if [ "$attempt" -gt "$expected_attempt" ]; then
+    release_launch_lane_lock
     echo "restart-task $task already advanced to attempt $attempt"
     return 0
   fi
@@ -3250,7 +3569,8 @@ print(json.dumps(matches[0],sort_keys=True,separators=(",",":")) if matches else
   # Publication is fenced before any signal.  A worker that resists or races
   # shutdown can no longer authorize new tracker effects while it is stopping.
   python3 "$SKILL_DIR/bin/outbox_capability.py" revoke-task \
-    --repo "$REPO_ROOT" --workspace "$dir" --team "$team" --task "$task" >/dev/null \
+    --repo "$REPO_ROOT" --workspace "$dir" --team "$team" --task "$task" \
+    --all-worktrees >/dev/null \
     || die "restart-task could not fence publication before stopping the worker"
   if [ -n "$record" ]; then
     case "$state" in
@@ -3259,7 +3579,10 @@ print(json.dumps(matches[0],sort_keys=True,separators=(",",":")) if matches else
           :
         else
           rc=$?
-          [ "$rc" -eq 3 ] || return "$rc"
+          if [ "$rc" -ne 3 ]; then
+            release_launch_lane_lock
+            return "$rc"
+          fi
           python3 "$SKILL_DIR/bin/process-lifecycle.py" forget \
             --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
             --team "$team" --category task --instance "$instance" \
@@ -3284,11 +3607,12 @@ print(json.dumps(matches[0],sort_keys=True,separators=(",",":")) if matches else
   rm -f -- "$pidfile" "$heartbeat"
   launch_task "$team" "$feature" "$role" "$task" "$((attempt + 1))" "$preset" \
     broker-restart "$control_id" "$expected_generation" "$restart_reason"
+  release_launch_lane_lock
   echo "restarted task $task as attempt $((attempt + 1)) ($control_id)"
 }
 
 retire_role() { # team feature role expected-created-at control-id [grant-action] [grant-reason]
-  local team="$1" feature="$2" role="$3" expected_created="$4" control_id="$5" grant_action="${6:-retire-role}" grant_reason="${7:-authorized}"
+  local team="$1" feature="$2" role="$3" expected_created="$4" control_id="$5" grant_action="${6:-retire-role}" grant_reason="${7:-authorized}" owns_lane=no
   [ "${STARTUP_FACTORY_CONTROL_BROKER:-}" = 1 ] \
     || die "retire-role is broker-only; submit an authenticated Team Lead control request"
   validate_team_id "$team"; validate_role_id "$role"
@@ -3296,6 +3620,15 @@ retire_role() { # team feature role expected-created-at control-id [grant-action
   local dir record state created rc marker heartbeat
   dir="$(teamroot "$team")" || die "unsafe team workspace"
   [ "$LIFECYCLE_ENABLED" = true ] || die "retire-role requires protected lifecycle supervision"
+  if [ -n "$LAUNCH_LANE_LOCK_PID" ]; then
+    [ "$LAUNCH_LANE_LOCK_TEAM" = "$team" ] \
+      && [ "$LAUNCH_LANE_LOCK_CATEGORY" = gate ] \
+      && [ "$LAUNCH_LANE_LOCK_INSTANCE" = "$role" ] \
+      || die "internal retire error: another protected lane is held"
+  else
+    acquire_launch_lane_lock "$team" gate "$role"
+    owns_lane=yes
+  fi
   python3 "$SKILL_DIR/bin/control-grant.py" verify \
     --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" \
     --team "$team" --feature "$feature" --action "$grant_action" --target "$role" \
@@ -3318,7 +3651,8 @@ print(json.dumps(matches[0],sort_keys=True,separators=(",",":")) if matches else
       *) die "retire-role observed unknown lifecycle state '$state'" ;;
     esac
     python3 "$SKILL_DIR/bin/outbox_capability.py" revoke-role \
-      --repo "$REPO_ROOT" --workspace "$dir" --team "$team" --role "$role" >/dev/null \
+      --repo "$REPO_ROOT" --workspace "$dir" --team "$team" --role "$role" \
+      --all-worktrees >/dev/null \
       || die "retire-role could not revoke publication before stopping $role"
     case "$state" in
       live)
@@ -3348,24 +3682,27 @@ print(json.dumps(matches[0],sort_keys=True,separators=(",",":")) if matches else
     [ "$expected_created" = - ] \
       || echo "retire-role lifecycle generation is already absent; converging replay" >&2
     python3 "$SKILL_DIR/bin/outbox_capability.py" revoke-role \
-      --repo "$REPO_ROOT" --workspace "$dir" --team "$team" --role "$role" >/dev/null \
+      --repo "$REPO_ROOT" --workspace "$dir" --team "$team" --role "$role" \
+      --all-worktrees >/dev/null \
       || die "retire-role could not converge publication revocation for $role"
   fi
   marker="$(team_path "$dir" "pids/$role.pid")" || die "unsafe role marker path"
   heartbeat="$(team_path "$dir" "heartbeats/$role")" || die "unsafe heartbeat path"
   rm -f -- "$marker" "$heartbeat"
+  [ "$owns_lane" != yes ] || release_launch_lane_lock
   echo "retired role $role for team $team ($control_id)"
 }
 
 restart_role() { # team feature role expected-created-at control-id [preset]
   local team="$1" feature="$2" role="$3" expected_created="$4" control_id="$5" preset="${6:-}"
   local record state created restart_reason restart_max restart_backoff policy_prepared=no marker heartbeat dir
-  local policy_json completed_control completed_generation replacement_seen=no replacement_record replacement_state replacement_created
+  local policy_json completed_control completed_generation replacement_seen=no replacement_record replacement_state replacement_created replacement_observed_created launched_generation i
   [ "${STARTUP_FACTORY_CONTROL_BROKER:-}" = 1 ] \
     || die "restart-role is broker-only; submit an authenticated Team Lead control request"
   validate_team_id "$team"; validate_role_id "$role"
   dir="$(teamroot "$team")" || die "unsafe team workspace"
   [ "$LIFECYCLE_ENABLED" = true ] || die "restart-role requires protected lifecycle supervision"
+  acquire_launch_lane_lock "$team" gate "$role"
   restart_reason="${STARTUP_FACTORY_CONTROL_REASON:-authorized}"
   case "$restart_reason" in
     automatic) restart_max="$(read_key MAX_AUTOMATIC_RESTARTS)"; restart_max="${restart_max:-1}" ;;
@@ -3428,6 +3765,7 @@ print(json.dumps(matches[0],sort_keys=True,separators=(",",":")) if matches else
   completed_generation="$(printf '%s' "$policy_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("completedGeneration") or "")')" \
     || die "restart-role protected policy completion is malformed"
   if [ "$completed_control" = "$control_id" ]; then
+    release_launch_lane_lock
     echo "restart-role $role already completed with protected replacement generation $completed_generation ($control_id)"
     return 0
   fi
@@ -3439,8 +3777,10 @@ print(json.dumps(matches[0],sort_keys=True,separators=(",",":")) if matches else
       --replacement-generation "$created" >/dev/null \
       || die "restart-role could not protect replacement completion evidence"
     if [ "$state" = live ]; then
+      release_launch_lane_lock
       echo "restart-role $role already launched a replacement ($control_id)"
     else
+      release_launch_lane_lock
       echo "restart-role $role already launched a replacement that has since exited ($control_id)"
     fi
     return 0
@@ -3449,23 +3789,47 @@ print(json.dumps(matches[0],sort_keys=True,separators=(",",":")) if matches else
     retire_role "$team" "$feature" "$role" "$expected_created" "$control_id" restart-role "$restart_reason"
   else
     python3 "$SKILL_DIR/bin/outbox_capability.py" revoke-role \
-      --repo "$REPO_ROOT" --workspace "$dir" --team "$team" --role "$role" >/dev/null \
+      --repo "$REPO_ROOT" --workspace "$dir" --team "$team" --role "$role" \
+      --all-worktrees >/dev/null \
       || die "restart-role could not fence the prior role capability"
     marker="$(team_path "$dir" "pids/$role.pid")" || die "unsafe role marker path"
     heartbeat="$(team_path "$dir" "heartbeats/$role")" || die "unsafe heartbeat path"
     rm -f -- "$marker" "$heartbeat"
   fi
   launch_one "$team" "$feature" "$role" "$preset"
-  replacement_record="$(python3 "$SKILL_DIR/bin/process-lifecycle.py" list \
-    --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" --team "$team" | \
-    python3 -c 'import json,sys; target=sys.argv[1]; rows=[json.loads(line) for line in sys.stdin if line.strip()]; matches=[r for r in rows if r.get("category")=="gate" and r.get("instance")==target];
-assert len(matches)==1, "missing or duplicate replacement lifecycle identity";
-print(json.dumps(matches[0],sort_keys=True,separators=(",",":")))' "$role")" \
-    || die "restart-role could not authenticate the replacement lifecycle generation"
-  replacement_state="$(printf '%s' "$replacement_record" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])')"
-  replacement_created="$(printf '%s' "$replacement_record" | python3 -c 'import json,sys; print(json.load(sys.stdin)["createdAt"])')"
+  launched_generation="$LAST_LAUNCH_CREATED_AT"
+  [ -n "$launched_generation" ] \
+    || die "restart-role launched $role without an authenticated replacement generation"
+  replacement_created="$launched_generation"
+  replacement_state=""
+  for i in $(seq 1 40); do
+    replacement_record="$(python3 "$SKILL_DIR/bin/process-lifecycle.py" list \
+      --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" --team "$team" | \
+      python3 -c 'import json,sys; target=sys.argv[1]; rows=[json.loads(line) for line in sys.stdin if line.strip()]; matches=[r for r in rows if r.get("category")=="gate" and r.get("instance")==target];
+assert len(matches)<=1, "duplicate replacement lifecycle identity";
+print(json.dumps(matches[0],sort_keys=True,separators=(",",":")) if matches else "")' "$role")" \
+      || die "restart-role could not authenticate the replacement lifecycle generation"
+    if [ -z "$replacement_record" ]; then
+      replacement_state=retired
+      break
+    fi
+    replacement_state="$(printf '%s' "$replacement_record" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])')"
+    replacement_observed_created="$(printf '%s' "$replacement_record" | python3 -c 'import json,sys; print(json.load(sys.stdin)["createdAt"])')"
+    [ "$replacement_observed_created" = "$launched_generation" ] \
+      || die "restart-role replacement generation changed before completion was recorded"
+    case "$replacement_state" in
+      live|dead) break ;;
+      # On Darwin, an exited session leader can briefly be unreadable to
+      # libproc while its trusted wrapper has not waitpid()ed it yet.  During
+      # that bounded zombie window the authenticated record conservatively
+      # reports identity-mismatch.  Wait only for the exact generation to
+      # settle; a persistent mismatch still fails closed below.
+      identity-mismatch) sleep 0.05 ;;
+      *) die "restart-role replacement identity is unsafe for $role" ;;
+    esac
+  done
   case "$replacement_state" in
-    live|dead) ;;
+    live|dead|retired) ;;
     *) die "restart-role replacement identity is unsafe for $role" ;;
   esac
   [ "$replacement_created" != "$expected_created" ] \
@@ -3476,6 +3840,7 @@ print(json.dumps(matches[0],sort_keys=True,separators=(",",":")))' "$role")" \
     --attempt 0 --generation "$expected_created" --control-id "$control_id" --reason "$restart_reason" \
     --replacement-generation "$replacement_created" >/dev/null \
     || die "restart-role launched $role but could not protect its completion evidence"
+  release_launch_lane_lock
   echo "restarted role $role for team $team ($control_id)"
 }
 
@@ -3483,6 +3848,20 @@ case "${1:-}" in
   validate-board|config-value|'') ;;
   planning-handoff) validate_planning_config ;;
   *) validate_config ;;
+esac
+
+# The team fence linearizes stop with every process/capability mutation.
+# Roster preflight/doctor run before taking it; all subsequent writes and
+# launches occur under the shared side.  Other commands take it at entry.
+case "${1:-}" in
+  start|start-task|restart-task|relaunch|retire-role|restart-role|stop-task|fence-task)
+    validate_team_id "${2:-}"
+    acquire_team_fence "$2" shared
+    ;;
+  stop)
+    validate_team_id "${2:-}"
+    acquire_team_fence "$2" exclusive
+    ;;
 esac
 
 case "${1:-}" in
@@ -3527,6 +3906,7 @@ case "${1:-}" in
       preflight "$team" "$fid"
       doctor "$preset" "$team" "$fid"
     fi
+    acquire_team_fence "$team" shared
     dir="$(teamroot "$team")" || die "unsafe team workspace"
     mkdir -p "$dir"
     preset_file="$(team_path "$dir" preset.env)" || die "unsafe preset path"
@@ -3557,6 +3937,7 @@ case "${1:-}" in
       preflight "$team" "$fid"
       doctor "$preset" "$team" "$fid"
     fi
+    acquire_team_fence "$team" shared
     dir="$(teamroot "$team")" || die "unsafe team workspace"
     mkdir -p "$dir"
     preset_file="$(team_path "$dir" preset.env)" || die "unsafe preset path"
@@ -3786,13 +4167,19 @@ PY
     records="$(python3 "$SKILL_DIR/bin/process-lifecycle.py" list \
       --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" --team "$2")" \
       || die "protected lifecycle records failed authentication; no process was signaled"
+    if printf '%s\n' "$records" | python3 -c 'import json,sys; raise SystemExit(any(json.loads(line).get("category") == "release" for line in sys.stdin if line.strip()))'; then
+      :
+    else
+      die "protected release job exists; cancel and reconcile it through the release supervisor before stopping the team; no process was signaled"
+    fi
     if printf '%s\n' "$records" | python3 -c 'import json,sys; raise SystemExit(any(json.loads(line).get("state") == "identity-mismatch" for line in sys.stdin if line.strip()))'; then
       :
     else
       die "protected process identity mismatch; no process was signaled"
     fi
     python3 "$SKILL_DIR/bin/outbox_capability.py" revoke-team \
-      --repo "$REPO_ROOT" --workspace "$dir" --team "$2" >/dev/null \
+      --repo "$REPO_ROOT" --workspace "$dir" --team "$2" \
+      --all-worktrees >/dev/null \
       || die "could not revoke team publication before stopping processes"
     while IFS= read -r record; do
       [ -n "$record" ] || continue
@@ -3815,6 +4202,9 @@ PY
       fi
       rm -f "$marker"
     done <<< "$records"
+    # Publish success while the exclusive fence is still held.  A separate,
+    # later start may run once this command exits, but no concurrent start can
+    # register between the completed snapshot and this success message.
     echo "stopped team $2"
     ;;
   stop-task)
@@ -3824,6 +4214,10 @@ PY
     [ "$LIFECYCLE_ENABLED" = true ] \
       || die "lifecycle supervision is disabled; refusing to signal from agent-writable workspace markers (stop task processes manually)"
     key="$(task_key "$3")"
+    # start-task and restart-task use this same stable key.  Keep the final
+    # lifecycle snapshot, cross-worktree publication fence, signals, and record
+    # retirement atomic with respect to every attempt/role of this task.
+    acquire_launch_lane_lock "$2" task "$key"
     records="$(python3 "$SKILL_DIR/bin/process-lifecycle.py" list \
       --root "$LIFECYCLE_STATE_ROOT" --repo "$REPO_ROOT" --team "$2")" \
       || die "protected lifecycle records failed authentication; no process was signaled"
@@ -3855,7 +4249,8 @@ for line in sys.stdin:
     # Fence all task publication generations before delivering TERM/KILL.
     # Revocation failure leaves every verified process untouched.
     python3 "$SKILL_DIR/bin/outbox_capability.py" revoke-task \
-      --repo "$REPO_ROOT" --workspace "$dir" --team "$2" --task "$3" >/dev/null \
+      --repo "$REPO_ROOT" --workspace "$dir" --team "$2" --task "$3" \
+      --all-worktrees >/dev/null \
       || die "could not revoke task publication before stopping workers"
 
     while IFS= read -r record; do
@@ -3909,7 +4304,23 @@ PY
         rm -f -- "$marker"
       done <<< "$markers"
     fi
+    release_launch_lane_lock
     echo "stopped task $3 for team $2"
+    ;;
+  fence-task)
+    [ $# -eq 3 ] || die "usage: fence-task <team> <taskId>"
+    validate_team_id "$2"
+    [ "$LIFECYCLE_ENABLED" = true ] \
+      || die "fence-task requires protected lifecycle supervision"
+    dir="$(teamroot "$2")" || die "unsafe team workspace"
+    key="$(task_key "$3")"
+    acquire_launch_lane_lock "$2" task "$key"
+    python3 "$SKILL_DIR/bin/outbox_capability.py" revoke-task \
+      --repo "$REPO_ROOT" --workspace "$dir" --team "$2" --task "$3" \
+      --all-worktrees >/dev/null \
+      || die "could not revoke task publication across worktrees"
+    release_launch_lane_lock
+    echo "fenced task $3 for team $2"
     ;;
   live-role)
     [ $# -eq 3 ] || die "usage: live-role <team> <role>"

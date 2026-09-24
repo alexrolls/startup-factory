@@ -10,11 +10,13 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -346,6 +348,176 @@ STATUS_CONFIG=config/statuses.config.json
         stdout, stderr = process.communicate(timeout=10)
         self.assertEqual(0, process.returncode, stderr.decode(errors="replace"))
         return stdout, stderr
+
+    def test_ready_receipt_is_not_visible_until_its_write_completes(self) -> None:
+        barrier = self.lifecycle / ".launch-ready-atomicity"
+        barrier.mkdir(mode=0o700)
+        ready = barrier / "supervisor.ready"
+        pending = barrier / ".supervisor.ready.pending"
+        writer_opened = threading.Event()
+        release_writer = threading.Event()
+        failures: list[BaseException] = []
+        real_fdopen = SUPERVISOR.os.fdopen
+
+        def delayed_fdopen(*args: object, **kwargs: object):
+            writer_opened.set()
+            if not release_writer.wait(2):
+                raise RuntimeError("test did not release ready-receipt writer")
+            return real_fdopen(*args, **kwargs)
+
+        def publish() -> None:
+            try:
+                SUPERVISOR.publish_ready(
+                    str(ready),
+                    str(self.lifecycle),
+                    capability_id=self.capability["id"],
+                    supervisor_pid=123,
+                    created_at="2026-09-21T00:00:00Z",
+                    child=SUPERVISOR.ProcessIdentity(456, "start"),
+                    endpoint_identity=(7, 8),
+                )
+            except BaseException as exc:  # surfaced on the test thread below
+                failures.append(exc)
+
+        with mock.patch.object(SUPERVISOR.os, "fdopen", side_effect=delayed_fdopen):
+            writer = threading.Thread(target=publish)
+            writer.start()
+            self.assertTrue(writer_opened.wait(2))
+            try:
+                self.assertTrue(pending.exists())
+                self.assertFalse(
+                    ready.exists(),
+                    "the launcher-visible receipt appeared before its write completed",
+                )
+            finally:
+                release_writer.set()
+                writer.join(2)
+
+        self.assertFalse(writer.is_alive())
+        self.assertEqual([], failures)
+        self.assertFalse(pending.exists())
+        receipt = json.loads(ready.read_bytes())
+        self.assertEqual(self.capability["id"], receipt["capabilityId"])
+
+    def test_ready_parent_can_be_retired_after_receipt_publication(self) -> None:
+        barrier = self.lifecycle / ".launch-ready-retirement"
+        barrier.mkdir(mode=0o700)
+        ready = barrier / "supervisor.ready"
+        receipt_published = threading.Event()
+        barrier_retired = threading.Event()
+        failures: list[BaseException] = []
+        real_replace = SUPERVISOR.os.replace
+
+        def delayed_replace(*args: object, **kwargs: object) -> None:
+            real_replace(*args, **kwargs)
+            receipt_published.set()
+            if not barrier_retired.wait(2):
+                raise RuntimeError("test did not retire ready-receipt directory")
+
+        def publish() -> None:
+            try:
+                SUPERVISOR.publish_ready(
+                    str(ready),
+                    str(self.lifecycle),
+                    capability_id=self.capability["id"],
+                    supervisor_pid=123,
+                    created_at="2026-09-21T00:00:00Z",
+                    child=SUPERVISOR.ProcessIdentity(456, "start"),
+                    endpoint_identity=(7, 8),
+                )
+            except BaseException as exc:  # surfaced on the test thread below
+                failures.append(exc)
+
+        with mock.patch.object(SUPERVISOR.os, "replace", side_effect=delayed_replace):
+            writer = threading.Thread(target=publish)
+            writer.start()
+            try:
+                self.assertTrue(receipt_published.wait(2))
+                self.assertTrue(ready.exists())
+                ready.unlink()
+                barrier.rmdir()
+            finally:
+                barrier_retired.set()
+                writer.join(2)
+
+        self.assertFalse(writer.is_alive())
+        self.assertEqual([], failures)
+        self.assertFalse(barrier.exists())
+
+    def test_worker_exec_waits_for_process_generation_identity(self) -> None:
+        real_identity = SUPERVISOR.process_start_identity
+        real_write = SUPERVISOR.os.write
+        identity_captured = False
+        gate_released = False
+
+        def capture_identity(pid: int) -> str:
+            nonlocal identity_captured
+            value = real_identity(pid)
+            identity_captured = True
+            return value
+
+        def observe_release(descriptor: int, value: bytes) -> int:
+            nonlocal gate_released
+            if value == b"1":
+                self.assertTrue(
+                    identity_captured,
+                    "the worker exec gate opened before identity capture",
+                )
+                gate_released = True
+            return real_write(descriptor, value)
+
+        with mock.patch.object(
+            SUPERVISOR, "process_start_identity", side_effect=capture_identity
+        ), mock.patch.object(SUPERVISOR.os, "write", side_effect=observe_release):
+            worker, identity = SUPERVISOR.spawn_identified_worker(["/usr/bin/true"])
+        self.addCleanup(self.stop_process, worker)
+        self.assertTrue(identity_captured)
+        self.assertTrue(gate_released)
+        self.assertEqual(identity.pid, worker.pid)
+        self.assertEqual(0, worker.wait(timeout=2))
+
+    def test_worker_exec_restores_popen_signal_defaults(self) -> None:
+        worker, _identity = SUPERVISOR.spawn_identified_worker(
+            ["/bin/sh", "-c", "kill -PIPE $$; exit 42"]
+        )
+        self.addCleanup(self.stop_process, worker)
+        self.assertEqual(-signal.SIGPIPE, worker.wait(timeout=2))
+
+    def test_worker_exec_failure_is_reported_after_identity_capture(self) -> None:
+        missing = self.root / "missing-worker-command"
+        with mock.patch.object(
+            SUPERVISOR,
+            "process_start_identity",
+            wraps=SUPERVISOR.process_start_identity,
+        ) as identity:
+            with self.assertRaisesRegex(
+                SUPERVISOR.SupervisorError,
+                "worker command could not be executed",
+            ):
+                SUPERVISOR.spawn_identified_worker([str(missing)])
+        identity.assert_called_once()
+
+    def test_worker_gate_closes_first_pipe_if_status_pipe_fails(self) -> None:
+        real_pipe = SUPERVISOR.os.pipe
+        allocated: list[int] = []
+        calls = 0
+
+        def fail_second_pipe() -> tuple[int, int]:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected status-pipe failure")
+            pair = real_pipe()
+            allocated.extend(pair)
+            return pair
+
+        with mock.patch.object(SUPERVISOR.os, "pipe", side_effect=fail_second_pipe):
+            with self.assertRaisesRegex(OSError, "injected status-pipe failure"):
+                SUPERVISOR.spawn_identified_worker(["/usr/bin/true"])
+        self.assertEqual(2, len(allocated))
+        for descriptor in allocated:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
 
     def test_worker_receives_locator_only_and_published_proof_remains_auditable(self) -> None:
         output = self.root / "signature.json"

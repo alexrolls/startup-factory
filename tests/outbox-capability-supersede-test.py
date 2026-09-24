@@ -58,7 +58,9 @@ def entry(actor: str = ROLE, *, marker: str = "architecture-approval") -> dict:
 class OutboxCapabilitySupersedeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.base = Path(self.temporary.name).resolve()
+        self.root = Path(self.temporary.name).resolve()
+        self.base = self.root / "repo"
+        self.base.mkdir()
         self.workspace = self.base / "workspace"
         self.workspace.mkdir()
         subprocess.run(
@@ -198,6 +200,81 @@ class OutboxCapabilitySupersedeTest(unittest.TestCase):
         with self.assertRaises(CapabilityError) as caught:
             self.verify(payload, signature)
         self.assertIn("revoked", str(caught.exception))
+
+    def test_all_worktrees_revocation_fences_the_original_checkout(self) -> None:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.base),
+                "-c",
+                "user.name=Capability Test",
+                "-c",
+                "user.email=capability@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "linked-worktree fixture",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        linked = self.root / "linked"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.base),
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                str(linked),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        linked_workspace = linked / "workspace"
+        linked_workspace.mkdir()
+        capability = mint(
+            str(self.base),
+            str(self.workspace),
+            TEAM,
+            FEATURE,
+            "implementer",
+            "task",
+            "TASK-1",
+            1,
+            "implementer--task-1--a1",
+        )
+        payload = entry(actor="implementer", marker="handoff")
+        signature = self.signed(capability, payload)
+
+        # The legacy workspace-scoped operation cannot see authority minted by
+        # another linked checkout even though lifecycle state is Git-common.
+        self.assertEqual(
+            revoke_task(
+                str(linked), str(linked_workspace), TEAM, "TASK-1"
+            ),
+            0,
+        )
+        self.assertEqual(self.verify(payload, signature)["role"], "implementer")
+
+        # The lifecycle-facing mode traverses only this protected Git-common
+        # broker, but covers every linked checkout scope within it.
+        self.assertEqual(
+            revoke_task(
+                str(linked),
+                str(linked_workspace),
+                TEAM,
+                "TASK-1",
+                all_worktrees=True,
+            ),
+            1,
+        )
+        with self.assertRaisesRegex(CapabilityError, "revoked"):
+            self.verify(payload, signature)
 
     def test_new_task_attempt_supersedes_the_stable_task_lane(self) -> None:
         first = mint(
