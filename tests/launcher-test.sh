@@ -29,6 +29,37 @@ check() { # check <desc> <cmd...>
   if "$@" >/dev/null 2>&1; then echo "ok: $desc"; else echo "FAIL: $desc"; FAILURES=$((FAILURES+1)); fi
 }
 
+supervisor_log_class() { # private-log -> fixed, untrusted diagnostic only
+  local log="$1"
+  if [ ! -f "$log" ] || [ -L "$log" ]; then
+    printf 'absent\n'
+  elif grep -Fq 'publication-supervisor: worker command could not be executed' "$log"; then
+    printf 'worker-exec\n'
+  elif grep -Fq 'publication-supervisor: protected lifecycle generation' "$log"; then
+    printf 'lifecycle-generation\n'
+  elif grep -Fq 'publication-supervisor: protected supervisor-ready' "$log"; then
+    printf 'ready-publication\n'
+  elif grep -Fq 'publication-supervisor: publication transport' "$log"; then
+    printf 'transport\n'
+  elif grep -Fq 'publication-supervisor: publication supervisor session' "$log"; then
+    printf 'session\n'
+  elif grep -Eq 'publication-supervisor: \[Errno (11|12|24)\]' "$log"; then
+    printf 'resource-unavailable\n'
+  elif grep -Fq 'publication-supervisor:' "$log"; then
+    printf 'other-supervisor-error\n'
+  elif grep -Fq 'Traceback (most recent call last):' "$log"; then
+    printf 'python-traceback\n'
+  else
+    printf 'no-supervisor-error\n'
+  fi
+}
+
+printf '%s\n' 'worker-secret-must-not-print' \
+  'publication-supervisor: worker command could not be executed' \
+  > "$TMP/supervisor-class-fixture.log"
+check "supervisor failure diagnostics reveal only a fixed class" \
+  test "$(supervisor_log_class "$TMP/supervisor-class-fixture.log")" = worker-exec
+
 SANDBOX_RUNNER="$TMP/protected-agent-sandbox-runner"
 SANDBOX_RUNNER_LOG="$TMP/agent-sandbox-runner.log"
 cat > "$SANDBOX_RUNNER" <<'EOF'
@@ -3501,7 +3532,14 @@ wait "$auth_victim_pid" 2>/dev/null || true
 rm -f "$auth_record"
 set_config_line BACKEND_CMD '"sleep 120"'
 
-TEAM_RUNNER=background "$LAUNCH" start lifecycle-identity FEAT-LIFE backend >/dev/null
+if ! TEAM_RUNNER=background "$LAUNCH" start lifecycle-identity FEAT-LIFE backend \
+    >"$TMP/lifecycle-identity-start.out" 2>&1; then
+  # This fixture must have a live authenticated generation before tampering.
+  # Never print the private log or worker output: only a fixed hint that can
+  # distinguish an early supervisor error from a missing diagnostic.
+  echo "FAIL: lifecycle identity fixture launch failed (supervisor-log-class=$(supervisor_log_class .teamwork/lifecycle-identity/pids/backend.log))" >&2
+  exit 1
+fi
 identity_record="$(record_for lifecycle-identity backend)"
 identity_agent_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$identity_record")"
 python3 - "$identity_record" "$LIFECYCLE_ROOT/record-auth.key" <<'PY'
