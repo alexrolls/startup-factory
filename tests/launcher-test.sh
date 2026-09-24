@@ -209,12 +209,15 @@ else
 fi
 if command -v tmux >/dev/null 2>&1; then
   TMUX_RESTART_SOCKET="$TMP/tmux-generation-restart.sock"
+  TMUX_SECOND_SOCKET="$TMP/tmux-generation-next.sock"
   if bash -c '
 set -euo pipefail
 eval "$1"
 socket="$2"
+next_socket="$3"
+old_socket="$socket"
 tmux_cmd() { tmux -S "$socket" "$@"; }
-trap "tmux_cmd kill-server >/dev/null 2>&1 || true" EXIT
+trap '\''tmux -S "$old_socket" kill-server >/dev/null 2>&1 || true; tmux -S "$next_socket" kill-server >/dev/null 2>&1 || true'\'' EXIT
 tmux_cmd new-session -d -s team-race -n _hub "sleep 60"
 token=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 tag="$(tmux_generation_tag "$token")"
@@ -225,8 +228,22 @@ old_pid="${old#*|}"
 [ "$old_pane" != "$duplicate" ]
 tmux_cmd display-message -p -t "$old_pane" "#{m:*sfgen-$tag*,#{pane_start_command}}" | grep -Fxq 1
 tmux_cmd display-message -p -t "$duplicate" "#{m:*sfgen-$tag*,#{pane_start_command}}" | grep -Fxq 0
-tmux_cmd kill-server
-tmux_cmd new-session -d -s team-race -n _hub "sleep 60"
+tmux_cmd kill-server 2>/dev/null || true
+for _ in $(seq 1 100); do
+  ! tmux_cmd has-session -t team-race 2>/dev/null && break
+  sleep 0.02
+done
+if tmux_cmd has-session -t team-race 2>/dev/null; then
+  echo "old tmux server retained its session after kill-server" >&2
+  exit 1
+fi
+# A fresh socket makes the server generation independent even if the old
+# socket is still being retired.  Pane IDs remain server-local and can reuse.
+socket="$next_socket"
+tmux_cmd new-session -d -s team-race -n _hub "sleep 60" || {
+  echo "could not start replacement tmux server" >&2
+  exit 1
+}
 tmux_cmd set-option -g remain-on-exit on
 tmux_cmd new-window -d -t team-race -n worker "sleep 60"
 new_pane="$(tmux_cmd new-window -d -P -F "#{pane_id}" -t team-race -n worker "true")"
@@ -274,7 +291,7 @@ done
 [ "$respawn_new_pid" != "$respawn_old_pid" ]
 lifecycle_retire_tmux_pane "$respawn_old_pid" team-race worker "$respawn_pane" "$token"
 tmux_cmd list-panes -a -F "#{pane_id}" | grep -Fqx "$respawn_pane"
-' _ "$TMUX_RETIRE_FUNCTION" "$TMUX_RESTART_SOCKET"; then
+' _ "$TMUX_RETIRE_FUNCTION" "$TMUX_RESTART_SOCKET" "$TMUX_SECOND_SOCKET"; then
     echo "ok: restarted tmux server cannot retire a reused dead pane without its generation tag"
   else
     echo "FAIL: restarted tmux server retired a reused dead pane or generation tag failed"
@@ -1661,7 +1678,7 @@ PY_READY
     [ "$_sf_mode" = ready-exit-final ] || return 125
     # Force the precise ordering that used to fail: the launcher has already
     # observed no receipt, then the supervisor publishes it and exits.  Hide
-    # the durable receipt while kill -0 is made to report live for all 200
+    # the durable receipt while kill -0 is made to report live for all 600
     # polls; the sleep hook restores it only after the last in-loop probe.
     _STARTUP_FACTORY_TEST_READY_ORIGINAL="$_sf_ready"
     _STARTUP_FACTORY_TEST_READY_HELD="${_sf_ready}.held"
@@ -1682,7 +1699,7 @@ sleep() {
   if [ "${STARTUP_FACTORY_TEST_READY_HANDSHAKE:-}" = ready-exit-final ] \
       && [ "$#" -eq 1 ] && [ "${1:-}" = 0.05 ]; then
     _STARTUP_FACTORY_TEST_READY_SLEEPS=$(( ${_STARTUP_FACTORY_TEST_READY_SLEEPS:-0} + 1 ))
-    if [ "$_STARTUP_FACTORY_TEST_READY_SLEEPS" -eq 200 ]; then
+    if [ "$_STARTUP_FACTORY_TEST_READY_SLEEPS" -eq 600 ]; then
       command mv "$_STARTUP_FACTORY_TEST_READY_HELD" \
         "$_STARTUP_FACTORY_TEST_READY_ORIGINAL" || return 125
       printf 'ready-then-dead-at-final-probe\n' \
@@ -2897,12 +2914,22 @@ for _i in $(seq 1 100); do [ -s "$HOLD_LANE_BARRIER/ready" ] && break; sleep 0.0
 check "hold race fixture owns the stable task lane" test -s "$HOLD_LANE_BARRIER/ready"
 HOLD_LANE_PROMPT="$PWD/.teamwork/$HOLD_LANE_TEAM/prompts/tasks/backend--$HOLD_LANE_KEY--a1.md"
 rm -f "$HOLD_LANE_PROMPT"
+find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' -print | sort > "$TMP/hold-lane-barriers-before"
 TEAM_RUNNER=background "$LAUNCH" start-task \
   "$HOLD_LANE_TEAM" "$HOLD_LANE_FEATURE" backend "$HOLD_LANE_TASK" 1 \
   >"$TMP/hold-lane-start.out" 2>&1 &
 HOLD_LANE_START=$!
-for _i in $(seq 1 200); do [ -s "$HOLD_LANE_PROMPT" ] && break; sleep 0.02; done
-check "queued start passes preflight and reaches the held lane" test -s "$HOLD_LANE_PROMPT"
+HOLD_LANE_QUEUED_BARRIER=""
+for _i in $(seq 1 300); do
+  HOLD_LANE_QUEUED_BARRIER="$(comm -13 "$TMP/hold-lane-barriers-before" <(
+    find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' -print | sort
+  ) | sed -n '1p')"
+  if [ -s "$HOLD_LANE_PROMPT" ] && [ -n "$HOLD_LANE_QUEUED_BARRIER" ]; then break; fi
+  if ! kill -0 "$HOLD_LANE_START" 2>/dev/null; then break; fi
+  sleep 0.1
+done
+check "queued start passes preflight and reaches the held lane" \
+  test -s "$HOLD_LANE_PROMPT" -a -n "$HOLD_LANE_QUEUED_BARRIER"
 python3 - "$TMP/hold-lane-blocked.json" "$HOLD_LANE_FEATURE" "$HOLD_LANE_TASK" <<'PY'
 import json,pathlib,sys
 path,feature,task=sys.argv[1:]
@@ -3845,16 +3872,24 @@ python3 .claude/skills/pm/bin/launch-lane-lock.py \
 FENCED_HOLDER=$!
 for _i in $(seq 1 100); do [ -s "$FENCED_BARRIER/ready" ] && break; sleep 0.02; done
 check "test launch holds the protected team fence" test -s "$FENCED_BARRIER/ready"
-FENCED_BARRIERS_BEFORE="$(find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' | wc -l | tr -d ' ')"
+find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' -print | sort > "$TMP/team-fence-barriers-before"
 "$LAUNCH" stop "$FENCED_TEAM" >"$TMP/team-stop-fenced.out" 2>&1 &
 FENCED_STOP=$!
-for _i in $(seq 1 100); do
-  FENCED_BARRIERS_NOW="$(find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' | wc -l | tr -d ' ')"
-  [ "$FENCED_BARRIERS_NOW" -gt "$FENCED_BARRIERS_BEFORE" ] && break
-  sleep 0.02
+FENCED_WAIT_BARRIER=""
+for _i in $(seq 1 300); do
+  FENCED_WAIT_BARRIER="$(comm -13 "$TMP/team-fence-barriers-before" <(
+    find "$LIFECYCLE_ROOT" -maxdepth 1 -type d -name '.launch-lane.*' -print | sort
+  ) | sed -n '1p')"
+  if [ -n "$FENCED_WAIT_BARRIER" ]; then break; fi
+  if ! kill -0 "$FENCED_STOP" 2>/dev/null; then break; fi
+  sleep 0.1
 done
 check "team stop reaches protected team-fence wait" \
-  test "$FENCED_BARRIERS_NOW" -gt "$FENCED_BARRIERS_BEFORE"
+  test -n "$FENCED_WAIT_BARRIER"
+if [ -n "$FENCED_WAIT_BARRIER" ]; then
+  check "team stop remains queued behind the held fence" \
+    test ! -e "$FENCED_WAIT_BARRIER/ready"
+fi
 check "team stop waits for an in-flight launch before snapshot" kill -0 "$FENCED_STOP"
 FENCED_PID="$(spawn_lifecycle_sleep)"
 register_lifecycle_process "$FENCED_TEAM" gate backend "$FENCED_PID"

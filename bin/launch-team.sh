@@ -919,9 +919,16 @@ PY
 
 wait_publication_supervisor_ready() { # supervisor-pid lifecycle-created-at
   local supervisor_pid="$1" expected_created_at="$2" i supervisor_live ready_rc
+  WAIT_PUBLICATION_READY_REASON=unknown
   [ "$PUBLICATION_AUTHORITY_ENABLED" = true ] || return 0
-  [ -n "$expected_created_at" ] || return 1
-  for i in $(seq 1 200); do
+  [ -n "$expected_created_at" ] || {
+    WAIT_PUBLICATION_READY_REASON=missing-lifecycle-generation
+    return 1
+  }
+  # A busy hosted runner can delay process startup even after the protected
+  # launch barrier is released.  Waiting longer does not grant publication
+  # authority: only the exact validated receipt can complete the handshake.
+  for i in $(seq 1 600); do
     # Sample liveness before the receipt.  If the supervisor exits after this
     # probe, the next iteration observes its durable receipt.  If it was
     # already gone, the following file probe is the final race-free state: no
@@ -934,19 +941,29 @@ wait_publication_supervisor_ready() { # supervisor-pid lifecycle-created-at
     else
       ready_rc=$?
     fi
-    [ "$ready_rc" -eq 3 ] || return 1
-    [ "$supervisor_live" = yes ] || return 1
+    [ "$ready_rc" -eq 3 ] || {
+      WAIT_PUBLICATION_READY_REASON=invalid-ready-receipt
+      return 1
+    }
+    [ "$supervisor_live" = yes ] || {
+      WAIT_PUBLICATION_READY_REASON=supervisor-exited-before-ready
+      return 1
+    }
     sleep 0.05
   done
   # Pair the final live/no-receipt sample with one observation after its sleep.
-  # Otherwise publication during iteration 200's sleep is another lost wakeup.
+  # Otherwise publication during the final sleep is another lost wakeup.
   if accept_publication_supervisor_ready_receipt \
       "$supervisor_pid" "$expected_created_at"; then
     return 0
   else
     ready_rc=$?
   fi
-  [ "$ready_rc" -eq 3 ] || return 1
+  [ "$ready_rc" -eq 3 ] || {
+    WAIT_PUBLICATION_READY_REASON=invalid-ready-receipt
+    return 1
+  }
+  WAIT_PUBLICATION_READY_REASON=ready-timeout
   return 1
 }
 
@@ -1407,7 +1424,7 @@ if not (
       "$created_at" "$launch_token"
     rm -f "$marker"
     remove_launch_barrier
-    die "publication supervisor failed its protected ready handshake for $instance"
+    die "publication supervisor failed its protected ready handshake for $instance ($WAIT_PUBLICATION_READY_REASON)"
   fi
 }
 
@@ -1519,7 +1536,7 @@ PY
       || die "protected tmux launch failed while retiring an unready supervisor"
     rm -f "$marker"
     remove_launch_barrier
-    die "publication supervisor failed its protected ready handshake for $instance"
+    die "publication supervisor failed its protected ready handshake for $instance ($WAIT_PUBLICATION_READY_REASON)"
   fi
 }
 

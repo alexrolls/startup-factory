@@ -916,6 +916,22 @@ launch_gate_submission() { # role marker body output-file [target] -> entry path
   rm -f ".teamwork/feature-runtime/$output_file"
   launch_output="$(TEAM_RUNNER=background "$LAUNCH" start feature-runtime "$FID" "$role" 2>&1)" || {
     echo "FAIL: could not launch fresh $role gate: $launch_output" >&2
+    # The private supervisor log can contain runtime output.  Report only a
+    # fixed classification, never log lines or command arguments, on CI.
+    local supervisor_log=".teamwork/feature-runtime/pids/$role.log" log_class=absent
+    if [ -f "$supervisor_log" ]; then
+      log_class=other
+      if grep -Fq 'publication-supervisor: worker command could not be executed' "$supervisor_log"; then
+        log_class=worker-exec
+      elif grep -Fq 'publication-supervisor: protected lifecycle generation' "$supervisor_log"; then
+        log_class=lifecycle-generation
+      elif grep -Fq 'publication-supervisor: protected supervisor-ready' "$supervisor_log"; then
+        log_class=ready-publication
+      elif grep -Fq 'publication-supervisor: publication transport' "$supervisor_log"; then
+        log_class=transport
+      fi
+    fi
+    echo "gate diagnostic: supervisor-log-class=$log_class (contents withheld)" >&2
     return 1
   }
   case "$launch_output" in
