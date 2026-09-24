@@ -2080,10 +2080,15 @@ def launch_once(previous_generation):
         if rows[0]["state"] == "live":
             time.sleep(0.02)
             continue
-        if rows[0]["state"] == "dead" and rows[0]["kind"] == "background":
+        if rows[0]["kind"] == "background" and rows[0]["state"] in (
+            "dead",
+            "identity-mismatch",
+        ):
             # waitpid() and the exact, lock-protected completion transition are
             # separate operations. A reader may briefly observe the verified-
             # dead source record before it becomes non-authoritative evidence.
+            # Darwin may instead report an exited, unreaped leader as an
+            # identity mismatch during the same bounded transition.
             time.sleep(0.02)
             continue
         if rows[0]["state"] != "dead" or rows[0]["kind"] != "completed-background":
