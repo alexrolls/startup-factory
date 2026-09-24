@@ -113,7 +113,7 @@ jobs:
     name: Validate main and build exact release artifacts
     needs: authorize
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     outputs:
       source_commit: ${{ steps.release.outputs.commit }}
       version: ${{ steps.release.outputs.version }}
