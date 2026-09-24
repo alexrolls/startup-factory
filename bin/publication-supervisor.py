@@ -18,13 +18,14 @@ import json
 import os
 from pathlib import Path
 import select
+import signal
 import socket
 import stat
 import struct
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 
 
 sys.dont_write_bytecode = True
@@ -49,6 +50,10 @@ LINUX_SO_PEERPIDFD = getattr(socket, "SO_PEERPIDFD", 77)
 
 class SupervisorError(RuntimeError):
     pass
+
+
+class SupervisorShutdown(Exception):
+    """Internal cancellation of an in-flight request during group shutdown."""
 
 
 @dataclass(frozen=True)
@@ -139,6 +144,7 @@ def publish_ready(
     created_at: str,
     child: ProcessIdentity,
     endpoint_identity: tuple[int, int],
+    may_publish: Callable[[], bool] | None = None,
 ) -> None:
     path = Path(ready_file)
     root = Path(lifecycle_root)
@@ -220,6 +226,8 @@ def publish_ready(
             pass
         else:
             raise SupervisorError("protected supervisor-ready receipt already exists")
+        if may_publish is not None and not may_publish():
+            raise SupervisorError("publication supervisor shutdown before ready")
         os.replace(
             pending_name,
             path.name,
@@ -240,16 +248,30 @@ def publish_ready(
             os.close(directory)
 
 
-def receive_exact(connection: socket.socket, size: int, deadline: float) -> bytes:
+def receive_exact(
+    connection: socket.socket,
+    size: int,
+    deadline: float,
+    should_shutdown: Callable[[], bool] | None = None,
+) -> bytes:
     value = bytearray()
     while len(value) < size:
+        if should_shutdown is not None and should_shutdown():
+            raise SupervisorShutdown
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise SupervisorError("publication request exceeded its frame deadline")
-        connection.settimeout(remaining)
-        block, ancillary, _flags, _address = connection.recvmsg(
-            size - len(value), 256
+        connection.settimeout(
+            min(remaining, POLL_SECONDS) if should_shutdown is not None else remaining
         )
+        try:
+            block, ancillary, _flags, _address = connection.recvmsg(
+                size - len(value), 256
+            )
+        except socket.timeout:
+            if should_shutdown is not None:
+                continue
+            raise
         if ancillary:
             raise SupervisorError("publication request carried ancillary data")
         if not block:
@@ -615,14 +637,16 @@ def lifecycle_generation(
 
 
 def decode_request(
-    connection: socket.socket, deadline: float
+    connection: socket.socket,
+    deadline: float,
+    should_shutdown: Callable[[], bool] | None = None,
 ) -> tuple[dict[str, Any], bytes]:
-    header = receive_exact(connection, 4, deadline)
+    header = receive_exact(connection, 4, deadline, should_shutdown)
     size = struct.unpack("!I", header)[0]
     if size <= 0 or size > MAX_TRANSPORT_REQUEST_BYTES:
         raise SupervisorError("publication request has an invalid size")
     try:
-        raw = receive_exact(connection, size, deadline)
+        raw = receive_exact(connection, size, deadline, should_shutdown)
         def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             result: dict[str, Any] = {}
             for key, item in pairs:
@@ -634,11 +658,23 @@ def decode_request(
         value = json.loads(raw, object_pairs_hook=unique_object)
     except (UnicodeError, ValueError) as exc:
         raise SupervisorError("publication request is malformed") from exc
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise SupervisorError("publication request exceeded its frame deadline")
-    connection.settimeout(remaining)
-    trailing, ancillary, _flags, _address = connection.recvmsg(1, 256)
+    while True:
+        if should_shutdown is not None and should_shutdown():
+            raise SupervisorShutdown
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SupervisorError("publication request exceeded its frame deadline")
+        connection.settimeout(
+            min(remaining, POLL_SECONDS) if should_shutdown is not None else remaining
+        )
+        try:
+            trailing, ancillary, _flags, _address = connection.recvmsg(1, 256)
+        except socket.timeout:
+            if should_shutdown is not None:
+                continue
+            raise
+        break
+    connection.settimeout(max(0.001, deadline - time.monotonic()))
     if trailing or ancillary:
         raise SupervisorError("publication request has trailing or ancillary data")
     if not isinstance(value, dict) or set(value) != {
@@ -663,11 +699,34 @@ def decode_request(
     return value["entry"], body
 
 
-def send_response(connection: socket.socket, value: dict[str, Any]) -> None:
+def send_response(
+    connection: socket.socket,
+    value: dict[str, Any],
+    should_shutdown: Callable[[], bool] | None = None,
+) -> None:
     payload = canonical(value)
     if not payload or len(payload) > MAX_RESPONSE_BYTES:
         raise SupervisorError("publication response is too large")
-    connection.sendall(struct.pack("!I", len(payload)) + payload)
+    frame = struct.pack("!I", len(payload)) + payload
+    if should_shutdown is None:
+        connection.sendall(frame)
+        return
+    deadline = time.monotonic() + FRAME_TIMEOUT_SECONDS
+    offset = 0
+    while offset < len(frame):
+        if should_shutdown():
+            raise SupervisorShutdown
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SupervisorError("publication response exceeded its frame deadline")
+        connection.settimeout(min(remaining, POLL_SECONDS))
+        try:
+            sent = connection.send(frame[offset:])
+        except socket.timeout:
+            continue
+        if sent <= 0:
+            raise SupervisorError("publication response connection closed")
+        offset += sent
 
 
 def serve_connection(
@@ -679,6 +738,7 @@ def serve_connection(
     child: ProcessIdentity,
     lifecycle: dict[str, str],
     created_at: str,
+    should_shutdown: Callable[[], bool] | None = None,
 ) -> None:
     deadline = time.monotonic() + FRAME_TIMEOUT_SECONDS
     proof: tuple[
@@ -689,8 +749,12 @@ def serve_connection(
         tuple[ProcessIdentity, ...],
     ] | None = None
     try:
+        if should_shutdown is not None and should_shutdown():
+            raise SupervisorShutdown
         proof = authenticate_peer(connection, child)
-        entry, body = decode_request(connection, deadline)
+        entry, body = decode_request(connection, deadline, should_shutdown)
+        if should_shutdown is not None and should_shutdown():
+            raise SupervisorShutdown
         reauthenticate_peer(connection, child, proof)
         lifecycle_generation(
             lifecycle_root=lifecycle["root"],
@@ -705,10 +769,17 @@ def serve_connection(
             repository, workspace, capability_id, entry, body
         )
         reauthenticate_peer(connection, child, proof)
+        if should_shutdown is not None and should_shutdown():
+            raise SupervisorShutdown
         send_response(
             connection,
             {"schemaVersion": 1, "producerCapability": capability},
+            should_shutdown,
         )
+    except SupervisorShutdown:
+        # Stop requested by the launcher: no new signature or denial response
+        # should delay exact capability revocation and child reaping.
+        return
     except (CapabilityError, SupervisorError, OSError) as exc:
         # The client receives one bounded generic denial.  Broker paths, keys,
         # capability ids, and verifier details never cross the worker boundary.
@@ -720,8 +791,9 @@ def serve_connection(
             send_response(
                 connection,
                 {"schemaVersion": 1, "error": "publication request denied"},
+                should_shutdown,
             )
-        except (OSError, SupervisorError):
+        except (OSError, SupervisorError, SupervisorShutdown):
             pass
     finally:
         if proof is not None and proof[3] is not None:
@@ -773,6 +845,17 @@ def run_supervisor(args: argparse.Namespace) -> int:
     child: subprocess.Popen[bytes] | None = None
     child_identity: ProcessIdentity | None = None
     endpoint_identity: tuple[int, int] | None = None
+    shutdown_signal = 0
+
+    def request_shutdown(signum: int, _frame: Any) -> None:
+        nonlocal shutdown_signal
+        # The launcher signals the entire dedicated group.  Do not let TERM
+        # kill this leader before it has waitpid()ed its worker: an orphaned
+        # zombie can keep the numeric PGID alive on a non-reaping Linux host.
+        shutdown_signal = signum
+
+    previous_term = signal.signal(signal.SIGTERM, request_shutdown)
+    previous_int = signal.signal(signal.SIGINT, request_shutdown)
     try:
         previous_umask = os.umask(0o177)
         try:
@@ -790,7 +873,11 @@ def run_supervisor(args: argparse.Namespace) -> int:
         endpoint_identity = (endpoint.st_dev, endpoint.st_ino)
         listener.listen(16)
         listener.settimeout(POLL_SECONDS)
+        if shutdown_signal:
+            return 128 + shutdown_signal
         child, child_identity = spawn_identified_worker(args.command)
+        if shutdown_signal:
+            return 128 + shutdown_signal
         publish_ready(
             args.ready_file,
             args.lifecycle_root,
@@ -799,8 +886,11 @@ def run_supervisor(args: argparse.Namespace) -> int:
             created_at=created_at,
             child=child_identity,
             endpoint_identity=endpoint_identity,
+            may_publish=lambda: shutdown_signal == 0,
         )
         while True:
+            if shutdown_signal:
+                return 128 + shutdown_signal
             result = child.poll()
             if result is not None:
                 return result
@@ -811,6 +901,8 @@ def run_supervisor(args: argparse.Namespace) -> int:
             except socket.timeout:
                 continue
             with connection:
+                if shutdown_signal:
+                    return 128 + shutdown_signal
                 serve_connection(
                     connection,
                     args.repo,
@@ -820,48 +912,53 @@ def run_supervisor(args: argparse.Namespace) -> int:
                     child_identity,
                     lifecycle,
                     created_at,
+                    lambda: shutdown_signal != 0,
                 )
     finally:
-        listener.close()
-        cleanup_error: SupervisorError | None = None
         try:
-            current = locator.lstat()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            cleanup_error = SupervisorError(
-                "publication transport endpoint cannot be inspected"
-            )
-        else:
-            if (
-                endpoint_identity is None
-                or (current.st_dev, current.st_ino) != endpoint_identity
-                or not stat.S_ISSOCK(current.st_mode)
-                or current.st_uid != os.geteuid()
-            ):
+            listener.close()
+            cleanup_error: SupervisorError | None = None
+            try:
+                current = locator.lstat()
+            except FileNotFoundError:
+                pass
+            except OSError:
                 cleanup_error = SupervisorError(
-                    "publication transport endpoint identity changed"
+                    "publication transport endpoint cannot be inspected"
                 )
             else:
-                locator.unlink()
-        if child is not None and child.poll() is None:
-            child.terminate()
+                if (
+                    endpoint_identity is None
+                    or (current.st_dev, current.st_ino) != endpoint_identity
+                    or not stat.S_ISSOCK(current.st_mode)
+                    or current.st_uid != os.geteuid()
+                ):
+                    cleanup_error = SupervisorError(
+                        "publication transport endpoint identity changed"
+                    )
+                else:
+                    locator.unlink()
+            if child is not None and child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+            # Exact-id compare-and-revoke cannot remove a successor pointer.  A
+            # normal agent exit and every supervisor failure therefore fence only
+            # this launch generation before lifecycle retirement can proceed.
             try:
-                child.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait()
-        # Exact-id compare-and-revoke cannot remove a successor pointer.  A
-        # normal agent exit and every supervisor failure therefore fence only
-        # this launch generation before lifecycle retirement can proceed.
-        try:
-            revoke_exact(args.repo, args.workspace, args.handle)
-        except CapabilityError as exc:
-            raise SupervisorError(
-                "publication generation could not be retired"
-            ) from exc
-        if cleanup_error is not None:
-            raise cleanup_error
+                revoke_exact(args.repo, args.workspace, args.handle)
+            except CapabilityError as exc:
+                raise SupervisorError(
+                    "publication generation could not be retired"
+                ) from exc
+            if cleanup_error is not None:
+                raise cleanup_error
+        finally:
+            signal.signal(signal.SIGTERM, previous_term)
+            signal.signal(signal.SIGINT, previous_int)
 
 
 def main() -> int:

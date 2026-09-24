@@ -444,6 +444,26 @@ STATUS_CONFIG=config/statuses.config.json
         self.assertEqual([], failures)
         self.assertFalse(barrier.exists())
 
+    def test_shutdown_guard_does_not_publish_a_ready_receipt(self) -> None:
+        barrier = self.lifecycle / ".launch-ready-shutdown"
+        barrier.mkdir(mode=0o700)
+        ready = barrier / "supervisor.ready"
+        with self.assertRaisesRegex(
+            SUPERVISOR.SupervisorError, "shutdown before ready"
+        ):
+            SUPERVISOR.publish_ready(
+                str(ready),
+                str(self.lifecycle),
+                capability_id=self.capability["id"],
+                supervisor_pid=123,
+                created_at="2026-09-21T00:00:00Z",
+                child=SUPERVISOR.ProcessIdentity(456, "start"),
+                endpoint_identity=(7, 8),
+                may_publish=lambda: False,
+            )
+        self.assertFalse(ready.exists())
+        self.assertFalse((barrier / ".supervisor.ready.pending").exists())
+
     def test_worker_exec_waits_for_process_generation_identity(self) -> None:
         real_identity = SUPERVISOR.process_start_identity
         real_write = SUPERVISOR.os.write
@@ -496,6 +516,89 @@ STATUS_CONFIG=config/statuses.config.json
             ):
                 SUPERVISOR.spawn_identified_worker([str(missing)])
         identity.assert_called_once()
+
+    def assert_group_signal_reaps_worker(self, signum: signal.Signals) -> None:
+        output = self.root / ("group-%s-output.txt" % signum.name.lower())
+        gate = self.root / ("group-%s-release" % signum.name.lower())
+        process = self.start(
+            self.client_script(wait=True), output, gate, "wait-group-signal"
+        )
+        receipt = json.loads(
+            (
+                self.lifecycle
+                / (".launch-test-%s" % output.name)
+                / "supervisor.ready"
+            ).read_text(encoding="utf-8")
+        )
+        worker_pid = receipt["childPid"]
+        self.assertEqual(process.pid, receipt["supervisorPid"])
+        self.assertNotEqual(process.pid, worker_pid)
+
+        # The launcher signals the authenticated dedicated group.  The
+        # supervisor must survive that signal long enough to reap its direct
+        # worker, even if an orphan-reaping PID 1 is absent or delayed.
+        os.killpg(process.pid, signum)
+        _stdout, stderr = process.communicate(timeout=10)
+        self.assertEqual(128 + signum, process.returncode, stderr)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("worker left the terminated supervisor's group alive")
+        self.assertFalse(Path(self.locator).exists())
+        tombstone = (
+            self.repository
+            / ".git"
+            / "startup-factory-broker"
+            / "outbox-revoked"
+            / (self.capability["id"] + ".revoked")
+        )
+        self.assertTrue(tombstone.is_file())
+
+    def test_group_term_reaps_worker_before_supervisor_exits(self) -> None:
+        self.assert_group_signal_reaps_worker(signal.SIGTERM)
+
+    def test_group_int_reaps_worker_before_supervisor_exits(self) -> None:
+        self.assert_group_signal_reaps_worker(signal.SIGINT)
+
+    def test_partial_request_does_not_hold_group_term_past_grace(self) -> None:
+        stalled = self.root / "partial-request-client.py"
+        stalled.write_text(
+            """import os, pathlib, socket, sys, time
+connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+connection.connect(os.environ['STARTUP_FACTORY_OUTBOX_TRANSPORT'])
+connection.sendall(b'\\x00')
+pathlib.Path(sys.argv[4]).write_text('partial frame sent\\n')
+time.sleep(30)
+""",
+            encoding="utf-8",
+        )
+        output = self.root / "partial-request-sent.txt"
+        process = self.start(
+            stalled, output, self.root / "partial-request-release", "partial"
+        )
+        self.wait_for(output)
+        # Give accept() time to enter the partial-frame read.  Before the
+        # shutdown-aware polling change, that read could hold for ten seconds.
+        time.sleep(0.2)
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            _stdout, stderr = process.communicate(timeout=3)
+        finally:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate(timeout=3)
+        self.assertEqual(128 + signal.SIGTERM, process.returncode, stderr)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(process.pid, 0)
+        self.assertFalse(Path(self.locator).exists())
 
     def test_worker_gate_closes_first_pipe_if_status_pipe_fails(self) -> None:
         real_pipe = SUPERVISOR.os.pipe
