@@ -3903,6 +3903,7 @@ result = directory / "result.json"
 result.write_text(json.dumps({"schemaVersion": 1, "identity": identity,
                               "state": "launching", "createdAt": "2026-09-24T00:00:00+00:00"},
                              sort_keys=True, separators=(",", ":")) + "\n")
+result.chmod(0o600)
 with (directory / "worker.log").open("w") as log:
     process = subprocess.Popen([sys.executable, str(worker), "--result", str(result),
         "--log", str(directory / "release.log"), "--timeout", "60",
@@ -3919,6 +3920,10 @@ for _i in $(seq 1 150); do
   [ -n "$RELEASE_FENCE_READY" ] && break
   sleep 0.02
 done
+if [ -z "$RELEASE_FENCE_READY" ]; then
+  echo "release fence fixture worker exited before readiness:" >&2
+  sed -n '1,12p' "$LIFECYCLE_ROOT/$RELEASE_FENCE_JOB_ID/worker.log" >&2 || true
+fi
 check "release worker holds the shared team fence before registration" test -n "$RELEASE_FENCE_READY"
 check "release command has not crossed the registration barrier" \
   test ! -e "$TMP/release-command-witness"
