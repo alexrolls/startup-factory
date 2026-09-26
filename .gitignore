@@ -2,6 +2,9 @@
 .teamwork/
 /.startup-factory-retrospective.md
 /.startup-factory-retrospective.lock
+/.startup-factory/plans/
+/.startup-factory/beta-evidence/
+/.startup-factory/beta-readiness-evidence.json
 .DS_Store
 .workspace/
 __pycache__/

@@ -50,6 +50,17 @@ def base_payload(version: str = "1") -> dict[str, tuple[bytes, int]]:
     return payload
 
 
+def migration_payload() -> dict[str, tuple[bytes, int]]:
+    payload = base_payload("2")
+    payload["config/team.config.md"] = (
+        b"AGENT_SANDBOX_ENFORCED=true\n"
+        b"AGENT_SANDBOX_RUNNER=null\n"
+        b"BROKER_LIFECYCLE_ROOT=null\n",
+        0o644,
+    )
+    return payload
+
+
 def write_bundle(
     path: Path,
     *,
@@ -273,6 +284,143 @@ class CliInstallerTest(unittest.TestCase):
         for relative in CONFIG_PATHS:
             self.assertEqual((target / relative).read_bytes(), payload_v2[relative][0])
         self.assertTrue((target / "extensions/tracker-backends/Acme.py").is_file())
+
+    def test_update_json_diagnoses_missing_and_null_preserved_authority(self) -> None:
+        target = self.install()
+        team_config = target / "config/team.config.md"
+        bundle_v2 = write_bundle(
+            self.root / "migration-v2.tar.gz",
+            version="2.0.0",
+            payload=migration_payload(),
+        )
+        for label, lifecycle, runner in (
+            ("missing", None, None),
+            ("null", "null", "null"),
+        ):
+            with self.subTest(label=label):
+                lines = ["AGENT_SANDBOX_ENFORCED=true"]
+                if runner is not None:
+                    lines.append(f"AGENT_SANDBOX_RUNNER={runner}")
+                if lifecycle is not None:
+                    lines.append(f"BROKER_LIFECYCLE_ROOT={lifecycle}")
+                preserved = "\n".join(lines) + "\n"
+                team_config.write_text(preserved, encoding="utf-8")
+
+                code, output, error = self.update(target, bundle_v2, "--dry-run")
+
+                self.assertEqual((code, error), (0, ""), output + error)
+                diagnostics = json.loads(output)["migrationDiagnostics"]
+                self.assertEqual(
+                    [diagnostic["id"] for diagnostic in diagnostics],
+                    [
+                        "lifecycle-authority.unconfigured",
+                        "sandbox-runner.reprovision-required",
+                    ],
+                )
+                self.assertIn("missing or null", diagnostics[1]["message"])
+                self.assertEqual(team_config.read_text(encoding="utf-8"), preserved)
+
+        code, output, error = self.update(target, bundle_v2)
+        self.assertEqual((code, error), (0, ""), output + error)
+        self.assertEqual(
+            [diagnostic["id"] for diagnostic in json.loads(output)["migrationDiagnostics"]],
+            [
+                "lifecycle-authority.unconfigured",
+                "sandbox-runner.reprovision-required",
+            ],
+        )
+
+    def test_update_reports_old_operator_runner_after_dry_run_and_apply(self) -> None:
+        target = self.install()
+        runner = self.root / "legacy-runner"
+        runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        runner.chmod(0o700)
+        preserved = (
+            "AGENT_SANDBOX_ENFORCED=true\n"
+            f'AGENT_SANDBOX_RUNNER="{runner}"\n'
+            "BROKER_LIFECYCLE_ROOT=/var/lib/startup-factory/lifecycle\n"
+        )
+        team_config = target / "config/team.config.md"
+        team_config.write_text(preserved, encoding="utf-8")
+        bundle_v2 = write_bundle(
+            self.root / "runner-migration-v2.tar.gz",
+            version="2.0.0",
+            payload=migration_payload(),
+        )
+
+        code, output, error = run_cli(
+            "update",
+            "--install-dir",
+            str(target),
+            "--project",
+            str(self.project),
+            "--bundle",
+            str(bundle_v2),
+            "--dry-run",
+        )
+        self.assertEqual((code, error), (0, ""), output + error)
+        self.assertIn("WARNING [sandbox-runner.reprovision-required]", output)
+        self.assertIn("not root-owned", output)
+        self.assertEqual(team_config.read_text(encoding="utf-8"), preserved)
+
+        code, output, error = self.update(target, bundle_v2)
+        self.assertEqual((code, error), (0, ""), output + error)
+        diagnostics = json.loads(output)["migrationDiagnostics"]
+        self.assertEqual(
+            [diagnostic["id"] for diagnostic in diagnostics],
+            ["sandbox-runner.reprovision-required"],
+        )
+        self.assertIn("not root-owned", diagnostics[0]["message"])
+        self.assertEqual(team_config.read_text(encoding="utf-8"), preserved)
+
+        code, output, error = run_cli(
+            "update",
+            "--install-dir",
+            str(target),
+            "--project",
+            str(self.project),
+            "--bundle",
+            str(bundle_v2),
+        )
+        self.assertEqual((code, error), (0, ""), output + error)
+        self.assertIn("WARNING [sandbox-runner.reprovision-required]", output)
+
+    def test_update_omits_migration_warnings_for_safe_or_overwritten_config(self) -> None:
+        target = self.install()
+        bundle_v2 = write_bundle(
+            self.root / "safe-migration-v2.tar.gz",
+            version="2.0.0",
+            payload=migration_payload(),
+        )
+        safe_runner = Path("/usr/bin/true").resolve(strict=True)
+        problem = installer._runner_migration_problem(
+            str(safe_runner), target=target, project=self.project
+        )
+        if problem is not None:
+            self.skipTest(f"host has no suitable system runner fixture: {problem}")
+        team_config = target / "config/team.config.md"
+        team_config.write_text(
+            "AGENT_SANDBOX_ENFORCED=true\n"
+            f'AGENT_SANDBOX_RUNNER="{safe_runner}" # protected system runner\n'
+            'BROKER_LIFECYCLE_ROOT="/var/lib/startup-factory/lifecycle" # protected state\n',
+            encoding="utf-8",
+        )
+
+        code, output, error = self.update(target, bundle_v2, "--dry-run")
+        self.assertEqual((code, error), (0, ""), output + error)
+        self.assertEqual(json.loads(output)["migrationDiagnostics"], [])
+
+        team_config.write_text(
+            "AGENT_SANDBOX_ENFORCED=true\n"
+            "AGENT_SANDBOX_RUNNER=null\n"
+            "BROKER_LIFECYCLE_ROOT=null\n",
+            encoding="utf-8",
+        )
+        code, output, error = self.update(
+            target, bundle_v2, "--dry-run", "--overwrite-config"
+        )
+        self.assertEqual((code, error), (0, ""), output + error)
+        self.assertEqual(json.loads(output)["migrationDiagnostics"], [])
 
     def test_new_upstream_custom_collision_fails_before_mutation(self) -> None:
         target = self.install()

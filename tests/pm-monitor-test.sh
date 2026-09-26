@@ -22,9 +22,7 @@ check() {
 
 # Run the production module against an isolated skill config. The shipped team
 # config is intentionally unsafe-by-default and must remain that way.
-PM_SANDBOX_RUNNER="$TMP/protected-agent-sandbox-runner"
-printf '#!/bin/sh\nexit 0\n' > "$PM_SANDBOX_RUNNER"
-chmod 700 "$PM_SANDBOX_RUNNER"
+PM_SANDBOX_RUNNER=/usr/bin/env
 TEST_SKILL="$TMP/skill"
 PM_LIFECYCLE_ROOT="$TMP/protected-lifecycle"
 mkdir -m 700 "$PM_LIFECYCLE_ROOT"
@@ -61,7 +59,7 @@ assert spec.loader is not None
 spec.loader.exec_module(module)
 module.SKILL_DIR = pathlib.Path(os.environ["PM_TEST_SKILL_DIR"])
 if os.environ.get("PM_TEST_RELEASE_HARNESS") == "1":
-    def test_release_handoff(project, *, dry_run=False):
+    def test_release_handoff(project, *, dry_run=False, **_policy_sources):
         return (
             [os.environ["STARTUP_FACTORY_RELEASE_FEATURE"]],
             None,
@@ -184,6 +182,7 @@ cat > "$PM_CONFIG" <<'EOF'
 PRODUCT_MANAGEMENT_TOOL=Fake
 TEAM_MODE=true
 EOF
+cp "$PM_CONFIG" "$TEST_SKILL/config/project-management.config.md"
 
 SCAN="$TMP/scan.json"
 LOG="$TMP/ops.log"
@@ -229,6 +228,11 @@ cat > "$TRACKER" <<'EOF'
 set -euo pipefail
 case "$1" in
   scan)
+    printf 'policy-binding\t%s\t%s\t%s\t%s\n' \
+      "${TRACKER_ADAPTER:-}" \
+      "${STARTUP_FACTORY_AUTOMATION_CONFIG:-}" \
+      "${STARTUP_FACTORY_PM_CONFIG:-}" \
+      "${STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON:-}" >> "$PM_TEST_LOG"
     printf 'scan\n' >> "$PM_TEST_LOG"
     [ -z "${PM_TEST_SCAN_SLEEP:-}" ] || sleep "$PM_TEST_SCAN_SLEEP"
     cp "$PM_SCAN_FILE" "$2"
@@ -289,6 +293,7 @@ cat > "$FAKE_RELEASE" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'release\t%s\n' "$*" >> "$PM_TEST_LOG"
+[ -z "${PM_RELEASE_PID_FILE:-}" ] || printf '%s\n' "$$" > "$PM_RELEASE_PID_FILE"
 [ -z "${PM_RELEASE_SLEEP:-}" ] || sleep "$PM_RELEASE_SLEEP"
 if [ "${PM_RELEASE_DISABLED:-0}" = "1" ]; then
   exit 4
@@ -312,6 +317,72 @@ monitor() {
       PM_FEATURE_STATE_FILE="$FEATURE_STATE_FILE" \
       "$MONITOR" --once
 }
+
+monitor_override() {
+  env "$@" STARTUP_FACTORY_PROJECT_ROOT="$REPO" \
+      STARTUP_FACTORY_AUTOMATION_CONFIG="$CONFIG" \
+      STARTUP_FACTORY_PM_CONFIG="$PM_CONFIG" \
+      STARTUP_FACTORY_TRACKER_OPS="$TRACKER" \
+      STARTUP_FACTORY_LAUNCH_TEAM="$LAUNCH" \
+      STARTUP_FACTORY_DISPATCH="$DISPATCH" \
+      STARTUP_FACTORY_RELEASE_FEATURE="$FAKE_RELEASE" \
+      PM_TEST_RELEASE_HARNESS=1 PM_SCAN_FILE="$SCAN" PM_TEST_LOG="$LOG" \
+      PM_FEATURE_STATE_FILE="$FEATURE_STATE_FILE" \
+      "$MONITOR" --once
+}
+
+CUSTOM_LABEL_CONFIG="$TMP/custom-label-automation.json"
+python3 - "$CONFIG" "$CUSTOM_LABEL_CONFIG" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1]))
+value['workspaceRoot']='.teamwork/custom-label-policy'
+value['ignoredTaskLabels']=['manual-only']
+json.dump(value,open(sys.argv[2],'w'))
+PY
+: > "$LOG"
+env STARTUP_FACTORY_PROJECT_ROOT="$REPO" \
+    STARTUP_FACTORY_AUTOMATION_CONFIG="$CUSTOM_LABEL_CONFIG" \
+    STARTUP_FACTORY_PM_CONFIG="$PM_CONFIG" STARTUP_FACTORY_TRACKER_OPS="$TRACKER" \
+    STARTUP_FACTORY_LAUNCH_TEAM="$LAUNCH" STARTUP_FACTORY_DISPATCH="$DISPATCH" \
+    STARTUP_FACTORY_RELEASE_FEATURE="$FAKE_RELEASE" PM_TEST_RELEASE_HARNESS=1 \
+    PM_SCAN_FILE="$SCAN" PM_TEST_LOG="$LOG" PM_FEATURE_STATE_FILE="$FEATURE_STATE_FILE" \
+    "$MONITOR" --once --dry-run >/dev/null
+check "custom ignored-label and non-default adapter sources reach tracker exactly" \
+  python3 - "$LOG" "$CUSTOM_LABEL_CONFIG" "$PM_CONFIG" <<'PY'
+import json, os, sys
+log, automation, pm = sys.argv[1:]
+automation = os.path.realpath(automation)
+pm = os.path.realpath(pm)
+expected = ["policy-binding", "Fake", automation, pm]
+lines = [line.rstrip("\n").split("\t") for line in open(log, encoding="utf-8")]
+assert any(line[:4] == expected for line in lines), lines
+with open(automation, encoding="utf-8") as handle:
+    assert json.load(handle)["ignoredTaskLabels"] == ["manual-only"]
+PY
+: > "$LOG"
+
+PM_FORGED_LIFECYCLE_ROOT="$TMP/forged-lifecycle"
+mkdir -m 700 "$PM_FORGED_LIFECYCLE_ROOT"
+for override_case in lifecycle adapter labels; do
+  case "$override_case" in
+    lifecycle) override=(STARTUP_FACTORY_LIFECYCLE_STATE_ROOT="$PM_FORGED_LIFECYCLE_ROOT"); expected='must exactly repeat canonical BROKER_LIFECYCLE_ROOT' ;;
+    adapter) override=(TRACKER_ADAPTER=Markdown); expected='must exactly repeat configured PRODUCT_MANAGEMENT_TOOL' ;;
+    labels) override=(STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='[]'); expected='must exactly repeat configured ignoredTaskLabels' ;;
+  esac
+  before_ops=0
+  [ ! -f "$LOG" ] || before_ops="$(wc -l < "$LOG")"
+  if override_out="$(monitor_override "${override[@]}" 2>&1)"; then
+    echo "FAIL: pm-agent accepted $override_case authority override"; FAILURES=$((FAILURES+1))
+  elif printf '%s' "$override_out" | grep -q "$expected"; then
+    echo "ok: pm-agent rejects $override_case authority override"
+  else
+    echo "FAIL: pm-agent $override_case authority override wrong error: $override_out"; FAILURES=$((FAILURES+1))
+  fi
+  after_ops=0
+  [ ! -f "$LOG" ] || after_ops="$(wc -l < "$LOG")"
+  [ "$before_ops" = "$after_ops" ] \
+    || { echo "FAIL: pm-agent mutated tracker before rejecting $override_case override"; FAILURES=$((FAILURES+1)); }
+done
 
 preflight_refused() { # preflight_refused <name> <config> <skill-root> <needle>
   local name="$1" config="$2" skill="$3" needle="$4" out
@@ -338,12 +409,21 @@ PY
 preflight_refused "requireAgentSandbox=false" "$TMP/no-sandbox-invariant.json" "$TEST_SKILL" "cannot be disabled"
 preflight_refused "requireSingleTrackerWriter=false" "$TMP/no-writer-invariant.json" "$TEST_SKILL" "cannot be disabled"
 
+WRITABLE_CONFIG_PARENT="$TMP/writable-config-parent"
+mkdir "$WRITABLE_CONFIG_PARENT"
+chmod 777 "$WRITABLE_CONFIG_PARENT"
+cp "$CONFIG" "$WRITABLE_CONFIG_PARENT/automation.json"
+preflight_refused "writable supervisor config parent" \
+  "$WRITABLE_CONFIG_PARENT/automation.json" "$TEST_SKILL" \
+  "parent chain must be supervisor/root-owned and not group/world writable"
+chmod 700 "$WRITABLE_CONFIG_PARENT"
+
 python3 - "$CONFIG" "$TMP/bad-ignored-labels.json" <<'PY'
 import json,sys
 data=json.load(open(sys.argv[1])); data['ignoredTaskLabels']=['human-work','Human-Work']
 json.dump(data,open(sys.argv[2],'w'))
 PY
-preflight_refused "case-insensitive duplicate ignored labels" "$TMP/bad-ignored-labels.json" "$TEST_SKILL" "case-insensitive duplicates"
+preflight_refused "case-insensitive duplicate ignored labels" "$TMP/bad-ignored-labels.json" "$TEST_SKILL" "case-insensitive duplicate"
 
 python3 - "$CONFIG" \
     "$TMP/bad-observe-statuses.json" \
@@ -399,7 +479,7 @@ cp "$PM_SANDBOX_RUNNER" "$WRITABLE_AGENT_RUNNER"
 chmod 722 "$WRITABLE_AGENT_RUNNER"
 sed_i "s|^AGENT_SANDBOX_RUNNER=.*|AGENT_SANDBOX_RUNNER=\"$WRITABLE_AGENT_RUNNER\"|" "$WRITABLE_RUNNER_SKILL/config/team.config.md"
 preflight_refused "missing protected agent runner" "$CONFIG" "$NO_RUNNER_SKILL" "AGENT_SANDBOX_RUNNER"
-preflight_refused "repository-local agent runner" "$CONFIG" "$LOCAL_RUNNER_SKILL" "external to the agent repository"
+preflight_refused "repository-local agent runner" "$CONFIG" "$LOCAL_RUNNER_SKILL" "must be root-owned"
 preflight_refused "writable agent runner" "$CONFIG" "$WRITABLE_RUNNER_SKILL" "group- or world-writable"
 rm "$LOCAL_AGENT_RUNNER"
 
@@ -495,6 +575,16 @@ for name, relative in module.RELEASE_SNAPSHOT_FILES.items():
     shutil.copy2(source / relative, destination)
     destination.chmod(0o600)
     digests[name] = "sha256:" + hashlib.sha256(destination.read_bytes()).hexdigest()
+pm_config = external / "config/project-management.config.md"
+pm_config.write_text(
+    pm_config.read_text().replace(
+        "PRODUCT_MANAGEMENT_TOOL=Markdown", "PRODUCT_MANAGEMENT_TOOL=Fake", 1
+    )
+)
+pm_config.chmod(0o600)
+digests["project-management.config.md"] = (
+    "sha256:" + hashlib.sha256(pm_config.read_bytes()).hexdigest()
+)
 custom_backend = external / "extensions/tracker-backends/Fake.py"
 custom_backend.parent.mkdir(parents=True, exist_ok=True)
 custom_backend.write_text("class Backend:\n    pass\n")
@@ -1085,9 +1175,32 @@ cat > "$SCAN" <<'EOF'
   "orphans":[]
 }
 EOF
-sleep 1
+cancel_result_path="$(python3 - "$STATE" "$PM_LIFECYCLE_ROOT" <<'PY'
+import json,os,sys
+entry=json.load(open(sys.argv[1]))['features']['F-CANCEL']
+print(os.path.join(
+    sys.argv[2],'release-jobs',entry['releaseJob']['identity']['jobId'],'result.json'
+))
+PY
+)"
+for _i in $(seq 1 240); do
+  if python3 - "$cancel_result_path" <<'PY'
+import json,sys
+raise SystemExit(0 if json.load(open(sys.argv[1]))['state'] in {'completed','cancelled'} else 1)
+PY
+  then
+    break
+  fi
+  sleep 0.05
+done
+check "guardian cancellation reaches protected terminal state" \
+  python3 - "$cancel_result_path" <<'PY'
+import json,sys
+assert json.load(open(sys.argv[1]))['state'] in {'completed','cancelled'}
+PY
 if monitor >"$TMP/post-go-cancel.out" 2>"$TMP/post-go-cancel.err"; then
-  fail "post-launch cancellation must require deployment reconciliation"
+  echo "FAIL: post-launch cancellation did not require deployment reconciliation"
+  FAILURES=$((FAILURES+1))
 fi
 check "post-launch cancellation never records a benign cancellation" python3 - "$STATE" <<'PY'
 import json,sys
@@ -1135,6 +1248,368 @@ with tempfile.TemporaryDirectory() as raw:
     assert safe_entry['state']=='paused'
 PY
 
+check "stale release recovery binds every mutation to one in-memory generation" \
+  python3 - "$MONITOR_IMPL" <<'PY'
+import importlib.util,json,subprocess,sys
+from pathlib import Path
+from unittest import mock
+
+spec=importlib.util.spec_from_file_location('pm_exact_release_recovery_test',sys.argv[1])
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+identity={'jobId':'release-'+'a'*32,'repository':'/repo','runId':'run','team':'team',
+          'featureId':'feature','attempt':1,'commandDigest':'sha256:'+'b'*64}
+token='c'*64
+created='2026-07-14T10:00:00Z'
+record={
+    'schemaVersion':3,'repositoryId':'d'*64,'team':'team','category':'release',
+    'instance':identity['jobId'],'kind':'background','pid':4242,
+    'processIdentity':'linux:boot:1','launchToken':token,'createdAt':created,
+    'tmuxSession':None,'tmuxWindow':None,'tmuxPane':None,
+    'processGroupId':4242,'sessionId':4242,'tmuxPanePid':None,'auth':'e'*64,
+}
+result={'releasePid':4242,'releaseMayHaveStartedAt':'2026-07-14T10:00:01Z'}
+calls=[]
+def completed(code=0, stdout='', stderr=''):
+    return subprocess.CompletedProcess([],code,stdout,stderr)
+def lifecycle(action, *, generation=None, signal_name=None, **_kwargs):
+    calls.append((action,generation,signal_name))
+    if action=='inspect':
+        return completed(stdout=json.dumps(record,separators=(',',':'))+'\n')
+    if generation != {'createdAt':created,'launchToken':token,'pid':4242}:
+        raise AssertionError('mutation lost its exact lifecycle generation')
+    return completed()
+module.RELEASE_ORPHAN_TERM_GRACE_SECONDS=1
+with mock.patch.object(module,'release_lifecycle_command',side_effect=lifecycle), \
+     mock.patch.object(module.time,'monotonic',side_effect=[0,0,2]), \
+     mock.patch.object(module.time,'sleep'):
+    module.stop_orphan_release_group(Path('/state'),Path('/repo'),identity,result)
+assert [item[0] for item in calls] == [
+    'inspect','probe','signal','probe','terminate','forget'
+]
+assert calls[2][2]=='TERM' and all(item[1] is not None for item in calls[1:])
+
+# The capability travels only on stdin; it is never exposed in argv.
+with mock.patch.object(module.subprocess,'run',return_value=completed()) as run:
+    module.release_lifecycle_command(
+        'terminate',lifecycle_root=Path('/state'),repository=Path('/repo'),
+        identity=identity,generation={'createdAt':created,'launchToken':token},
+    )
+argv=run.call_args.args[0]; options=run.call_args.kwargs
+assert token not in argv and options['input']==token+'\n'
+assert options['stdout'] is subprocess.PIPE and options['stderr'] is subprocess.PIPE
+assert token not in repr(argv)
+PY
+
+check "release PID or generation mismatch fails closed before cleanup" \
+  python3 - "$MONITOR_IMPL" <<'PY'
+import importlib.util,json,subprocess,sys
+from pathlib import Path
+from unittest import mock
+
+spec=importlib.util.spec_from_file_location('pm_release_mismatch_test',sys.argv[1])
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+identity={'jobId':'release-'+'a'*32,'repository':'/repo','runId':'run','team':'team',
+          'featureId':'feature','attempt':1,'commandDigest':'sha256:'+'b'*64}
+token='c'*64
+record={
+    'schemaVersion':3,'repositoryId':'d'*64,'team':'team','category':'release',
+    'instance':identity['jobId'],'kind':'background','pid':4343,
+    'processIdentity':'linux:boot:1','launchToken':token,
+    'createdAt':'2026-07-14T10:00:00Z','tmuxSession':None,'tmuxWindow':None,
+    'tmuxPane':None,'processGroupId':4343,'sessionId':4343,
+    'tmuxPanePid':None,'auth':'e'*64,
+}
+calls=[]
+def lifecycle(action, **_kwargs):
+    calls.append(action)
+    return subprocess.CompletedProcess([],0,json.dumps(record)+'\n','')
+with mock.patch.object(module,'release_lifecycle_command',side_effect=lifecycle):
+    try:
+        module.stop_orphan_release_group(
+            Path('/state'),Path('/repo'),identity,{'releasePid':4242}
+        )
+    except module.MonitorError as exc:
+        assert 'release PID anchor' in str(exc)
+        assert token not in str(exc)
+    else:
+        raise AssertionError('mismatched release PID was accepted')
+assert calls==['inspect']
+
+record['pid']=record['processGroupId']=record['sessionId']=4242
+calls=[]
+def changed(action, *, generation=None, **_kwargs):
+    calls.append(action)
+    if action=='inspect':
+        return subprocess.CompletedProcess([],0,json.dumps(record)+'\n','')
+    return subprocess.CompletedProcess([],1,'','protected lifecycle generation changed')
+with mock.patch.object(module,'release_lifecycle_command',side_effect=changed):
+    try:
+        module.stop_orphan_release_group(
+            Path('/state'),Path('/repo'),identity,{'releasePid':4242}
+        )
+    except module.MonitorError as exc:
+        assert 'identity changed' in str(exc)
+        assert token not in str(exc)
+    else:
+        raise AssertionError('changed lifecycle generation was accepted')
+assert calls==['inspect','probe']
+PY
+
+check "dead and completed release generations recover without signalling" \
+  python3 - "$MONITOR_IMPL" <<'PY'
+import importlib.util,json,subprocess,sys
+from pathlib import Path
+from unittest import mock
+
+spec=importlib.util.spec_from_file_location('pm_release_dead_generation_test',sys.argv[1])
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+identity={'jobId':'release-'+'a'*32,'repository':'/repo','runId':'run','team':'team',
+          'featureId':'feature','attempt':1,'commandDigest':'sha256:'+'b'*64}
+token='c'*64
+created='2026-07-14T10:00:00Z'
+record={
+    'schemaVersion':3,'repositoryId':'d'*64,'team':'team','category':'release',
+    'instance':identity['jobId'],'kind':'background','pid':4242,
+    'processIdentity':'linux:boot:1','launchToken':token,'createdAt':created,
+    'tmuxSession':None,'tmuxWindow':None,'tmuxPane':None,
+    'processGroupId':4242,'sessionId':4242,'tmuxPanePid':None,'auth':'e'*64,
+}
+generation={'createdAt':created,'launchToken':token,'pid':4242}
+def completed(code=0, stdout='', stderr=''):
+    return subprocess.CompletedProcess([],code,stdout,stderr)
+
+# Registration succeeded, but a worker crash closed the guardian's pre-go pipe.
+# The resulting dead background record is retired without TERM/KILL authority.
+calls=[]
+def dead(action, *, generation=None, **_kwargs):
+    calls.append((action,generation))
+    if action=='inspect':
+        return completed(stdout=json.dumps(record)+'\n')
+    assert generation==globals()['generation']
+    return completed(3 if action=='probe' else 0)
+with mock.patch.object(module,'release_lifecycle_command',side_effect=dead):
+    module.stop_orphan_release_group(
+        Path('/state'),Path('/repo'),identity,{'releasePid':4242}
+    )
+assert [item[0] for item in calls]==['inspect','probe','inspect','forget']
+
+# Probe rc=3 is not by itself proof of death: the exact record must still be
+# inspectable, otherwise nonterminal recovery retains the fail-closed hold.
+calls=[]
+inspection_count=0
+def vanished(action, *, generation=None, **_kwargs):
+    global inspection_count
+    calls.append(action)
+    if action=='inspect':
+        inspection_count+=1
+        return (
+            completed(stdout=json.dumps(record)+'\n')
+            if inspection_count==1 else completed(3)
+        )
+    assert action=='probe' and generation==globals()['generation']
+    return completed(3)
+with mock.patch.object(module,'release_lifecycle_command',side_effect=vanished):
+    try:
+        module.stop_orphan_release_group(
+            Path('/state'),Path('/repo'),identity,{'releasePid':4242}
+        )
+    except module.MonitorError as exc:
+        assert 'disappeared' in str(exc) and token not in str(exc)
+    else:
+        raise AssertionError('vanished nonterminal generation was accepted as dead')
+assert calls==['inspect','probe','inspect']
+
+# Atomic terminate already proved cleanup. A retained tombstone is forgotten
+# exactly, without probing or signalling a numeric process group.
+completed_record=dict(record,kind='completed-background',auth='f'*64)
+calls=[]
+def tombstone(action, *, generation=None, **_kwargs):
+    calls.append((action,generation))
+    if action=='inspect':
+        return completed(stdout=json.dumps(completed_record)+'\n')
+    assert action=='forget' and generation==globals()['generation']
+    return completed()
+terminal={'state':'completed','exitCode':0,'completedAt':'2026-07-14T10:00:02Z',
+          'releasePid':4242}
+with mock.patch.object(module,'release_lifecycle_command',side_effect=tombstone):
+    module.stop_orphan_release_group(Path('/state'),Path('/repo'),identity,terminal)
+assert [item[0] for item in calls]==['inspect','forget']
+PY
+
+check "stale recovery persists terminal evidence before exact forget" \
+  python3 - "$MONITOR_IMPL" <<'PY'
+import importlib.util,json,subprocess,sys
+from pathlib import Path
+from unittest import mock
+
+spec=importlib.util.spec_from_file_location('pm_release_terminal_order_test',sys.argv[1])
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+identity={'jobId':'release-'+'a'*32,'repository':'/repo','runId':'run','team':'team',
+          'featureId':'feature','attempt':1,'commandDigest':'sha256:'+'b'*64}
+token='c'*64
+created='2026-07-14T10:00:00Z'
+record={
+    'schemaVersion':3,'repositoryId':'d'*64,'team':'team','category':'release',
+    'instance':identity['jobId'],'kind':'completed-background','pid':4242,
+    'processIdentity':'linux:boot:1','launchToken':token,'createdAt':created,
+    'tmuxSession':None,'tmuxWindow':None,'tmuxPane':None,
+    'processGroupId':4242,'sessionId':4242,'tmuxPanePid':None,'auth':'e'*64,
+}
+events=[]
+persisted=[]
+def completed(code=0, stdout='', stderr=''):
+    return subprocess.CompletedProcess([],code,stdout,stderr)
+def lifecycle(action, **_kwargs):
+    events.append(('lifecycle',action))
+    if action=='inspect':
+        return completed(stdout=json.dumps(record)+'\n')
+    assert action=='forget'
+    return completed()
+def persist(_path,value):
+    events.append(('persist',value['state']))
+    persisted.append(value)
+running={'state':'running','heartbeatAt':'2026-07-14T09:00:00Z','releasePid':4242,
+         'releaseMayHaveStartedAt':'2026-07-14T10:00:01Z'}
+with mock.patch.object(module,'release_lifecycle_command',side_effect=lifecycle), \
+     mock.patch.object(module,'request_release_job_cancel',side_effect=lambda *_: None), \
+     mock.patch.object(module,'result_age_seconds',return_value=999), \
+     mock.patch.object(module,'atomic_private_json',side_effect=persist):
+    recovered=module.recover_stale_release_job(
+        {},Path('/repo'),Path('/state'),identity,Path('/job'),running
+    )
+assert events==[('lifecycle','inspect'),('persist','completed'),('lifecycle','forget')]
+assert recovered is persisted[0] and recovered['exitCode']==125
+assert recovered['releasePid']==4242
+assert token not in json.dumps(recovered,sort_keys=True)
+PY
+
+check "private terminal evidence is durable before tombstone retirement" \
+  python3 - "$MONITOR_IMPL" <<'PY'
+import importlib.util,json,os,stat,sys,tempfile
+from pathlib import Path
+from unittest import mock
+
+spec=importlib.util.spec_from_file_location('pm_private_state_durability_test',sys.argv[1])
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+with tempfile.TemporaryDirectory() as raw:
+    directory=Path(raw)
+    path=directory/'result.json'
+    with mock.patch.object(module.os,'fsync',wraps=os.fsync) as synced:
+        module.atomic_private_json(path,{'state':'completed'})
+    assert synced.call_count==2
+    assert stat.S_IMODE(path.stat().st_mode)==0o600
+    assert json.loads(path.read_text())=={'state':'completed'}
+    assert list(directory.iterdir())==[path]
+PY
+
+check "terminal consumption retires a crash-retained tombstone" \
+  python3 - "$MONITOR_IMPL" <<'PY'
+import importlib.util,sys
+from pathlib import Path
+from unittest import mock
+
+spec=importlib.util.spec_from_file_location('pm_terminal_tombstone_test',sys.argv[1])
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+identity={'jobId':'release-'+'a'*32,'repository':'/repo','runId':'run','team':'team',
+          'featureId':'feature','attempt':1,'commandDigest':'sha256:'+'b'*64}
+metadata={'schemaVersion':1,'identity':identity,'startedAt':'2026-07-14T10:00:00Z'}
+entry={'releaseJob':metadata}
+terminal={'schemaVersion':1,'identity':identity,'state':'completed','exitCode':0,
+          'completedAt':'2026-07-14T10:00:02Z','releasePid':4242}
+with mock.patch.object(module,'validate_release_job_identity',return_value=identity), \
+     mock.patch.object(module,'release_job_directory',return_value=Path('/job')), \
+     mock.patch.object(module,'validate_release_job_directory'), \
+     mock.patch.object(module,'read_release_job_result',return_value=terminal), \
+     mock.patch.object(module,'reestablish_terminal_release_result_durability',return_value=terminal) as durable, \
+     mock.patch.object(module,'stop_orphan_release_group') as stop:
+    attached=module.active_release_job(entry,Path('/repo'),Path('/state'))
+assert attached==(identity,Path('/job'),terminal)
+durable.assert_called_once_with(Path('/job'),identity,terminal)
+stop.assert_called_once_with(Path('/state'),Path('/repo'),identity,terminal)
+PY
+
+check "terminal result change fails closed before tombstone retirement" \
+  python3 - "$MONITOR_IMPL" <<'PY'
+import importlib.util,sys
+from pathlib import Path
+from unittest import mock
+
+spec=importlib.util.spec_from_file_location('pm_terminal_revalidation_test',sys.argv[1])
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+identity={'jobId':'release-'+'a'*32,'repository':'/repo','runId':'run','team':'team',
+          'featureId':'feature','attempt':1,'commandDigest':'sha256:'+'b'*64}
+metadata={'schemaVersion':1,'identity':identity,'startedAt':'2026-07-14T10:00:00Z'}
+entry={'releaseJob':metadata}
+terminal={'schemaVersion':1,'identity':identity,'state':'completed','exitCode':0,
+          'completedAt':'2026-07-14T10:00:02Z','releasePid':4242}
+changed=dict(terminal,exitCode=1)
+with mock.patch.object(module,'validate_release_job_identity',return_value=identity), \
+     mock.patch.object(module,'release_job_directory',return_value=Path('/job')), \
+     mock.patch.object(module,'validate_release_job_directory'), \
+     mock.patch.object(module,'load_private_json',return_value=terminal), \
+     mock.patch.object(module,'read_release_job_result',side_effect=[terminal,terminal,changed]), \
+     mock.patch.object(module,'atomic_private_json') as persist, \
+     mock.patch.object(module,'stop_orphan_release_group') as stop:
+    try:
+        module.active_release_job(entry,Path('/repo'),Path('/state'))
+    except module.MonitorError as exc:
+        assert 'changed during durability recovery' in str(exc)
+    else:
+        raise AssertionError('changed terminal result was accepted')
+persist.assert_called_once_with(Path('/job/result.json'),terminal)
+stop.assert_not_called()
+PY
+
+check "pre-go absence recovers but post-go absence fails closed without leaking token" \
+  python3 - "$MONITOR_IMPL" <<'PY'
+import importlib.util,json,subprocess,sys
+from pathlib import Path
+from unittest import mock
+
+spec=importlib.util.spec_from_file_location('pm_release_absence_test',sys.argv[1])
+module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+identity={'jobId':'release-'+'a'*32,'repository':'/repo','runId':'run','team':'team',
+          'featureId':'feature','attempt':1,'commandDigest':'sha256:'+'b'*64}
+token='c'*64
+def completed(code=0, stdout='', stderr=''):
+    return subprocess.CompletedProcess([],code,stdout,stderr)
+with mock.patch.object(module,'release_lifecycle_command',return_value=completed(3)):
+    module.stop_orphan_release_group(
+        Path('/state'),Path('/repo'),identity,{'state':'running','releasePid':4242}
+    )
+    try:
+        module.stop_orphan_release_group(
+            Path('/state'),Path('/repo'),identity,
+            {'state':'running','releasePid':4242,
+             'releaseMayHaveStartedAt':'2026-07-14T10:00:01Z'}
+        )
+    except module.MonitorError as exc:
+        assert 'disappeared' in str(exc) and token not in str(exc)
+    else:
+        raise AssertionError('missing post-go generation was accepted')
+    module.stop_orphan_release_group(
+        Path('/state'),Path('/repo'),identity,
+        {'state':'completed','exitCode':0,'completedAt':'done','releasePid':4242}
+    )
+    module.stop_orphan_release_group(
+        Path('/state'),Path('/repo'),identity,{'state':'running'}
+    )
+
+generation={'createdAt':'2026-07-14T10:00:00Z','launchToken':token,'pid':4242}
+with mock.patch.object(
+    module,'release_lifecycle_command',
+    return_value=completed(1,stderr='provider accidentally echoed '+token)
+):
+    try:
+        module.forget_release_generation(
+            Path('/state'),Path('/repo'),identity,generation
+        )
+    except module.MonitorError as exc:
+        assert token not in str(exc)
+    else:
+        raise AssertionError('failed exact forget was accepted')
+PY
+
 # A SIGKILLed worker must not orphan its already-authorized release child. The
 # next pass uses the stale protected heartbeat and authenticated lifecycle
 # identity to terminate exactly that process group before allowing any retry.
@@ -1147,8 +1622,10 @@ cat > "$SCAN" <<'EOF'
   "orphans":[]
 }
 EOF
-PM_DISPATCH_COMPLETE=1 PM_RELEASE_SLEEP=20 monitor >/dev/null
-read -r orphan_worker_pid orphan_release_pid orphan_result <<EOF
+orphan_release_child_file="$TMP/orphan-release-child.pid"
+PM_DISPATCH_COMPLETE=1 PM_RELEASE_SLEEP=20 \
+  PM_RELEASE_PID_FILE="$orphan_release_child_file" monitor >/dev/null
+read -r orphan_worker_pid orphan_guardian_pid orphan_result <<EOF
 $(python3 - "$STATE" "$PM_LIFECYCLE_ROOT" <<'PY'
 import json,os,sys
 entry=json.load(open(sys.argv[1]))['features']['F-ORPHAN']
@@ -1159,8 +1636,19 @@ print(data['workerPid'],data['releasePid'],result)
 PY
 )
 EOF
-check "detached worker and release child are independently live" \
-  sh -c 'kill -0 "$1" && kill -0 "$2"' _ "$orphan_worker_pid" "$orphan_release_pid"
+orphan_release_child_pid="$(cat "$orphan_release_child_file")"
+check "detached worker, release guardian, and command child are independently live" \
+  sh -c 'kill -0 "$1" && kill -0 "$2" && kill -0 "$3"' _ \
+    "$orphan_worker_pid" "$orphan_guardian_pid" "$orphan_release_child_pid"
+check "release guardian remains distinct from its command child" \
+  test "$orphan_guardian_pid" != "$orphan_release_child_pid"
+check "release command stays in the authenticated guardian group and session" \
+  python3 - "$orphan_guardian_pid" "$orphan_release_child_pid" <<'PY'
+import os,sys
+guardian,child=map(int,sys.argv[1:])
+assert os.getpgid(guardian)==guardian==os.getpgid(child)
+assert os.getsid(guardian)==guardian==os.getsid(child)
+PY
 kill -KILL "$orphan_worker_pid"
 sleep 1
 python3 - "$orphan_result" <<'PY'
@@ -1174,7 +1662,8 @@ with open(path,'w') as handle:
 os.chmod(path,0o600)
 PY
 if monitor >"$TMP/stale-worker.out" 2>"$TMP/stale-worker.err"; then
-  fail "stale post-launch worker must require deployment reconciliation"
+  echo "FAIL: stale post-launch worker did not require deployment reconciliation"
+  FAILURES=$((FAILURES+1))
 fi
 check "stale post-launch worker records an uncertain completed release" python3 - "$STATE" <<'PY'
 import json,sys
@@ -1183,8 +1672,10 @@ assert entry['state']=='deployment-blocked' and 'releaseJob' not in entry
 assert entry['lastReleaseJob']['state']=='completed'
 assert entry['lastReleaseJob']['exitCode']==125
 PY
-check "stale worker recovery terminates the authenticated release child" \
-  sh -c '! kill -0 "$1" 2>/dev/null' _ "$orphan_release_pid"
+check "stale worker recovery terminates the authenticated release guardian" \
+  sh -c '! kill -0 "$1" 2>/dev/null' _ "$orphan_guardian_pid"
+check "stale worker recovery terminates the guardian's release command" \
+  sh -c '! kill -0 "$1" 2>/dev/null' _ "$orphan_release_child_pid"
 check "stale worker recovery never launches a duplicate release" \
   test "$(grep -c $'^release\t.*--feature F-ORPHAN' "$LOG" || true)" -eq 1
 

@@ -86,11 +86,17 @@ bindings.
 
 ## Delivery profiles
 
-`bin/delivery_profile.py` is likewise diagnostic-only. `delivery-profile` task
-metadata accepts `auto`, `micro`, or `standard`; a request can only increase
-rigor. `micro` is limited to small ordinary-documentation diffs. Code, control,
-test and configuration paths; MDX; ambiguous scope; binary and non-regular files;
-renames, deletions, mode changes, symlinks; excessive changes; and strong-risk
-language in task text, actual paths, or readable bounded patch content all
-resolve to `standard`. Oversized or unreadable patches fail closed. No result
-removes a Startup Factory gate.
+`bin/delivery_profile.py` produces an authoritative, monotonic delivery-policy
+decision. `delivery-profile` task metadata accepts `auto`, `micro`, `standard`,
+or `high-risk`; a request can only increase rigor. `micro` is limited to small,
+declared, ordinary-documentation diffs. Ordinary code, tests, and broader docs
+resolve to at least `standard`; undeclared task scope remains `high-risk` at
+both task and exact-diff review time. Security/authentication,
+credentials, deployment/release/production, control-plane and policy work;
+operations; binary and non-regular files; renames, deletions, mode changes and
+symlinks; destructive changes; and ambiguous or unreadable exact evidence
+resolve to `high-risk`. High-risk work forces QA and Security, a strong model
+floor, and exclusive implementation. The outbox, dispatcher, evidence validator,
+and integrator independently bind or recompute the exact-diff decision; no
+profile removes a core review, validation, integration, release, or production
+authority. See `reference/delivery-profiles.md` for the full contract.

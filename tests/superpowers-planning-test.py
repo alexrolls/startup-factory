@@ -83,6 +83,30 @@ def main() -> None:
         assert shown["enabled"] is True
         assert shown["pluginId"] == "superpowers@claude-plugins-official"
 
+        quoted = temp / "quoted.md"
+        quoted.write_text(
+            "USE_SUPERPOWERS=\"true\" # governed value\n"
+            "SUPERPOWERS_PLUGIN_ID='superpowers@claude-plugins-official'\n"
+            "SUPERPOWERS_SPEC_ROOT=docs/superpowers/specs # relative root\n"
+            "SUPERPOWERS_PLAN_ROOT=\"docs/superpowers/plans\"\n",
+            encoding="utf-8",
+        )
+        quoted_result = json.loads(
+            run("--config", os.fspath(quoted), "show-config").stdout
+        )
+        assert quoted_result["enabled"] is True
+        assert quoted_result["planRoot"] == "docs/superpowers/plans"
+
+        duplicate = temp / "duplicate.md"
+        duplicate.write_text(
+            enabled.read_text(encoding="utf-8") + "USE_SUPERPOWERS=false\n",
+            encoding="utf-8",
+        )
+        duplicate_result = run(
+            "--config", os.fspath(duplicate), "show-config", expected=1
+        )
+        assert "duplicate configuration key USE_SUPERPOWERS" in duplicate_result.stderr
+
         disabled_result = json.loads(
             run(
                 "--config",

@@ -6,9 +6,11 @@ import dataclasses
 import json
 import os
 import re
+import stat
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .config_values import ConfigValueError, read_config_file, value_for
 from .installer import InstallerError, verify_installation
 from .project_config import (
     PROJECT_CONFIG_RELATIVE_PATH,
@@ -23,7 +25,6 @@ SCHEMA_VERSION = 1
 MODES = ("solo", "team", "autonomous", "release")
 APPLY_MODES = ("solo", "team")
 _SKILL_MARKER = re.compile(r"(?m)^name:[ \t]*startup-factory[ \t]*$")
-_ASSIGNMENT_VALUE = re.compile(r"^[A-Z][A-Z0-9_]*=(.*)$")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -202,26 +203,17 @@ def _strict_json_object(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _exact_assignments(path: Path, keys: Iterable[str]) -> dict[str, str] | None:
-    text = _regular_text(path)
-    if text is None:
+def _exact_assignments(
+    path: Path, keys: Iterable[str]
+) -> dict[str, str | None] | None:
+    try:
+        parsed = read_config_file(path, "team config")
+    except ConfigValueError:
         return None
     requested = set(keys)
-    result: dict[str, str] = {}
-    for line in text.splitlines():
-        match = _ASSIGNMENT_VALUE.fullmatch(line)
-        if match is None:
-            continue
-        key = line.split("=", 1)[0]
-        if key not in requested:
-            continue
-        if key in result:
-            return None
-        value = match.group(1).strip()
-        if " #" in value and not value.startswith('"'):
-            value = value.split(" #", 1)[0].rstrip()
-        result[key] = value
-    return result if requested.issubset(result) else None
+    if not requested.issubset(parsed):
+        return None
+    return {key: value_for(parsed, key) for key in requested}
 
 
 def _team_configuration(target: Path) -> tuple[bool, bool, bool]:
@@ -234,8 +226,6 @@ def _team_configuration(target: Path) -> tuple[bool, bool, bool]:
     runtime_keys = (
         *command_keys,
         "TRACKER_WRITERS",
-        "AGENT_SANDBOX_ENFORCED",
-        "BROKER_LIFECYCLE_ROOT",
     )
     validation_keys = (
         "VALIDATE_BUILD",
@@ -247,14 +237,271 @@ def _team_configuration(target: Path) -> tuple[bool, bool, bool]:
     values = _exact_assignments(target / "config/team.config.md", (*runtime_keys, *validation_keys))
     if values is None:
         return False, False, False
-    commands_configured = all(values[key] != "null" for key in command_keys)
-    validation_configured = any(values[key] != "null" for key in validation_keys)
-    protected_configured = (
-        values["TRACKER_WRITERS"] == "broker"
-        and values["AGENT_SANDBOX_ENFORCED"] == "true"
-        and values["BROKER_LIFECYCLE_ROOT"] != "null"
+    commands_configured = all(values[key] is not None for key in command_keys)
+    validation_configured = any(values[key] is not None for key in validation_keys)
+    broker_configured = values["TRACKER_WRITERS"] == "broker"
+    return commands_configured, validation_configured, broker_configured
+
+
+def _configured_path_value(raw: str | None) -> str | None:
+    """Return the already-normalized scalar used for protected local paths."""
+
+    return raw
+
+
+def _sandbox_runner_readiness(
+    target: Path, project: Path
+) -> tuple[bool, str, str | None]:
+    """Validate the configured runner's structure without executing it."""
+
+    remediation = (
+        "Provision a root-managed OS isolation runner under a canonical system path "
+        "whose complete ancestor chain is root-owned and non-writable by the operator, "
+        "group, or world. Keep it outside the repository and installed runtime, then "
+        "set its canonical absolute path as "
+        "AGENT_SANDBOX_RUNNER and set AGENT_SANDBOX_ENFORCED=true in "
+        "config/team.config.md. Startup Factory does not ship this runner."
     )
-    return commands_configured, validation_configured, protected_configured
+    values = _exact_assignments(
+        target / "config/team.config.md",
+        ("AGENT_SANDBOX_ENFORCED", "AGENT_SANDBOX_RUNNER"),
+    )
+    if values is None:
+        return (
+            False,
+            "sandbox enforcement or runner configuration is missing or duplicated",
+            remediation,
+        )
+    if values["AGENT_SANDBOX_ENFORCED"] != "true":
+        return False, "AGENT_SANDBOX_ENFORCED is not true", remediation
+    configured = _configured_path_value(values["AGENT_SANDBOX_RUNNER"])
+    if configured is None:
+        return False, "AGENT_SANDBOX_RUNNER is not configured", remediation
+    if not configured:
+        return False, "AGENT_SANDBOX_RUNNER has an invalid scalar value", remediation
+    runner = Path(configured)
+    if (
+        not runner.is_absolute()
+        or configured != os.path.normpath(configured)
+        or str(runner) != configured
+    ):
+        return (
+            False,
+            "AGENT_SANDBOX_RUNNER is not an absolute normalized path",
+            remediation,
+        )
+    try:
+        metadata = runner.lstat()
+    except OSError as exc:
+        return False, f"AGENT_SANDBOX_RUNNER is unavailable: {exc}", remediation
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        return (
+            False,
+            "AGENT_SANDBOX_RUNNER is not a non-symlink regular file",
+            remediation,
+        )
+    if not metadata.st_mode & 0o111 or not os.access(runner, os.X_OK):
+        return False, "AGENT_SANDBOX_RUNNER is not executable", remediation
+    if metadata.st_uid != 0:
+        return (
+            False,
+            "AGENT_SANDBOX_RUNNER is not root-owned",
+            remediation,
+        )
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        return (
+            False,
+            "AGENT_SANDBOX_RUNNER is group- or world-writable",
+            remediation,
+        )
+    try:
+        resolved = runner.resolve(strict=True)
+        project_boundary = project.resolve(strict=True)
+        target_boundary = target.resolve(strict=True)
+    except OSError as exc:
+        return False, f"cannot resolve AGENT_SANDBOX_RUNNER boundary: {exc}", remediation
+    if resolved != runner:
+        return (
+            False,
+            "AGENT_SANDBOX_RUNNER is not its canonical absolute path",
+            remediation,
+        )
+    for boundary, label in (
+        (project_boundary, "project repository"),
+        (target_boundary, "installed runtime"),
+    ):
+        try:
+            resolved.relative_to(boundary)
+        except ValueError:
+            continue
+        return (
+            False,
+            f"AGENT_SANDBOX_RUNNER is inside the {label}",
+            remediation,
+        )
+    ancestor = resolved.parent
+    while True:
+        try:
+            ancestor_metadata = ancestor.lstat()
+        except OSError as exc:
+            return (
+                False,
+                f"cannot inspect AGENT_SANDBOX_RUNNER ancestor {ancestor}: {exc}",
+                remediation,
+            )
+        if stat.S_ISLNK(ancestor_metadata.st_mode) or not stat.S_ISDIR(
+            ancestor_metadata.st_mode
+        ):
+            return (
+                False,
+                f"AGENT_SANDBOX_RUNNER ancestor is not a real directory: {ancestor}",
+                remediation,
+            )
+        if ancestor_metadata.st_uid != 0:
+            return (
+                False,
+                f"AGENT_SANDBOX_RUNNER ancestor is not root-owned: {ancestor}",
+                remediation,
+            )
+        if stat.S_IMODE(ancestor_metadata.st_mode) & 0o022:
+            return (
+                False,
+                f"AGENT_SANDBOX_RUNNER ancestor is group- or world-writable: {ancestor}",
+                remediation,
+            )
+        try:
+            operator_can_write = os.access(ancestor, os.W_OK, effective_ids=True)
+        except (NotImplementedError, TypeError):
+            operator_can_write = os.access(ancestor, os.W_OK)
+        if operator_can_write:
+            return (
+                False,
+                f"AGENT_SANDBOX_RUNNER ancestor is writable by the operator: {ancestor}",
+                remediation,
+            )
+        if ancestor == ancestor.parent:
+            break
+        ancestor = ancestor.parent
+    try:
+        operator_can_write_runner = os.access(runner, os.W_OK, effective_ids=True)
+    except (NotImplementedError, TypeError):
+        operator_can_write_runner = os.access(runner, os.W_OK)
+    if operator_can_write_runner:
+        return (
+            False,
+            "AGENT_SANDBOX_RUNNER is writable by the operator",
+            remediation,
+        )
+    return (
+        True,
+        "external sandbox runner and its complete path chain are root-protected; "
+        "the runner was not executed",
+        None,
+    )
+
+
+def _lifecycle_root_readiness(
+    target: Path, project: Path
+) -> tuple[bool, str, str | None]:
+    """Validate configured lifecycle storage without creating or modifying it."""
+
+    remediation = (
+        "Pre-create a private mode-0700 directory outside the repository, installed "
+        "runtime, and shared temporary directories; deny agent sandboxes access; then "
+        "set its canonical absolute path as BROKER_LIFECYCLE_ROOT in config/team.config.md."
+    )
+    values = _exact_assignments(
+        target / "config/team.config.md", ("BROKER_LIFECYCLE_ROOT",)
+    )
+    if values is None:
+        return False, "BROKER_LIFECYCLE_ROOT is missing or duplicated", remediation
+    configured = _configured_path_value(values["BROKER_LIFECYCLE_ROOT"])
+    if configured is None:
+        return False, "BROKER_LIFECYCLE_ROOT is not configured", remediation
+    if not configured:
+        return False, "BROKER_LIFECYCLE_ROOT has an invalid scalar value", remediation
+    root = Path(configured)
+    if (
+        not root.is_absolute()
+        or configured != os.path.normpath(configured)
+        or str(root) != configured
+    ):
+        return (
+            False,
+            "BROKER_LIFECYCLE_ROOT is not an absolute normalized path",
+            remediation,
+        )
+    for shared in (Path("/tmp"), Path("/private/tmp")):
+        try:
+            root.relative_to(shared)
+        except ValueError:
+            pass
+        else:
+            return (
+                False,
+                "BROKER_LIFECYCLE_ROOT is below a shared temporary directory",
+                remediation,
+            )
+    try:
+        resolved = root.resolve(strict=True)
+        project_boundary = project.resolve(strict=True)
+        target_boundary = target.resolve(strict=True)
+    except OSError as exc:
+        return False, f"BROKER_LIFECYCLE_ROOT is unavailable: {exc}", remediation
+    if resolved != root:
+        return (
+            False,
+            "BROKER_LIFECYCLE_ROOT or one of its ancestors is a symlink",
+            remediation,
+        )
+    current = Path(root.anchor)
+    for part in root.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            return False, f"cannot inspect lifecycle path {current}: {exc}", remediation
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            return (
+                False,
+                f"lifecycle path component is not a non-symlink directory: {current}",
+                remediation,
+            )
+        if metadata.st_uid not in {0, os.geteuid()} or stat.S_IMODE(
+            metadata.st_mode
+        ) & 0o022:
+            return (
+                False,
+                f"lifecycle path component has unsafe ownership or write permissions: {current}",
+                remediation,
+            )
+    if stat.S_IMODE(root.lstat().st_mode) != 0o700:
+        return False, "BROKER_LIFECYCLE_ROOT must have mode 0700", remediation
+    if not os.access(root, os.R_OK | os.W_OK | os.X_OK):
+        return (
+            False,
+            "BROKER_LIFECYCLE_ROOT is not usable by the current operator identity",
+            remediation,
+        )
+    for boundary, label in (
+        (project_boundary, "project repository"),
+        (target_boundary, "installed runtime"),
+    ):
+        try:
+            common = Path(os.path.commonpath((str(root), str(boundary))))
+        except ValueError:
+            continue
+        if common in {root, boundary}:
+            return (
+                False,
+                f"BROKER_LIFECYCLE_ROOT is not disjoint from the {label}",
+                remediation,
+            )
+    return (
+        True,
+        "external lifecycle authority directory is canonical, private, and locally usable",
+        None,
+    )
 
 
 def _autonomy_configured(target: Path, protected_team: bool) -> bool:
@@ -454,7 +701,7 @@ def diagnose(project: Path, target: Path, *, mode: str) -> DoctorReport:
             else "team configuration is missing or unsafe",
         )
     )
-    commands, validation, protected_team = _team_configuration(target)
+    commands, validation, broker_configured = _team_configuration(target)
     checks.append(
         ReadinessCheck(
             "team-runtime.configured",
@@ -463,6 +710,47 @@ def diagnose(project: Path, target: Path, *, mode: str) -> DoctorReport:
             "mandatory team role commands are configured"
             if commands
             else "mandatory team role commands are missing, duplicated, or disabled",
+        )
+    )
+    configured_failure = "warn" if mode == "team" else "fail"
+    checks.append(
+        ReadinessCheck(
+            "tracker-writer-boundary.configured",
+            "configured",
+            "pass" if broker_configured else configured_failure,
+            "tracker writes are restricted to the authenticated broker"
+            if broker_configured
+            else "TRACKER_WRITERS is not restricted to the authenticated broker",
+            None
+            if broker_configured
+            else (
+                "Set TRACKER_WRITERS=broker before relying on authenticated review, "
+                "integration, or release authority."
+            ),
+        )
+    )
+    sandbox_ready, sandbox_message, sandbox_remediation = _sandbox_runner_readiness(
+        target, project
+    )
+    checks.append(
+        ReadinessCheck(
+            "sandbox-runner.configured",
+            "configured",
+            "pass" if sandbox_ready else configured_failure,
+            sandbox_message,
+            sandbox_remediation,
+        )
+    )
+    lifecycle_ready, lifecycle_message, lifecycle_remediation = (
+        _lifecycle_root_readiness(target, project)
+    )
+    checks.append(
+        ReadinessCheck(
+            "lifecycle-authority.configured",
+            "configured",
+            "pass" if lifecycle_ready else "fail",
+            lifecycle_message,
+            lifecycle_remediation,
         )
     )
     checks.append(
@@ -498,6 +786,7 @@ def diagnose(project: Path, target: Path, *, mode: str) -> DoctorReport:
         )
         return DoctorReport(mode, project, target, tuple(checks))
 
+    protected_team = broker_configured and sandbox_ready and lifecycle_ready
     autonomy = _autonomy_configured(target, protected_team)
     checks.append(
         ReadinessCheck(

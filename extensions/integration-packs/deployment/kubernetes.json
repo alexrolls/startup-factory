@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "deployment-kubernetes",
+  "kind": "deployment",
+  "displayName": "Kubernetes deployment boundary",
+  "summary": "Create an inactive Kubernetes deployment boundary with no release authority.",
+  "compatibility": {
+    "minimumVersion": "0.2.0",
+    "platforms": ["darwin", "linux"],
+    "state": "supported"
+  },
+  "prerequisites": ["Cluster configuration remains external and requires operator review."],
+  "credentials": {
+    "policy": "adapter-managed",
+    "required": []
+  },
+  "capability": {
+    "target": "kubernetes",
+    "outputFile": "boundary.json",
+    "template": {
+      "schemaVersion": 1,
+      "enabled": false,
+      "target": "kubernetes",
+      "mode": "approval-required",
+      "releaseAuthority": false,
+      "containsCredentialValues": false,
+      "activation": "external-reviewed-config-only"
+    }
+  }
+}

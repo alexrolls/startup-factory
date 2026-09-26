@@ -15,6 +15,15 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(SKILL_DIR / "src"))
+
+from startup_factory_cli.config_values import (  # noqa: E402
+    ConfigValueError,
+    read_config_file,
+    value_for,
+)
+
 DEFAULT_CONFIG = SKILL_DIR / "config" / "planning.config.md"
 DEFAULTS = {
     "USE_SUPERPOWERS": "true",
@@ -51,36 +60,23 @@ def strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def parse_config(path: Path) -> dict[str, str]:
     values = dict(DEFAULTS)
-    if not path.exists():
-        return values
-    if path.is_symlink() or not path.is_file():
-        raise PlanningError(f"planning config is not a regular file: {path}")
-    seen: set[str] = set()
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as exc:
-        raise PlanningError(f"cannot read planning config: {exc}") from exc
-    for raw_line in lines:
-        match = re.match(r"^([A-Z][A-Z0-9_]*)=(.*)$", raw_line)
-        if not match:
-            continue
-        key, raw_value = match.groups()
-        if key not in ALLOWED_KEYS:
-            raise PlanningError(f"unknown planning configuration key: {key}")
-        if key in seen:
-            raise PlanningError(f"duplicate planning configuration key: {key}")
-        seen.add(key)
-        value = raw_value.strip()
-        if value.startswith('"'):
-            closing = value.find('"', 1)
-            if closing < 0:
-                raise PlanningError(f"unterminated quoted value for {key}")
-            trailing = value[closing + 1 :].strip()
-            if trailing and not trailing.startswith("#"):
-                raise PlanningError(f"unexpected text after quoted value for {key}")
-            value = value[1:closing]
-        else:
-            value = value.split("#", 1)[0].strip()
+        path.lstat()
+    except FileNotFoundError:
+        return values
+    except OSError as exc:
+        raise PlanningError(f"cannot inspect planning config: {exc}") from exc
+    try:
+        parsed = read_config_file(path, "planning config")
+    except ConfigValueError as exc:
+        raise PlanningError(str(exc)) from exc
+    unknown = sorted(set(parsed) - ALLOWED_KEYS)
+    if unknown:
+        raise PlanningError(f"unknown planning configuration key: {unknown[0]}")
+    for key in parsed:
+        value = value_for(parsed, key)
+        if value is None:
+            raise PlanningError(f"planning configuration key must not be null: {key}")
         values[key] = value
     if values["USE_SUPERPOWERS"] not in {"true", "false"}:
         raise PlanningError("USE_SUPERPOWERS must be exactly true or false")

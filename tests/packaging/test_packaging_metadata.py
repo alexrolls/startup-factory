@@ -9,6 +9,7 @@ import hashlib
 import io
 import os
 import re
+import shlex
 import sys
 import tarfile
 import tempfile
@@ -27,6 +28,9 @@ PYPROJECT = ROOT / "pyproject.toml"
 PROJECT_MANAGEMENT_CONFIG = ROOT / "config" / "project-management.config.md"
 TEAM_CONFIG = ROOT / "config" / "team.config.md"
 README = ROOT / "README.md"
+DEPLOYMENT_REFERENCE = ROOT / "reference" / "deployment.md"
+AUTOMATION_REFERENCE = ROOT / "reference" / "automation.md"
+PM_PRODUCTION_ENV_EXAMPLE = ROOT / "config" / "pm-agent.production.env.example"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 PACKAGE_CI_WORKFLOW = ROOT / ".github" / "workflows" / "package-ci.yml"
 RESOURCE_ARCHIVE = "startup_factory_cli/resources/startup-factory.tar.gz"
@@ -151,10 +155,12 @@ class ProjectMetadataTests(unittest.TestCase):
     def test_public_package_metadata(self) -> None:
         project = self.config["project"]
         self.assertEqual(project["name"], "startup-factory")
-        self.assertEqual(project["version"], "0.1.23")
+        self.assertEqual(project["version"], "0.2.0")
         self.assertEqual(project["requires-python"], ">=3.10")
         self.assertEqual(project["license"], "MIT")
         self.assertEqual(project["license-files"], ["LICENSE"])
+        self.assertIn("Development Status :: 4 - Beta", project["classifiers"])
+        self.assertNotIn("Development Status :: 3 - Alpha", project["classifiers"])
 
     def test_runtime_is_dependency_free(self) -> None:
         self.assertEqual(self.config["project"]["dependencies"], [])
@@ -177,13 +183,117 @@ class ProjectMetadataTests(unittest.TestCase):
 
 
 class BundledDefaultsTests(unittest.TestCase):
+    def test_role_command_defaults_keep_complete_quoted_prompt_templates(self) -> None:
+        config = TEAM_CONFIG.read_text(encoding="utf-8")
+        command_keys = (
+            "TEAM_LEAD_CMD",
+            "PRINCIPAL_ARCHITECT_CMD",
+            "SCEPTICAL_ARCHITECT_CMD",
+            "SENIOR_SECURITY_ENGINEER_CMD",
+            "INTEGRATOR_CMD",
+            "BACKEND_CMD",
+            "FRONTEND_CMD",
+            "REVIEWER_CMD",
+            "TEAM_DEFAULT_CMD",
+        )
+        values = {}
+        for line in config.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                if key in command_keys:
+                    values[key] = value
+
+        self.assertEqual(set(values), set(command_keys))
+        for key, value in values.items():
+            self.assertTrue(value.startswith('"') and value.endswith('"'), key)
+            self.assertIn("{prompt_file}", value, key)
+            self.assertIn(r'\"', value, key)
+            # The parsed value must be the command string an operator wrote:
+            # outer quotes removed, documented escapes folded, so the interior
+            # quotes still group the prompt at execution time.
+            parsed = value[1:-1].replace(r'\"', '"').replace('\\\\', '\\')
+            self.assertIn('"$(cat \'{prompt_file}\')"', parsed, key)
+            self.assertEqual(shlex.split(parsed).count("$(cat '{prompt_file}')"), 1, key)
+
+        self.assertIn("Configuration parsing is inert", config)
+        self.assertIn("launch-team.sh config-value <KEY>", config)
+
+    def test_agent_sandbox_home_is_absent_by_default(self) -> None:
+        config = TEAM_CONFIG.read_text(encoding="utf-8")
+        self.assertRegex(config, r"(?m)^AGENT_SANDBOX_HOME=null(?:\s+#.*)?$")
+
     def test_team_mode_is_enabled_by_default(self) -> None:
         config = PROJECT_MANAGEMENT_CONFIG.read_text(encoding="utf-8")
         self.assertRegex(config, r"(?m)^TEAM_MODE=true(?:\s|$)")
         self.assertNotRegex(config, r"(?m)^TEAM_MODE=false(?:\s|$)")
 
+    def test_preserved_lifecycle_authority_migration_is_explicit(self) -> None:
+        env_example = PM_PRODUCTION_ENV_EXAMPLE.read_text(encoding="utf-8")
+        deployment = DEPLOYMENT_REFERENCE.read_text(encoding="utf-8")
+        readme = README.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "may only repeat the exact canonical BROKER_LIFECYCLE_ROOT",
+            env_example,
+        )
+        self.assertIn("Required 0.1.x lifecycle-authority migration", deployment)
+        self.assertIn("BROKER_LIFECYCLE_ROOT=null", deployment)
+        self.assertRegex(
+            deployment, r"The\s+environment value cannot create or override"
+        )
+        self.assertIn("0.1.x upgrade action", readme)
+        self.assertIn(
+            "STARTUP_FACTORY_LIFECYCLE_STATE_ROOT` may only repeat", readme
+        )
+
+    def test_automation_uses_the_root_protected_runner_contract(self) -> None:
+        automation = AUTOMATION_REFERENCE.read_text(encoding="utf-8")
+
+        self.assertRegex(
+            automation, r"outside\s+both the repository and installed runtime"
+        )
+        self.assertRegex(
+            automation, r"complete\s+ancestor chain must be real, root-owned"
+        )
+        self.assertIn("not writable by the executor", automation)
+        self.assertIn(
+            "operator-owned mode-0700 wrapper is deliberately refused", automation
+        )
+        self.assertIn("revalidates that boundary immediately before every", automation)
+        self.assertNotIn("owned by the executor or root", automation)
+
+    def test_readme_does_not_claim_unmeasured_onboarding_latency(self) -> None:
+        readme = README.read_text(encoding="utf-8").casefold()
+
+        self.assertNotIn("two-minute", readme)
+        self.assertNotIn("two minutes", readme)
+        self.assertIn("quick start (local markdown, no tracker account)", readme)
+
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def test_full_validation_jobs_have_sufficient_timeout_budget(self) -> None:
+        def job_timeout(workflow: str, job: str) -> int:
+            prefix, marker, tail = workflow.partition(f"  {job}:\n")
+            self.assertTrue(marker, f"missing {job!r} job")
+            header, steps_marker, _steps = tail.partition("    steps:\n")
+            self.assertTrue(steps_marker, f"missing steps for {job!r} job")
+            matches = re.findall(
+                r"(?m)^    timeout-minutes: ([1-9][0-9]*)$", header
+            )
+            self.assertEqual(len(matches), 1, f"expected one timeout for {job!r}")
+            return int(matches[0])
+
+        package_timeout = job_timeout(
+            PACKAGE_CI_WORKFLOW.read_text(encoding="utf-8"), "package"
+        )
+        release_timeout = job_timeout(
+            RELEASE_WORKFLOW.read_text(encoding="utf-8"), "build"
+        )
+
+        self.assertGreaterEqual(package_timeout, 60)
+        self.assertGreaterEqual(release_timeout, 60)
+        self.assertGreaterEqual(release_timeout, package_timeout)
+
     def test_pull_requests_must_use_an_unreleased_version(self) -> None:
         workflow = PACKAGE_CI_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("Require an unreleased version before merge", workflow)
@@ -191,14 +301,112 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("project.version must increase before merge", workflow)
         self.assertIn('refs/tags/v$VERSION^{commit}', workflow)
 
-    def test_release_runs_for_merged_main_commits(self) -> None:
+    def test_pull_requests_prove_source_compatibility_on_python_310(self) -> None:
+        workflow = PACKAGE_CI_WORKFLOW.read_text(encoding="utf-8")
+        minimum = workflow.split("  minimum-python:\n", 1)[1].split(
+            "\n  package:\n", 1
+        )[0]
+        self.assertIn("if: github.event_name == 'pull_request'", minimum)
+        self.assertIn('python-version: "3.10"', minimum)
+        self.assertIn("sys.version_info[:2] == (3, 10)", minimum)
+        self.assertIn("python -m startup_factory_cli version --json", minimum)
+        self.assertIn(
+            'python -m unittest discover -s tests/packaging -p "test_*.py" -v',
+            minimum,
+        )
+
+    def test_release_is_manual_protected_and_exact_evidence_gated(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn("    branches:\n      - main", workflow)
+        self.assertIn("  workflow_dispatch:\n", workflow)
+        self.assertIn("      release_commit:\n", workflow)
+        self.assertIn("      evidence_commit:\n", workflow)
+        self.assertNotIn("  push:\n", workflow)
         self.assertNotIn("    tags:\n", workflow)
-        self.assertIn('test "$GITHUB_REF" = "refs/heads/main"', workflow)
-        self.assertIn('test "$commit" = "$GITHUB_SHA"', workflow)
+        self.assertIn("  authorize:\n", workflow)
+        authorize = workflow.split("  authorize:\n", 1)[1].split("\n  build:\n", 1)[0]
+        self.assertIn("      name: release", authorize)
+        self.assertIn("          ref: main", authorize)
+        self.assertIn("          ref: release-evidence", authorize)
+        self.assertIn(
+            'test "$(git -C candidate rev-parse origin/main)" = "$RELEASE_COMMIT"',
+            authorize,
+        )
+        self.assertIn('test "$GITHUB_REF" = "refs/heads/main"', authorize)
+        self.assertIn('test "$RELEASE_COMMIT" = "$GITHUB_SHA"', authorize)
+        self.assertIn(
+            'test "$(git -C release-evidence rev-parse HEAD)" = "$EVIDENCE_COMMIT"',
+            authorize,
+        )
+        self.assertIn(
+            'git -C release-evidence show-ref --verify --quiet', authorize
+        )
+        self.assertIn(
+            'rev-parse origin/release-evidence)', authorize
+        )
+        self.assertIn("Extract only bounded regular secret-free evidence blobs", authorize)
+        self.assertIn("candidate/packaging/extract_release_evidence.py", authorize)
+        self.assertIn("--source release-evidence", authorize)
+        self.assertIn('--commit "$EVIDENCE_COMMIT"', authorize)
+        self.assertIn("--target candidate", authorize)
+        self.assertIn("python3 bin/beta-readiness.py", authorize)
+        self.assertIn("releaseSetSha256", authorize)
+        self.assertIn("candidateVersion", authorize)
+        self.assertIn("release_set_sha256=$release_set_sha256", authorize)
+        self.assertIn("version=$candidate_version", authorize)
+        build_header = workflow.split("  build:\n", 1)[1].split("    steps:\n", 1)[0]
+        self.assertIn("    needs: authorize", build_header)
+        self.assertIn(
+            "          ref: ${{ needs.authorize.outputs.source_commit }}", workflow
+        )
         self.assertIn("bump project.version", workflow)
         self.assertIn("  group: release-main", workflow)
+
+        binding = workflow.index(
+            "      - name: Bind rebuilt artifact names and bytes to approved evidence"
+        )
+        first_upload = workflow.index("      - name: Upload Python distributions")
+        self.assertLess(binding, first_upload)
+        bind_step = workflow[binding:first_upload]
+        self.assertIn(
+            "EXPECTED_RELEASE_SET_SHA256: ${{ needs.authorize.outputs.release_set_sha256 }}",
+            bind_step,
+        )
+        self.assertIn("packaging/verify_release_artifacts.py", bind_step)
+        self.assertIn("--distributions dist", bind_step)
+        self.assertIn("--release-assets release-assets", bind_step)
+
+        publish = workflow.split("  publish:\n", 1)[1].split("\n  verify-uvx:\n", 1)[0]
+        self.assertIn("      - authorize", publish)
+        self.assertIn("      name: pypi", publish)
+        self.assertIn("Check out the current main tip after publication approval", publish)
+        self.assertIn("Check out the current protected evidence tip", publish)
+        self.assertIn("Reconfirm both authorized protected tips after approval", publish)
+        self.assertIn("Freshly extract the exact bounded evidence set", publish)
+        self.assertIn("Revalidate freshness and exact release identity after approval", publish)
+        self.assertIn('"candidateCommit": expected_commit', publish)
+        self.assertIn('"candidateVersion": expected_version', publish)
+        self.assertIn('"releaseSetSha256": expected_release_set', publish)
+        self.assertIn("Download the complete attested release set", publish)
+        self.assertIn("Rebind downloaded names and bytes to approved evidence", publish)
+        self.assertIn("candidate/packaging/verify_release_artifacts.py", publish)
+        self.assertIn("Refuse a last-moment protected-tip change", publish)
+        self.assertIn("git/ref/heads/main", publish)
+        self.assertIn("git/ref/heads/release-evidence", publish)
+        self.assertEqual(workflow.count("extract_release_evidence.py"), 2)
+        self.assertEqual(workflow.count("verify_release_artifacts.py"), 2)
+        last_tip = publish.index("Refuse a last-moment protected-tip change")
+        pypi = publish.index("pypa/gh-action-pypi-publish")
+        self.assertLess(last_tip, pypi)
+
+    def test_python_310_smoke_exercises_installed_integration_pack(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        smoke = workflow.split("  smoke:\n", 1)[1].split("\n  publish:\n", 1)[0]
+        self.assertIn('python-version: "3.10"', smoke)
+        for operation in ("list", "validate", "preview", "apply", "doctor"):
+            self.assertRegex(smoke, rf"startup-factory integration-pack {operation}\b")
+        self.assertNotIn("bin/integration_pack.py", smoke)
+        self.assertIn('report["configured"]["status"] == "configured"', smoke)
+        self.assertIn('report["proved"]["status"] == "unknown"', smoke)
 
     def test_github_release_tag_comes_from_the_package_version(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
@@ -208,15 +416,80 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         self.assertNotIn("$GITHUB_REF_NAME", workflow)
 
-    def test_runtime_suite_uses_a_private_temporary_directory(self) -> None:
-        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn('runtime_tmp="$RUNNER_TEMP/startup-factory-runtime"', workflow)
-        self.assertIn('install -d -m 700 "$runtime_tmp"', workflow)
-        self.assertIn(
-            'PATH="/usr/bin:/bin" TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh',
-            workflow,
-        )
-        self.assertNotIn("        run: bash tests/run-all.sh", workflow)
+    def test_runtime_suites_use_a_protected_pinned_python_in_a_private_tmpdir(self) -> None:
+        for path in (PACKAGE_CI_WORKFLOW, RELEASE_WORKFLOW):
+            with self.subTest(workflow=path.name):
+                workflow = path.read_text(encoding="utf-8")
+                self.assertIn(
+                    'runtime_tmp="$RUNNER_TEMP/startup-factory-runtime"', workflow
+                )
+                self.assertIn('install -d -m 700 "$runtime_tmp"', workflow)
+                self.assertIn('python-version: "3.14"', workflow)
+                self.assertIn(
+                    'build_env="$(mktemp -d "$RUNNER_TEMP/startup-factory-build.XXXXXX")"',
+                    workflow,
+                )
+                self.assertIn(
+                    '"$protected_python" -I -B -m venv --copies "$build_env"',
+                    workflow,
+                )
+                self.assertIn('build_python="$build_env/bin/python"', workflow)
+                self.assertIn(
+                    '"$build_python" -I -B -m pip install --disable-pip-version-check',
+                    workflow,
+                )
+                self.assertIn(
+                    '"$build_python" -I -B -m build --no-isolation', workflow
+                )
+                self.assertIn('setup_prefix="$(python -I -S -E -s', workflow)
+                self.assertIn(
+                    'test "$RUNNER_TOOL_CACHE" = "/opt/hostedtoolcache"', workflow
+                )
+                self.assertIn(
+                    '"$RUNNER_TOOL_CACHE"/Python/3.14.*/x64', workflow
+                )
+                self.assertIn(
+                    'sudo chown root:root /opt "$RUNNER_TOOL_CACHE" "$python_root" '
+                    '"$version_root"',
+                    workflow,
+                )
+                self.assertIn(
+                    'sudo chmod go-w /opt "$RUNNER_TOOL_CACHE" "$python_root" '
+                    '"$version_root"',
+                    workflow,
+                )
+                self.assertIn('sudo chown -R root:root "$setup_prefix"', workflow)
+                self.assertIn('sudo chmod -R go-w "$setup_prefix"', workflow)
+                self.assertIn("sys.version_info[:2] == (3, 14)", workflow)
+                self.assertIn('assert info.st_uid == 0', workflow)
+                self.assertIn('assert not stat.S_IMODE(info.st_mode) & 0o022', workflow)
+                self.assertIn('path.resolve(strict=True).is_relative_to(root)', workflow)
+                self.assertIn('maps = Path("/proc/self/maps")', workflow)
+                self.assertIn('path.name.startswith("libpython3.14")', workflow)
+                self.assertLess(
+                    workflow.index('sudo chown -R root:root "$setup_prefix"'),
+                    workflow.index('"$build_python" -I -B -m pip install'),
+                )
+                self.assertLess(
+                    workflow.index('TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh'),
+                    workflow.index('build_env="$(mktemp -d'),
+                )
+                self.assertLess(
+                    workflow.index('Prepare two clean package source trees'),
+                    workflow.index('build_env="$(mktemp -d'),
+                )
+                self.assertIn(
+                    'PATH="$setup_prefix/bin:/usr/bin:/bin" \\\n'
+                    '            TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh',
+                    workflow,
+                )
+                self.assertNotIn('protected_python_root=', workflow)
+                self.assertNotIn('sudo cp -a "$setup_prefix/."', workflow)
+                self.assertNotIn('BUILD_PYTHON=', workflow)
+                self.assertNotIn('setup_python="$(command -v python3)"', workflow)
+                self.assertNotIn('PATH="$setup_python_dir:/usr/bin:/bin"', workflow)
+                self.assertNotIn("/usr/bin/python3 -c", workflow)
+                self.assertNotIn("        run: bash tests/run-all.sh", workflow)
 
     def test_github_release_commands_have_explicit_repository_context(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
@@ -348,7 +621,7 @@ class BuiltDistributionIdentityTests(unittest.TestCase):
             license_bytes = archive.read(license_names[0])
 
         self.assertEqual(metadata["Name"], "startup-factory")
-        self.assertEqual(metadata["Version"], "0.1.23")
+        self.assertEqual(metadata["Version"], "0.2.0")
         self.assertEqual(metadata["Requires-Python"], ">=3.10")
         self.assertEqual(metadata["License-Expression"], "MIT")
         self.assertEqual(metadata.get_all("License-File", []), ["LICENSE"])

@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import warnings
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,15 @@ from typing import Callable, Iterator
 
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(SKILL_DIR / "src"))
+
+from startup_factory_cli.config_values import (  # noqa: E402
+    ConfigValueError,
+    parse_config_bytes,
+    value_for,
+)
+
 COMMAND_TIMEOUT_SECONDS = 120
 COMMAND_KILL_GRACE_SECONDS = 5
 RELEASE_TIMEOUT_SECONDS = 7200
@@ -38,7 +48,8 @@ RELEASE_WORKER_HEARTBEAT_STALE_SECONDS = 10
 # active provider hook in its own session.  Stale-worker recovery must let that
 # trusted SIGTERM handler finish before it escalates the outer release group.
 RELEASE_ORPHAN_TERM_GRACE_SECONDS = 10
-RELEASE_ORPHAN_KILL_GRACE_SECONDS = 2
+RELEASE_RESULT_LOCK_TIMEOUT_SECONDS = 2.0
+RELEASE_RESULT_LOCK_POLL_SECONDS = 0.02
 ACTIVE_TRUSTED_PATH = "/usr/bin:/bin"
 TRUSTED_GIT = "/usr/bin/git"
 RELEASE_WORKER = Path(__file__).resolve().with_name("release-worker.py")
@@ -97,6 +108,10 @@ HEALTH_ROW_KEYS = {
 }
 RELEASE_SNAPSHOT_FILES = {
     "release-feature.py": Path("bin/release-feature.py"),
+    "authority_config.py": Path("bin/authority_config.py"),
+    "config-value.py": Path("bin/config-value.py"),
+    "config_values.py": Path("src/startup_factory_cli/config_values.py"),
+    "authority-bootstrap.sh": Path("bin/authority-bootstrap.sh"),
     "policy-check.py": Path("bin/policy-check.py"),
     "tracker-ops.sh": Path("bin/tracker-ops.sh"),
     "finalize-integrations.sh": Path("bin/finalize-integrations.sh"),
@@ -105,23 +120,44 @@ RELEASE_SNAPSHOT_FILES = {
     "task-hold.py": Path("bin/task-hold.py"),
     "outbox_capability.py": Path("bin/outbox_capability.py"),
     "broker_evidence.py": Path("bin/broker_evidence.py"),
+    "delivery_profile.py": Path("bin/delivery_profile.py"),
     "retrospective.py": Path("bin/retrospective.py"),
     "runtime-state.py": Path("bin/runtime-state.py"),
     "ticket_content_security.py": Path("bin/ticket_content_security.py"),
+    "secret_safety.py": Path("src/startup_factory_cli/secret_safety.py"),
     "task_metadata.py": Path("bin/task_metadata.py"),
     "product_acceptance.py": Path("bin/product_acceptance.py"),
     "teamwork-path.py": Path("bin/teamwork-path.py"),
+    "launch-lane-lock.py": Path("bin/launch-lane-lock.py"),
     "review_evidence.py": Path("bin/review_evidence.py"),
     "statuses.config.json": Path("config/statuses.config.json"),
     "guardrails.config.json": Path("config/guardrails.config.json"),
     "team.config.md": Path("config/team.config.md"),
     "project-management.config.md": Path("config/project-management.config.md"),
+    "automation.config.json": Path("config/automation.config.json"),
 }
 BUILTIN_TRACKER_ADAPTERS = {"Linear", "Jira", "GitHubIssues", "Markdown"}
 
 
 class MonitorError(RuntimeError):
     pass
+
+
+_AUTHORITY_RESOLVER: types.ModuleType | None = None
+
+
+def authority_resolver() -> types.ModuleType:
+    """Load securely captured resolver bytes without consulting import paths."""
+    global _AUTHORITY_RESOLVER
+    if _AUTHORITY_RESOLVER is not None:
+        return _AUTHORITY_RESOLVER
+    path = Path(__file__).resolve().with_name("authority_config.py")
+    raw, _digest = capture_protected_file(path, "authority configuration resolver")
+    module = types.ModuleType("startup_factory_authority_config")
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    _AUTHORITY_RESOLVER = module
+    return module
 
 
 def unprivileged_git_environment(source: dict[str, str] | None = None) -> dict[str, str]:
@@ -544,25 +580,18 @@ def read_teamwork_root() -> str:
     team_config = (SKILL_DIR / "config" / "team.config.md").resolve()
     raw, _ = capture_protected_file(team_config, "team config")
     try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise MonitorError("team config must be UTF-8 text") from exc
-    match = re.search(r"^TEAMWORK_ROOT=([^\s#]+)", text, re.MULTILINE)
-    value = (match.group(1).strip('"') if match else ".teamwork")
-    return ".teamwork" if value in {"", "null"} else value
+        value = value_for(parse_config_bytes(raw, "team config"), "TEAMWORK_ROOT")
+    except ConfigValueError as exc:
+        raise MonitorError(f"team config: {exc}") from exc
+    return value or ".teamwork"
 
 
 def parse_key_values(text: str, path: Path) -> dict[str, str | None]:
-    values: dict[str, str | None] = {}
-    for match in re.finditer(r"^([A-Z_]+)=(.*)$", text, re.MULTILINE):
-        if match.group(1) in values:
-            raise MonitorError(
-                f"duplicate configuration key {match.group(1)} in {path}; "
-                "safety settings must have one unambiguous value"
-            )
-        value = match.group(2).split("#", 1)[0].strip().strip('"')
-        values[match.group(1)] = None if value == "null" else value
-    return values
+    try:
+        parsed = parse_config_bytes(text.encode("utf-8"), str(path))
+    except (ConfigValueError, UnicodeEncodeError) as exc:
+        raise MonitorError(f"invalid configuration {path}: {exc}") from exc
+    return {key: value_for(parsed, key) for key in parsed}
 
 
 def read_key_values(path: Path) -> dict[str, str | None]:
@@ -716,11 +745,12 @@ def validate_health_snapshot(
     return value
 
 
-def validate_pm_automation(project: Path) -> None:
-    path = Path(os.environ.get("STARTUP_FACTORY_PM_CONFIG") or SKILL_DIR / "config" / "project-management.config.md").expanduser()
-    if not path.is_absolute() or path.is_symlink():
-        raise MonitorError("project-management config must be an absolute, non-symlink protected file")
-    resolved = path.resolve()
+def validate_pm_automation(project: Path) -> tuple[str, Path]:
+    path = Path(
+        os.environ.get("STARTUP_FACTORY_PM_CONFIG")
+        or SKILL_DIR / "config" / "project-management.config.md"
+    )
+    resolved = validate_protected_config_path(path, "project-management config")
     try:
         resolved.relative_to(project)
     except ValueError:
@@ -734,7 +764,15 @@ def validate_pm_automation(project: Path) -> None:
         raise MonitorError("project-management config must be UTF-8 text") from exc
     if values.get("TEAM_MODE") != "true":
         raise MonitorError("portfolio automation requires TEAM_MODE=true")
-    adapter = os.environ.get("TRACKER_ADAPTER") or values.get("PRODUCT_MANAGEMENT_TOOL")
+    try:
+        adapter = authority_resolver().configured_tracker_adapter(
+            resolved,
+            os.environ.get("TRACKER_ADAPTER")
+            if "TRACKER_ADAPTER" in os.environ
+            else None,
+        )
+    except RuntimeError as exc:
+        raise MonitorError(str(exc)) from exc
     if adapter == "Linear":
         if values.get("LINEAR_ACCESS") != "rest":
             raise MonitorError("Linear cron/service automation requires LINEAR_ACCESS=rest")
@@ -758,6 +796,7 @@ def validate_pm_automation(project: Path) -> None:
             raise MonitorError(
                 "GitHub portfolio automation requires an explicit GITHUB_REPO=owner/repository scope"
             )
+    return adapter, resolved
 
 
 def meaningful_command(value: str | None) -> bool:
@@ -785,74 +824,95 @@ def validate_agent_sandbox_runner(project: Path, values: dict[str, str | None]) 
         raise MonitorError("AGENT_SANDBOX_RUNNER must be a regular file")
     if not metadata.st_mode & 0o111 or not os.access(runner, os.X_OK):
         raise MonitorError("AGENT_SANDBOX_RUNNER must be executable")
-    if metadata.st_uid not in {0, os.geteuid()}:
-        raise MonitorError("AGENT_SANDBOX_RUNNER must be owned by the executor or root")
     if stat.S_IMODE(metadata.st_mode) & 0o022:
         raise MonitorError("AGENT_SANDBOX_RUNNER must not be group- or world-writable")
+    if metadata.st_uid != 0:
+        raise MonitorError("AGENT_SANDBOX_RUNNER must be root-owned")
     try:
         resolved = runner.resolve(strict=True)
-        resolved.relative_to(project.resolve(strict=True))
-    except ValueError:
-        return
     except OSError as exc:
         raise MonitorError(f"cannot resolve AGENT_SANDBOX_RUNNER {runner}: {exc}") from exc
-    raise MonitorError("AGENT_SANDBOX_RUNNER must be external to the agent repository")
+    if resolved != runner:
+        raise MonitorError(
+            "AGENT_SANDBOX_RUNNER must use its canonical absolute path"
+        )
+    for boundary, label in (
+        (project.resolve(strict=True), "agent repository"),
+        (SKILL_DIR.resolve(strict=True), "installed runtime"),
+    ):
+        try:
+            resolved.relative_to(boundary)
+        except ValueError:
+            pass
+        else:
+            raise MonitorError(
+                f"AGENT_SANDBOX_RUNNER must be external to the {label}"
+            )
+    try:
+        executor_can_write = os.access(resolved, os.W_OK, effective_ids=True)
+    except (NotImplementedError, TypeError):
+        executor_can_write = os.access(resolved, os.W_OK)
+    if executor_can_write:
+        raise MonitorError(
+            "AGENT_SANDBOX_RUNNER must not be writable by the executor"
+        )
+    ancestor = resolved.parent
+    while True:
+        try:
+            ancestor_metadata = ancestor.lstat()
+        except OSError as exc:
+            raise MonitorError(
+                f"cannot inspect AGENT_SANDBOX_RUNNER ancestor {ancestor}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(ancestor_metadata.st_mode) or not stat.S_ISDIR(
+            ancestor_metadata.st_mode
+        ):
+            raise MonitorError(
+                f"AGENT_SANDBOX_RUNNER ancestor must be a real directory: {ancestor}"
+            )
+        if stat.S_IMODE(ancestor_metadata.st_mode) & 0o022:
+            raise MonitorError(
+                "AGENT_SANDBOX_RUNNER ancestor must not be group- or "
+                f"world-writable: {ancestor}"
+            )
+        if ancestor_metadata.st_uid != 0:
+            raise MonitorError(
+                f"AGENT_SANDBOX_RUNNER ancestor must be root-owned: {ancestor}"
+            )
+        try:
+            executor_can_write = os.access(
+                ancestor, os.W_OK, effective_ids=True
+            )
+        except (NotImplementedError, TypeError):
+            executor_can_write = os.access(ancestor, os.W_OK)
+        if executor_can_write:
+            raise MonitorError(
+                "AGENT_SANDBOX_RUNNER ancestor must not be writable by the "
+                f"executor: {ancestor}"
+            )
+        if ancestor == ancestor.parent:
+            break
+        ancestor = ancestor.parent
 
 
 def validate_lifecycle_state_root(
     project: Path, values: dict[str, str | None]
 ) -> Path:
-    raw = os.environ.get("STARTUP_FACTORY_LIFECYCLE_STATE_ROOT") or values.get(
-        "BROKER_LIFECYCLE_ROOT"
+    del values  # The resolver re-reads the exact protected config bytes.
+    team_config = (SKILL_DIR / "config" / "team.config.md").resolve()
+    ambient = (
+        os.environ.get("STARTUP_FACTORY_LIFECYCLE_STATE_ROOT")
+        if "STARTUP_FACTORY_LIFECYCLE_STATE_ROOT" in os.environ
+        else None
     )
-    if not raw:
-        raise MonitorError(
-            "autonomous launch requires BROKER_LIFECYCLE_ROOT or "
-            "STARTUP_FACTORY_LIFECYCLE_STATE_ROOT"
-        )
-    root = Path(raw)
-    if not root.is_absolute() or Path(os.path.normpath(str(root))) != root:
-        raise MonitorError(
-            "autonomous lifecycle state root must be an absolute normalized path"
-        )
-    current = Path(root.anchor)
-    components = [current]
-    for part in root.parts[1:]:
-        current /= part
-        components.append(current)
-    for current in components:
-        try:
-            metadata = current.lstat()
-        except OSError as exc:
-            raise MonitorError(
-                f"cannot stat lifecycle state path component {current}: {exc}"
-            ) from exc
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise MonitorError(
-                f"lifecycle state path components must be non-symlink directories: {current}"
-            )
-        if metadata.st_uid not in {0, os.geteuid()} or stat.S_IMODE(metadata.st_mode) & 0o022:
-            raise MonitorError(
-                "lifecycle state path components must be broker/root-owned and not "
-                f"group/world-writable: {current}"
-            )
-    if stat.S_IMODE(root.lstat().st_mode) != 0o700:
-        raise MonitorError("autonomous lifecycle state root must have mode 0700")
     try:
-        resolved = root.resolve(strict=True)
-        boundaries = (project.resolve(strict=True), SKILL_DIR.resolve(strict=True))
-    except OSError as exc:
-        raise MonitorError(f"cannot resolve autonomous lifecycle state root: {exc}") from exc
-    for boundary in boundaries:
-        try:
-            common = Path(os.path.commonpath((str(resolved), str(boundary))))
-        except ValueError:
-            continue
-        if common in {resolved, boundary}:
-            raise MonitorError(
-                "lifecycle state root must be disjoint from both the agent repository "
-                "and the mounted skill installation"
-            )
+        resolved = authority_resolver().configured_lifecycle_root(
+            team_config, project, SKILL_DIR, ambient, required=True
+        )
+    except RuntimeError as exc:
+        raise MonitorError(str(exc)) from exc
+    if resolved is None:
+        raise MonitorError("autonomous launch requires BROKER_LIFECYCLE_ROOT")
     if not os.access(resolved, os.R_OK | os.W_OK | os.X_OK):
         raise MonitorError("lifecycle state root is not accessible to the broker executor")
     return resolved
@@ -955,6 +1015,57 @@ def capture_protected_file(
         if observed != expected_digest:
             raise MonitorError(f"{label} digest does not match the protected deployment config")
     return value, observed
+
+
+def validate_protected_config_path(path: Path, label: str) -> Path:
+    """Authenticate a supervisor-selected external config and its parent chain."""
+    if not path.is_absolute():
+        raise MonitorError(f"{label} must be an absolute, non-symlink protected file")
+    candidate = Path(os.path.abspath(path))
+    if candidate.is_symlink():
+        raise MonitorError(f"{label} must be an absolute, non-symlink protected file")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise MonitorError(f"cannot resolve {label}: {exc}") from exc
+    if resolved != candidate:
+        raise MonitorError(f"{label} must use its canonical non-symlink path")
+    for shared in (Path("/tmp"), Path("/private/tmp")):
+        try:
+            resolved.relative_to(shared)
+        except ValueError:
+            pass
+        else:
+            raise MonitorError(
+                f"{label} must not live below a shared temporary directory"
+            )
+    current = Path(resolved.anchor)
+    for part in resolved.parent.parts[1:]:
+        current /= part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise MonitorError(f"cannot inspect {label} parent {current}: {exc}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise MonitorError(f"{label} parent chain must contain non-symlink directories")
+        mode = stat.S_IMODE(info.st_mode)
+        sticky_shared_ancestor = (
+            current != resolved.parent
+            and info.st_uid == 0
+            and bool(mode & stat.S_ISVTX)
+        )
+        homebrew_group_write = (
+            info.st_uid == os.geteuid()
+            and str(resolved).startswith("/opt/homebrew/")
+            and not mode & 0o002
+        )
+        if info.st_uid not in {0, os.geteuid()} or (
+            mode & 0o022 and not sticky_shared_ancestor and not homebrew_group_write
+        ):
+            raise MonitorError(
+                f"{label} parent chain must be supervisor/root-owned and not group/world writable: {current}"
+            )
+    return resolved
 
 
 def private_directory(path: Path, label: str) -> Path:
@@ -1080,9 +1191,11 @@ def validate_supervisor_install(project: Path) -> Path:
     capture_protected_file(worker, "detached release worker")
     for filename, label in (
         ("process-lifecycle.py", "release lifecycle supervisor"),
+        ("launch-lane-lock.py", "release team admission fence"),
         ("agent-health.py", "agent health collector"),
         ("heartbeat-status.py", "agent heartbeat classifier"),
         ("teamwork-path.py", "agent health path policy"),
+        ("authority_config.py", "authority configuration resolver"),
     ):
         candidate = worker.with_name(filename)
         if candidate.is_symlink():
@@ -1101,10 +1214,7 @@ def validate_supervisor_install(project: Path) -> Path:
 
 
 def load_protected_automation_config(path: Path) -> tuple[dict, Path]:
-    candidate = path.expanduser()
-    if not candidate.is_absolute() or candidate.is_symlink():
-        raise MonitorError("automation config must be an absolute, non-symlink protected file")
-    resolved = candidate.resolve()
+    resolved = validate_protected_config_path(path, "automation config")
     raw, _ = capture_protected_file(resolved, "automation config")
     try:
         config = strict_json(raw.decode("utf-8"))
@@ -1511,6 +1621,8 @@ def validate_release_deadline(config: dict) -> None:
 def validate_release_handoff(
     project: Path,
     *,
+    automation_config_path: Path | None = None,
+    pm_config_path: Path | None = None,
     dry_run: bool = False,
 ) -> tuple[list[str] | None, str | None, dict[str, str] | None]:
     """Authenticate and snapshot an external executor before its first instruction."""
@@ -1592,12 +1704,44 @@ def validate_release_handoff(
             "STARTUP_FACTORY_RELEASE_FEATURE must name bin/release-feature.py in the external skill install"
         )
     release_env = minimal_release_environment(config)
-    release_env["STARTUP_FACTORY_TEAM_POLICY_SOURCE_ROOT"] = str(source_root)
     snapshot_files = dict(RELEASE_SNAPSHOT_FILES)
-    pm_values = read_key_values(source_root / "config" / "project-management.config.md")
-    tracker_adapter = release_env.get("TRACKER_ADAPTER") or pm_values.get(
-        "PRODUCT_MANAGEMENT_TOOL"
+    pm_config = validate_protected_config_path(
+        pm_config_path
+        or Path(
+            os.environ.get("STARTUP_FACTORY_PM_CONFIG")
+            or source_root / "config" / "project-management.config.md"
+        ),
+        "project-management config",
     )
+    automation_config = validate_protected_config_path(
+        automation_config_path
+        or Path(
+            os.environ.get("STARTUP_FACTORY_AUTOMATION_CONFIG")
+            or source_root / "config" / "automation.config.json"
+        ),
+        "automation config",
+    )
+    for policy_path, label in (
+        (pm_config, "project-management config"),
+        (automation_config, "automation config"),
+    ):
+        try:
+            policy_path.relative_to(project)
+        except ValueError:
+            pass
+        else:
+            raise MonitorError(f"{label} must live outside the agent repository")
+    read_key_values(pm_config)  # Preserve duplicate/config readability checks.
+    try:
+        tracker_adapter = authority_resolver().configured_tracker_adapter(
+            pm_config,
+            release_env.get("TRACKER_ADAPTER")
+            if "TRACKER_ADAPTER" in release_env
+            else None,
+        )
+    except RuntimeError as exc:
+        raise MonitorError(str(exc)) from exc
+    release_env["TRACKER_ADAPTER"] = tracker_adapter
     if not isinstance(tracker_adapter, str) or not re.fullmatch(
         r"[A-Za-z][A-Za-z0-9_-]{0,63}", tracker_adapter
     ):
@@ -1612,6 +1756,10 @@ def validate_release_handoff(
         raise MonitorError(
             "trustedCodeDigests must contain the exact protected release helper set"
         )
+    policy_sources = {
+        "project-management.config.md": pm_config,
+        "automation.config.json": automation_config,
+    }
     captured: dict[str, tuple[bytes, str]] = {}
     for name, relative in snapshot_files.items():
         expected_digest = configured.get(name)
@@ -1620,12 +1768,15 @@ def validate_release_handoff(
         ):
             raise MonitorError(f"external release helper {name} needs a pinned sha256 digest")
         captured[name] = capture_protected_file(
-            source_root / relative,
+            policy_sources.get(name, source_root / relative),
             f"external release helper {name}",
             expected_digest,
         )
 
     if dry_run:
+        release_env["STARTUP_FACTORY_TEAM_POLICY_SOURCE_ROOT"] = str(source_root)
+        release_env["STARTUP_FACTORY_PM_CONFIG"] = str(pm_config)
+        release_env["STARTUP_FACTORY_AUTOMATION_CONFIG"] = str(automation_config)
         return (
             isolated_release_command(resolved.parent, resolved),
             str(config_path.resolve()),
@@ -1662,6 +1813,13 @@ def validate_release_handoff(
         config_digest,
         0o400,
         "authenticated deployment config snapshot",
+    )
+    release_env["STARTUP_FACTORY_TEAM_POLICY_SOURCE_ROOT"] = str(snapshot)
+    release_env["STARTUP_FACTORY_PM_CONFIG"] = str(
+        snapshot / RELEASE_SNAPSHOT_FILES["project-management.config.md"]
+    )
+    release_env["STARTUP_FACTORY_AUTOMATION_CONFIG"] = str(
+        snapshot / RELEASE_SNAPSHOT_FILES["automation.config.json"]
     )
     return (
         isolated_release_command(
@@ -1761,14 +1919,96 @@ def validate_release_job_identity(
     return validated
 
 
+def acquire_release_result_lock(directory: int) -> None:
+    """Bound writer serialization so a stopped worker cannot wedge the monitor."""
+    deadline = time.monotonic() + RELEASE_RESULT_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except (BlockingIOError, InterruptedError) as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MonitorError(
+                    "timed out acquiring the release result writer fence"
+                ) from exc
+            time.sleep(min(RELEASE_RESULT_LOCK_POLL_SECONDS, remaining))
+
+
 def atomic_private_json(path: Path, value: dict) -> None:
-    if path.is_symlink():
-        raise MonitorError(f"refusing to replace protected symlink {path}")
-    atomic_json(path, value)
+    is_release_result = (
+        path.name == "result.json"
+        and re.fullmatch(r"release-[0-9a-f]{32}", path.parent.name) is not None
+    )
+    data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    descriptor = -1
+    directory = -1
+    temporary = ""
     try:
-        path.chmod(0o600)
+        directory = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        if is_release_result:
+            info = os.fstat(directory)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid not in {0, os.geteuid()}
+                or stat.S_IMODE(info.st_mode) != 0o700
+            ):
+                raise MonitorError("release job directory must be private mode 0700")
+            candidate_identity = value.get("identity") if isinstance(value, dict) else None
+            if not isinstance(candidate_identity, dict):
+                raise MonitorError("release job result has no protected identity")
+            validate_release_job_result(value, candidate_identity)
+            # result.json is atomically replaced, so its inode cannot be the
+            # stable lock target.  The private job-directory inode persists for
+            # the whole attempt and is the shared PM/worker writer fence.
+            acquire_release_result_lock(directory)
+
+        if path.is_symlink():
+            raise MonitorError(f"refusing to replace protected symlink {path}")
+        if is_release_result and path.exists():
+            current = validate_release_job_result(
+                load_private_json(path, "current release job result"),
+                value["identity"],
+            )
+            if (
+                current["state"] in {"completed", "cancelled"}
+                and current != value
+            ):
+                raise MonitorError(
+                    "refusing to replace an existing terminal release job result"
+                )
+
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{path.name}.", dir=path.parent
+        )
+        os.fchmod(descriptor, 0o600)
+        offset = 0
+        while offset < len(data):
+            offset += os.write(descriptor, data[offset:])
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        temporary = ""
+        os.fsync(directory)
     except OSError as exc:
         raise MonitorError(f"cannot protect release job state {path}: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+        if directory >= 0:
+            os.close(directory)
 
 
 def load_private_json(path: Path, label: str) -> dict:
@@ -1876,6 +2116,41 @@ def read_release_job_result(job_dir: Path, identity: dict) -> dict:
             result = dict(result)
             result.setdefault("authorityRevokedAt", cancellation["requestedAt"])
     return result
+
+
+def reestablish_terminal_release_result_durability(
+    job_dir: Path, identity: dict, expected: dict
+) -> dict:
+    """Make crash-visible terminal evidence durable before tombstone retirement."""
+    validate_release_job_directory(job_dir, identity)
+    # Keep the immutable on-disk result distinct from the read-time authority
+    # view, which may add cancellation evidence from cancel.json.  Durability
+    # recovery must republish the exact terminal value that won, never turn a
+    # derived view into a second terminal writer.
+    raw_result = validate_release_job_result(
+        load_private_json(job_dir / "result.json", "release job result"), identity
+    )
+    revalidated = read_release_job_result(job_dir, identity)
+    if (
+        revalidated != expected
+        or not terminal_release_result_proves_cleanup(raw_result)
+    ):
+        raise MonitorError(
+            "terminal release job result changed before durability recovery"
+        )
+    # A prior writer may have renamed these exact terminal bytes into place and
+    # then crashed (or received an error) before the parent-directory fsync.
+    # Republishing the raw value fsyncs its inode and the job directory
+    # again.  Any error is deliberately raised before the retained lifecycle
+    # tombstone can be forgotten, so a later restart can retry this boundary.
+    atomic_private_json(job_dir / "result.json", raw_result)
+    validate_release_job_directory(job_dir, identity)
+    persisted = read_release_job_result(job_dir, identity)
+    if persisted != revalidated:
+        raise MonitorError(
+            "terminal release job result changed during durability recovery"
+        )
+    return persisted
 
 
 def validate_release_job_directory(
@@ -2008,8 +2283,11 @@ def release_lifecycle_command(
     lifecycle_root: Path,
     repository: Path,
     identity: dict,
+    generation: dict | None = None,
     signal_name: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if action not in {"inspect", "probe", "signal", "terminate", "forget"}:
+        raise MonitorError("invalid release lifecycle action")
     argv = [
         str(Path(sys.executable).resolve()),
         "-I", "-S", "-E", "-s",
@@ -2021,80 +2299,250 @@ def release_lifecycle_command(
         "--category", "release",
         "--instance", identity["jobId"],
     ]
+    input_text: str | None = None
+    if generation is not None:
+        created_at = generation.get("createdAt")
+        launch_token = generation.get("launchToken")
+        if (
+            not isinstance(created_at, str)
+            or not created_at.endswith("Z")
+            or not isinstance(launch_token, str)
+            or re.fullmatch(r"[0-9a-f]{64}", launch_token) is None
+        ):
+            raise MonitorError("invalid exact release lifecycle generation")
+        argv += ["--expected-created-at", created_at, "--expect-token-stdin"]
+        input_text = launch_token + "\n"
+    elif action not in {"inspect", "probe"}:
+        raise MonitorError("release lifecycle mutation requires an exact generation")
     if action == "signal":
-        if signal_name not in {"TERM", "KILL"}:
+        if signal_name != "TERM":
             raise MonitorError("invalid release lifecycle signal")
         argv += ["--signal", signal_name]
+    elif signal_name is not None:
+        raise MonitorError("release lifecycle signal supplied for a non-signal action")
     try:
-        return subprocess.run(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env={
+        options = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "env": {
                 "PATH": ACTIVE_TRUSTED_PATH,
                 "PYTHONNOUSERSITE": "1",
                 "PYTHONSAFEPATH": "1",
             },
-            timeout=10,
-            check=False,
-        )
+            "timeout": 10,
+            "check": False,
+        }
+        if input_text is None:
+            options["stdin"] = subprocess.DEVNULL
+        else:
+            options["input"] = input_text
+        return subprocess.run(argv, **options)
     except (OSError, subprocess.SubprocessError) as exc:
         raise MonitorError("protected release lifecycle command failed") from exc
 
 
-def stop_orphan_release_group(
-    lifecycle_root: Path, repository: Path, identity: dict
-) -> None:
-    probe = release_lifecycle_command(
-        "probe", lifecycle_root=lifecycle_root, repository=repository, identity=identity
-    )
-    if probe.returncode not in {0, 3}:
-        raise MonitorError("protected release lifecycle record is invalid")
-    if probe.returncode == 0:
-        term = release_lifecycle_command(
-            "signal", lifecycle_root=lifecycle_root, repository=repository,
-            identity=identity, signal_name="TERM"
+RELEASE_LIFECYCLE_RECORD_KEYS = {
+    "schemaVersion", "repositoryId", "team", "category", "instance", "kind",
+    "pid", "processIdentity", "launchToken", "createdAt", "tmuxSession",
+    "tmuxWindow", "tmuxPane", "processGroupId", "sessionId", "tmuxPanePid",
+    "auth",
+}
+
+
+def exact_release_lifecycle_generation(
+    inspected: subprocess.CompletedProcess[str], identity: dict, release_pid: int
+) -> tuple[dict, str]:
+    if len(inspected.stdout.encode("utf-8")) > 4096:
+        raise MonitorError("protected release lifecycle record is too large")
+    try:
+        record = strict_json(inspected.stdout)
+    except (UnicodeError, ValueError) as exc:
+        raise MonitorError("protected release lifecycle record is malformed") from exc
+    if (
+        not isinstance(record, dict)
+        or set(record) != RELEASE_LIFECYCLE_RECORD_KEYS
+        or record.get("schemaVersion") != 3
+        or record.get("team") != identity["team"]
+        or record.get("category") != "release"
+        or record.get("instance") != identity["jobId"]
+        or record.get("kind") not in {"background", "completed-background"}
+        or record.get("pid") != release_pid
+        or record.get("processGroupId") != release_pid
+        or record.get("sessionId") != release_pid
+        or not isinstance(record.get("processIdentity"), str)
+        or not record["processIdentity"]
+        or not isinstance(record.get("repositoryId"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", record["repositoryId"]) is None
+        or not isinstance(record.get("launchToken"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", record["launchToken"]) is None
+        or not isinstance(record.get("createdAt"), str)
+        or not record["createdAt"].endswith("Z")
+        or not isinstance(record.get("auth"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", record["auth"]) is None
+        or any(
+            record.get(name) is not None
+            for name in ("tmuxSession", "tmuxWindow", "tmuxPane", "tmuxPanePid")
         )
-        if term.returncode not in {0, 3}:
-            raise MonitorError("could not terminate stale release process group")
-        deadline = time.monotonic() + RELEASE_ORPHAN_TERM_GRACE_SECONDS
-        while time.monotonic() < deadline:
-            probe = release_lifecycle_command(
-                "probe", lifecycle_root=lifecycle_root,
-                repository=repository, identity=identity
-            )
-            if probe.returncode == 3:
-                break
-            if probe.returncode != 0:
-                raise MonitorError("protected release lifecycle record became invalid")
-            time.sleep(0.05)
-        if probe.returncode == 0:
-            killed = release_lifecycle_command(
-                "signal", lifecycle_root=lifecycle_root, repository=repository,
-                identity=identity, signal_name="KILL"
-            )
-            if killed.returncode not in {0, 3}:
-                raise MonitorError("could not kill stale release process group")
-            deadline = time.monotonic() + RELEASE_ORPHAN_KILL_GRACE_SECONDS
-            while time.monotonic() < deadline:
-                probe = release_lifecycle_command(
-                    "probe", lifecycle_root=lifecycle_root,
-                    repository=repository, identity=identity
-                )
-                if probe.returncode == 3:
-                    break
-                if probe.returncode != 0:
-                    raise MonitorError("protected release lifecycle record became invalid")
-                time.sleep(0.05)
-            if probe.returncode == 0:
-                raise MonitorError("stale release process group survived SIGKILL")
+    ):
+        raise MonitorError(
+            "protected release lifecycle record does not match its release PID anchor"
+        )
+    return (
+        {
+            "createdAt": record["createdAt"],
+            "launchToken": record["launchToken"],
+            "pid": record["pid"],
+        },
+        record["kind"],
+    )
+
+
+def terminal_release_result_proves_cleanup(result: dict) -> bool:
+    return (
+        result.get("state") in {"completed", "cancelled"}
+        and type(result.get("exitCode")) is int
+        and isinstance(result.get("completedAt"), str)
+        and bool(result["completedAt"])
+    )
+
+
+def forget_release_generation(
+    lifecycle_root: Path, repository: Path, identity: dict, generation: dict
+) -> None:
     forgotten = release_lifecycle_command(
-        "forget", lifecycle_root=lifecycle_root, repository=repository, identity=identity
+        "forget", lifecycle_root=lifecycle_root, repository=repository,
+        identity=identity, generation=generation
     )
     if forgotten.returncode:
-        raise MonitorError("could not retire stale release lifecycle record")
+        raise MonitorError("could not retire exact stale release lifecycle record")
+
+
+def confirm_inspected_release_generation(
+    lifecycle_root: Path,
+    repository: Path,
+    identity: dict,
+    result: dict,
+    generation: dict,
+    release_pid: int,
+) -> str | None:
+    """Disambiguate exact probe rc=3 without treating record absence as death."""
+    inspected = release_lifecycle_command(
+        "inspect", lifecycle_root=lifecycle_root, repository=repository,
+        identity=identity
+    )
+    if inspected.returncode == 3:
+        if terminal_release_result_proves_cleanup(result):
+            return None
+        raise MonitorError(
+            "protected release lifecycle record disappeared before exact recovery"
+        )
+    if inspected.returncode != 0:
+        raise MonitorError("protected release lifecycle record is invalid")
+    observed, kind = exact_release_lifecycle_generation(
+        inspected, identity, release_pid
+    )
+    if observed != generation:
+        raise MonitorError(
+            "exact protected release lifecycle generation changed while stopping"
+        )
+    return kind
+
+
+def stop_orphan_release_group(
+    lifecycle_root: Path, repository: Path, identity: dict, result: dict,
+    *, retain_record: bool = False,
+) -> dict | None:
+    inspected = release_lifecycle_command(
+        "inspect", lifecycle_root=lifecycle_root, repository=repository,
+        identity=identity
+    )
+    if inspected.returncode == 3:
+        # A missing record is safe only before the worker durably admitted that
+        # the launch barrier may have opened.  release-worker persists the PID
+        # before registration and persists releaseMayHaveStartedAt before the
+        # go write, so this covers a crash in the PID -> register window without
+        # weakening fail-closed recovery after launch authorization.
+        if (
+            result.get("releaseMayHaveStartedAt")
+            and not terminal_release_result_proves_cleanup(result)
+        ):
+            raise MonitorError(
+                "protected release lifecycle record disappeared before exact recovery"
+            )
+        return None
+    if inspected.returncode != 0:
+        raise MonitorError("protected release lifecycle record is invalid")
+    release_pid = result.get("releasePid")
+    if type(release_pid) is not int or release_pid <= 1:
+        raise MonitorError(
+            "protected release lifecycle record has no release PID anchor"
+        )
+    generation, kind = exact_release_lifecycle_generation(
+        inspected, identity, release_pid
+    )
+    if kind == "background":
+        probe = release_lifecycle_command(
+            "probe", lifecycle_root=lifecycle_root, repository=repository,
+            identity=identity, generation=generation
+        )
+        if probe.returncode not in {0, 3}:
+            raise MonitorError(
+                "protected release lifecycle identity changed before exact recovery"
+            )
+        generation_live = probe.returncode == 0
+        if not generation_live:
+            kind = confirm_inspected_release_generation(
+                lifecycle_root, repository, identity, result, generation, release_pid
+            )
+            if kind is None:
+                return None
+        if generation_live:
+            term = release_lifecycle_command(
+                "signal", lifecycle_root=lifecycle_root, repository=repository,
+                identity=identity, generation=generation, signal_name="TERM"
+            )
+            if term.returncode not in {0, 3}:
+                raise MonitorError("could not terminate exact stale release process group")
+            deadline = time.monotonic() + RELEASE_ORPHAN_TERM_GRACE_SECONDS
+            generation_live = term.returncode == 0
+            if not generation_live:
+                kind = confirm_inspected_release_generation(
+                    lifecycle_root, repository, identity, result,
+                    generation, release_pid
+                )
+                if kind is None:
+                    return None
+            while generation_live and time.monotonic() < deadline:
+                probe = release_lifecycle_command(
+                    "probe", lifecycle_root=lifecycle_root, repository=repository,
+                    identity=identity, generation=generation
+                )
+                if probe.returncode == 3:
+                    generation_live = False
+                    kind = confirm_inspected_release_generation(
+                        lifecycle_root, repository, identity, result,
+                        generation, release_pid
+                    )
+                    if kind is None:
+                        return None
+                    break
+                if probe.returncode != 0:
+                    raise MonitorError(
+                        "exact protected release lifecycle generation changed while stopping"
+                    )
+                time.sleep(0.05)
+        if generation_live:
+            terminated = release_lifecycle_command(
+                "terminate", lifecycle_root=lifecycle_root, repository=repository,
+                identity=identity, generation=generation
+            )
+            if terminated.returncode != 0:
+                raise MonitorError("could not terminate exact stale release process group")
+    if retain_record:
+        return generation
+    forget_release_generation(lifecycle_root, repository, identity, generation)
+    return None
 
 
 def result_age_seconds(result: dict) -> float:
@@ -2125,7 +2573,12 @@ def recover_stale_release_job(
     if not stale:
         return result
     request_release_job_cancel(job_dir, identity, "run-paused")
-    stop_orphan_release_group(lifecycle_root, repository, identity)
+    # Keep the authenticated dead/completed record until the recovered terminal
+    # result is durable.  If this monitor dies at either boundary, the next pass
+    # can recover from the tombstone or trust the already-terminal result.
+    generation = stop_orphan_release_group(
+        lifecycle_root, repository, identity, result, retain_record=True
+    )
     release_may_have_started = bool(result.get("releaseMayHaveStartedAt"))
     recovered = {
         "schemaVersion": 1,
@@ -2144,7 +2597,16 @@ def recover_stale_release_job(
         recovered["authorityRevokedAt"] = iso_now()
     else:
         recovered["cancelledAt"] = iso_now()
+    if "releasePid" in result:
+        # Preserve the private PID anchor in the durable terminal result.  If
+        # this monitor dies before exact forget, the next pass can still bind
+        # the retained authenticated tombstone to the same guardian.
+        recovered["releasePid"] = result["releasePid"]
     atomic_private_json(job_dir / "result.json", recovered)
+    if generation is not None:
+        forget_release_generation(
+            lifecycle_root, repository, identity, generation
+        )
     entry["releaseJobState"] = "recovered-stale-worker"
     return recovered
 
@@ -2166,9 +2628,21 @@ def active_release_job(entry: dict, repository: Path, lifecycle_root: Path) -> t
     job_dir = release_job_directory(lifecycle_root, identity)
     validate_release_job_directory(job_dir, identity)
     result = read_release_job_result(job_dir, identity)
-    result = recover_stale_release_job(
-        entry, repository, lifecycle_root, identity, job_dir, result
-    )
+    if terminal_release_result_proves_cleanup(result):
+        # A visible terminal result may come from a writer that crashed after
+        # rename but before its parent-directory fsync.  Revalidate and
+        # identically republish it before completing idempotent retirement in
+        # the terminal-result -> forget window.
+        result = reestablish_terminal_release_result_durability(
+            job_dir, identity, result
+        )
+        stop_orphan_release_group(
+            lifecycle_root, repository, identity, result
+        )
+    else:
+        result = recover_stale_release_job(
+            entry, repository, lifecycle_root, identity, job_dir, result
+        )
     return identity, job_dir, result
 
 
@@ -2452,32 +2926,19 @@ def has_launch_eligible_task(items: list[dict], launch_statuses: frozenset[str])
     return eligible
 
 
-def ignored_task_labels(automation: dict) -> tuple[str, ...]:
+def ignored_task_labels(automation: dict, config_path: Path) -> tuple[str, ...]:
     """Return canonical case-insensitive labels excluded from autonomous work."""
-    raw = automation.get("ignoredTaskLabels", ["human-work"])
-    if not isinstance(raw, list):
-        raise MonitorError("ignoredTaskLabels must be a list of label names")
-    labels: list[str] = []
-    seen: set[str] = set()
-    for value in raw:
-        if not isinstance(value, str):
-            raise MonitorError("ignoredTaskLabels must contain only label names")
-        label = value.strip()
-        if (
-            not label
-            or label != value
-            or len(label) > 255
-            or any(ord(char) < 32 for char in label)
-        ):
-            raise MonitorError(
-                "ignoredTaskLabels entries must be canonical non-empty label names up to 255 characters"
-            )
-        canonical = label.casefold()
-        if canonical in seen:
-            raise MonitorError("ignoredTaskLabels must not contain case-insensitive duplicates")
-        seen.add(canonical)
-        labels.append(canonical)
-    return tuple(labels)
+    del automation  # The resolver re-reads the authenticated config path.
+    ambient = (
+        os.environ.get("STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON")
+        if "STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON" in os.environ
+        else None
+    )
+    try:
+        labels = authority_resolver().configured_ignored_labels(config_path, ambient)
+    except RuntimeError as exc:
+        raise MonitorError(str(exc)) from exc
+    return tuple(label.casefold() for label in labels)
 
 
 def partition_automated_tasks(
@@ -3230,13 +3691,20 @@ def one_pass(*, dry_run: bool) -> int:
     if not enabled and not dry_run:
         print("pm-agent: disabled (set enabled=true in config/automation.config.json)")
         return 0
-    validate_pm_automation(project)
+    tracker_adapter, pm_config_path = validate_pm_automation(project)
     lifecycle_root = validate_team_safety(config, project)
+    ignored_labels = ignored_task_labels(config, config_path)
     release_command, deployment_config, release_environment = validate_release_handoff(
-        project, dry_run=dry_run
+        project,
+        automation_config_path=config_path,
+        pm_config_path=pm_config_path,
+        dry_run=dry_run,
     )
     automation_root = contained(project, str(config.get("workspaceRoot") or ""), "workspaceRoot")
     env = supervisor_child_environment()
+    env["TRACKER_ADAPTER"] = tracker_adapter
+    env["STARTUP_FACTORY_AUTOMATION_CONFIG"] = str(config_path)
+    env["STARTUP_FACTORY_PM_CONFIG"] = str(pm_config_path)
     env["TRACKER_PROJECT_ROOT"] = str(project)
     env["STARTUP_FACTORY_RETROSPECTIVE_PROJECT_ROOT"] = str(project)
     env["STARTUP_FACTORY_LIFECYCLE_STATE_ROOT"] = str(lifecycle_root)
@@ -3249,7 +3717,6 @@ def one_pass(*, dry_run: bool) -> int:
         return 0
     try:
         statuses, launch_statuses = resolve_portfolio_policy(config)
-        ignored_labels = ignored_task_labels(config)
         if dry_run:
             with tempfile.TemporaryDirectory(prefix="startup-factory-scan-") as temp:
                 scan = scan_board(project, env, statuses, Path(temp) / "scan.json")
@@ -3542,7 +4009,7 @@ def one_pass(*, dry_run: bool) -> int:
                 )
             try:
                 items = export_registered_feature(project, env, feature_id, authorization_path)
-            except MonitorError as exc:
+            except MonitorError:
                 print(
                     f"pm-agent: {safe_log_value(feature_id)} not launched: "
                     "the complete authoritative [feature] export could not be verified",
@@ -4080,6 +4547,7 @@ def watch_supervisor(
 
 def print_cron() -> int:
     config, config_path, project, interpreter = bootstrap_automation()
+    _tracker_adapter, pm_config_path = validate_pm_automation(project)
     lifecycle_root = validate_team_safety(config, project)
     seconds = scan_interval_seconds(config)
     if seconds < 60 or seconds % 60:
@@ -4113,6 +4581,7 @@ def print_cron() -> int:
         f"cd {shlex.quote(str(project))} && "
         f"STARTUP_FACTORY_PROJECT_ROOT={shlex.quote(str(project))} "
         f"STARTUP_FACTORY_AUTOMATION_CONFIG={shlex.quote(str(config_path))} "
+        f"STARTUP_FACTORY_PM_CONFIG={shlex.quote(str(pm_config_path))} "
         f"STARTUP_FACTORY_LIFECYCLE_STATE_ROOT={shlex.quote(str(lifecycle_root))} "
         f"PATH={shlex.quote(ACTIVE_TRUSTED_PATH)} "
         f"{shlex.quote(str(interpreter))} -I -S -E -s {shlex.quote(str(Path(__file__).resolve()))} --once "

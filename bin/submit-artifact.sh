@@ -7,13 +7,8 @@ SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="$SKILL_DIR/config/team.config.md"
 
 read_key() {
-  local line value _t
-  line="$(grep -m1 "^$1=" "$CONFIG" || true)"
-  value="${line#*=}"
-  if [ "${value#\"}" != "$value" ]; then value="${value#\"}"; value="${value%%\"*}"
-  else value="${value%%[[:space:]]#*}"; _t="${value##*[![:space:]]}"; value="${value%"$_t"}"; fi
-  [ "$value" = "null" ] && value=""
-  printf '%s' "$value"
+  python3 "$SKILL_DIR/bin/config-value.py" --config "$CONFIG" \
+    --label "team config" --prefix submit-artifact value "$1"
 }
 
 [ $# -eq 8 ] || {
@@ -39,6 +34,7 @@ esac
 # protected execution record; this early check makes accidental or opportunistic
 # cross-task/role submissions fail before any outbox state is created.
 launched=no
+authenticated_launch=no
 if [ -n "${STARTUP_FACTORY_EXECUTION_KIND:-}${STARTUP_FACTORY_TEAM:-}${STARTUP_FACTORY_FEATURE_ID:-}${STARTUP_FACTORY_ROLE:-}" ]; then
   launched=yes
   for name in STARTUP_FACTORY_EXECUTION_KIND STARTUP_FACTORY_TEAM STARTUP_FACTORY_FEATURE_ID STARTUP_FACTORY_ROLE STARTUP_FACTORY_TASK_ID STARTUP_FACTORY_ATTEMPT; do
@@ -63,25 +59,33 @@ if [ -n "${STARTUP_FACTORY_EXECUTION_KIND:-}${STARTUP_FACTORY_TEAM:-}${STARTUP_F
       ;;
     *) echo "submit-artifact: unknown fixed execution kind" >&2; exit 1 ;;
   esac
-  for name in STARTUP_FACTORY_INSTANCE STARTUP_FACTORY_CANONICAL_REPO STARTUP_FACTORY_CANONICAL_WORKSPACE \
-      STARTUP_FACTORY_OUTBOX_CAPABILITY_ID STARTUP_FACTORY_OUTBOX_CAPABILITY_SECRET \
-      STARTUP_FACTORY_OUTBOX_CAPABILITY_EXPIRES_AT; do
-    [ -n "${!name:-}" ] || { echo "submit-artifact: incomplete launched-role capability ($name is absent)" >&2; exit 1; }
-  done
-elif [ -n "${STARTUP_FACTORY_OUTBOX_CAPABILITY_ID:-}${STARTUP_FACTORY_OUTBOX_CAPABILITY_SECRET:-}${STARTUP_FACTORY_OUTBOX_CAPABILITY_EXPIRES_AT:-}" ]; then
+  if [ -n "${STARTUP_FACTORY_OUTBOX_CAPABILITY_ID:-}${STARTUP_FACTORY_OUTBOX_CAPABILITY_SECRET:-}${STARTUP_FACTORY_OUTBOX_CAPABILITY_EXPIRES_AT:-}" ]; then
+    echo "submit-artifact: raw outbox capability values are forbidden in a worker environment" >&2
+    exit 1
+  fi
+  if [ -n "${STARTUP_FACTORY_OUTBOX_TRANSPORT:-}" ]; then
+    authenticated_launch=yes
+    for name in STARTUP_FACTORY_INSTANCE STARTUP_FACTORY_CANONICAL_REPO STARTUP_FACTORY_CANONICAL_WORKSPACE; do
+      [ -n "${!name:-}" ] || { echo "submit-artifact: incomplete launched-role capability ($name is absent)" >&2; exit 1; }
+    done
+  elif [ -n "${STARTUP_FACTORY_INSTANCE:-}${STARTUP_FACTORY_CANONICAL_REPO:-}${STARTUP_FACTORY_CANONICAL_WORKSPACE:-}" ]; then
+    echo "submit-artifact: partial publication transport identity is forbidden" >&2
+    exit 1
+  fi
+elif [ -n "${STARTUP_FACTORY_OUTBOX_TRANSPORT:-}${STARTUP_FACTORY_OUTBOX_CAPABILITY_ID:-}${STARTUP_FACTORY_OUTBOX_CAPABILITY_SECRET:-}${STARTUP_FACTORY_OUTBOX_CAPABILITY_EXPIRES_AT:-}" ]; then
   echo "submit-artifact: an outbox capability is invalid without the complete fixed runtime identity" >&2
   exit 1
 fi
 
 current_repo="$(git rev-parse --show-toplevel)"
-if [ "$launched" = yes ]; then
+if [ "$authenticated_launch" = yes ]; then
   repo="$STARTUP_FACTORY_CANONICAL_REPO"
 else
   repo="$current_repo"
 fi
 root="$(read_key TEAMWORK_ROOT)"; root="${root:-.teamwork}"
 workspace="$(python3 "$SKILL_DIR/bin/teamwork-path.py" workspace --repo "$repo" --root "$root" --team "$team")"
-if [ "$launched" = yes ]; then
+if [ "$authenticated_launch" = yes ]; then
   [ "$workspace" = "$STARTUP_FACTORY_CANONICAL_WORKSPACE" ] \
     || { echo "submit-artifact: launcher-fixed canonical workspace does not match team configuration" >&2; exit 1; }
   # A linked task worktree is valid only when it belongs to the same Git common
@@ -182,25 +186,18 @@ data = {
     'bodyPath': body, 'targetStatus': None if target == '-' else target,
     'phase': 'pending', 'createdAt': datetime.now(timezone.utc).isoformat(timespec='seconds')
 }
-capability_values = {
-    'id': os.environ.get('STARTUP_FACTORY_OUTBOX_CAPABILITY_ID', ''),
-    'secret': os.environ.get('STARTUP_FACTORY_OUTBOX_CAPABILITY_SECRET', ''),
-    'instance': os.environ.get('STARTUP_FACTORY_INSTANCE', ''),
-    'expires': os.environ.get('STARTUP_FACTORY_OUTBOX_CAPABILITY_EXPIRES_AT', ''),
-}
-if any(capability_values.values()):
-    if not all(capability_values.values()):
-        raise SystemExit('submit-artifact: incomplete producer capability while signing entry')
+transport = os.environ.get('STARTUP_FACTORY_OUTBOX_TRANSPORT', '')
+if transport:
+    sys.dont_write_bytecode = True
     sys.path.insert(0, os.path.join(skill_dir, 'bin'))
-    from outbox_capability import CapabilityError, sign_entry
+    from outbox_capability import CapabilityError, request_signature
     try:
-        data['producerCapability'] = sign_entry(
-            data, open(body, 'rb').read(), capability_values['id'],
-            capability_values['secret'], capability_values['instance'],
-            int(capability_values['expires']),
-        )
-    except (CapabilityError, OSError, ValueError) as exc:
-        raise SystemExit('submit-artifact: cannot sign producer entry: %s' % exc)
+        with open(body, 'rb') as handle:
+            data['producerCapability'] = request_signature(
+                transport, data, handle.read()
+            )
+    except (CapabilityError, OSError) as exc:
+        raise SystemExit('submit-artifact: publication authorization denied') from exc
 with open(temp, 'w') as handle:
     json.dump(data, handle, indent=2)
     handle.write('\n')

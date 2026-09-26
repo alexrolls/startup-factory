@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "tracker-jira",
+  "kind": "tracker",
+  "displayName": "Jira tracker",
+  "summary": "Select the Jira tracker while keeping its endpoint and credentials in the operator environment.",
+  "compatibility": {
+    "minimumVersion": "0.2.0",
+    "platforms": ["darwin", "linux"],
+    "state": "supported"
+  },
+  "prerequisites": ["The Jira adapter is installed, and its existing MCP or REST access mode owns authentication."],
+  "credentials": {
+    "policy": "adapter-managed",
+    "required": []
+  },
+  "capability": {
+    "adapter": "Jira",
+    "teamMode": true
+  }
+}

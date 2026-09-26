@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "tracker-markdown",
+  "kind": "tracker",
+  "displayName": "Markdown tracker",
+  "summary": "Use the repository-native Markdown control plane without external credentials.",
+  "compatibility": {
+    "minimumVersion": "0.2.0",
+    "platforms": ["darwin", "linux"],
+    "state": "supported"
+  },
+  "prerequisites": ["The repository includes the Markdown tracker adapter."],
+  "credentials": {
+    "policy": "none",
+    "required": []
+  },
+  "capability": {
+    "adapter": "Markdown",
+    "teamMode": true
+  }
+}

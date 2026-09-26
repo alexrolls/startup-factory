@@ -24,9 +24,13 @@ mkdir -p \
   "$UPSTREAM/adapters" \
   "$UPSTREAM/bin" \
   "$UPSTREAM/config" \
+  "$UPSTREAM/extensions/integration-packs/ci" \
+  "$UPSTREAM/extensions/integration-packs/deployment" \
+  "$UPSTREAM/extensions/integration-packs/tracker" \
   "$UPSTREAM/extensions/tracker-backends" \
   "$UPSTREAM/reference" \
   "$UPSTREAM/roles" \
+  "$UPSTREAM/src/startup_factory_cli" \
   "$UPSTREAM/teams" \
   "$UPSTREAM/tests" \
   "$TARGET"
@@ -47,33 +51,83 @@ for adapter in GitHubIssues Jira Linear Markdown; do
   printf 'fixture adapter:%s\n' "$adapter" > "$UPSTREAM/adapters/$adapter.md"
 done
 for required_file in \
+  SECURITY.md \
   adapters/_TEMPLATE.md \
   bin/agent-health.py \
+  bin/authority_config.py \
+  bin/authority-bootstrap.sh \
+  bin/config-value.py \
+  bin/beta-readiness.py \
   bin/board-status.py \
+  bin/broker_evidence.py \
+  bin/delivery_profile.py \
   bin/dispatch.sh \
   bin/heartbeat-status.py \
+  bin/integration_pack.py \
+  bin/lineage-migration.py \
+  bin/launch-lane-lock.py \
   bin/launch-team.sh \
+  bin/outbox_capability.py \
   bin/process-lifecycle.py \
+  bin/publication-supervisor.py \
   bin/superpowers-planning.py \
   bin/pm-agent.py \
   bin/policy-check.py \
   bin/release-feature.py \
+  bin/release-worker.py \
+  bin/recovery_validation.py \
   bin/retrospective.py \
   bin/runtime-state.py \
   bin/ticket_content_security.py \
   bin/teamwork-path.py \
+  bin/team-context.py \
   bin/tracker-ops.sh \
+  bin/worker-control.py \
   extensions/tracker-backends/README.md \
+  extensions/integration-packs/README.md \
+  extensions/integration-packs/schema.json \
+  extensions/integration-packs/ci/github-actions-exact-commit.json \
+  extensions/integration-packs/deployment/docker-compose.json \
+  extensions/integration-packs/deployment/kubernetes.json \
+  extensions/integration-packs/tracker/github-issues.json \
+  extensions/integration-packs/tracker/jira.json \
+  extensions/integration-packs/tracker/linear.json \
+  extensions/integration-packs/tracker/markdown.json \
   reference/automation.md \
   reference/deployment.md \
   reference/guardrails.md \
   reference/superpowers-planning.md \
   roles/senior-security-engineer.md \
   roles/team-lead.md \
+  src/startup_factory_cli/__init__.py \
+  src/startup_factory_cli/config_values.py \
+  src/startup_factory_cli/installer.py \
+  src/startup_factory_cli/integration_packs.py \
+  src/startup_factory_cli/project_config.py \
+  src/startup_factory_cli/secret_safety.py \
+  tests/claim-lineage-runtime-test.py \
+  tests/lineage-migration-test.py \
+  tests/launch-lane-lock-test.py \
+  tests/release-worker-test.py \
+  tests/run-all.sh \
   teams/_PLAYBOOK.md
 do
   printf 'fixture:%s\n' "$required_file" > "$UPSTREAM/$required_file"
 done
+cp "$ROOT/bin/config-value.py" "$UPSTREAM/bin/config-value.py"
+cp "$ROOT/src/startup_factory_cli/config_values.py" \
+  "$UPSTREAM/src/startup_factory_cli/config_values.py"
+chmod 755 \
+  "$UPSTREAM/bin/config-value.py" \
+  "$UPSTREAM/bin/lineage-migration.py" \
+  "$UPSTREAM/bin/launch-lane-lock.py" \
+  "$UPSTREAM/bin/release-worker.py" \
+  "$UPSTREAM/bin/team-context.py" \
+  "$UPSTREAM/bin/worker-control.py" \
+  "$UPSTREAM/tests/claim-lineage-runtime-test.py" \
+  "$UPSTREAM/tests/lineage-migration-test.py" \
+  "$UPSTREAM/tests/launch-lane-lock-test.py" \
+  "$UPSTREAM/tests/run-all.sh"
 printf 'fixture\n' > "$UPSTREAM/tests/.fixture"
 
 CONFIG_FILES=(
@@ -120,6 +174,27 @@ printf '%s\n' \
 git -C "$UPSTREAM" add .
 git -C "$UPSTREAM" commit -qm fixture-v1
 V1_COMMIT="$(git -C "$UPSTREAM" rev-parse HEAD)"
+
+# A preview must treat the fetched ref as data.  In particular, it must not
+# execute a parser supplied by that ref merely to inspect preserved config.
+git -C "$UPSTREAM" checkout -qb malicious-parser
+cat > "$UPSTREAM/bin/config-value.py" <<'EOF'
+#!/usr/bin/env bash
+: > "$REMOTE_PARSER_MARKER"
+exit 97
+EOF
+chmod 755 "$UPSTREAM/bin/config-value.py"
+git -C "$UPSTREAM" add bin/config-value.py
+git -C "$UPSTREAM" commit -qm malicious-parser-fixture
+MALICIOUS_PREVIEW="$TARGET/.agents/skills/malicious-parser-preview"
+env REMOTE_PARSER_MARKER="$TMP/remote-parser-executed" \
+  STARTUP_FACTORY_REMOTE_URL="$UPSTREAM" STARTUP_FACTORY_REF=malicious-parser \
+  bash "$ROOT/bin/update-installed-skill.sh" \
+    --install-dir "$MALICIOUS_PREVIEW" --dry-run \
+    > "$TMP/malicious-parser-preview.out"
+check "dry-run never executes the fetched configuration parser" \
+  test ! -e "$TMP/remote-parser-executed"
+git -C "$UPSTREAM" checkout -q main
 
 FRESH_PREVIEW="$TARGET/.agents/skills/preview-startup-factory"
 env STARTUP_FACTORY_REMOTE_URL="$UPSTREAM" STARTUP_FACTORY_REF=main \
@@ -200,9 +275,13 @@ mkdir -p \
   "$INSTALL/bin" \
   "$INSTALL/config" \
   "$INSTALL/extensions/tracker-backends" \
+  "$INSTALL/src/startup_factory_cli" \
   "$INSTALL/teams/commands" \
   "$INSTALL/teams/roles"
 cp "$ROOT/bin/update-installed-skill.sh" "$INSTALL/bin/update-installed-skill.sh"
+cp "$ROOT/bin/config-value.py" "$INSTALL/bin/config-value.py"
+cp "$ROOT/src/startup_factory_cli/config_values.py" \
+  "$INSTALL/src/startup_factory_cli/config_values.py"
 cp "$UPSTREAM/SKILL.md" "$INSTALL/SKILL.md"
 printf 'stale\n' > "$INSTALL/stale-runtime.txt"
 printf 'custom-adapter\n' > "$INSTALL/adapters/Acme.md"
@@ -322,6 +401,11 @@ rm "$UPSTREAM/adapters/Retired.md"
 for name in "${CONFIG_FILES[@]}"; do
   printf 'upstream-v2:%s\n' "$name" > "$UPSTREAM/config/$name"
 done
+printf '%s\n' \
+  'AGENT_SANDBOX_ENFORCED=true' \
+  'AGENT_SANDBOX_RUNNER=null' \
+  'BROKER_LIFECYCLE_ROOT=null' \
+  > "$UPSTREAM/config/team.config.md"
 write_status_fixture "$UPSTREAM/config/statuses.config.json" v2
 printf '%s\n' \
   'PRODUCT_MANAGEMENT_TOOL=BuiltIn' \
@@ -332,6 +416,44 @@ git -C "$UPSTREAM" add .
 git -C "$UPSTREAM" commit -qm fixture-v2
 V2_COMMIT="$(git -C "$UPSTREAM" rev-parse HEAD)"
 
+LEGACY_SANDBOX_RUNNER="$TMP/legacy-sandbox-runner"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$LEGACY_SANDBOX_RUNNER"
+chmod 0700 "$LEGACY_SANDBOX_RUNNER"
+printf '%s\n' \
+  'AGENT_SANDBOX_ENFORCED=true' \
+  "AGENT_SANDBOX_RUNNER=\"$LEGACY_SANDBOX_RUNNER\"" \
+  'BROKER_LIFECYCLE_ROOT=null' \
+  > "$INSTALL/config/team.config.md"
+
+MISSING_AUTH_INSTALL="$TARGET/.agents/skills/missing-authority-startup-factory"
+cp -R "$INSTALL" "$MISSING_AUTH_INSTALL"
+printf 'AGENT_SANDBOX_ENFORCED=true\n' > "$MISSING_AUTH_INSTALL/config/team.config.md"
+env STARTUP_FACTORY_REMOTE_URL="$UPSTREAM" STARTUP_FACTORY_REF=main \
+  bash "$MISSING_AUTH_INSTALL/bin/update-installed-skill.sh" --dry-run \
+    > "$TMP/missing-authority.out"
+check "dry-run diagnoses a missing preserved lifecycle root" \
+  grep -q 'no configured BROKER_LIFECYCLE_ROOT' "$TMP/missing-authority.out"
+check "dry-run diagnoses a missing enforced preserved sandbox runner" \
+  grep -q 'AGENT_SANDBOX_RUNNER is missing or null' "$TMP/missing-authority.out"
+
+SAFE_SYSTEM_RUNNER="$(python3 - <<'PY'
+from pathlib import Path
+print(Path('/usr/bin/true').resolve(strict=True))
+PY
+)"
+SAFE_AUTH_INSTALL="$TARGET/.agents/skills/safe-authority-startup-factory"
+cp -R "$INSTALL" "$SAFE_AUTH_INSTALL"
+printf '%s\n' \
+  'AGENT_SANDBOX_ENFORCED=true' \
+  "AGENT_SANDBOX_RUNNER=\"$SAFE_SYSTEM_RUNNER\"" \
+  'BROKER_LIFECYCLE_ROOT=/var/lib/startup-factory/lifecycle' \
+  > "$SAFE_AUTH_INSTALL/config/team.config.md"
+env STARTUP_FACTORY_REMOTE_URL="$UPSTREAM" STARTUP_FACTORY_REF=main \
+  bash "$SAFE_AUTH_INSTALL/bin/update-installed-skill.sh" --dry-run \
+    > "$TMP/safe-authority.out"
+check "configured lifecycle and protected system runner need no migration warning" \
+  sh -c "! grep -Eq 'no configured BROKER_LIFECYCLE_ROOT|does not satisfy the 0.2.0 protected-runner contract' '$TMP/safe-authority.out'"
+
 before_configs="$TMP/before-configs"
 mkdir -p "$before_configs"
 cp "$INSTALL"/config/* "$before_configs"/
@@ -341,6 +463,12 @@ env STARTUP_FACTORY_REMOTE_URL="$UPSTREAM" STARTUP_FACTORY_REF=main \
 
 check "dry-run reports a new runtime file" grep -q 'runtime-v2.txt' "$TMP/dry-run.out"
 check "dry-run reports a planned change count" grep -Eq 'Planned filesystem changes: [1-9][0-9]*' "$TMP/dry-run.out"
+check "dry-run guides the preserved lifecycle authority migration" \
+  grep -q 'preserved config/team.config.md has no configured BROKER_LIFECYCLE_ROOT' "$TMP/dry-run.out"
+check "migration warning rejects ambient-only lifecycle authority" \
+  grep -q 'STARTUP_FACTORY_LIFECYCLE_STATE_ROOT may only repeat that exact configured value' "$TMP/dry-run.out"
+check "dry-run diagnoses the old operator-owned mode-0700 sandbox runner" \
+  grep -q 'AGENT_SANDBOX_RUNNER is not root-owned' "$TMP/dry-run.out"
 check "dry-run does not install the new runtime file" test ! -e "$INSTALL/runtime-v2.txt"
 check "dry-run leaves source provenance byte-identical" \
   cmp -s "$TMP/provenance-before-dry-run.json" "$INSTALL/.startup-factory-source-install.json"
@@ -356,6 +484,10 @@ check "upstream-owned adapter is updated" grep -qx 'upstream-adapter-v2' "$INSTA
 check "retired upstream adapter is deleted" test ! -e "$INSTALL/adapters/Retired.md"
 check "real update reports its filesystem change count" \
   grep -Eq 'Applied filesystem changes: [1-9][0-9]*' "$TMP/update.out"
+check "real update repeats the lifecycle authority migration" \
+  grep -q 'BROKER_LIFECYCLE_ROOT to the canonical external mode-0700 lifecycle path' "$TMP/update.out"
+check "real update repeats the sandbox-runner reprovisioning migration" \
+  grep -q 'complete ancestor chain are root-owned' "$TMP/update.out"
 check "real update refreshes deterministic source provenance" \
   grep -Fqx \
     "{\"schemaVersion\":1,\"name\":\"startup-factory\",\"sourceCommit\":\"$V2_COMMIT\"}" \
@@ -420,6 +552,8 @@ done
 check "overwrite-config still preserves a custom adapter" grep -qx 'custom-adapter' "$INSTALL/adapters/Acme.md"
 check "overwrite-config still preserves a custom tracker backend" grep -qx 'custom-backend' "$INSTALL/extensions/tracker-backends/Acme.py"
 check "overwrite-config still preserves a custom team" grep -qx 'custom-team' "$INSTALL/teams/acme.md"
+check "overwrite-config suppresses preserved-authority migration warnings" \
+  sh -c "! grep -Eq 'no configured BROKER_LIFECYCLE_ROOT|does not satisfy the 0.2.0 protected-runner contract' '$TMP/overwrite.out'"
 
 if env STARTUP_FACTORY_REMOTE_URL="$UPSTREAM" STARTUP_FACTORY_REF=main \
     bash "$ROOT/bin/update-installed-skill.sh" \
@@ -466,6 +600,124 @@ elif grep -q 'bundle is incomplete: missing adapters/Jira.md' "$TMP/missing-buil
   echo "ok: source missing a shipped tracker adapter is rejected before mutation"
 else
   echo "FAIL: missing shipped tracker adapter produced the wrong result"
+  FAILURES=$((FAILURES + 1))
+fi
+
+for missing_authority in bin/authority-bootstrap.sh bin/authority_config.py; do
+  missing_name="${missing_authority##*/}"
+  missing_root="$TMP/missing-${missing_name%.*}-upstream"
+  git clone -q "$UPSTREAM" "$missing_root"
+  git -C "$missing_root" config user.email test@example.com
+  git -C "$missing_root" config user.name Test
+  git -C "$missing_root" rm -q "$missing_authority"
+  git -C "$missing_root" commit -qm "missing $missing_name"
+  cp "$INSTALL/runtime-v2.txt" "$TMP/runtime-before-$missing_name"
+  if env STARTUP_FACTORY_REMOTE_URL="$missing_root" STARTUP_FACTORY_REF=main \
+      bash "$INSTALL/bin/update-installed-skill.sh" \
+        > "$TMP/missing-$missing_name.out" 2>&1; then
+    echo "FAIL: source missing $missing_authority was accepted"
+    FAILURES=$((FAILURES + 1))
+  elif grep -q "bundle is incomplete: missing $missing_authority" \
+        "$TMP/missing-$missing_name.out" && \
+      cmp -s "$TMP/runtime-before-$missing_name" "$INSTALL/runtime-v2.txt"; then
+    echo "ok: source missing $missing_authority is rejected before mutation"
+  else
+    echo "FAIL: missing $missing_authority produced the wrong result"
+    FAILURES=$((FAILURES + 1))
+  fi
+done
+
+for required_release_file in \
+  SECURITY.md \
+  bin/publication-supervisor.py \
+  bin/release-worker.py \
+  bin/launch-lane-lock.py \
+  bin/lineage-migration.py \
+  bin/outbox_capability.py \
+  bin/team-context.py \
+  bin/worker-control.py \
+  tests/claim-lineage-runtime-test.py \
+  tests/lineage-migration-test.py \
+  tests/launch-lane-lock-test.py \
+  tests/release-worker-test.py \
+  tests/run-all.sh
+do
+  release_name="${required_release_file##*/}"
+  release_stem="${release_name%.*}"
+  missing_root="$TMP/missing-${release_stem}-upstream"
+  git clone -q "$UPSTREAM" "$missing_root"
+  git -C "$missing_root" config user.email test@example.com
+  git -C "$missing_root" config user.name Test
+  git -C "$missing_root" rm -q "$required_release_file"
+  git -C "$missing_root" commit -qm "missing $release_name"
+  cp "$INSTALL/runtime-v2.txt" "$TMP/runtime-before-$release_stem"
+  if env STARTUP_FACTORY_REMOTE_URL="$missing_root" STARTUP_FACTORY_REF=main \
+      bash "$INSTALL/bin/update-installed-skill.sh" \
+        > "$TMP/missing-$release_stem.out" 2>&1; then
+    echo "FAIL: source missing $required_release_file was accepted"
+    FAILURES=$((FAILURES + 1))
+  elif grep -q "bundle is incomplete: missing $required_release_file" \
+        "$TMP/missing-$release_stem.out" && \
+      cmp -s "$TMP/runtime-before-$release_stem" "$INSTALL/runtime-v2.txt"; then
+    echo "ok: source missing $required_release_file is rejected before mutation"
+  else
+    echo "FAIL: missing $required_release_file produced the wrong result"
+    FAILURES=$((FAILURES + 1))
+  fi
+done
+
+MISSING_PACK_MODULE_UPSTREAM="$TMP/missing-pack-module-upstream"
+git clone -q "$UPSTREAM" "$MISSING_PACK_MODULE_UPSTREAM"
+git -C "$MISSING_PACK_MODULE_UPSTREAM" config user.email test@example.com
+git -C "$MISSING_PACK_MODULE_UPSTREAM" config user.name Test
+git -C "$MISSING_PACK_MODULE_UPSTREAM" rm -q src/startup_factory_cli/integration_packs.py
+git -C "$MISSING_PACK_MODULE_UPSTREAM" commit -qm missing-pack-module
+if env STARTUP_FACTORY_REMOTE_URL="$MISSING_PACK_MODULE_UPSTREAM" STARTUP_FACTORY_REF=main \
+    bash "$INSTALL/bin/update-installed-skill.sh" > "$TMP/missing-pack-module.out" 2>&1; then
+  echo "FAIL: source missing the canonical pack module was accepted"
+  FAILURES=$((FAILURES + 1))
+elif grep -q 'bundle is incomplete: missing src/startup_factory_cli/integration_packs.py' \
+      "$TMP/missing-pack-module.out"; then
+  echo "ok: source missing the canonical pack module is rejected before mutation"
+else
+  echo "FAIL: missing canonical pack module produced the wrong result"
+  FAILURES=$((FAILURES + 1))
+fi
+
+MISSING_SECRET_MODULE_UPSTREAM="$TMP/missing-secret-module-upstream"
+git clone -q "$UPSTREAM" "$MISSING_SECRET_MODULE_UPSTREAM"
+git -C "$MISSING_SECRET_MODULE_UPSTREAM" config user.email test@example.com
+git -C "$MISSING_SECRET_MODULE_UPSTREAM" config user.name Test
+git -C "$MISSING_SECRET_MODULE_UPSTREAM" rm -q src/startup_factory_cli/secret_safety.py
+git -C "$MISSING_SECRET_MODULE_UPSTREAM" commit -qm missing-secret-module
+if env STARTUP_FACTORY_REMOTE_URL="$MISSING_SECRET_MODULE_UPSTREAM" STARTUP_FACTORY_REF=main \
+    bash "$INSTALL/bin/update-installed-skill.sh" > "$TMP/missing-secret-module.out" 2>&1; then
+  echo "FAIL: source missing the shared secret-safety module was accepted"
+  FAILURES=$((FAILURES + 1))
+elif grep -q 'bundle is incomplete: missing src/startup_factory_cli/secret_safety.py' \
+      "$TMP/missing-secret-module.out"; then
+  echo "ok: source missing the shared secret-safety module is rejected before mutation"
+else
+  echo "FAIL: missing shared secret-safety module produced the wrong result"
+  FAILURES=$((FAILURES + 1))
+fi
+
+MISSING_PACK_CATALOG_UPSTREAM="$TMP/missing-pack-catalog-upstream"
+git clone -q "$UPSTREAM" "$MISSING_PACK_CATALOG_UPSTREAM"
+git -C "$MISSING_PACK_CATALOG_UPSTREAM" config user.email test@example.com
+git -C "$MISSING_PACK_CATALOG_UPSTREAM" config user.name Test
+git -C "$MISSING_PACK_CATALOG_UPSTREAM" rm -q \
+  extensions/integration-packs/tracker/markdown.json
+git -C "$MISSING_PACK_CATALOG_UPSTREAM" commit -qm missing-pack-catalog
+if env STARTUP_FACTORY_REMOTE_URL="$MISSING_PACK_CATALOG_UPSTREAM" STARTUP_FACTORY_REF=main \
+    bash "$INSTALL/bin/update-installed-skill.sh" > "$TMP/missing-pack-catalog.out" 2>&1; then
+  echo "FAIL: source missing a reference integration pack was accepted"
+  FAILURES=$((FAILURES + 1))
+elif grep -q 'bundle is incomplete: missing extensions/integration-packs/tracker/markdown.json' \
+      "$TMP/missing-pack-catalog.out"; then
+  echo "ok: source missing a reference integration pack is rejected before mutation"
+else
+  echo "FAIL: missing reference integration pack produced the wrong result"
   FAILURES=$((FAILURES + 1))
 fi
 
@@ -554,11 +806,15 @@ REAL_RSYNC="$(command -v rsync)"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -eu' \
-  'printf "\\nCONCURRENT_EDIT=true\\n" >> "$RACE_CONFIG"' \
+  'if [ ! -e "$RACE_MARKER" ]; then' \
+  '  : > "$RACE_MARKER"' \
+  '  printf "\\nCONCURRENT_EDIT=true\\n" >> "$RACE_CONFIG"' \
+  'fi' \
   'exec "$REAL_RSYNC" "$@"' \
   > "$RACE_BIN/rsync"
 chmod 755 "$RACE_BIN/rsync"
 if env PATH="$RACE_BIN:$PATH" REAL_RSYNC="$REAL_RSYNC" \
+    RACE_MARKER="$TMP/race-config-edited" \
     RACE_CONFIG="$RACE_INSTALL/config/project-management.config.md" \
     STARTUP_FACTORY_REMOTE_URL="$UPSTREAM" STARTUP_FACTORY_REF=main \
     bash "$RACE_INSTALL/bin/update-installed-skill.sh" \

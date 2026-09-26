@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://startup-factory.local/schemas/integration-pack-v1.json",
+  "title": "Startup Factory integration pack v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "kind",
+    "displayName",
+    "summary",
+    "compatibility",
+    "prerequisites",
+    "credentials",
+    "capability"
+  ],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "id": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"},
+    "kind": {"enum": ["tracker", "ci", "deployment"]},
+    "displayName": {"type": "string", "minLength": 1, "maxLength": 96},
+    "summary": {"type": "string", "minLength": 1, "maxLength": 240},
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimumVersion", "platforms", "state"],
+      "properties": {
+        "minimumVersion": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "platforms": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {"enum": ["darwin", "linux", "windows"]}
+        },
+        "state": {"enum": ["supported", "experimental", "unsupported"]}
+      }
+    },
+    "prerequisites": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "maxLength": 200}
+    },
+    "credentials": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy", "required"],
+      "properties": {
+        "policy": {"enum": ["none", "adapter-managed", "required-environment"]},
+        "required": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,127}$"}
+        }
+      }
+    },
+    "capability": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "credentials": {
+            "properties": {"policy": {"const": "none"}}
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "credentials": {
+            "properties": {"required": {"maxItems": 0}}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "credentials": {
+            "properties": {"policy": {"const": "adapter-managed"}}
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "credentials": {
+            "properties": {"required": {"maxItems": 0}}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "credentials": {
+            "properties": {"policy": {"const": "required-environment"}}
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "credentials": {
+            "properties": {"required": {"minItems": 1}}
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "tracker"}}},
+      "then": {
+        "properties": {
+          "capability": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["adapter", "teamMode"],
+            "properties": {
+              "adapter": {"enum": ["GitHubIssues", "Jira", "Linear", "Markdown"]},
+              "teamMode": {"type": "boolean"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "ci"}}},
+      "then": {
+        "properties": {
+          "capability": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["provider", "evidenceContract", "outputFile", "template"],
+            "properties": {
+              "provider": {"const": "github-actions"},
+              "evidenceContract": {"const": "exact-commit-green-checks"},
+              "outputFile": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9._-]{0,62}\\.json$"
+              },
+              "template": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "schemaVersion",
+                  "active",
+                  "provider",
+                  "commitBinding",
+                  "proofContract",
+                  "requiredChecks",
+                  "activation"
+                ],
+                "properties": {
+                  "schemaVersion": {"const": 1},
+                  "active": {"const": false},
+                  "provider": {"const": "github-actions"},
+                  "commitBinding": {"const": "exact"},
+                  "proofContract": {"const": "exact-commit-green-checks"},
+                  "requiredChecks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 32,
+                    "uniqueItems": true,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^\\S(?:[^\\u0000-\\u001F\\u007F]*\\S)?$"
+                    }
+                  },
+                  "activation": {"const": "operator-reviewed-copy"}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "deployment"}}},
+      "then": {
+        "properties": {
+          "capability": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["target", "outputFile", "template"],
+            "properties": {
+              "target": {"enum": ["docker-compose", "kubernetes"]},
+              "outputFile": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9._-]{0,62}\\.json$"
+              },
+              "template": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "schemaVersion",
+                  "enabled",
+                  "target",
+                  "mode",
+                  "releaseAuthority",
+                  "containsCredentialValues",
+                  "activation"
+                ],
+                "properties": {
+                  "schemaVersion": {"const": 1},
+                  "enabled": {"const": false},
+                  "target": {"enum": ["docker-compose", "kubernetes"]},
+                  "mode": {"const": "approval-required"},
+                  "releaseAuthority": {"const": false},
+                  "containsCredentialValues": {"const": false},
+                  "activation": {"const": "external-reviewed-config-only"}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

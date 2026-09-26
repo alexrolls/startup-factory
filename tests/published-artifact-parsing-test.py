@@ -23,6 +23,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bin"))
 
 from review_evidence import (  # noqa: E402
+    EvidenceError,
     parse_files_evidence,
     strip_publication_trailer,
 )
@@ -88,11 +89,11 @@ class ParseFilesEvidenceTest(unittest.TestCase):
         body = published("[review-request]\nFiles: README.md, app/widget.py, scripts/deploy.sh")
         self.assertEqual(parse_files_evidence(body), self.EXPECTED)
 
-    def test_prose_labels_and_middot_separators_state_the_same_set(self):
+    def test_prose_labels_and_consistent_explicit_separators_state_the_same_set(self):
         for line in (
             "Files approved (exact): README.md · app/widget.py · scripts/deploy.sh",
             "Approved files (verified set-equal to the diff): README.md · app/widget.py · scripts/deploy.sh",
-            "Files: README.md app/widget.py scripts/deploy.sh",
+            "Files: README.md • app/widget.py • scripts/deploy.sh",
         ):
             with self.subTest(line=line):
                 self.assertEqual(parse_files_evidence(published(f"[x]\n{line}")), self.EXPECTED)
@@ -106,24 +107,30 @@ class ParseFilesEvidenceTest(unittest.TestCase):
         self.assertEqual(parse_files_evidence(body), {"docs/release notes.md", "app/widget.py"})
 
     def test_absent_evidence_is_distinguishable_from_empty_evidence(self):
-        # The two failures read differently to the author, so they must not
-        # collapse: None = no line at all, empty set = a line declaring nothing.
+        # No declaration remains distinguishable from a present-but-empty one;
+        # the latter is malformed evidence and fails at the parser boundary.
         self.assertIsNone(parse_files_evidence("[architecture-approval]\nverdict: APPROVED"))
-        self.assertEqual(parse_files_evidence("[architecture-approval]\nFiles:   "), set())
+        with self.assertRaisesRegex(EvidenceError, "empty path"):
+            parse_files_evidence("[architecture-approval]\nFiles:   ")
 
     def test_a_prose_sentence_beginning_with_files_is_not_evidence(self):
         # No colon terminating the label, so there is no declared set to read.
         self.assertIsNone(parse_files_evidence("Files changed in this round were reviewed"))
 
-    def test_canonical_label_wins_over_surrounding_prose(self):
-        # Widening the accepted labels must not change what an artifact that
-        # already carries a canonical line means, wherever the prose sits.
+    def test_canonical_and_prose_declarations_together_are_ambiguous(self):
         body = (
             "[team-lead-approval]\n"
             "Approved files (quoting the request): see the line below\n"
             "Files: README.md, app/widget.py, scripts/deploy.sh\n"
         )
-        self.assertEqual(parse_files_evidence(body), self.EXPECTED)
+        with self.assertRaisesRegex(EvidenceError, "exactly one Files declaration"):
+            parse_files_evidence(body)
+
+    def test_whitespace_only_separation_is_ambiguous(self):
+        with self.assertRaisesRegex(EvidenceError, "whitespace must quote one path"):
+            parse_files_evidence(
+                "Files: README.md app/widget.py scripts/deploy.sh"
+            )
 
     def test_wrong_set_is_still_a_wrong_set(self):
         # The parser is permissive about *form*; the caller's set-equality against

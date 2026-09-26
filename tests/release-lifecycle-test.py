@@ -31,6 +31,24 @@ SPEC.loader.exec_module(release)
 
 
 class ReleaseLifecycleTest(unittest.TestCase):
+    def test_captured_authority_uses_digest_bound_shared_config_parser(self) -> None:
+        authority = release.captured_authority_resolver(
+            (ROOT / "bin" / "authority_config.py").read_bytes(),
+            (ROOT / "src" / "startup_factory_cli" / "config_values.py").read_bytes(),
+        )
+        raw = b"ROOT='/protected path'\nABSENT=\"null\"\n"
+        self.assertEqual(
+            authority.parse_assignment_bytes(raw, "ROOT", "trusted config"),
+            "/protected path",
+        )
+        self.assertIsNone(
+            authority.parse_assignment_bytes(raw, "ABSENT", "trusted config")
+        )
+        with self.assertRaisesRegex(RuntimeError, "duplicate configuration key"):
+            authority.parse_assignment_bytes(
+                b"ROOT=/one\nROOT=/two\n", "ROOT", "trusted config"
+            )
+
     @staticmethod
     def valid_ci_proof(commit: str = "a" * 40) -> dict:
         completed = datetime.now(timezone.utc)

@@ -22,12 +22,19 @@ from pathlib import Path
 from typing import Any
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+SKILL_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(SKILL_DIR / "bin"))
+sys.path.insert(0, str(SKILL_DIR / "src"))
 from outbox_capability import (
     CapabilityError,
-    sign_entry,
+    request_signature,
     verify_entry,
     verify_published_entry,
+)
+from startup_factory_cli.config_values import (  # noqa: E402
+    ConfigValueError,
+    parse_config_bytes,
+    value_for,
 )
 
 
@@ -83,6 +90,36 @@ REQUEST_KEYS = {
 }
 PROJECTION_KEYS = REQUEST_KEYS | {"result", "detail", "processedAt"}
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+CLAIM_RECORD_FIELDS = {
+    "schemaVersion", "team", "featureId", "taskId", "taskKey", "attempt",
+    "role", "claimId", "targetStatus", "claimDigest", "recordedAt",
+}
+LINEAGE_FIELDS = {
+    "schemaVersion", "team", "featureId", "taskId", "taskKey",
+    "targetStatus", "claimAttempt", "role", "claimId", "claimDigest",
+}
+LEGACY_EXECUTION_REQUIRED_FIELDS = {
+    "schemaVersion", "featureId", "taskId", "taskKey", "attempt", "role",
+    "branch", "worktree", "packetPath", "packetJsonPath", "reportPath",
+    "modelProfile", "updatedAt",
+}
+LEGACY_EXECUTION_OPTIONAL_FIELDS = {"deliveryProfile"}
+MIGRATION_REQUEST_KEYS = {
+    "schemaVersion", "id", "team", "featureId", "taskId", "taskKey",
+    "actor", "authorizationTaskId", "authorizationTaskRevision",
+    "authorizationTaskStatus", "contractRegistrySha256", "contractEntrySha256",
+    "marker", "createdAt", "expiresAt", "observedLifecycleCreatedAt",
+    "observedTaskRevision", "observedTaskStatus", "observedExecutionSha256",
+    "observedClaimSha256", "branch", "worktree", "head", "packetPath",
+    "packetSha256", "packetJsonPath", "packetJsonSha256", "reportPath",
+    "reportSha256", "controlBodySha256", "producerCapability",
+}
+SAFE_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
 
 
 class ControlError(RuntimeError):
@@ -137,7 +174,136 @@ def private_directory(path: Path, label: str) -> Path:
         info = path.lstat()
         if stat.S_IMODE(info.st_mode) != 0o700:
             raise ControlError(f"{label} must have mode 0700")
+    fsync_directory(path.parent)
     return path
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ControlError("control durability target is not a directory")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def open_bound_directory(path: Path, label: str) -> int:
+    if not path.is_absolute() or path != Path(os.path.normpath(str(path))):
+        raise ControlError(f"{label} must be an absolute canonical directory")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            os.path.sep,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        for component in path.parts[1:]:
+            child = os.open(
+                component,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ControlError(f"{label} is not a directory")
+        return descriptor
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise ControlError(f"cannot pin {label}: {exc}") from exc
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def assert_directory_binding(path: Path, descriptor: int, label: str) -> None:
+    try:
+        named = path.lstat()
+        opened = os.fstat(descriptor)
+    except OSError as exc:
+        raise ControlError(f"{label} pathname changed before publication: {exc}") from exc
+    if (
+        stat.S_ISLNK(named.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+    ):
+        raise ControlError(f"{label} pathname changed before publication")
+
+
+def private_subdirectory(
+    parent_descriptor: int,
+    parent_path: Path,
+    name: str,
+    label: str,
+) -> tuple[Path, int]:
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise ControlError(f"cannot create {label}: {exc}") from exc
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, os.geteuid()}:
+            raise ControlError(f"{label} must be an owned non-symlink directory")
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            os.fchmod(descriptor, 0o700)
+            if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
+                raise ControlError(f"{label} must have mode 0700")
+        os.fsync(parent_descriptor)
+        path = parent_path / name
+        assert_directory_binding(path, descriptor, label)
+        return path, descriptor
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise ControlError(f"cannot pin {label}: {exc}") from exc
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def regular_bytes_at(
+    directory_descriptor: int,
+    name: str,
+    label: str,
+    maximum: int = MAX_REQUEST_BYTES,
+) -> tuple[bytes, os.stat_result]:
+    descriptor = -1
+    try:
+        descriptor = os.open(name, SAFE_READ_FLAGS, dir_fd=directory_descriptor)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or not 0 < opened.st_size <= maximum:
+            raise ControlError(f"{label} must contain 1..{maximum} bytes")
+        content = b""
+        while len(content) <= maximum:
+            block = os.read(descriptor, maximum + 1 - len(content))
+            if not block:
+                break
+            content += block
+        after = os.fstat(descriptor)
+        if (
+            len(content) > maximum
+            or after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise ControlError(f"{label} changed while being read")
+        return content, opened
+    except OSError as exc:
+        raise ControlError(f"cannot read {label}: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def operation_digest(request: dict[str, Any]) -> str:
@@ -566,6 +732,40 @@ def task_key(task: str) -> str:
     return f"{slug}-{hashlib.sha256(task.encode()).hexdigest()[:10]}"
 
 
+def deterministic_claim_id(
+    team: str, feature: str, task: str, role: str, attempt: int, target: str
+) -> str:
+    material = "\0".join((team, feature, task, role, str(attempt), target)).encode()
+    return "dispatch-" + hashlib.sha256(material).hexdigest()[:32]
+
+
+def require_tracker_claim_receipt(task: dict[str, Any], claim: dict[str, Any]) -> None:
+    expected_tail = (
+        f"claim-id: {claim['claimId']}\n"
+        f"role: {claim['role']}\n"
+        f"target-status: {claim['targetStatus']}\n\n"
+        "— dispatcher"
+    )
+
+    def matches(comment: object) -> bool:
+        if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
+            return False
+        body = comment["body"].strip()
+        if not body.startswith("[claim]") or "claim-id:" not in body:
+            return False
+        position = body.find("claim-id:")
+        prefix = body[len("[claim]"):position]
+        if prefix != "\n" and not re.fullmatch(
+            r" \(\d{4}-\d{2}-\d{2}\): (?:\n)?", prefix
+        ):
+            return False
+        return body[position:] == expected_tail
+
+    comments = task.get("comments")
+    if not isinstance(comments, list) or sum(matches(item) for item in comments) != 1:
+        raise ControlError("task claim lacks one exact fresh tracker-side receipt")
+
+
 def tracker_task(tasks: dict[str, Any], task_id: str) -> dict[str, Any]:
     matches = [
         item
@@ -627,25 +827,56 @@ def bound_task_state(
     claim_path = workspace / "claims" / f"{key}.json"
     claim_raw = regular_bytes(claim_path, "task claim", 1024 * 1024)
     claim_record = strict_json(claim_raw, "task claim")
+    lineage = execution_record.get("claimLineage")
+    lineage_digest = execution_record.get("lineageDigest")
+    if not isinstance(lineage, dict) or set(lineage) != LINEAGE_FIELDS:
+        raise ControlError("task execution has no supported immutable claim lineage")
+    claim_attempt = lineage.get("claimAttempt")
+    if type(claim_attempt) is not int or not 1 <= claim_attempt <= attempt:
+        raise ControlError("task execution claim lineage has an invalid generation")
+    claim_target = claim_record.get("targetStatus")
+    if not isinstance(claim_target, str) or not claim_target.strip():
+        raise ControlError("task claim has no concrete target status")
+    expected_claim_id = deterministic_claim_id(
+        team, feature, task_id, str(role), claim_attempt, claim_target
+    )
     claim_identity = {
         "schemaVersion": 1,
         "team": team,
         "featureId": feature,
         "taskId": task_id,
         "taskKey": key,
-        "attempt": attempt,
+        "attempt": claim_attempt,
         "role": role,
-        "claimId": claim_record.get("claimId"),
-        "targetStatus": task["status"],
+        "claimId": expected_claim_id,
+        "targetStatus": claim_target,
     }
+    if set(claim_record) != CLAIM_RECORD_FIELDS or not isinstance(
+        claim_record.get("recordedAt"), str
+    ):
+        raise ControlError("task claim has an unsupported schema")
     if any(claim_record.get(name) != value for name, value in claim_identity.items()):
-        raise ControlError("task claim does not match the fresh task/execution identity")
-    claim_id = claim_identity["claimId"]
-    if not isinstance(claim_id, str) or not claim_id:
-        raise ControlError("task claim has no immutable claim identity")
+        raise ControlError("task claim does not match the immutable execution lineage")
     expected_claim_digest = sha256_bytes(canonical(claim_identity))
     if claim_record.get("claimDigest") != expected_claim_digest:
         raise ControlError("task claim digest is invalid")
+    require_tracker_claim_receipt(task, claim_record)
+    expected_lineage = {
+        "schemaVersion": 1,
+        "team": team,
+        "featureId": feature,
+        "taskId": task_id,
+        "taskKey": key,
+        "targetStatus": claim_target,
+        "claimAttempt": claim_attempt,
+        "role": role,
+        "claimId": expected_claim_id,
+        "claimDigest": expected_claim_digest,
+    }
+    if lineage != expected_lineage or lineage_digest != sha256_bytes(
+        canonical(expected_lineage)
+    ):
+        raise ControlError("task execution claim lineage identity or digest is invalid")
 
     return {
         "task": task,
@@ -653,11 +884,310 @@ def bound_task_state(
         "attempt": attempt,
         "execution": execution_record,
         "claim": claim_record,
+        "claimLineage": lineage,
         "observedTaskRevision": task["revision"],
         "observedTaskStatus": task["status"],
         "observedExecutionSha256": sha256_bytes(execution_raw),
         "observedClaimSha256": sha256_bytes(claim_raw),
     }
+
+
+def migration_request_body(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value.get(key)
+        for key in sorted(
+            MIGRATION_REQUEST_KEYS - {"controlBodySha256", "producerCapability"}
+        )
+    }
+
+
+def migration_operation_digest(value: dict[str, Any]) -> str:
+    """Bind the stable migration operation without its renewable lease fields."""
+
+    operation = {
+        key: value.get(key)
+        for key in sorted(
+            MIGRATION_REQUEST_KEYS
+            - {"createdAt", "expiresAt", "controlBodySha256", "producerCapability"}
+        )
+    }
+    return sha256_bytes(canonical(operation))
+
+
+def validate_migration_request_shape(value: dict[str, Any]) -> None:
+    if set(value) != MIGRATION_REQUEST_KEYS or value.get("schemaVersion") != 1:
+        raise ControlError("lineage migration control has an unexpected schema")
+    if not CONTROL_ID.fullmatch(str(value.get("id") or "")):
+        raise ControlError("lineage migration control has an invalid identity")
+    if value.get("marker") != "lineage-migration":
+        raise ControlError("lineage migration control has an invalid marker")
+    created, expires = value.get("createdAt"), value.get("expiresAt")
+    if type(created) is not int or type(expires) is not int:
+        raise ControlError("lineage migration control time fields must be integers")
+    if expires <= created or expires - created > REQUEST_TTL_SECONDS:
+        raise ControlError("lineage migration control has an invalid validity interval")
+    expected_body = sha256_bytes(canonical(migration_request_body(value)))
+    if value.get("controlBodySha256") != expected_body:
+        raise ControlError("lineage migration control body digest mismatch")
+
+
+def validate_existing_migration_request(
+    target: Path,
+    expected: dict[str, Any],
+    *,
+    repository: Path,
+    workspace: Path,
+    actor: str,
+    raw: bytes | None = None,
+) -> None:
+    prior = strict_json(
+        raw
+        if raw is not None
+        else regular_bytes(target, "existing lineage migration control"),
+        "existing lineage migration control",
+    )
+    validate_migration_request_shape(prior)
+    try:
+        capability = verify_entry(
+            str(repository), str(workspace), prior, prior["controlBodySha256"]
+        )
+    except (CapabilityError, OSError, ValueError) as exc:
+        raise ControlError(
+            f"existing lineage migration capability rejected: {exc}"
+        ) from exc
+    if capability.get("executionKind") != "gate" or capability.get("role") != actor:
+        raise ControlError(
+            "existing lineage migration control lacks the current gate capability"
+        )
+    if prior["expiresAt"] <= int(time.time()):
+        raise ControlError(
+            "existing lineage migration control expired; reconcile before restaging"
+        )
+    if migration_operation_digest(prior) != migration_operation_digest(expected):
+        raise ControlError("lineage migration control identity collision")
+
+
+def lineage_migration_contract(workspace: Path) -> dict[str, str]:
+    path = workspace / "CONTRACTS.md"
+    raw = regular_bytes(path, "lineage migration contract registry", 1024 * 1024)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError as exc:
+        raise ControlError("lineage migration contract registry is not UTF-8") from exc
+    matches = []
+    for line in text.splitlines():
+        match = re.fullmatch(
+            r"(.+?#\d+) exports transaction `lineageMigration/v1` — .+", line
+        )
+        if match:
+            matches.append((match.group(1), line))
+    if len(matches) != 1:
+        raise ControlError("lineageMigration/v1 must have one unique registered owner")
+    owner, entry = matches[0]
+    return {
+        "taskId": owner,
+        "contractRegistrySha256": sha256_bytes(raw),
+        "contractEntrySha256": sha256_bytes(entry.encode("utf-8")),
+    }
+
+
+def integrated_task_status() -> str:
+    board_path = Path(__file__).resolve().parent.parent / "config" / "statuses.config.json"
+    board = strict_json(
+        regular_bytes(board_path, "status board", 1024 * 1024), "status board"
+    )
+    matches = [
+        str(item.get("name"))
+        for item in board.get("tasks", {}).get("statuses", [])
+        if item.get("kind") == "integrated" and item.get("terminal") is True
+    ]
+    if len(matches) != 1:
+        raise ControlError("integrated terminal task status must resolve exactly once")
+    return matches[0]
+
+
+def require_historical_claim_receipt(
+    task: dict[str, Any], claim_id: str, role: str, target: str
+) -> None:
+    """Bind a legacy durable claim to one exact tracker-side claim receipt."""
+
+    assignee = task.get("assignee")
+    if assignee is not None and (
+        not isinstance(assignee, str) or assignee != role
+    ):
+        raise ControlError("tracker assignee conflicts with the durable task claim")
+    if not re.fullmatch(r"dispatch-[0-9a-f]{32}", claim_id):
+        raise ControlError("legacy task claim id is non-canonical")
+    if not ROLE.fullmatch(role):
+        raise ControlError("legacy task claim role is non-canonical")
+    if (
+        target != target.strip()
+        or not re.fullmatch(r"[A-Za-z][A-Za-z0-9 _-]{0,79}", target)
+    ):
+        raise ControlError("legacy task claim target is non-canonical")
+    expected_tail = (
+        f"claim-id: {claim_id}\n"
+        f"role: {role}\n"
+        f"target-status: {target}\n\n"
+        "— dispatcher"
+    )
+
+    def exact_receipt(comment: Any) -> bool:
+        if not isinstance(comment, dict):
+            return False
+        body = str(comment.get("body") or "").strip()
+        if not body.startswith("[claim]") or "claim-id:" not in body:
+            return False
+        position = body.find("claim-id:")
+        prefix = body[len("[claim]") : position]
+        if prefix != "\n" and not re.fullmatch(
+            r" \([0-9]{4}-[0-9]{2}-[0-9]{2}\): (?:\n)?", prefix
+        ):
+            return False
+        return body[position:] == expected_tail
+
+    comments = task.get("comments") or []
+    if not isinstance(comments, list):
+        raise ControlError("legacy task tracker comments are malformed")
+    if sum(1 for comment in comments if exact_receipt(comment)) != 1:
+        raise ControlError(
+            "legacy task claim lacks one exact historical tracker receipt"
+        )
+
+
+def legacy_migration_binding(
+    workspace: Path,
+    tasks: dict[str, Any],
+    team: str,
+    feature: str,
+    task_id: str,
+) -> dict[str, Any]:
+    """Bind a genuine pre-lineage execution without conflating tracker/claim status."""
+
+    task = tracker_task(tasks, task_id)
+    key = task_key(task_id)
+    execution_path = workspace / "executions" / f"{key}.json"
+    claim_path = workspace / "claims" / f"{key}.json"
+    execution_raw = regular_bytes(execution_path, "legacy task execution", 1024 * 1024)
+    claim_raw = regular_bytes(claim_path, "legacy task claim", 1024 * 1024)
+    execution_record = strict_json(execution_raw, "legacy task execution")
+    claim_record = strict_json(claim_raw, "legacy task claim")
+    legacy_fields = set(execution_record)
+    if (
+        not LEGACY_EXECUTION_REQUIRED_FIELDS.issubset(legacy_fields)
+        or not (legacy_fields - LEGACY_EXECUTION_REQUIRED_FIELDS).issubset(
+            LEGACY_EXECUTION_OPTIONAL_FIELDS
+        )
+    ):
+        if ("claimLineage" in execution_record) != ("lineageDigest" in execution_record):
+            raise ControlError("task execution has a mixed lineage state")
+        raise ControlError("task execution is not an exact pre-lineage record")
+    role, attempt = execution_record.get("role"), execution_record.get("attempt")
+    if not ROLE.fullmatch(str(role or "")) or type(attempt) is not int or attempt < 1:
+        raise ControlError("legacy task execution has an invalid role/attempt")
+    expected_branch = f"agent-task/{team}/{key}"
+    expected_worktree = workspace / "worktrees" / f"{role}#{attempt}-{key}"
+    expected_packet = workspace / "artifacts" / key / f"attempt-{attempt}" / "task-packet.md"
+    expected_packet_json = expected_packet.with_name("task-packet.json")
+    expected_report = expected_packet.with_name("task-report.md")
+    expected_execution = {
+        "schemaVersion": 1,
+        "featureId": feature,
+        "taskId": task_id,
+        "taskKey": key,
+        "role": role,
+        "attempt": attempt,
+        "branch": expected_branch,
+        "worktree": str(expected_worktree),
+        "packetPath": str(expected_packet),
+        "packetJsonPath": str(expected_packet_json),
+        "reportPath": str(expected_report),
+    }
+    if any(execution_record.get(name) != value for name, value in expected_execution.items()):
+        raise ControlError("legacy task execution identity mismatch")
+    if (
+        not isinstance(execution_record.get("modelProfile"), str)
+        or not execution_record["modelProfile"]
+        or not isinstance(execution_record.get("updatedAt"), str)
+        or not execution_record["updatedAt"]
+    ):
+        raise ControlError("legacy task execution metadata is invalid")
+    try:
+        resolved_worktree = expected_worktree.resolve(strict=True)
+    except OSError as exc:
+        raise ControlError(f"legacy task worktree is unavailable: {exc}") from exc
+    if resolved_worktree != expected_worktree or expected_worktree.is_symlink():
+        raise ControlError("legacy task worktree is not canonical")
+    if set(claim_record) != {
+        "schemaVersion", "team", "featureId", "taskId", "taskKey", "attempt",
+        "role", "claimId", "targetStatus", "claimDigest", "recordedAt",
+    }:
+        raise ControlError("legacy task claim has an unsupported schema")
+    claim_attempt, claim_target = claim_record.get("attempt"), claim_record.get("targetStatus")
+    if (
+        type(claim_attempt) is not int or not 1 <= claim_attempt <= attempt
+        or not isinstance(claim_target, str) or not claim_target.strip()
+    ):
+        raise ControlError("legacy task claim has an invalid attempt/target")
+    claim_id = "dispatch-" + hashlib.sha256(
+        "\0".join(
+            (team, feature, task_id, str(role), str(claim_attempt), claim_target)
+        ).encode()
+    ).hexdigest()[:32]
+    claim_identity = {
+        "schemaVersion": 1, "team": team, "featureId": feature,
+        "taskId": task_id, "taskKey": key, "attempt": claim_attempt,
+        "role": role, "claimId": claim_id, "targetStatus": claim_target,
+    }
+    if any(claim_record.get(name) != value for name, value in claim_identity.items()):
+        raise ControlError("legacy task claim identity mismatch")
+    if claim_record.get("claimDigest") != sha256_bytes(canonical(claim_identity)):
+        raise ControlError("legacy task claim digest is invalid")
+    if not isinstance(claim_record.get("recordedAt"), str) or not claim_record["recordedAt"]:
+        raise ControlError("legacy task claim timestamp is invalid")
+    require_historical_claim_receipt(task, claim_id, str(role), claim_target)
+
+    def git_value(*arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(expected_worktree), *arguments],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        if completed.returncode != 0:
+            raise ControlError("cannot authenticate legacy task git identity")
+        return completed.stdout.strip()
+
+    if git_value("branch", "--show-current") != expected_branch:
+        raise ControlError("legacy task worktree has the wrong branch")
+    head = git_value("rev-parse", "HEAD")
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        raise ControlError("legacy task worktree has an invalid HEAD")
+    packet_raw = regular_bytes(expected_packet, "legacy task packet", 64 * 1024 * 1024)
+    packet_json_raw = regular_bytes(
+        expected_packet_json, "legacy task packet JSON", 64 * 1024 * 1024
+    )
+    report_raw = regular_bytes(
+        expected_report, "legacy task report", 64 * 1024 * 1024
+    )
+    return {
+        "task": task,
+        "taskKey": key,
+        "role": role,
+        "attempt": attempt,
+        "branch": expected_branch,
+        "worktree": str(expected_worktree),
+        "head": head,
+        "packetPath": str(expected_packet),
+        "packetSha256": sha256_bytes(packet_raw),
+        "packetJsonPath": str(expected_packet_json),
+        "packetJsonSha256": sha256_bytes(packet_json_raw),
+        "reportPath": str(expected_report),
+        "reportSha256": sha256_bytes(report_raw),
+        "observedTaskRevision": task["revision"],
+        "observedTaskStatus": task["status"],
+        "observedExecutionSha256": sha256_bytes(execution_raw),
+        "observedClaimSha256": sha256_bytes(claim_raw),
+    }
+
 
 
 def request_from_projection(value: dict[str, Any]) -> dict[str, Any]:
@@ -707,18 +1237,18 @@ def parse_time(raw: Any, label: str) -> datetime:
 def read_config_integer(path: Path, key: str, default: int, minimum: int, maximum: int) -> int:
     if not path.exists():
         return default
-    raw = regular_bytes(path, "team configuration", 1024 * 1024).decode("utf-8")
-    matches = []
-    for line in raw.splitlines():
-        if line.startswith(f"{key}="):
-            value = line.split("=", 1)[1].split("#", 1)[0].strip().strip('"')
-            matches.append(value)
-    if len(matches) > 1:
-        raise ControlError(f"team configuration repeats {key}")
-    if not matches:
+    try:
+        values = parse_config_bytes(
+            regular_bytes(path, "team configuration", 1024 * 1024),
+            "team configuration",
+        )
+    except ConfigValueError as exc:
+        raise ControlError(str(exc)) from exc
+    raw = value_for(values, key)
+    if raw is None:
         return default
     try:
-        result = int(matches[0])
+        result = int(raw)
     except ValueError as exc:
         raise ControlError(f"team configuration {key} is not an integer") from exc
     if not minimum <= result <= maximum:
@@ -890,6 +1420,233 @@ def discover_completed_nudge_projection(
     return max(candidates)[1]
 
 
+def migration_request_command(args: argparse.Namespace) -> int:
+    """Stage an inert exact-state request; only the dispatch broker may consume it."""
+
+    repository = safe_directory(
+        os.environ.get("STARTUP_FACTORY_CANONICAL_REPO", ""), "canonical repository"
+    )
+    workspace = safe_directory(
+        os.environ.get("STARTUP_FACTORY_CANONICAL_WORKSPACE", ""),
+        "canonical workspace",
+    )
+    if os.path.commonpath((str(repository), str(workspace))) != str(repository):
+        raise ControlError("canonical workspace escapes canonical repository")
+    team = safe_text(os.environ.get("STARTUP_FACTORY_TEAM"), "team", 63)
+    feature = safe_text(os.environ.get("STARTUP_FACTORY_FEATURE_ID"), "feature identity")
+    actor = safe_text(os.environ.get("STARTUP_FACTORY_ROLE"), "actor", 80)
+    if os.environ.get("STARTUP_FACTORY_EXECUTION_KIND") != "gate":
+        raise ControlError("lineage migration requires a launched gate-role capability")
+    lead_role, _, _ = parse_preset(workspace, repository, team, feature)
+    if actor != lead_role:
+        raise ControlError("lineage migration requests require the configured Team Lead")
+    task_id = safe_text(args.task, "task identity")
+    authorization_task_id = safe_text(
+        args.authorization_task, "authorization task identity"
+    )
+    if not args.observed_created_at:
+        raise ControlError("lineage migration requires --observed-created-at")
+    tasks = strict_json(
+        regular_bytes(workspace / "tasks.json", "task snapshot", 64 * 1024 * 1024),
+        "task snapshot",
+    )
+    if tasks.get("featureId") != feature or tasks.get("team") not in {None, team}:
+        raise ControlError("task snapshot does not match the launched team/feature")
+    binding = legacy_migration_binding(workspace, tasks, team, feature, task_id)
+    contract = lineage_migration_contract(workspace)
+    if authorization_task_id != contract["taskId"]:
+        raise ControlError(
+            "authorization task is not the unique registered lineageMigration/v1 owner"
+        )
+    authorization_task = tracker_task(tasks, authorization_task_id)
+    if authorization_task["status"] != integrated_task_status():
+        raise ControlError(
+            "lineage migration authorization task is not an integrated exact package"
+        )
+    if args.expected_attempt != binding["attempt"]:
+        raise ControlError("--expected-attempt is stale")
+    now = int(time.time())
+    identity = {
+        "repository": str(repository), "workspace": str(workspace), "team": team,
+        "featureId": feature, "taskId": task_id, "taskKey": binding["taskKey"],
+        "actor": actor,
+        "authorizationTaskId": authorization_task_id,
+        "authorizationTaskRevision": authorization_task["revision"],
+        "authorizationTaskStatus": authorization_task["status"],
+        "contractRegistrySha256": contract["contractRegistrySha256"],
+        "contractEntrySha256": contract["contractEntrySha256"],
+        "attempt": binding["attempt"], "observedLifecycleCreatedAt": args.observed_created_at,
+        "observedTaskRevision": binding["observedTaskRevision"],
+        "observedTaskStatus": binding["observedTaskStatus"],
+        "observedExecutionSha256": binding["observedExecutionSha256"],
+        "observedClaimSha256": binding["observedClaimSha256"],
+        "branch": binding["branch"], "worktree": binding["worktree"],
+        "head": binding["head"], "packetPath": binding["packetPath"],
+        "packetSha256": binding["packetSha256"],
+        "packetJsonPath": binding["packetJsonPath"],
+        "packetJsonSha256": binding["packetJsonSha256"],
+        "reportPath": binding["reportPath"],
+        "reportSha256": binding["reportSha256"],
+    }
+    control_id = "control-" + hashlib.sha256(canonical(identity)).hexdigest()[:32]
+    value: dict[str, Any] = {
+        "schemaVersion": 1, "id": control_id, "team": team,
+        "featureId": feature, "taskId": task_id, "taskKey": binding["taskKey"],
+        "authorizationTaskId": authorization_task_id,
+        "authorizationTaskRevision": authorization_task["revision"],
+        "authorizationTaskStatus": authorization_task["status"],
+        "contractRegistrySha256": contract["contractRegistrySha256"],
+        "contractEntrySha256": contract["contractEntrySha256"],
+        "actor": actor, "marker": "lineage-migration", "createdAt": now,
+        "expiresAt": now + REQUEST_TTL_SECONDS,
+        "observedLifecycleCreatedAt": args.observed_created_at,
+        "observedTaskRevision": binding["observedTaskRevision"],
+        "observedTaskStatus": binding["observedTaskStatus"],
+        "observedExecutionSha256": binding["observedExecutionSha256"],
+        "observedClaimSha256": binding["observedClaimSha256"],
+        "branch": binding["branch"], "worktree": binding["worktree"],
+        "head": binding["head"], "packetPath": binding["packetPath"],
+        "packetSha256": binding["packetSha256"],
+        "packetJsonPath": binding["packetJsonPath"],
+        "packetJsonSha256": binding["packetJsonSha256"],
+        "reportPath": binding["reportPath"],
+        "reportSha256": binding["reportSha256"],
+    }
+    body = canonical(migration_request_body(value))
+    value["controlBodySha256"] = sha256_bytes(body)
+    if any(
+        os.environ.get(name)
+        for name in (
+            "STARTUP_FACTORY_OUTBOX_CAPABILITY_ID",
+            "STARTUP_FACTORY_OUTBOX_CAPABILITY_SECRET",
+            "STARTUP_FACTORY_OUTBOX_CAPABILITY_EXPIRES_AT",
+        )
+    ):
+        raise ControlError("raw launched-role capability values are forbidden")
+    transport = os.environ.get("STARTUP_FACTORY_OUTBOX_TRANSPORT", "")
+    if not transport or not os.environ.get("STARTUP_FACTORY_INSTANCE"):
+        raise ControlError("launched-role publication transport is incomplete")
+    try:
+        value["producerCapability"] = request_signature(
+            transport,
+            value,
+            body,
+        )
+    except CapabilityError as exc:
+        raise ControlError("lineage migration publication authorization denied") from exc
+    validate_migration_request_shape(value)
+    workspace_descriptor = open_bound_directory(
+        workspace, "canonical migration workspace"
+    )
+    root_descriptor = pending_descriptor = consumed_descriptor = -1
+    try:
+        root, root_descriptor = private_subdirectory(
+            workspace_descriptor,
+            workspace,
+            "lineage-migration-outbox",
+            "lineage migration outbox",
+        )
+        pending, pending_descriptor = private_subdirectory(
+            root_descriptor,
+            root,
+            "pending",
+            "lineage migration pending queue",
+        )
+        consumed, consumed_descriptor = private_subdirectory(
+            root_descriptor,
+            root,
+            "consumed",
+            "lineage migration consumed queue",
+        )
+        target_name = f"{control_id}.json"
+        target = pending / target_name
+        content = canonical(value) + b"\n"
+
+        descriptor = -1
+        created_info: os.stat_result | None = None
+        try:
+            descriptor = os.open(
+                target_name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=pending_descriptor,
+            )
+        except FileExistsError:
+            prior_raw, prior_info = regular_bytes_at(
+                pending_descriptor,
+                target_name,
+                "existing lineage migration control",
+            )
+            validate_existing_migration_request(
+                target,
+                value,
+                repository=repository,
+                workspace=workspace,
+                actor=actor,
+                raw=prior_raw,
+            )
+            os.fsync(pending_descriptor)
+            assert_directory_binding(root, root_descriptor, "lineage migration outbox")
+            assert_directory_binding(
+                pending, pending_descriptor, "lineage migration pending queue"
+            )
+            current = os.stat(
+                target_name, dir_fd=pending_descriptor, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino)
+                != (prior_info.st_dev, prior_info.st_ino)
+            ):
+                raise ControlError(
+                    "existing lineage migration control changed before publication"
+                )
+            print(target)
+            return 0
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+                created_info = os.fstat(handle.fileno())
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        os.fsync(pending_descriptor)
+        assert_directory_binding(root, root_descriptor, "lineage migration outbox")
+        assert_directory_binding(
+            pending, pending_descriptor, "lineage migration pending queue"
+        )
+        assert_directory_binding(
+            consumed, consumed_descriptor, "lineage migration consumed queue"
+        )
+        current = os.stat(
+            target_name, dir_fd=pending_descriptor, follow_symlinks=False
+        )
+        if (
+            created_info is None
+            or not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino)
+            != (created_info.st_dev, created_info.st_ino)
+        ):
+            raise ControlError("lineage migration control changed before publication")
+        print(target)
+        return 0
+    finally:
+        for descriptor in (
+            consumed_descriptor,
+            pending_descriptor,
+            root_descriptor,
+            workspace_descriptor,
+        ):
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
 def request_command(args: argparse.Namespace) -> int:
     repository = safe_directory(
         os.environ.get("STARTUP_FACTORY_CANONICAL_REPO", ""), "canonical repository"
@@ -993,26 +1750,29 @@ def request_command(args: argparse.Namespace) -> int:
     outbox = private_directory(workspace / "control-outbox", "control outbox")
     for state in ("pending", "done", "failed"):
         private_directory(outbox / state, f"control outbox {state}")
-    capability = {
-        "id": os.environ.get("STARTUP_FACTORY_OUTBOX_CAPABILITY_ID", ""),
-        "secret": os.environ.get("STARTUP_FACTORY_OUTBOX_CAPABILITY_SECRET", ""),
-        "instance": os.environ.get("STARTUP_FACTORY_INSTANCE", ""),
-        "expires": os.environ.get("STARTUP_FACTORY_OUTBOX_CAPABILITY_EXPIRES_AT", ""),
-    }
-    if not all(capability.values()):
-        raise ControlError("launched-role capability is incomplete")
+    if any(
+        os.environ.get(name)
+        for name in (
+            "STARTUP_FACTORY_OUTBOX_CAPABILITY_ID",
+            "STARTUP_FACTORY_OUTBOX_CAPABILITY_SECRET",
+            "STARTUP_FACTORY_OUTBOX_CAPABILITY_EXPIRES_AT",
+        )
+    ):
+        raise ControlError("raw launched-role capability values are forbidden")
+    transport = os.environ.get("STARTUP_FACTORY_OUTBOX_TRANSPORT", "")
+    if not transport or not os.environ.get("STARTUP_FACTORY_INSTANCE"):
+        raise ControlError("launched-role publication transport is incomplete")
+    # This producer-authored digest is part of the immutable request envelope;
+    # add it before asking the supervisor to sign every field.
+    value["controlBodySha256"] = sha256_bytes(canonical(control_body(value)))
     try:
-        value["producerCapability"] = sign_entry(
+        value["producerCapability"] = request_signature(
+            transport,
             value,
             canonical(control_body(value)),
-            capability["id"],
-            capability["secret"],
-            capability["instance"],
-            int(capability["expires"]),
         )
-    except (CapabilityError, ValueError) as exc:
-        raise ControlError(f"cannot sign control request: {exc}") from exc
-    value["controlBodySha256"] = sha256_bytes(canonical(control_body(value)))
+    except CapabilityError as exc:
+        raise ControlError("control publication authorization denied") from exc
     validate_shape(value)
 
     pending = outbox / "pending"
@@ -1692,6 +2452,12 @@ def parser() -> argparse.ArgumentParser:
     request.add_argument("--nudge-control-id")
     request.add_argument("--reason-code", choices=sorted(REASONS), required=True)
     request.set_defaults(func=request_command)
+    migration = subparsers.add_parser("request-lineage-migration")
+    migration.add_argument("--task", required=True)
+    migration.add_argument("--authorization-task", required=True)
+    migration.add_argument("--expected-attempt", type=int, required=True)
+    migration.add_argument("--observed-created-at", required=True)
+    migration.set_defaults(func=migration_request_command)
     reconcile = subparsers.add_parser("reconcile")
     reconcile.add_argument("--repo", required=True)
     reconcile.add_argument("--workspace", required=True)

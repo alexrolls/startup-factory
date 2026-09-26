@@ -110,6 +110,36 @@ handoff; a valid `verifyApproval` proof lets apply/status/verify continue withou
 another agent action. The [feature] reaches its terminal state only after that
 verification succeeds.
 
+### Required 0.1.x lifecycle-authority migration
+
+The updater deliberately preserves `config/team.config.md`. Before restarting
+an installation upgraded from 0.1.x, edit that protected installed file and
+replace `BROKER_LIFECYCLE_ROOT=null` (or add the missing assignment) with the
+canonical absolute path of the pre-created external mode-0700 lifecycle
+directory. Keep `STARTUP_FACTORY_LIFECYCLE_STATE_ROOT` in the protected
+scheduler environment only when it repeats that configured path exactly. The
+environment value cannot create or override lifecycle authority.
+
+The same preserved file can carry the 0.1.23 sandbox-runner shape. When
+`AGENT_SANDBOX_ENFORCED=true`, a missing/null runner or an operator-owned
+mode-0700 executable is no longer sufficient. Reprovision the runner outside
+both the project and installed runtime at a canonical absolute path. The
+executable and every directory in its complete ancestor chain must be
+root-owned, non-symlink, and not writable by the executor, group, or world.
+Then set `AGENT_SANDBOX_RUNNER` to that exact path. Do not move or copy the old
+operator-owned executable into another operator-owned directory: the full path
+chain is part of the authority boundary.
+
+Do not use `--overwrite-config` as a migration shortcut: it replaces all seven
+preserved project configuration files. Make only the reviewed lifecycle and
+runner edits that apply, then run `startup-factory doctor` for the target
+project before enabling autonomous or release operation. Both
+`startup-factory update` and `bin/update-installed-skill.sh` print the applicable
+diagnostics for dry-run and applied updates; the release CLI also exposes them
+in `migrationDiagnostics`. They do not mutate preserved authority settings. If
+a step is missed, 0.2.0 remains fail-closed and names the required config edit;
+it does not trust the legacy ambient-only setting or weaker runner ownership.
+
 The product marker is a mandatory workflow gate in both modes, but it is still
 tracker evidence rather than a security principal. The release executor writes
 `<TEAMWORK_ROOT>/<team>/product-acceptance-request.json` when it is missing or
@@ -198,6 +228,10 @@ setting `enabled`):
   },
   "trustedCodeDigests": {
     "release-feature.py": "sha256:<64 lowercase hex>",
+    "authority_config.py": "sha256:<64 lowercase hex>",
+    "config-value.py": "sha256:<64 lowercase hex>",
+    "config_values.py": "sha256:<64 lowercase hex>",
+    "authority-bootstrap.sh": "sha256:<64 lowercase hex>",
     "policy-check.py": "sha256:<64 lowercase hex>",
     "tracker-ops.sh": "sha256:<64 lowercase hex>",
     "finalize-integrations.sh": "sha256:<64 lowercase hex>",
@@ -206,17 +240,21 @@ setting `enabled`):
     "task-hold.py": "sha256:<64 lowercase hex>",
     "outbox_capability.py": "sha256:<64 lowercase hex>",
     "broker_evidence.py": "sha256:<64 lowercase hex>",
+    "delivery_profile.py": "sha256:<64 lowercase hex>",
     "retrospective.py": "sha256:<64 lowercase hex>",
     "runtime-state.py": "sha256:<64 lowercase hex>",
     "ticket_content_security.py": "sha256:<64 lowercase hex>",
+    "secret_safety.py": "sha256:<64 lowercase hex>",
     "task_metadata.py": "sha256:<64 lowercase hex>",
     "product_acceptance.py": "sha256:<64 lowercase hex>",
     "teamwork-path.py": "sha256:<64 lowercase hex>",
+    "launch-lane-lock.py": "sha256:<64 lowercase hex>",
     "review_evidence.py": "sha256:<64 lowercase hex>",
     "statuses.config.json": "sha256:<64 lowercase hex>",
     "guardrails.config.json": "sha256:<64 lowercase hex>",
     "team.config.md": "sha256:<64 lowercase hex>",
-    "project-management.config.md": "sha256:<64 lowercase hex>"
+    "project-management.config.md": "sha256:<64 lowercase hex>",
+    "automation.config.json": "sha256:<64 lowercase hex>"
   },
   "trustedHookDigests": {
     "plan": "sha256:<64 lowercase hex>",

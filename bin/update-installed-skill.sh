@@ -23,6 +23,7 @@ change_count=0
 lock_acquired=false
 old_install_moved=false
 new_install_placed=false
+trusted_config_parser=""
 
 CONFIG_FILES=(
   config/project-management.config.md
@@ -132,21 +133,9 @@ has_git_marker_at_or_above() {
 read_config_value() {
   local config_path="$1"
   local config_key="$2"
-  local config_line config_value
-  config_line="$(grep -m1 "^${config_key}=" "$config_path" 2>/dev/null || true)"
-  [ -n "$config_line" ] || {
-    printf '\n'
-    return
-  }
-  config_value="${config_line#*=}"
-  config_value="${config_value%%#*}"
-  config_value="$(printf '%s' "$config_value" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-  case "$config_value" in
-    \"*\") config_value="${config_value#\"}"; config_value="${config_value%\"}" ;;
-    \'*\') config_value="${config_value#\'}"; config_value="${config_value%\'}" ;;
-  esac
-  [ "$config_value" != "null" ] || config_value=""
-  printf '%s\n' "$config_value"
+  python3 "$trusted_config_parser" --config "$config_path" \
+    --label "preserved configuration" --prefix update-installed-skill \
+    value "$config_key"
 }
 
 validate_regular_relative_file() {
@@ -643,6 +632,24 @@ tmp="$(mktemp -d)"
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
+# Configuration preserved from an existing installation is authority-bearing
+# input.  Parse it with the exact parser shipped alongside this updater, not
+# code from the remote ref being previewed or installed.  The snapshot also
+# remains available if this updater replaces its own installation directory.
+for trusted_parser_file in \
+  "$script_dir/config-value.py" \
+  "$script_skill_dir/src/startup_factory_cli/config_values.py"
+do
+  [ -f "$trusted_parser_file" ] && [ ! -L "$trusted_parser_file" ] || \
+    die "trusted configuration parser is missing or invalid: $trusted_parser_file"
+done
+trusted_parser_root="$tmp/trusted-config-parser"
+mkdir -p "$trusted_parser_root/bin" "$trusted_parser_root/src/startup_factory_cli"
+cp -p "$script_dir/config-value.py" "$trusted_parser_root/bin/config-value.py"
+cp -p "$script_skill_dir/src/startup_factory_cli/config_values.py" \
+  "$trusted_parser_root/src/startup_factory_cli/config_values.py"
+trusted_config_parser="$trusted_parser_root/bin/config-value.py"
+
 validate_existing_target
 
 checkout="$tmp/source"
@@ -681,6 +688,7 @@ for required_dir in \
   extensions \
   reference \
   roles \
+  src \
   teams \
   tests
 do
@@ -688,6 +696,7 @@ do
     die "fetched Startup Factory bundle is incomplete: missing $required_dir/"
 done
 for required_file in \
+  SECURITY.md \
   adapters/_TEMPLATE.md \
   adapters/GitHubIssues.md \
   adapters/Jira.md \
@@ -695,20 +704,35 @@ for required_file in \
   adapters/Markdown.md \
   bin/dispatch.sh \
   bin/agent-health.py \
+  bin/authority-bootstrap.sh \
+  bin/authority_config.py \
+  bin/config-value.py \
   bin/board-status.py \
+  bin/beta-readiness.py \
+  bin/broker_evidence.py \
+  bin/delivery_profile.py \
   bin/heartbeat-status.py \
+  bin/integration_pack.py \
+  bin/lineage-migration.py \
+  bin/launch-lane-lock.py \
   bin/launch-team.sh \
+  bin/outbox_capability.py \
   bin/process-lifecycle.py \
+  bin/publication-supervisor.py \
   bin/superpowers-planning.py \
   bin/pm-agent.py \
   bin/policy-check.py \
   bin/release-feature.py \
+  bin/release-worker.py \
+  bin/recovery_validation.py \
   bin/retrospective.py \
   bin/runtime-state.py \
   bin/ticket_content_security.py \
   bin/teamwork-path.py \
+  bin/team-context.py \
   bin/tracker-ops.sh \
   bin/update-installed-skill.sh \
+  bin/worker-control.py \
   config/project-management.config.md \
   config/planning.config.md \
   config/team.config.md \
@@ -717,12 +741,32 @@ for required_file in \
   config/deployment.config.json \
   config/guardrails.config.json \
   extensions/tracker-backends/README.md \
+  extensions/integration-packs/README.md \
+  extensions/integration-packs/schema.json \
+  extensions/integration-packs/ci/github-actions-exact-commit.json \
+  extensions/integration-packs/deployment/docker-compose.json \
+  extensions/integration-packs/deployment/kubernetes.json \
+  extensions/integration-packs/tracker/github-issues.json \
+  extensions/integration-packs/tracker/jira.json \
+  extensions/integration-packs/tracker/linear.json \
+  extensions/integration-packs/tracker/markdown.json \
   reference/automation.md \
   reference/deployment.md \
   reference/guardrails.md \
   reference/superpowers-planning.md \
   roles/senior-security-engineer.md \
   roles/team-lead.md \
+  src/startup_factory_cli/__init__.py \
+  src/startup_factory_cli/config_values.py \
+  src/startup_factory_cli/installer.py \
+  src/startup_factory_cli/integration_packs.py \
+  src/startup_factory_cli/project_config.py \
+  src/startup_factory_cli/secret_safety.py \
+  tests/claim-lineage-runtime-test.py \
+  tests/lineage-migration-test.py \
+  tests/launch-lane-lock-test.py \
+  tests/release-worker-test.py \
+  tests/run-all.sh \
   teams/_PLAYBOOK.md
 do
   [ -f "$checkout/$required_file" ] && [ ! -L "$checkout/$required_file" ] || \
@@ -761,6 +805,136 @@ report_locally_modified() {
   echo "Re-apply anything still needed, or upstream it so the next sync keeps it."
 }
 
+report_lifecycle_authority_migration() {
+  local configured_root
+  $overwrite_config && return 0
+  [ -n "${preserved_paths:-}" ] && \
+    grep -Fqx 'config/team.config.md' "$preserved_paths" || return 0
+  [ -f "$install_dir/config/team.config.md" ] && \
+    [ ! -L "$install_dir/config/team.config.md" ] || return 0
+  grep -Eq '^BROKER_LIFECYCLE_ROOT=' "$checkout/config/team.config.md" || return 0
+  configured_root="$(read_config_value \
+    "$install_dir/config/team.config.md" BROKER_LIFECYCLE_ROOT)"
+  [ -z "$configured_root" ] || return 0
+
+  echo
+  echo "WARNING: preserved config/team.config.md has no configured BROKER_LIFECYCLE_ROOT."
+  echo "Authority-bearing 0.2.0 operations remain fail-closed until you set"
+  echo "BROKER_LIFECYCLE_ROOT to the canonical external mode-0700 lifecycle path."
+  echo "STARTUP_FACTORY_LIFECYCLE_STATE_ROOT may only repeat that exact configured value."
+  echo "See reference/deployment.md#required-01x-lifecycle-authority-migration."
+}
+
+report_sandbox_runner_migration() {
+  local enforced configured_runner project_root validation_problem
+  $overwrite_config && return 0
+  [ -n "${preserved_paths:-}" ] && \
+    grep -Fqx 'config/team.config.md' "$preserved_paths" || return 0
+  [ -f "$install_dir/config/team.config.md" ] && \
+    [ ! -L "$install_dir/config/team.config.md" ] || return 0
+  grep -Eq '^AGENT_SANDBOX_ENFORCED=' "$checkout/config/team.config.md" || return 0
+  grep -Eq '^AGENT_SANDBOX_RUNNER=' "$checkout/config/team.config.md" || return 0
+  enforced="$(read_config_value \
+    "$install_dir/config/team.config.md" AGENT_SANDBOX_ENFORCED)"
+  [ "$enforced" = "true" ] || return 0
+  configured_runner="$(read_config_value \
+    "$install_dir/config/team.config.md" AGENT_SANDBOX_RUNNER)"
+  project_root="$(git -C "$install_dir" rev-parse --show-toplevel 2>/dev/null || true)"
+
+  if validation_problem="$(python3 - "$configured_runner" "$install_dir" "$project_root" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+configured, install_text, project_text = sys.argv[1:]
+
+
+def fail(message: str) -> None:
+    print(message)
+    raise SystemExit(1)
+
+
+if not configured:
+    fail("AGENT_SANDBOX_RUNNER is missing or null")
+runner = Path(configured)
+if not runner.is_absolute() or configured != os.path.normpath(configured):
+    fail("AGENT_SANDBOX_RUNNER is not a normalized absolute path")
+try:
+    metadata = runner.lstat()
+except OSError as exc:
+    fail(f"AGENT_SANDBOX_RUNNER is unavailable: {exc}")
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    fail("AGENT_SANDBOX_RUNNER is not a non-symlink regular file")
+if not metadata.st_mode & 0o111 or not os.access(runner, os.X_OK):
+    fail("AGENT_SANDBOX_RUNNER is not executable")
+if metadata.st_uid != 0:
+    fail("AGENT_SANDBOX_RUNNER is not root-owned")
+if stat.S_IMODE(metadata.st_mode) & 0o022:
+    fail("AGENT_SANDBOX_RUNNER is group- or world-writable")
+try:
+    resolved = runner.resolve(strict=True)
+    install = Path(install_text).resolve(strict=True)
+    project = Path(project_text).resolve(strict=True) if project_text else None
+except OSError as exc:
+    fail(f"cannot resolve AGENT_SANDBOX_RUNNER boundary: {exc}")
+if resolved != runner:
+    fail("AGENT_SANDBOX_RUNNER is not its canonical absolute path")
+for boundary, label in ((install, "installed runtime"), (project, "project repository")):
+    if boundary is None:
+        continue
+    try:
+        resolved.relative_to(boundary)
+    except ValueError:
+        continue
+    fail(f"AGENT_SANDBOX_RUNNER is inside the {label}")
+ancestor = resolved.parent
+while True:
+    try:
+        ancestor_metadata = ancestor.lstat()
+    except OSError as exc:
+        fail(f"cannot inspect AGENT_SANDBOX_RUNNER ancestor {ancestor}: {exc}")
+    if stat.S_ISLNK(ancestor_metadata.st_mode) or not stat.S_ISDIR(ancestor_metadata.st_mode):
+        fail(f"AGENT_SANDBOX_RUNNER ancestor is not a real directory: {ancestor}")
+    if ancestor_metadata.st_uid != 0:
+        fail(f"AGENT_SANDBOX_RUNNER ancestor is not root-owned: {ancestor}")
+    if stat.S_IMODE(ancestor_metadata.st_mode) & 0o022:
+        fail(f"AGENT_SANDBOX_RUNNER ancestor is group- or world-writable: {ancestor}")
+    try:
+        operator_can_write = os.access(ancestor, os.W_OK, effective_ids=True)
+    except (NotImplementedError, TypeError):
+        operator_can_write = os.access(ancestor, os.W_OK)
+    if operator_can_write:
+        fail(f"AGENT_SANDBOX_RUNNER ancestor is writable by the operator: {ancestor}")
+    if ancestor == ancestor.parent:
+        break
+    ancestor = ancestor.parent
+try:
+    operator_can_write_runner = os.access(runner, os.W_OK, effective_ids=True)
+except (NotImplementedError, TypeError):
+    operator_can_write_runner = os.access(runner, os.W_OK)
+if operator_can_write_runner:
+    fail("AGENT_SANDBOX_RUNNER is writable by the operator")
+PY
+)"; then
+    return 0
+  fi
+
+  echo
+  echo "WARNING: preserved config/team.config.md has an enforced AGENT_SANDBOX_RUNNER"
+  echo "that does not satisfy the 0.2.0 protected-runner contract: $validation_problem."
+  echo "Authority-bearing autonomous operations remain fail-closed. Reprovision the runner"
+  echo "outside the project and installed runtime under a canonical path whose executable"
+  echo "and complete ancestor chain are root-owned and not writable by the executor, group,"
+  echo "or world; update AGENT_SANDBOX_RUNNER, then run startup-factory doctor."
+  echo "See reference/deployment.md#required-01x-lifecycle-authority-migration."
+}
+
+report_authority_migrations() {
+  report_lifecycle_authority_migration
+  report_sandbox_runner_migration
+}
+
 if $dry_run; then
   collect_preserved_paths
   stage_dir="$tmp/stage"
@@ -773,6 +947,7 @@ if $dry_run; then
   echo "Planned filesystem changes: $change_count"
   echo "Dry run complete; no destination files were written."
   report_locally_modified
+  report_authority_migrations
 else
   mkdir -p "$install_parent"
   lock_dir="$install_parent/.$install_name.startup-factory.lock"
@@ -826,6 +1001,7 @@ else
     echo "Preserved existing project configuration and project-owned files."
   fi
   report_locally_modified
+  report_authority_migrations
 fi
 
 target_repo="$(git -C "$install_dir" rev-parse --show-toplevel 2>/dev/null || true)"

@@ -27,18 +27,18 @@ Startup Factory does not replace your coding agent, repository, project-manageme
 ## Table of contents
 
 - [Who it is for](#who-it-is-for)
-- [Quick start (two minutes, no accounts)](#quick-start-two-minutes-no-accounts)
+- [Quick start (local Markdown, no tracker account)](#quick-start-local-markdown-no-tracker-account)
   - [Safe updates](#safe-updates)
 - [Ten easy prompts for startup delivery](#ten-easy-prompts-for-startup-delivery)
 - [See the factory work](#see-the-factory-work)
 - [This is not another coding copilot](#this-is-not-another-coding-copilot)
 - [The delivery loop](#the-delivery-loop)
 - [Meet the team](#meet-the-team)
-- [Six ready-to-run teams](#six-ready-to-run-teams)
+- [Six team presets](#six-team-presets)
 - [Bring your own agents, tracker, and stack](#bring-your-own-agents-tracker-and-stack)
 - [Choose how much autonomy you want](#choose-how-much-autonomy-you-want)
 - [Safety is part of the architecture](#safety-is-part-of-the-architecture)
-- [What's new](#whats-new-in-0121)
+- [What's new](#whats-new-in-020)
 - [Documentation](#documentation)
 - [Project status](#project-status)
 - [Contributing](#contributing)
@@ -56,11 +56,9 @@ Startup Factory does not replace your coding agent, repository, project-manageme
 
 Use your coding agent directly for a one-line fix. Startup Factory earns its keep when work crosses roles, branches, reviews, trackers, or production. See [Meet the team](#meet-the-team) for the roles it adds.
 
-## Quick start (two minutes, no accounts)
+## Quick start (local Markdown, no tracker account)
 
-Start with one agent and the local Markdown tracker. You do not need a Linear or Jira account, an application server, or a coordinator database. Hosted trackers come later, in [Project-management tools](#project-management-tools).
-
-From your project root:
+Start with one agent and the local Markdown tracker. From your project root:
 
 ```bash
 uvx startup-factory@latest install --agent codex
@@ -68,125 +66,44 @@ uvx startup-factory@latest init --agent codex --mode solo \
   --product-management-tool Markdown --apply
 ```
 
-Using Claude Code instead? Replace `codex` with `claude-code`. The installer also supports `aider` and `deepseek-harness`; see [Coding agents and models](#coding-agents-and-models).
-
-Now ask your agent:
+Use `--agent claude-code` for Claude Code. Then ask your agent:
 
 ```text
 Plan a feature: add CSV export to the reports page.
 ```
 
-Startup Factory creates the feature and its tasks under `.workspace/task-manager/`. Continue in plain language:
+Continue with `Start task 1`, `Send task 1 to review`, and `Finalize task 1`.
+That exercises the smallest useful loop: **plan → build → review → verify**.
 
-```text
-Start task 1.
-Send task 1 to review.
-Finalize task 1.
-```
-
-That is the smallest useful loop:
-
-```text
-PLAN -> BUILD -> REVIEW -> VERIFY
-```
-
-Run it on one small, real feature. You will know quickly whether the workflow fits.
+For a governed team delivery, guided integration-pack setup, prerequisites, and
+the explicit non-production boundary, follow the
+[`governed delivery benchmark path`](reference/quickstart.md). A reproducible
+example is in
+[`reference/governed-delivery-example.md`](reference/governed-delivery-example.md).
 
 ### Safe updates
 
-Preview and apply an update with the same release CLI. It recognizes the
-selected project installation and performs a complete preflight before any
-destination mutation:
+Preview, apply, and verify an update with the same release CLI:
 
 ```bash
 uvx startup-factory@latest update --agent codex --dry-run
 uvx startup-factory@latest update --agent codex
-```
-
-For Claude Code, use `--agent claude-code`. You can also ask your agent:
-
-```text
-Fetch latest Startup Factory skill.
-```
-
-Existing project configuration remains byte-for-byte untouched by default,
-while newly introduced config files are installed. Destination-only files under
-the documented `adapters/`, `extensions/`, and `teams/` extension points are
-also preserved. A generated ownership manifest lets later updates delete an
-upstream extension that has been retired without mistaking project-owned files
-for upstream files. A legacy installation without a manifest is migrated
-conservatively: destination-only extension files are kept. If a later upstream
-release introduces a file at a project-owned extension path, the update fails
-before mutation instead of overwriting it:
-
-- [`config/project-management.config.md`](config/project-management.config.md)
-- [`config/planning.config.md`](config/planning.config.md)
-- [`config/team.config.md`](config/team.config.md)
-- [`config/statuses.config.json`](config/statuses.config.json)
-- [`config/automation.config.json`](config/automation.config.json)
-- [`config/deployment.config.json`](config/deployment.config.json)
-- [`config/guardrails.config.json`](config/guardrails.config.json)
-
-To intentionally replace those files with upstream defaults too:
-
-```bash
-uvx startup-factory@latest update --agent codex --overwrite-config
-```
-
-To verify the owned runtime independently of preserved configuration and custom
-extensions:
-
-```bash
 uvx startup-factory@latest verify --agent codex
 ```
 
-The release CLI uses a sibling staging directory, an installation lock, and a
-backup swap with rollback. Interrupted copying cannot silently turn a valid
-installation into a partial one. Its main operator options are:
-
-| Option | Purpose |
-|---|---|
-| `--agent codex\|claude-code\|aider\|deepseek-harness` | Select the native project skill directory. |
-| `--project PATH` | Resolve the agent directory relative to another project. |
-| `--install-dir PATH` | Override the mapped installation directory. |
-| `--bundle PATH` | For install/update, use an explicitly supplied local canonical archive. |
-| `--overwrite-config` | For install/update, replace all seven preserved project configuration files. |
-| `--dry-run` | For install/update, print the plan without writing the destination or lock. |
-| `--mode solo\|team\|autonomous\|release` | Select the initialization/readiness profile; protected modes are inspection-only in phase one. |
-| `--apply` | For `init`, atomically apply a supported preview; without it initialization is read-only. |
-| `--product-management-tool ADAPTER` | For `init`, select an installed regular adapter without accepting credentials. |
-| `--json` | Emit machine-readable output for operator automation. |
-
-The `--mode` profiles are described in [Choose how much autonomy you want](#choose-how-much-autonomy-you-want), and `--product-management-tool` accepts any adapter listed in [Project-management tools](#project-management-tools).
-
-Legacy or source-installed copies can continue to use the shell compatibility
-updater from their installed bundle:
-
-```bash
-bash .agents/skills/startup-factory/bin/update-installed-skill.sh --dry-run
-bash .agents/skills/startup-factory/bin/update-installed-skill.sh
-bash .agents/skills/startup-factory/tests/run-all.sh --smoke
-```
-
-It requires `git`, `rsync`, and `python3`, accepts `--remote-url` and `--ref`,
-and defaults to `main`; prefer a reviewed tag or exact commit. The compatibility
-updater builds and validates a sibling staging tree under an installation lock,
-then uses a backup swap so a failed copy cannot partially replace the live
-skill. Before activation it verifies that the selected tracker adapter and
-configured `STATUS_CONFIG` both exist in the staged result. It also parses the
-retained board and checks its status names, transitions, initial/terminal
-states, and mappings for the selected project-management tool, returning a
-specific error before mutation if they are incompatible. Existing canonical
-config, the configured custom status board, and destination-only project files
-are preserved by default. Path plus Git-object ownership metadata lets a later
-update delete a retired upstream file only when its installed bytes still match
-the previously installed source; legacy path-only metadata is migrated
-conservatively.
-
-Each successful source-managed update records the exact fetched commit in
-`.startup-factory-source-install.json`. The console reports the planned or
-applied filesystem-entry count; when the install directory is Git-ignored it
-also explains why `git status` and `git diff` cannot display those changes.
+Updates are staged, locked, verified, and rollback-capable. Existing project
+configuration and project-owned extensions are preserved by default; conflicts
+fail before mutation. Replacing preserved configuration requires the explicit
+`--overwrite-config` flag. Both supported updaters report preserved 0.1.x
+authority settings that need migration in dry-run and applied output. The
+release CLI also returns them as structured `migrationDiagnostics`; it never
+rewrites the preserved settings. Reprovision a legacy operator-owned sandbox
+runner under a canonical root-owned, non-executor-writable system path, and set
+the protected lifecycle root explicitly before restarting governed services.
+See [`SKILL.md`](SKILL.md#self-update-request) for the
+release-managed and legacy/source-managed procedures and
+[`reference/troubleshooting.md`](reference/troubleshooting.md) for fail-closed
+recovery guidance.
 
 ## Ten easy prompts for startup delivery
 
@@ -375,9 +292,9 @@ Every stage has an owner, an allowed set of actions, and a visible handoff. The 
 | **Integrator** | Verifies the approved package with deterministic repository checks and performs serialized integration | Does not redesign or silently repair rejected work |
 | **Release Executor** | Applies an approved production plan using isolated credentials and verifies the result | Is not an LLM and does not infer missing approval |
 
-Every preset team includes three distinct core review-board roles — Team Lead, Principal Architect, and Sceptical Principal Architect — plus a dedicated integrator. The presets are listed in [Six ready-to-run teams](#six-ready-to-run-teams).
+Every preset team includes three distinct core review-board roles — Team Lead, Principal Architect, and Sceptical Principal Architect — plus a dedicated integrator. The presets are listed in [Six team presets](#six-team-presets).
 
-## Six ready-to-run teams
+## Six team presets
 
 | Preset | Use it for |
 |---|---|
@@ -446,6 +363,13 @@ The workflow speaks one generic vocabulary — `[feature]`, `[task]`, `[subtask]
 
 Credentials live in environment variables, never in the config files, and a hosted tracker needs its access wired once. See [`reference/tracker-access.md`](reference/tracker-access.md) for the exact key, scope, and env-var setup per tool.
 
+Validated integration packs provide a guided `validate → preview → apply → doctor`
+path for the shipped trackers, exact-commit GitHub Actions evidence, and inactive
+Docker Compose or Kubernetes deployment boundaries. Packs are data-only, plans
+are digest-bound, and doctor checks names/presence without reading credential
+values or authenticating a provider. See
+[`extensions/integration-packs/README.md`](extensions/integration-packs/README.md).
+
 ### Engineering stack
 
 Startup Factory is language-, framework-, cloud-, and CI-provider-agnostic. Your repository defines the real build, test, lint, format, deployment, rollback, and verification commands.
@@ -457,11 +381,18 @@ Start small and add authority only when the environment is ready.
 | Mode | What runs | Best use |
 |---|---|---|
 | **Solo** | One installed agent follows the lifecycle; self-review is labelled as self-review and cannot impersonate independent approval | Learning the workflow and shipping small features |
-| **Team** | Authenticated specialist agents work through separate roles, packages, worktrees, and mandatory review gates | Normal multi-agent delivery |
+| **Team** | Specialist agents work through separate roles, packages, worktrees, and mandatory review gates | Normal multi-agent delivery after protected runtime setup |
 | **Autonomous** | A deterministic supervisor scans the board, restores in-flight state, and launches only eligible bounded work | Carefully controlled unattended queues |
 | **Release** | A separate executor applies an exact, approved production plan and verifies the target | Governed production delivery |
 
 `init --apply` configures the safe `solo` and `team` starting modes; the full flag list is in [Safe updates](#safe-updates). Autonomous board processing and production release are intentionally off by default and require external configuration, identities, sandboxes, hooks, and readiness checks. Read [Safety is part of the architecture](#safety-is-part-of-the-architecture) before turning either on.
+
+Team initialization alone does not grant authenticated publication authority.
+That requires the separately provisioned external sandbox runner, broker-only
+tracker writes, lifecycle authority, and successful doctor probes documented in
+the [governed delivery benchmark path](reference/quickstart.md). Without that
+boundary, team processes are manually supervised and cannot publish governed
+review, integration, or release evidence.
 
 ## Safety is part of the architecture
 
@@ -486,6 +417,57 @@ Read the full contracts before enabling unattended or production operation:
 - [`reference/automation.md`](reference/automation.md)
 - [`reference/deployment.md`](reference/deployment.md)
 - [`reference/orchestration.md`](reference/orchestration.md)
+
+## What's new in 0.2.0
+
+This release candidate introduces three improvements:
+
+- **Risk-based delivery:** `micro` covers small, declared documentation changes;
+  `standard` covers ordinary code and tests; `high-risk` covers unknown scope,
+  security, control-plane, and release work. A requested profile cannot lower
+  inferred risk; the exact committed diff is checked again before review and
+  can add gates. High-risk work uses a strong-model floor, exclusive
+  implementation, and QA and Security gates. The core review board, exact
+  package evidence, immutable deny rules, integration authority, and production
+  authority do not change. Common fused auth, role, and key/token-rotation
+  filenames are treated as high risk. See
+  [`reference/delivery-profiles.md`](reference/delivery-profiles.md).
+- **Guided integration packs:** `validate → preview → apply → doctor` covers the
+  shipped Markdown, GitHub Issues, Jira, and Linear trackers, plus inactive
+  boundary descriptors for GitHub Actions exact-commit verification, Docker
+  Compose, and Kubernetes. Packs are validated data, saved plans bind their
+  source and target, and credentials stay outside repository config. Malformed
+  pack JSON fails validation; apply never executes commands or activates CI or
+  deployment.
+  Doctor reports local setup without authenticating a provider. See
+  [`extensions/integration-packs/README.md`](extensions/integration-packs/README.md).
+- **Objective beta readiness:** [`SECURITY.md`](SECURITY.md) defines disclosure;
+  a shorter [quickstart](reference/quickstart.md),
+  [compatibility boundaries](reference/compatibility.md), a reproducible
+  walkthrough, and [benchmark and usage methodology](reference/benchmarks.md)
+  make evaluation repeatable. Native Windows is unsupported and WSL remains
+  experimental and untested. The exact-release-set checker reports **not ready**
+  until fresh protected validation, package, review, disclosure, compatibility,
+  walkthrough, benchmark, and usage evidence is supplied. The under-15-minute
+  delivery target is not yet a measured result.
+
+Release is manual and fail-closed: merging to `main` does not publish. The
+workflow binds the exact current-main and protected evidence-branch commits,
+serializes release runs, and checks live `release` and `pypi` environments for
+required reviewers, self-review prevention, and disabled administrator bypass.
+The separate PyPI approval and exact bundle, wheel, and sdist checks remain
+mandatory. These safeguards do not themselves authorize a production release.
+
+**0.1.x upgrade action:** project configuration is preserved during updates.
+Before restarting autonomous or release services, update the protected
+installed `config/team.config.md`: set `BROKER_LIFECYCLE_ROOT` to the exact
+canonical external lifecycle path and, when `AGENT_SANDBOX_ENFORCED=true`,
+replace a missing, null, or legacy operator-owned `AGENT_SANDBOX_RUNNER` with a
+canonical external executable whose file and complete ancestor chain are
+root-owned and not writable by the executor, group, or world. The scheduler's
+`STARTUP_FACTORY_LIFECYCLE_STATE_ROOT` may only repeat that value; it no longer
+substitutes for a null or missing config assignment. Follow the bounded
+[migration procedure](reference/deployment.md#required-01x-lifecycle-authority-migration).
 
 ## What's new in 0.1.23
 
@@ -526,11 +508,12 @@ relaunched every pass while the board reported itself idle. Signature resolution
 now skips that trailer.
 
 The integration authorizer also accepted only a `Files:` line split on commas,
-while reviewers publish the same evidence as `Files approved (exact): a - b`.
-Those artifacts failed after every review had finished. Both authorizer sites now
-share one parser that accepts the prose labels and middot or space separators,
-with the canonical `Files:` label still winning wherever it appears; set-equality
-against the reviewed Git diff is unchanged. That contract is now specified in
+while reviewers publish the same evidence under prose labels. Both authorizer
+sites now share one fail-closed parser: it accepts the prose labels and a single
+consistent comma, middot, or bullet separator, while rejecting duplicate
+declarations or paths, mixed separators, empty declarations, and unquoted
+whitespace-only lists. Set-equality against the reviewed Git diff is unchanged.
+That contract is now specified in
 [`reference/orchestration.md`](reference/orchestration.md) and in every role brief
 that publishes a file list, and a set mismatch names which paths differ in each
 direction.
@@ -562,17 +545,21 @@ would simply omits it.
 reaching `exited` is the normal end of a pass and per-role output cannot
 separate a board that finished from one nobody is driving.
 
-Gate capabilities are minted with a stable instance, so relaunching a role
-replaced its active pointer and orphaned every artifact the previous boot had
-enqueued — including independent review verdicts. Supersession no longer blocks
-publication; the unexpired lease is the bound. Explicit revocation still stops a
-capability, now through durable tombstones that also cover capabilities an
-earlier relaunch had superseded.
+Workers no longer receive an outbox signing secret. For sandbox-enforced launches,
+the launcher keeps each secret in a generation-bound publication supervisor and
+gives the worker only a non-secret Unix-socket locator; unenforced/manual launches
+receive no authenticated publication transport. Task relaunches share one logical task lane and
+gate relaunches one role lane, so a successor immediately fences its predecessor
+from signing anything new. Signing also creates a protected, durable receipt for
+that exact entry and body under the same authority lock used by mint, revoke,
+holds, and tracker effects. This lets a final package already admitted before a
+normal worker exit drain safely after the supervisor's exact-id revocation,
+without letting a stale generation publish a different package.
 
 ## What's new in 0.1.19
 
 This release rewrites the README as a landing page. It leads with what Startup
-Factory is, who it is for, and a two-minute quick start, then hands off to
+Factory is, who it is for, and a short local quick start, then hands off to
 [`SKILL.md`](SKILL.md) and [`reference/`](reference/) for operational detail.
 
 Navigation is new: a table of contents, section anchors, and cross-links between
@@ -637,15 +624,23 @@ reviews, integration, or releases.
 
 | Start here | What it covers |
 |---|---|
+| [`reference/quickstart.md`](reference/quickstart.md) | External-runner prerequisites and the unproven benchmark path for a governed, non-production team delivery |
 | [`SKILL.md`](SKILL.md) | The operational front door and supported user requests |
 | [`reference/lifecycle.md`](reference/lifecycle.md) | Planning, starting, reviewing, finalizing, blocking, automation, and release scenarios |
 | [`reference/orchestration.md`](reference/orchestration.md) | Task packets, worktrees, mailboxes, dispatch, gates, attempts, and integration |
+| [`reference/delivery-profiles.md`](reference/delivery-profiles.md) | Monotonic micro, standard, and high-risk routing and invariant authority boundaries |
+| [`extensions/integration-packs/README.md`](extensions/integration-packs/README.md) | Pack schema, two-root setup model, preview/apply/doctor flow, and extension contract |
 | [`teams/README.md`](teams/README.md) | Team presets, roles, launch modes, and extension rules |
 | [`reference/vocabulary.md`](reference/vocabulary.md) | Tool-neutral entities, statuses, mappings, and naming rules |
 | [`reference/automation.md`](reference/automation.md) | Deterministic board monitoring and bounded task dispatch |
 | [`reference/guardrails.md`](reference/guardrails.md) | Denied actions, exact human approvals, and allowed operations |
 | [`reference/deployment.md`](reference/deployment.md) | Provider-neutral, recoverable production delivery |
 | [`reference/evidence-providers.md`](reference/evidence-providers.md) | Commit-bound external evidence and provider contracts |
+| [`reference/compatibility.md`](reference/compatibility.md) | Tested, declared, untested, and unsupported platform/runtime positions |
+| [`reference/governed-delivery-example.md`](reference/governed-delivery-example.md) | Reproducible first-delivery and exact package-build walkthrough |
+| [`reference/benchmarks.md`](reference/benchmarks.md) | Honest latency, usage, and cost measurement methodology |
+| [`reference/beta-readiness.md`](reference/beta-readiness.md) | Objective beta criteria and exact evidence schema |
+| [`SECURITY.md`](SECURITY.md) | Private vulnerability reporting and coordinated disclosure process |
 | [`reference/tracker-access.md`](reference/tracker-access.md) | Wiring a tracker: access mechanisms, scopes, and credential env vars |
 | [`reference/troubleshooting.md`](reference/troubleshooting.md) | Symptoms an operator hits, and what each fail-closed stop means |
 | [`config/`](config/) | Tracker, planning, team, automation, guardrail, and deployment configuration |
@@ -656,7 +651,7 @@ Claude Code users can optionally connect [`obra/superpowers`](https://github.com
 
 ## Project status
 
-Startup Factory is early-stage open-source software under active development. Start with Markdown and `solo` or `team` mode. Pin a reviewed package version in controlled environments and upgrade through [Safe updates](#safe-updates), and do not enable autonomous or production operation until the documented readiness checks pass.
+Startup Factory is early-stage open-source software under active development. Start with Markdown and `solo` or `team` mode. Pin a reviewed package version in controlled environments and upgrade through [Safe updates](#safe-updates). Native Windows is unsupported and WSL is currently untested; see the [compatibility matrix](reference/compatibility.md). Do not enable autonomous or production operation until the documented readiness checks pass.
 
 The framework is deliberately explicit. It would rather stop visibly than invent state, skip a gate, or pretend that work shipped.
 

@@ -90,6 +90,53 @@ class BundleBuilderTest(unittest.TestCase):
             }.issubset(required)
         )
 
+    def test_repository_spec_requires_shared_secret_safety_runtime(self) -> None:
+        spec = json.loads(REPOSITORY_SPEC_PATH.read_text(encoding="utf-8"))
+        self.assertIn(
+            "src/startup_factory_cli/secret_safety.py",
+            spec["requiredPaths"],
+        )
+
+    def test_repository_spec_requires_shared_config_parser_and_contract_tests(self) -> None:
+        spec = json.loads(REPOSITORY_SPEC_PATH.read_text(encoding="utf-8"))
+        required = set(spec["requiredPaths"])
+        self.assertTrue(
+            {
+                "bin/config-value.py",
+                "src/startup_factory_cli/config_values.py",
+                "tests/config-values-test.py",
+            }.issubset(required)
+        )
+
+    def test_repository_spec_requires_lineage_runtime_and_tests(self) -> None:
+        spec = json.loads(REPOSITORY_SPEC_PATH.read_text(encoding="utf-8"))
+        required = set(spec["requiredPaths"])
+        self.assertTrue(
+            {
+                "bin/lineage-migration.py",
+                "tests/claim-lineage-runtime-test.py",
+                "tests/lineage-migration-test.py",
+            }.issubset(required)
+        )
+        for relative in (
+            "bin/lineage-migration.py",
+            "tests/claim-lineage-runtime-test.py",
+            "tests/lineage-migration-test.py",
+        ):
+            with self.subTest(path=relative):
+                self.assertEqual((ROOT / relative).stat().st_mode & 0o111, 0o111)
+
+    def test_repository_spec_requires_release_worker_and_contract_test(self) -> None:
+        spec = json.loads(REPOSITORY_SPEC_PATH.read_text(encoding="utf-8"))
+        required = set(spec["requiredPaths"])
+        self.assertTrue(
+            {
+                "bin/release-worker.py",
+                "tests/release-worker-test.py",
+            }.issubset(required)
+        )
+        self.assertNotEqual((ROOT / "bin/release-worker.py").stat().st_mode & 0o111, 0)
+
     def make_repo(self, name: str) -> tuple[Path, str]:
         repo = self.temp / name
         repo.mkdir()
@@ -101,6 +148,12 @@ class BundleBuilderTest(unittest.TestCase):
         self.write(repo, "README.md", "# Fixture\n")
         self.write(repo, "SKILL.md", "---\nname: startup-factory\n---\n")
         self.write(repo, "adapters/_TEMPLATE.md", "adapter fixture\n")
+        self.write(
+            repo,
+            "bin/release-worker.py",
+            "#!/usr/bin/env python3\nraise SystemExit(0)\n",
+            0o755,
+        )
         self.write(repo, "bin/tool.sh", "#!/bin/sh\necho committed\n", 0o755)
         for relative in PRESERVED_CONFIGS:
             self.write(repo, relative, f"fixture:{relative}\n")
@@ -108,6 +161,11 @@ class BundleBuilderTest(unittest.TestCase):
         self.write(repo, "reference/automation.md", "reference fixture\n")
         self.write(repo, "roles/team-lead.md", "role fixture\n")
         self.write(repo, "teams/_PLAYBOOK.md", "team fixture\n")
+        self.write(
+            repo,
+            "tests/release-worker-test.py",
+            "# release-worker contract fixture\n",
+        )
         self.write(repo, "tests/run-all.sh", "#!/bin/sh\nexit 0\n", 0o755)
         self.write(
             repo,
@@ -121,12 +179,14 @@ class BundleBuilderTest(unittest.TestCase):
             "README.md",
             "SKILL.md",
             "adapters/_TEMPLATE.md",
+            "bin/release-worker.py",
             "bin/tool.sh",
             *PRESERVED_CONFIGS,
             "extensions/tracker-backends/README.md",
             "reference/automation.md",
             "roles/team-lead.md",
             "teams/_PLAYBOOK.md",
+            "tests/release-worker-test.py",
             "tests/run-all.sh",
         ]
         spec = {
@@ -267,6 +327,22 @@ class BundleBuilderTest(unittest.TestCase):
                 archive.getnames(),
             )
         self.assertEqual(self.manifest(output)["sourceCommit"], commit)
+
+    def test_required_release_worker_paths_fail_closed_when_removed(self) -> None:
+        for relative in (
+            "bin/release-worker.py",
+            "tests/release-worker-test.py",
+        ):
+            with self.subTest(path=relative):
+                repo, _ = self.make_repo("missing-" + Path(relative).stem)
+                self.git(repo, "rm", "-q", relative)
+                commit = self.commit_all(repo, "remove required release worker path")
+                with self.assertRaises(builder.BundleError) as raised:
+                    self.build(repo, commit, self.temp / (Path(relative).stem + ".tar.gz"))
+                self.assertIn(
+                    "required file is missing from the bundle: " + relative,
+                    str(raised.exception),
+                )
 
     def test_rejects_symlinks_submodules_and_newline_paths(self) -> None:
         repo, _ = self.make_repo("symlink")

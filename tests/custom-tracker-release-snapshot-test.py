@@ -33,7 +33,7 @@ def digest(path: Path) -> str:
 pm_agent = load_module(ROOT / "bin" / "pm-agent.py", "custom_tracker_pm_agent_test")
 
 with tempfile.TemporaryDirectory() as raw_tmp:
-    tmp = Path(raw_tmp)
+    tmp = Path(raw_tmp).resolve()
     skill = tmp / "protected-skill"
     project = tmp / "project"
     project.mkdir()
@@ -60,10 +60,26 @@ with tempfile.TemporaryDirectory() as raw_tmp:
     snapshot_files = dict(pm_agent.RELEASE_SNAPSHOT_FILES)
     custom_key = "tracker-backend.Acme.py"
     snapshot_files[custom_key] = custom_relative
+    policy_root = tmp / "protected-policy"
+    policy_root.mkdir(mode=0o700)
+    external_pm_config = policy_root / "project-management.config.md"
+    external_pm_config.write_bytes(
+        (skill / "config" / "project-management.config.md").read_bytes()
+    )
+    external_automation_config = policy_root / "automation.config.json"
+    automation = json.loads(
+        (skill / "config" / "automation.config.json").read_text()
+    )
+    automation["ignoredTaskLabels"] = ["manual-only"]
+    external_automation_config.write_text(json.dumps(automation, sort_keys=True))
+    external_pm_config.chmod(0o600)
+    external_automation_config.chmod(0o600)
     trusted = {
         name: digest(skill / relative)
         for name, relative in snapshot_files.items()
     }
+    trusted["project-management.config.md"] = digest(external_pm_config)
+    trusted["automation.config.json"] = digest(external_automation_config)
 
     state_root = tmp / "supervisor-state"
     state_root.mkdir(mode=0o700)
@@ -96,8 +112,14 @@ with tempfile.TemporaryDirectory() as raw_tmp:
             skill / "bin" / "release-feature.py"
         )
         os.environ["TRACKER_ADAPTER"] = "Acme"
+        os.environ["STARTUP_FACTORY_PM_CONFIG"] = str(external_pm_config)
+        os.environ["STARTUP_FACTORY_AUTOMATION_CONFIG"] = str(
+            external_automation_config
+        )
         command, observed_config, release_environment = pm_agent.validate_release_handoff(
             project,
+            pm_config_path=external_pm_config,
+            automation_config_path=external_automation_config,
             dry_run=False,
         )
     finally:
@@ -111,6 +133,12 @@ with tempfile.TemporaryDirectory() as raw_tmp:
     assert release_environment["TRACKER_ADAPTER"] == "Acme"
     release_script = Path(command[-1])
     supervisor_snapshot = release_script.parent.parent
+    assert Path(release_environment["STARTUP_FACTORY_PM_CONFIG"]).read_bytes() == (
+        external_pm_config.read_bytes()
+    )
+    assert Path(
+        release_environment["STARTUP_FACTORY_AUTOMATION_CONFIG"]
+    ).read_bytes() == external_automation_config.read_bytes()
     snapshotted_backend = supervisor_snapshot / custom_relative
     assert snapshotted_backend.read_bytes() == custom_backend.read_bytes()
     assert stat.S_IMODE(snapshotted_backend.stat().st_mode) == 0o400

@@ -6,33 +6,69 @@
 #   dispatch.sh <team> <featureId> --once [--dry-run] [--task <taskId>]
 #   dispatch.sh <team> <featureId> --watch
 set -euo pipefail
+umask 077
+STARTUP_FACTORY_CALLER_PATH="${PATH:-/usr/bin:/bin}"
+PATH=/usr/bin:/bin
+export PATH
+unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE
+unset PYTHONNOUSERSITE PYTHONSAFEPATH PYTHONDONTWRITEBYTECODE
+unset LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH
 
-SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+script_directory="${BASH_SOURCE[0]%/*}"
+[ "$script_directory" != "${BASH_SOURCE[0]}" ] || script_directory=.
+SKILL_DIR="$(cd "$script_directory/.." && pwd -P)"
+. "$SKILL_DIR/bin/authority-bootstrap.sh"
+python3() { authority_runtime_python "$@"; }
 CONFIG="$SKILL_DIR/config/team.config.md"
-PM_CONFIG="$SKILL_DIR/config/project-management.config.md"
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-
-STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON="$(python3 - \
-  "$SKILL_DIR/config/automation.config.json" \
-  "${STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON-}" <<'PY'
-import json,sys
-config_path,override=sys.argv[1:]
-if override:
-    try: value=json.loads(override)
-    except ValueError: raise SystemExit("dispatch: ignored-label policy override is invalid JSON")
-else:
-    value=json.load(open(config_path)).get("ignoredTaskLabels", ["human-work"])
-if not isinstance(value,list) or any(not isinstance(item,str) or not item.strip() or item!=item.strip() for item in value):
-    raise SystemExit("dispatch: ignored-label policy must be a JSON array of canonical strings")
-canonical=[item.casefold() for item in value]
-if len(canonical)!=len(set(canonical)):
-    raise SystemExit("dispatch: ignored-label policy contains a case-insensitive duplicate")
-print(json.dumps(value,separators=(",",":")))
-PY
-)"
-export STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON
+DEFAULT_PM_CONFIG="$SKILL_DIR/config/project-management.config.md"
+DEFAULT_AUTOMATION_CONFIG="$SKILL_DIR/config/automation.config.json"
+REPO_ROOT="$(/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  git -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "$PWD" rev-parse --show-toplevel)"
 
 die() { echo "dispatch: $*" >&2; exit 1; }
+
+# Autonomous authority is selected by installed configuration. Scheduler
+# environment values may only repeat the exact configured values.
+authority_args=(policy-source --default-config "$DEFAULT_PM_CONFIG" --repo "$REPO_ROOT" --skill "$SKILL_DIR" --label "project-management config")
+[ -z "${STARTUP_FACTORY_PM_CONFIG+x}" ] \
+  || authority_args+=(--ambient "$STARTUP_FACTORY_PM_CONFIG")
+PM_CONFIG="$(authority_python "$SKILL_DIR/bin/authority_config.py" "${authority_args[@]}")" \
+  || die "project-management policy source is unavailable"
+export STARTUP_FACTORY_PM_CONFIG="$PM_CONFIG"
+
+authority_args=(policy-source --default-config "$DEFAULT_AUTOMATION_CONFIG" --repo "$REPO_ROOT" --skill "$SKILL_DIR" --label "automation config")
+[ -z "${STARTUP_FACTORY_AUTOMATION_CONFIG+x}" ] \
+  || authority_args+=(--ambient "$STARTUP_FACTORY_AUTOMATION_CONFIG")
+AUTOMATION_CONFIG="$(authority_python "$SKILL_DIR/bin/authority_config.py" "${authority_args[@]}")" \
+  || die "automation policy source is unavailable"
+export STARTUP_FACTORY_AUTOMATION_CONFIG="$AUTOMATION_CONFIG"
+
+authority_args=(lifecycle-root --team-config "$CONFIG" --repo "$REPO_ROOT" --skill "$SKILL_DIR" --required)
+[ -z "${STARTUP_FACTORY_LIFECYCLE_STATE_ROOT+x}" ] \
+  || authority_args+=(--ambient "$STARTUP_FACTORY_LIFECYCLE_STATE_ROOT")
+STARTUP_FACTORY_LIFECYCLE_STATE_ROOT="$(
+  authority_python "$SKILL_DIR/bin/authority_config.py" "${authority_args[@]}"
+)" || die "configured lifecycle authority is unavailable"
+export STARTUP_FACTORY_LIFECYCLE_STATE_ROOT
+
+authority_args=(tracker-adapter --pm-config "$PM_CONFIG")
+[ -z "${TRACKER_ADAPTER+x}" ] || authority_args+=(--ambient "$TRACKER_ADAPTER")
+TRACKER_ADAPTER="$(authority_python "$SKILL_DIR/bin/authority_config.py" "${authority_args[@]}")" \
+  || die "configured tracker adapter authority is unavailable"
+export TRACKER_ADAPTER
+
+authority_args=(ignored-labels --automation-config "$AUTOMATION_CONFIG")
+[ -z "${STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON+x}" ] \
+  || authority_args+=(--ambient "$STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON")
+STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON="$(
+  authority_python "$SKILL_DIR/bin/authority_config.py" "${authority_args[@]}"
+)" || die "configured human-work label policy is unavailable"
+export STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON
+
+PATH="$(authority_python "$SKILL_DIR/bin/authority_config.py" runtime-path \
+  --value "$STARTUP_FACTORY_CALLER_PATH" --repo "$REPO_ROOT" --skill "$SKILL_DIR")" \
+  || die "caller runtime PATH is not a protected executable search path"
+export PATH
 
 validate_team_id() {
   case "$1" in
@@ -46,33 +82,20 @@ role_cmd_key() { # backend -> BACKEND_CMD ; principal-architect -> PRINCIPAL_ARC
 }
 
 key_is_null() { # key_is_null KEY -> 0 if the config sets KEY explicitly to null
-  grep -qE "^$1=null[[:space:]]*(#.*)?$" "$CONFIG"
+  local state
+  state="$(python3 "$SKILL_DIR/bin/config-value.py" --config "$CONFIG" \
+    --label "team config" --prefix dispatch state "$1")" || return $?
+  [ "$state" = null ]
 }
 
-read_key() { # from team.config.md; quotes stripped; null -> empty; inline # stripped on unquoted
-  local line _t; line="$(grep -m1 "^$1=" "$CONFIG" || true)"
-  line="${line#*=}"
-  if [ "${line#\"}" != "$line" ]; then
-    line="${line#\"}"; line="${line%%\"*}"
-  else
-    line="${line%%[[:space:]]#*}"
-    _t="${line##*[![:space:]]}"; line="${line%"$_t"}"
-  fi
-  [ "$line" = "null" ] && line=""
-  printf '%s' "$line"
+read_key() { # complete inert value; missing/null -> empty
+  python3 "$SKILL_DIR/bin/config-value.py" --config "$CONFIG" \
+    --label "team config" --prefix dispatch value "$1"
 }
 
 read_pm_key() { # read from project-management.config.md; quotes stripped; null -> empty; inline # stripped
-  local line _t; line="$(grep -m1 "^$1=" "$PM_CONFIG" || true)"
-  line="${line#*=}"
-  if [ "${line#\"}" != "$line" ]; then
-    line="${line#\"}"; line="${line%%\"*}"
-  else
-    line="${line%%[[:space:]]#*}"
-    _t="${line##*[![:space:]]}"; line="${line%"$_t"}"
-  fi
-  [ "$line" = "null" ] && line=""
-  printf '%s' "$line"
+  python3 "$SKILL_DIR/bin/config-value.py" --config "$PM_CONFIG" \
+    --label "project-management config" --prefix dispatch value "$1"
 }
 
 is_mcp_only() { # is_mcp_only <adapter> -> 0 if configured for MCP-only access
@@ -180,13 +203,12 @@ task_any_live() { # task_any_live <team> <taskId> -> any role/attempt process fo
 }
 
 stop_task_or_quarantine() { # <team> <workspace> <taskId>
-  local stop_team="$1" stop_workspace="$2" stop_task="$3"
+  local stop_team="$1" stop_task="$3"
   if "$SKILL_DIR/bin/launch-team.sh" stop-task "$stop_team" "$stop_task"; then
     return 0
   fi
-  echo "dispatch: task $stop_task could not be fully signaled; revoking publication authority and continuing isolated work" >&2
-  python3 "$SKILL_DIR/bin/outbox_capability.py" revoke-task \
-    --repo "$REPO_ROOT" --workspace "$stop_workspace" --team "$stop_team" --task "$stop_task" >/dev/null \
+  echo "dispatch: task $stop_task could not be fully signaled; fencing cross-worktree publication authority and continuing isolated work" >&2
+  "$SKILL_DIR/bin/launch-team.sh" fence-task "$stop_team" "$stop_task" >/dev/null \
     || die "task $stop_task stop failed and publication authority could not be revoked"
 }
 
@@ -197,7 +219,7 @@ process_worker_controls() { # team feature workspace tasks-snapshot
   [ -d "$pending" ] || return 0
   entries="$(find "$pending" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)"
   [ -n "$entries" ] || return 0
-  lifecycle_root="${STARTUP_FACTORY_LIFECYCLE_STATE_ROOT:-$(read_key BROKER_LIFECYCLE_ROOT)}"
+  lifecycle_root="$STARTUP_FACTORY_LIFECYCLE_STATE_ROOT"
   [ -n "$lifecycle_root" ] \
     || die "authenticated worker-control request is pending but protected lifecycle supervision is disabled"
   python3 "$SKILL_DIR/bin/worker-control.py" reconcile \
@@ -205,6 +227,24 @@ process_worker_controls() { # team feature workspace tasks-snapshot
     --feature "$control_feature" --tasks "$control_tasks" \
     --launcher "$SKILL_DIR/bin/launch-team.sh" --lifecycle-root "$lifecycle_root" \
     || die "worker-control reconciliation failed"
+}
+
+process_lineage_migrations() { # team feature workspace tasks-snapshot
+  local migration_team="$1" migration_feature="$2" migration_workspace="$3" migration_tasks="$4"
+  local pending lifecycle_root entries
+  pending="$(team_path "$migration_workspace" lineage-migration-outbox/pending)"
+  [ -d "$pending" ] || return 0
+  entries="$(find "$pending" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)"
+  [ -n "$entries" ] || return 0
+  lifecycle_root="$STARTUP_FACTORY_LIFECYCLE_STATE_ROOT"
+  [ -n "$lifecycle_root" ] \
+    || die "authenticated lineage migration is pending but protected lifecycle supervision is disabled"
+  STARTUP_FACTORY_LINEAGE_MIGRATION_BROKER=1 \
+    python3 "$SKILL_DIR/bin/lineage-migration.py" reconcile \
+      --repo "$REPO_ROOT" --workspace "$migration_workspace" \
+      --team "$migration_team" --feature "$migration_feature" \
+      --tasks "$migration_tasks" --lifecycle-root "$lifecycle_root" \
+    || die "lineage migration reconciliation failed"
 }
 
 next_mailbox_file() { # next_mailbox_file <mailbox-dir> -> path with next free NNN
@@ -291,6 +331,17 @@ for kind in ("queued","blocked","working","review"):
 PY
 }
 
+dispatch_lineage_preflight() { # team feature role task attempt workspace tasks
+  local preflight_team="$1" preflight_feature="$2" preflight_role="$3"
+  local preflight_task="$4" preflight_attempt="$5" preflight_workspace="$6" preflight_tasks="$7"
+  "$SKILL_DIR/bin/tracker-ops.sh" export "$preflight_feature" "$preflight_tasks" >/dev/null
+  python3 "$SKILL_DIR/bin/runtime-state.py" lineage-check \
+    --repo "$REPO_ROOT" --workspace "$preflight_workspace" --tasks "$preflight_tasks" \
+    --team "$preflight_team" --feature "$preflight_feature" --task "$preflight_task" \
+    --role "$preflight_role" --attempt "$preflight_attempt" >/dev/null \
+    || die "dispatcher claim-lineage preflight failed"
+}
+
 claim_id_for() { # team feature task role attempt target -> deterministic bounded id
   python3 - "$@" <<'PY'
 import hashlib,sys
@@ -328,8 +379,7 @@ refresh_export_if_changed() { # <workspace> <featureId> <tasks-file>
   [ "$max_reuse" -le 3600 ] || max_reuse=3600
   if [ "$force" = no ] && [ -s "$tasks_file" ] && [ -s "$token_file" ]; then
     local observed_token cached_token last_export now_seconds
-    observed_token="$(env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
-      "$SKILL_DIR/bin/tracker-ops.sh" change-token "$fid" 2>/dev/null || true)"
+    observed_token="$("$SKILL_DIR/bin/tracker-ops.sh" change-token "$fid" 2>/dev/null || true)"
     cached_token="$(cat "$token_file" 2>/dev/null || true)"
     if [ -n "$observed_token" ] && [ "$observed_token" = "$cached_token" ]; then
       now_seconds="$(date -u +%s)"
@@ -341,12 +391,10 @@ refresh_export_if_changed() { # <workspace> <featureId> <tasks-file>
       fi
     fi
   fi
-  env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
-    "$SKILL_DIR/bin/tracker-ops.sh" export "$fid" "$tasks_file" >/dev/null
+  "$SKILL_DIR/bin/tracker-ops.sh" export "$fid" "$tasks_file" >/dev/null
   # Record the token only after a successful export, so a failed export can
   # never leave a token claiming the cached snapshot is current.
-  env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
-    "$SKILL_DIR/bin/tracker-ops.sh" change-token "$fid" 2>/dev/null \
+  "$SKILL_DIR/bin/tracker-ops.sh" change-token "$fid" 2>/dev/null \
     > "$token_file" || : > "$token_file"
   date -u +%s > "$export_stamp" 2>/dev/null || true
 }
@@ -363,8 +411,7 @@ dispatch_once() { # dispatch_once <team> <featureId> <dry:yes|no> [target-task]
   team_path "$dir" heartbeats >/dev/null
   team_path "$dir" executions >/dev/null
   team_path "$dir" claims >/dev/null
-  local _a; _a="$(grep -m1 '^PRODUCT_MANAGEMENT_TOOL=' "$PM_CONFIG" 2>/dev/null | cut -d= -f2 | tr -d '"' || true)"
-  local adapter="${TRACKER_ADAPTER:-$_a}"
+  local adapter="$TRACKER_ADAPTER"
   if is_mcp_only "$adapter"; then
     die "dispatch requires scriptable tracker access — $adapter is configured for MCP-only.
   Set the scriptable option in config/project-management.config.md or use harness mode."
@@ -422,8 +469,7 @@ PY
         block)
           # The team-lead verdict is advisory until the broker re-exports the
           # exact graph and authenticated marker immediately before mutation.
-          env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
-            "$SKILL_DIR/bin/tracker-ops.sh" export "$fid" "$tasks_file" >/dev/null
+          "$SKILL_DIR/bin/tracker-ops.sh" export "$fid" "$tasks_file" >/dev/null
           python3 "$SKILL_DIR/bin/task-hold.py" validate-dependent \
             --repo "$REPO_ROOT" --workspace "$dir" --tasks "$tasks_file" --feature "$fid" --team "$team" \
             --task "$hold_task" --graph-digest "$hold_graph" \
@@ -431,13 +477,11 @@ PY
             --inflight-status "$queued_status" --inflight-status "$working_status" --inflight-status "$review_status" \
             --ignored-labels-json "$STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON" >/dev/null
           echo "dispatch: lead-confirmed dependency prevents $hold_task; moving it to [$blocked_status]"
-          env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
-            "$SKILL_DIR/bin/tracker-ops.sh" state "$hold_task" "$blocked_status"
+          "$SKILL_DIR/bin/tracker-ops.sh" state "$hold_task" "$blocked_status"
           # Make the durable hold visible to every broker before attempting to
           # signal the worker. Even if process termination later fails closed,
           # no publication or integration can pass this registry/status fence.
-          env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
-            "$SKILL_DIR/bin/tracker-ops.sh" export "$fid" "$tasks_file" >/dev/null
+          "$SKILL_DIR/bin/tracker-ops.sh" export "$fid" "$tasks_file" >/dev/null
           python3 "$SKILL_DIR/bin/task-hold.py" sync \
             --repo "$REPO_ROOT" --workspace "$dir" --tasks "$tasks_file" --feature "$fid" --team "$team" \
             --blocked-status "$blocked_status" --queued-status "$queued_status" \
@@ -452,8 +496,7 @@ PY
 $hold_actions
 EOF
     if [ "$changed" = "yes" ]; then
-      env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
-        "$SKILL_DIR/bin/tracker-ops.sh" export "$fid" "$tasks_file" >/dev/null
+      "$SKILL_DIR/bin/tracker-ops.sh" export "$fid" "$tasks_file" >/dev/null
       python3 "$SKILL_DIR/bin/task-hold.py" sync \
         --repo "$REPO_ROOT" --workspace "$dir" --tasks "$tasks_file" --feature "$fid" --team "$team" \
         --blocked-status "$blocked_status" --queued-status "$queued_status" \
@@ -497,6 +540,7 @@ EOF
     done <<EOF
 $(python3 -c 'import json,sys; [print(item) for item in json.loads(sys.argv[1]).get("stopTasks", [])]' "$hold_result")
 EOF
+    process_lineage_migrations "$team" "$fid" "$dir" "$tasks_file"
     process_worker_controls "$team" "$fid" "$dir" "$tasks_file"
   fi
   if [ "$dry" != "yes" ]; then
@@ -509,7 +553,7 @@ EOF
   trusted_preset="$(trusted_team_preset "$team" "$fid")" \
     || die "could not verify protected team preset authority"
   health_json="[]"
-  lifecycle_root="${STARTUP_FACTORY_LIFECYCLE_STATE_ROOT:-$(read_key BROKER_LIFECYCLE_ROOT)}"
+  lifecycle_root="$STARTUP_FACTORY_LIFECYCLE_STATE_ROOT"
   if [ -n "$lifecycle_root" ]; then
     health_json="$("$SKILL_DIR/bin/launch-team.sh" status "$team" --json | python3 -c 'import json,sys; print(json.dumps([json.loads(line) for line in sys.stdin if line.strip()],separators=(",",":")))')" \
       || die "could not build authenticated worker-health snapshot"
@@ -577,8 +621,7 @@ print(matches[0])
 PY
             )"
             claim_id="$(claim_id_for "$team" "$fid" "$detail" "$claim_role" "$extra" "$claim_target")"
-            env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
-              "$SKILL_DIR/bin/tracker-ops.sh" export "$fid" "$tasks_file" >/dev/null
+            "$SKILL_DIR/bin/tracker-ops.sh" export "$fid" "$tasks_file" >/dev/null
             python3 - "$tasks_file" "$detail" "$queued_status" \
               "${STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON:-[]}" <<'PY'
 import json,sys
@@ -612,12 +655,22 @@ for status in board["tasks"]["statuses"]:
 PY
 )
             python3 "$SKILL_DIR/bin/task-hold.py" "${claim_authority_args[@]}" >/dev/null
-            "$SKILL_DIR/bin/tracker-ops.sh" claim "$detail" "$claim_role" --to "$claim_target" --claim-id "$claim_id"
-            # Persist the local identity only after the tracker claim succeeds;
-            # a failed remote claim can never leave a stale local claim record.
+            # Prove the prior immutable lineage is recoverable before either
+            # local claim preparation or the remote tracker transition. The
+            # target claim remains a retryable local prepare, and packetization
+            # still requires the fresh exact tracker receipt.
+            python3 "$SKILL_DIR/bin/runtime-state.py" claim-preflight \
+              --repo "$REPO_ROOT" --workspace "$dir" --tasks "$tasks_file" \
+              --team "$team" --feature "$fid" --task "$detail" --role "$claim_role" \
+              --attempt "$extra" --claim-id "$claim_id" \
+              --current-status "$queued_status" --target "$claim_target" >/dev/null \
+              || die "dispatcher claim-lineage preflight failed before tracker claim"
             python3 "$SKILL_DIR/bin/runtime-state.py" claim --workspace "$dir" \
+              --repo "$REPO_ROOT" \
               --team "$team" --feature "$fid" --task "$detail" --role "$claim_role" \
               --attempt "$extra" --claim-id "$claim_id" --target "$claim_target" >/dev/null
+            "$SKILL_DIR/bin/tracker-ops.sh" claim "$detail" "$claim_role" --to "$claim_target" --claim-id "$claim_id"
+            dispatch_lineage_preflight "$team" "$fid" "$claim_role" "$detail" "$extra" "$dir" "$tasks_file"
             # Keep the feature lifecycle deterministic: the first successful
             # task claim also advances a queued feature into its working state.
             "$SKILL_DIR/bin/tracker-ops.sh" feature-state "$fid" "$(working_feature_status)"
@@ -632,6 +685,7 @@ PY
         else
           echo "plan: launch task $detail as $task_role (attempt $extra)"
           if [ "$dry" != "yes" ]; then
+            dispatch_lineage_preflight "$team" "$fid" "$task_role" "$detail" "$extra" "$dir" "$tasks_file"
             "$SKILL_DIR/bin/launch-team.sh" start-task "$team" "$fid" "$task_role" "$detail" "$extra"
           fi
         fi ;;
@@ -659,6 +713,7 @@ print((matches[0]["state"]+"\t"+matches[0]["createdAt"]) if matches else "absent
             || die "automatic recovery refused an identity-mismatched lifecycle record for $detail"
           echo "plan: recover exited task $detail as $recover_role (attempt $extra -> $((extra + 1)))"
           if [ "$dry" != "yes" ]; then
+            dispatch_lineage_preflight "$team" "$fid" "$recover_role" "$detail" "$extra" "$dir" "$tasks_file"
             python3 "$SKILL_DIR/bin/control-grant.py" issue \
               --root "$lifecycle_root" --repo "$REPO_ROOT" \
               --team "$team" --feature "$fid" --action restart-task --target "$detail" \

@@ -11,10 +11,19 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sys
 import unicodedata
 from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import Path
+
+
+SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src"
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
+
+from startup_factory_cli.secret_safety import SECRET_MATERIAL_RE  # noqa: E402
 
 
 POLICY_NAME = "ticket-content-data-only-v1"
@@ -292,19 +301,12 @@ FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+.-]*)")
 
 
 PRIVATE_KEY_BEGIN_RE = re.compile(
-    r"-----BEGIN ([A-Z0-9 ]{0,40}PRIVATE KEY)-----"
+    r"-----BEGIN ([A-Z0-9 ]{0,40}(?:PRIVATE KEY|CERTIFICATE))-----"
 )
-SECRET_PATTERNS = (
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})\b"),
-    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
-    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
-    re.compile(
-        r"(?i)\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|password|passwd|secret|client[_-]?secret)\b"
-        r"\s*[:=]\s*(?:[\"'])?([A-Za-z0-9_+./=-]{8,})(?:[\"'])?"
-    ),
-)
+# Tracker ingress and every later publication boundary use the same canonical
+# high-confidence detector.  Keeping this as a tuple preserves the bounded
+# substitution loop and makes accidental narrowing visible in tests.
+SECRET_PATTERNS = (SECRET_MATERIAL_RE,)
 
 
 CONTROL_CATEGORIES = {"Cc", "Cf"}
@@ -326,7 +328,7 @@ def _redaction_marker(_secret: str) -> str:
 
 
 def _redact_private_keys(text: str) -> tuple[str, int, set[int]]:
-    """Redact PEM private-key blocks with bounded, deterministic string searches."""
+    """Redact PEM key/certificate blocks with bounded string searches."""
     newline_offsets = [index for index, char in enumerate(text) if char == "\n"]
     output: list[str] = []
     cursor = 0

@@ -29,8 +29,15 @@ skill's directory):
   implementation [task] or one exact review package
 - `bin/launch-team.sh doctor` — non-mutating CLI authentication/startup smoke
   test under the real sanitized agent environment
-- `bin/delivery_profile.py` — diagnostic-only task/committed-diff assessment;
-  `micro` never removes a design, review, validation, integration, or release gate
+- `bin/delivery_profile.py` + `reference/delivery-profiles.md` — authoritative,
+  monotonic `micro` / `standard` / `high-risk` task and exact-committed-diff
+  classification; a requested profile may raise rigor but cannot lower it, and
+  no profile removes core design, review, validation, integration, or release authority
+- `bin/integration_pack.py` + `extensions/integration-packs/` — strict data-only
+  integration packs with digest-bound preview/apply and secret-safe doctor checks
+- `bin/beta-readiness.py` + `reference/beta-readiness.md` — offline structural
+  beta criteria bound to the exact bundle/wheel/sdist release set; protected
+  evidence authenticity and release authority remain external
 - `bin/evidence_provider.py` + `reference/evidence-providers.md` — strict offline
   validation/indexing for commit-bound, non-authoritative provider evidence
 - `extensions/evidence-providers/` — preserved project-owned evidence workers;

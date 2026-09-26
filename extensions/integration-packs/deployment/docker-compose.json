@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "deployment-docker-compose",
+  "kind": "deployment",
+  "displayName": "Docker Compose deployment boundary",
+  "summary": "Create an inactive Docker Compose deployment boundary with no release authority.",
+  "compatibility": {
+    "minimumVersion": "0.2.0",
+    "platforms": ["darwin", "linux"],
+    "state": "supported"
+  },
+  "prerequisites": ["Deployment configuration remains external and requires operator review."],
+  "credentials": {
+    "policy": "adapter-managed",
+    "required": []
+  },
+  "capability": {
+    "target": "docker-compose",
+    "outputFile": "boundary.json",
+    "template": {
+      "schemaVersion": 1,
+      "enabled": false,
+      "target": "docker-compose",
+      "mode": "approval-required",
+      "releaseAuthority": false,
+      "containsCredentialValues": false,
+      "activation": "external-reviewed-config-only"
+    }
+  }
+}

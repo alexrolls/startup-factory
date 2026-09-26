@@ -2,56 +2,111 @@
 # Finalize integration transactions through the credentialed deterministic broker.
 set -euo pipefail
 umask 077
+STARTUP_FACTORY_CALLER_PATH="${PATH:-/usr/bin:/bin}"
+PATH=/usr/bin:/bin
+export PATH
+unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE
+unset PYTHONNOUSERSITE PYTHONSAFEPATH PYTHONDONTWRITEBYTECODE
+unset LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH
 
-SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+script_directory="${BASH_SOURCE[0]%/*}"
+[ "$script_directory" != "${BASH_SOURCE[0]}" ] || script_directory=.
+SKILL_DIR="$(cd "$script_directory/.." && pwd -P)"
+. "$SKILL_DIR/bin/authority-bootstrap.sh"
+python3() { authority_runtime_python "$@"; }
 POLICY_SOURCE_ROOT="${STARTUP_FACTORY_TEAM_POLICY_SOURCE_ROOT:-$SKILL_DIR}"
 CONFIG="$SKILL_DIR/config/team.config.md"
+DEFAULT_PM_CONFIG="$SKILL_DIR/config/project-management.config.md"
+DEFAULT_AUTOMATION_CONFIG="$SKILL_DIR/config/automation.config.json"
+GIT_EXECUTABLE="$(python3 "$SKILL_DIR/bin/delivery_profile.py" git-executable)"
+RECOVERY_PYTHON="$AUTHORITY_PYTHON"
 
 die() { echo "finalize-integrations: $*" >&2; exit 1; }
 read_key() {
-  local line value _t
-  line="$(grep -m1 "^$1=" "$CONFIG" || true)"
-  value="${line#*=}"
-  if [ "${value#\"}" != "$value" ]; then value="${value#\"}"; value="${value%%\"*}"
-  else value="${value%%[[:space:]]#*}"; _t="${value##*[![:space:]]}"; value="${value%"$_t"}"; fi
-  [ "$value" = "null" ] && value=""
-  printf '%s' "$value"
+  python3 "$SKILL_DIR/bin/config-value.py" --config "$CONFIG" \
+    --label "team config" --prefix finalize-integrations value "$1"
 }
 
-# Broker authorization must use the protected hold authority even when this
-# script is invoked directly rather than through the PM supervisor.
-if [ -z "${STARTUP_FACTORY_LIFECYCLE_STATE_ROOT:-}" ]; then
-  configured_lifecycle_root="$(read_key BROKER_LIFECYCLE_ROOT)"
-  if [ -n "$configured_lifecycle_root" ]; then
-    export STARTUP_FACTORY_LIFECYCLE_STATE_ROOT="$configured_lifecycle_root"
-  fi
-fi
+# Mutation/release authority comes only from installed configuration. Ambient
+# values are compatibility assertions and must repeat that configuration.
+AUTHORITY_REPO="$(/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  git -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "$PWD" rev-parse --show-toplevel)" \
+  || die "cannot resolve canonical repository before authority binding"
+authority_args=(policy-source --default-config "$DEFAULT_PM_CONFIG" --repo "$AUTHORITY_REPO" --skill "$SKILL_DIR" --label "project-management config")
+[ -z "${STARTUP_FACTORY_PM_CONFIG+x}" ] \
+  || authority_args+=(--ambient "$STARTUP_FACTORY_PM_CONFIG")
+PM_CONFIG="$(authority_python "$SKILL_DIR/bin/authority_config.py" "${authority_args[@]}")" \
+  || die "project-management policy source is unavailable"
+export STARTUP_FACTORY_PM_CONFIG="$PM_CONFIG"
+
+authority_args=(policy-source --default-config "$DEFAULT_AUTOMATION_CONFIG" --repo "$AUTHORITY_REPO" --skill "$SKILL_DIR" --label "automation config")
+[ -z "${STARTUP_FACTORY_AUTOMATION_CONFIG+x}" ] \
+  || authority_args+=(--ambient "$STARTUP_FACTORY_AUTOMATION_CONFIG")
+AUTOMATION_CONFIG="$(authority_python "$SKILL_DIR/bin/authority_config.py" "${authority_args[@]}")" \
+  || die "automation policy source is unavailable"
+export STARTUP_FACTORY_AUTOMATION_CONFIG="$AUTOMATION_CONFIG"
+
+authority_args=(lifecycle-root --team-config "$CONFIG" --repo "$AUTHORITY_REPO" --skill "$SKILL_DIR" --required)
+[ -z "${STARTUP_FACTORY_LIFECYCLE_STATE_ROOT+x}" ] \
+  || authority_args+=(--ambient "$STARTUP_FACTORY_LIFECYCLE_STATE_ROOT")
+STARTUP_FACTORY_LIFECYCLE_STATE_ROOT="$(
+  authority_python "$SKILL_DIR/bin/authority_config.py" "${authority_args[@]}"
+)" || die "configured lifecycle authority is unavailable"
+export STARTUP_FACTORY_LIFECYCLE_STATE_ROOT
+
+authority_args=(tracker-adapter --pm-config "$PM_CONFIG")
+[ -z "${TRACKER_ADAPTER+x}" ] || authority_args+=(--ambient "$TRACKER_ADAPTER")
+TRACKER_ADAPTER="$(authority_python "$SKILL_DIR/bin/authority_config.py" "${authority_args[@]}")" \
+  || die "configured tracker adapter authority is unavailable"
+export TRACKER_ADAPTER
+
+authority_args=(ignored-labels --automation-config "$AUTOMATION_CONFIG")
+[ -z "${STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON+x}" ] \
+  || authority_args+=(--ambient "$STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON")
+STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON="$(
+  authority_python "$SKILL_DIR/bin/authority_config.py" "${authority_args[@]}"
+)" || die "configured human-work label policy is unavailable"
+export STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON
+
+PATH="$(authority_python "$SKILL_DIR/bin/authority_config.py" runtime-path \
+  --value "$STARTUP_FACTORY_CALLER_PATH" --repo "$AUTHORITY_REPO" --skill "$SKILL_DIR")" \
+  || die "caller runtime PATH is not a protected executable search path"
+export PATH
 
 git_unprivileged() {
-  local args=(-i "PATH=${PATH:-/usr/bin:/bin}" "GIT_CONFIG_GLOBAL=/dev/null" "GIT_CONFIG_NOSYSTEM=1")
+  local args=(-i "PATH=/usr/bin:/bin" "GIT_CONFIG_GLOBAL=/dev/null" "GIT_CONFIG_NOSYSTEM=1"
+    "GIT_ALLOW_PROTOCOL=" "GIT_PROTOCOL_FROM_USER=0" "GIT_NO_LAZY_FETCH=1"
+    "GIT_NO_REPLACE_OBJECTS=1" "GIT_TERMINAL_PROMPT=0")
   [ -z "${TMPDIR-}" ] || args+=("TMPDIR=$TMPDIR")
   [ -z "${LANG-}" ] || args+=("LANG=$LANG")
   [ -z "${LC_ALL-}" ] || args+=("LC_ALL=$LC_ALL")
-  /usr/bin/env "${args[@]}" git -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+  /usr/bin/env "${args[@]}" "$GIT_EXECUTABLE" \
+    -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    -c core.attributesFile=/dev/null -c credential.helper= \
+    -c commit.gpgSign=false -c tag.gpgSign=false \
+    -c fetch.recurseSubmodules=false -c merge.default=text \
+    -c merge.renormalize=false -c protocol.allow=never \
+    -c rerere.autoupdate=false -c rerere.enabled=false \
+    -c submodule.recurse=false "$@"
 }
 
 usage() {
   die "usage: finalize-integrations.sh <team> <featureId> [transaction.json]
        finalize-integrations.sh --validate-only <team> <featureId> <transaction.json>
        finalize-integrations.sh --authorize-prepared <team> <featureId> <prepared.json>
-       finalize-integrations.sh --evidence <tasks.json> <taskId> <baseCommit> <headCommit> <packageSha256> [preset.env]"
+       finalize-integrations.sh --evidence <tasks.json> <taskId> <baseCommit> <headCommit> <packageSha256> <requestRole> <attempt> <preset.env>"
 }
 
 # Keep approval eligibility identical in the integrator and broker. Every
 # approval is bound to the exact request, base, head, and review-package digest.
 approval_evidence() {
-  [ $# -ge 5 ] && [ $# -le 6 ] || usage
+  [ $# -eq 8 ] || usage
   local args=(validate "$1" "$2" "$3" "$4" "$5" "$SKILL_DIR/config/statuses.config.json")
   local policy_tmp="" policy_workspace policy_team policy_feature rc=0
-  if [ $# -eq 6 ]; then
-    [ "$(basename "$6")" = preset.env ] \
+  if [ $# -eq 8 ]; then
+    [ "$(basename "$8")" = preset.env ] \
       || die "team policy projection must be named preset.env"
-    policy_workspace="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).absolute().parent.resolve())' "$6")"
+    policy_workspace="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).absolute().parent.resolve())' "$8")"
     policy_team="$(basename "$policy_workspace")"
     policy_feature="$(python3 - "$1" <<'PY'
 import json,sys
@@ -63,7 +118,7 @@ PY
 )"
     policy_tmp="$(mktemp "${TMPDIR:-/tmp}/startup-factory-team-policy.XXXXXX")"
     if ! python3 "$SKILL_DIR/bin/team_policy.py" \
-      --repo "$(git_unprivileged rev-parse --show-toplevel)" \
+      --repo "$(python3 "$SKILL_DIR/bin/delivery_profile.py" repo-root --path "$PWD")" \
       --workspace "$policy_workspace" --team "$policy_team" --feature "$policy_feature" \
       --skill "$SKILL_DIR" --source-skill "$POLICY_SOURCE_ROOT" > "$policy_tmp"; then
       rm -f -- "$policy_tmp"
@@ -71,13 +126,18 @@ PY
     fi
     args+=(--preset "$policy_tmp")
   fi
+  args+=(
+    --repo "$(python3 "$SKILL_DIR/bin/delivery_profile.py" repo-root --path "$PWD")"
+    --workspace "$policy_workspace" --team "$policy_team" --feature "$policy_feature"
+    --request-role "$6" --attempt "$7"
+  )
   python3 "$SKILL_DIR/bin/review_evidence.py" "${args[@]}" || rc=$?
   [ -z "$policy_tmp" ] || rm -f -- "$policy_tmp"
   return "$rc"
 }
 
 if [ "${1:-}" = "--evidence" ]; then
-  [ $# -ge 6 ] && [ $# -le 7 ] || usage
+  [ $# -eq 9 ] || usage
   approval_evidence "${@:2}"
   exit 0
 fi
@@ -103,7 +163,7 @@ if not value or len(value) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in v
     raise SystemExit("finalize-integrations: invalid featureId")
 PY
 
-repo="$(git_unprivileged rev-parse --show-toplevel)"
+repo="$(python3 "$SKILL_DIR/bin/delivery_profile.py" repo-root --path "$PWD")"
 root="$(read_key TEAMWORK_ROOT)"; root="${root:-.teamwork}"
 workspace="$(python3 "$SKILL_DIR/bin/teamwork-path.py" workspace --repo "$repo" --root "$root" --team "$team")"
 integrations="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative integrations)"
@@ -202,8 +262,7 @@ assert_tracker_task_review_authorized() {
   local task="$1" fresh="$pm_dir/integration-write-snapshot.json"
   [ ! -L "$fresh" ] || die "fresh integration-write snapshot path is a symlink"
   [ ! -e "$fresh" ] || [ -f "$fresh" ] || die "fresh integration-write snapshot path is not a regular file"
-  if ! env -u STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON \
-    "$SKILL_DIR/bin/tracker-ops.sh" export "$feature" "$fresh" >/dev/null; then
+  if ! "$SKILL_DIR/bin/tracker-ops.sh" export "$feature" "$fresh" >/dev/null; then
     die "fresh tracker export unavailable; tracker integration remains stopped"
   fi
   python3 - "$fresh" "$SKILL_DIR/config/statuses.config.json" "$feature" "$task" <<'PY'
@@ -291,9 +350,11 @@ from pathlib import Path
 entry_raw,snapshot_raw,repo_raw,workspace_raw,team,feature,board_raw,review_module_raw,skill_raw,policy_source_raw=sys.argv[1:]
 entry,snapshot,repo,workspace=Path(entry_raw),Path(snapshot_raw),Path(repo_raw).resolve(),Path(workspace_raw).resolve()
 sys.dont_write_bytecode=True; sys.path.insert(0,str(Path(review_module_raw).resolve().parent))
-from review_evidence import EvidenceError, SUPPORTING_GATE_MARKERS, parse_files_evidence, request_binding, validate as validate_review_evidence
+from review_evidence import EvidenceError, SUPPORTING_GATE_MARKERS, parse_files_evidence, request_binding, strip_publication_trailer, validate as validate_review_evidence
+from delivery_profile import DeliveryProfileError, _git as safe_git, _repository_root
 from task_metadata import required_review_gates
 from team_policy import TeamPolicyError, load_team_policy
+repo=_repository_root(repo)
 def fail(message): raise SystemExit("finalize-integrations: prepared authorization: "+message)
 def regular(path,label,maximum=8*1024*1024):
     try: mode=path.lstat().st_mode
@@ -359,12 +420,11 @@ material={name:data[name] for name in ("team","featureId","taskId","attempt","ex
     "reviewBaseCommit","taskBranchHead","reviewPackageSha256","approvalEvidenceDigest")}
 canonical=json.dumps(material,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
 if data.get("preparationId") != "integration-prep-"+hashlib.sha256(canonical).hexdigest()[:32]: fail("id mismatch")
-env={name:os.environ[name] for name in ("PATH","TMPDIR","LANG","LC_ALL") if name in os.environ}
-env.setdefault("PATH","/usr/bin:/bin"); env.update({"GIT_CONFIG_GLOBAL":os.devnull,"GIT_CONFIG_NOSYSTEM":"1"})
 def git(*args):
-    result=subprocess.run(["git","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false",*args],cwd=repo,text=True,capture_output=True,env=env)
-    if result.returncode: fail("Git check failed: "+(result.stderr.strip() or result.stdout.strip()))
-    return result.stdout.strip()
+    try: raw=safe_git(repo,*args,max_output_bytes=8*1024*1024,timeout_seconds=30.0)
+    except DeliveryProfileError as exc: fail("Git check failed: "+str(exc))
+    try: return raw.decode("utf-8","strict").strip()
+    except UnicodeError: fail("Git check produced non-UTF-8 output")
 if git("rev-parse","refs/heads/"+team) != data["baseCommit"]: fail("feature branch moved after preparation")
 if git("rev-parse","refs/heads/"+data["branch"]) != data["taskBranchHead"]: fail("task branch moved after preparation")
 if git("merge-base",data["baseCommit"],data["taskBranchHead"]) != data["reviewBaseCommit"]: fail("review base mismatch")
@@ -376,11 +436,16 @@ if "sha256:"+hashlib.sha256(package.read_bytes()).hexdigest()!=data["reviewPacka
 tracked=next((item for item in payload.get("tasks") or [] if str(item.get("taskId"))==data["taskId"]),None)
 if not tracked: fail("task absent from fresh tracker snapshot")
 review_statuses={item.get("name") for item in board.get("tasks",{}).get("statuses",[]) if item.get("kind")=="review"}
+if len(review_statuses)!=1: fail("status board must define exactly one semantic review status")
+review_target=next(iter(review_statuses))
 if tracked.get("status") not in review_statuses: fail("task is no longer in review")
 try:
     evidence=validate_review_evidence(payload,data["taskId"],base=data["reviewBaseCommit"],head=data["taskBranchHead"],
                                       package=data["reviewPackageSha256"],review_statuses=review_statuses,
-                                      required_gates=preset_gates)
+                                      review_target_status=review_target,
+                                      required_gates=preset_gates,repo=repo,workspace=workspace,
+                                      team=team,feature=feature,request_role=data["role"],
+                                      request_attempt=data["attempt"])
 except EvidenceError as exc: fail("fresh review evidence rejected: %s"%exc)
 if evidence != data["approvalEvidenceDigest"]: fail("fresh approval evidence differs from prepared evidence")
 comments=tracked.get("comments") or []; marker_re=re.compile(r"^\s*\[([\w-]+)\]"); positions={}
@@ -392,9 +457,13 @@ def files(body,marker):
     if values is None: fail("[%s] lacks Files evidence — declare it as 'Files: <path>, <path>'"%marker)
     if not values: fail("[%s] has an empty Files: evidence"%marker)
     return values
-raw=subprocess.run(["git","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false","diff","--name-only","-z",
-                    data["reviewBaseCommit"]+".."+data["taskBranchHead"]],cwd=repo,capture_output=True,env=env,check=True).stdout
-actual={item.decode("utf-8","surrogateescape") for item in raw.split(b"\0") if item}
+try:
+    raw=safe_git(repo,"diff","--name-only","-z","--no-ext-diff","--no-textconv",
+                 "--ignore-submodules=none",
+                 data["reviewBaseCommit"],data["taskBranchHead"],"--",
+                 max_output_bytes=8*1024*1024,timeout_seconds=30.0)
+    actual={item.decode("utf-8","strict") for item in raw.split(b"\0") if item}
+except (DeliveryProfileError,UnicodeError) as exc: fail("cannot calculate exact reviewed file set: %s"%exc)
 binding=request_binding(str(comments[positions["review-request"]].get("body") or ""))
 approval_markers=(
     "review-request",
@@ -436,18 +505,21 @@ PY
 }
 
 run_recovery_validation() {
-  local changed="$1" value command
-  value="$(read_key VALIDATE_SCRIPT)"
-  if [ -n "$value" ]; then
-    local changed_files=() item
-    while IFS= read -r item; do [ -z "$item" ] || changed_files+=("$item"); done < "$changed"
-    ( cd "$repo" && "$value" "${changed_files[@]}" ) || return $?
-    return
-  fi
-  for command in VALIDATE_BUILD VALIDATE_TEST VALIDATE_LINT VALIDATE_FORMAT; do
-    value="$(read_key "$command")"
-    [ -z "$value" ] || ( cd "$repo" && eval "$value" ) || return $?
-  done
+  [ $# -eq 0 ] || die "recovery validation reads one NUL-delimited changed-file list from stdin"
+  [ -x "$RECOVERY_PYTHON" ] || die "trusted recovery interpreter is unavailable: $RECOVERY_PYTHON"
+  /usr/bin/env -i \
+    "PATH=/usr/bin:/bin" \
+    "TMPDIR=${TMPDIR:-/tmp}" \
+    "LANG=${LANG:-C}" \
+    "LC_ALL=${LC_ALL:-C}" \
+    "TERM=${TERM:-dumb}" \
+    "NO_COLOR=${NO_COLOR:-}" \
+    AWS_EC2_METADATA_DISABLED=true \
+    PYTHONDONTWRITEBYTECODE=1 \
+    "$RECOVERY_PYTHON" -I -B "$SKILL_DIR/bin/recovery_validation.py" \
+    --repo "$repo" \
+    --config "$CONFIG" \
+    --changed-files -
 }
 
 supersede_one() {
@@ -462,7 +534,7 @@ supersede_one() {
     *) die "late invalidation recovery only applies to merged integrations" ;;
   esac
   key="$(basename "$entry" .json)"
-  local recovery_dir history_dir recovery changed recovery_fields recovery_id pre_head revert_commit recovery_snapshot queued_status
+  local recovery_dir history_dir recovery recovery_fields recovery_id pre_head revert_commit recovery_snapshot queued_status
   recovery_dir="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative integrations/.recoveries)"
   history_dir="$(python3 "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative integrations/history)"
   mkdir -p "$recovery_dir" "$history_dir"
@@ -533,9 +605,8 @@ PY
       git_unprivileged -C "$repo" revert --abort >/dev/null 2>&1 || true
       die "late-invalidation revert conflicts; preserved recovery journal requires human resolution"
     fi
-    changed="$recovery_dir/$key.changed-files"
-    git_unprivileged -C "$repo" diff --name-only HEAD > "$changed"
-    if ! run_recovery_validation "$changed"; then
+    if ! git_unprivileged -C "$repo" diff --name-only -z --no-ext-diff --no-textconv \
+      --ignore-submodules=none HEAD -- | run_recovery_validation; then
       git_unprivileged -C "$repo" revert --abort >/dev/null 2>&1 || true
       die "late-invalidation revert failed project validation; recovery journal preserved"
     fi
@@ -645,17 +716,11 @@ repo, workspace = Path(repo_raw).resolve(), Path(workspace_raw).resolve()
 entry = Path(entry_raw)
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(review_module_raw).resolve().parent))
-from review_evidence import EvidenceError, SUPPORTING_GATE_MARKERS, parse_files_evidence, request_binding, validate as validate_review_evidence
+from review_evidence import EvidenceError, SUPPORTING_GATE_MARKERS, parse_files_evidence, request_binding, strip_publication_trailer, validate as validate_review_evidence
+from delivery_profile import DeliveryProfileError, _git as safe_git, _repository_root, build_review_package, canonical_merge_tree
 from task_metadata import required_review_gates
 from team_policy import TeamPolicyError, load_team_policy
-GIT_ENV = {name: os.environ[name] for name in ("PATH", "TMPDIR", "LANG", "LC_ALL") if name in os.environ}
-GIT_ENV.setdefault("PATH", "/usr/bin:/bin")
-GIT_ENV.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
-
-def git_command(argv):
-    if argv and argv[0] == "git":
-        return ("git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *argv[1:])
-    return argv
+repo = _repository_root(repo)
 
 def fail(message):
     raise SystemExit("finalize-integrations: " + message)
@@ -677,14 +742,19 @@ def contained(path, base, label):
         fail("%s escapes the team workspace" % label)
 
 def run(*argv, input_text=None):
-    command = git_command(argv)
-    result = subprocess.run(
-        command, cwd=repo, text=True, input=input_text, capture_output=True,
-        env=GIT_ENV if argv and argv[0] == "git" else None,
-    )
-    if result.returncode:
-        fail("command failed (%s): %s" % (" ".join(argv), result.stderr.strip() or result.stdout.strip()))
-    return result.stdout
+    if not argv or argv[0] != "git":
+        fail("only controlled Git commands are allowed during integration validation")
+    try:
+        raw = safe_git(
+            repo,
+            *argv[1:],
+            max_output_bytes=8 * 1024 * 1024,
+            timeout_seconds=30.0,
+            input_bytes=None if input_text is None else input_text.encode("utf-8"),
+        )
+        return raw.decode("utf-8", "strict")
+    except (DeliveryProfileError, UnicodeError) as exc:
+        fail("command failed (%s): %s" % (" ".join(argv), exc))
 
 def safe_key(value):
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()[:32] or "task"
@@ -775,10 +845,33 @@ if parents != [data["baseCommit"], data["taskBranchHead"]]:
 review_base = run("git", "merge-base", data["baseCommit"], data["taskBranchHead"]).strip()
 if review_base != data["reviewBaseCommit"]:
     fail("review base is not the exact merge-base of integration parent + task head")
-if subprocess.run(
-    git_command(("git", "merge-base", "--is-ancestor", data["commit"], team)),
-    cwd=repo, env=GIT_ENV,
-).returncode:
+try:
+    expected_tree, canonical_base, canonical_head, canonical_review_base = canonical_merge_tree(
+        repo,
+        data["baseCommit"],
+        data["taskBranchHead"],
+        data["reviewBaseCommit"],
+    )
+except DeliveryProfileError as exc:
+    fail("cannot reproduce canonical integration tree: %s" % exc)
+if (canonical_base, canonical_head, canonical_review_base) != (
+    data["baseCommit"], data["taskBranchHead"], data["reviewBaseCommit"]
+):
+    fail("canonical integration inputs do not match the transaction")
+commit_tree = run("git", "show", "-s", "--format=%T", data["commit"]).strip()
+if commit_tree != expected_tree:
+    fail("integration commit tree is not the canonical reviewed overlay")
+try:
+    safe_git(
+        repo,
+        "merge-base",
+        "--is-ancestor",
+        data["commit"],
+        team,
+        max_output_bytes=64 * 1024,
+        timeout_seconds=30.0,
+    )
+except DeliveryProfileError:
     fail("integration commit is not on the feature branch")
 
 review_path = Path(str(data.get("reviewPackagePath")))
@@ -789,23 +882,22 @@ if review_path != expected_review_path:
     fail("review package path is not the exact generated package for base/head")
 regular(review_path, "review package", maximum=8 * 1024 * 1024)
 contained(review_path, workspace, "review package")
-expected_package = "\n".join([
-    "# Review package: %s" % task,
-    "",
-    "Base: %s" % data["reviewBaseCommit"],
-    "Head: %s" % data["taskBranchHead"],
-    "",
-    "## Commits",
-    run("git", "log", "--oneline", "%s..%s" % (data["reviewBaseCommit"], data["taskBranchHead"])).rstrip("\n"),
-    "",
-    "## Files changed",
-    run("git", "diff", "--stat", "%s..%s" % (data["reviewBaseCommit"], data["taskBranchHead"])).rstrip("\n"),
-    "",
-    "## Diff",
-    run("git", "diff", "-U10", "%s..%s" % (data["reviewBaseCommit"], data["taskBranchHead"])).rstrip("\n"),
-]) + "\n"
+try:
+    expected_package, package_base, package_head = build_review_package(
+        repo,
+        task,
+        data["reviewBaseCommit"],
+        data["taskBranchHead"],
+    )
+except DeliveryProfileError as exc:
+    fail("cannot safely reproduce review package: %s" % exc)
+if (package_base, package_head) != (
+    data["reviewBaseCommit"],
+    data["taskBranchHead"],
+):
+    fail("review package commits are not canonical")
 actual_package = review_path.read_bytes()
-if actual_package != expected_package.encode():
+if actual_package != expected_package:
     fail("review package does not exactly reproduce the reviewed Git diff")
 review_digest = "sha256:" + hashlib.sha256(actual_package).hexdigest()
 if data.get("reviewPackageSha256") != review_digest:
@@ -989,6 +1081,9 @@ if snapshot_raw:
         fail("invalid board config: %s" % exc)
     review_statuses = {item.get("name") for item in board.get("tasks", {}).get("statuses", []) if item.get("kind") == "review"}
     terminal_statuses = {item.get("name") for item in board.get("tasks", {}).get("statuses", []) if item.get("terminal") and item.get("requiresCommit")}
+    if len(review_statuses) != 1:
+        fail("status board must define exactly one semantic review status")
+    review_target = next(iter(review_statuses))
     if tracked.get("status") not in review_statuses | terminal_statuses:
         fail("fresh tracker task is neither in review nor commit-requiring terminal state")
     comments = tracked.get("comments") or []
@@ -1019,11 +1114,10 @@ if snapshot_raw:
     required_support = [supporting_positions[gate] for gate in review_binding["reviewGates"]]
     if (
         request < 0
-        or team_lead <= request
-        or architecture <= request
-        or sceptical <= request
-        or any(index <= request for index in required_support)
-        or any(team_lead <= index for index in required_support)
+        or team_lead < 0
+        or architecture < 0
+        or sceptical < 0
+        or any(index < 0 for index in required_support)
         or findings > request
     ):
         fail("fresh tracker state lacks current core and declared supporting approvals")
@@ -1034,7 +1128,15 @@ if snapshot_raw:
             base=data["reviewBaseCommit"],
             head=data["taskBranchHead"],
             package=review_digest,
+            review_statuses=review_statuses | terminal_statuses,
+            review_target_status=review_target,
             required_gates=preset_gates,
+            repo=repo,
+            workspace=workspace,
+            team=team,
+            feature=feature,
+            request_role=role,
+            request_attempt=attempt,
         )
     except EvidenceError as exc:
         fail("review approval binding failed: %s" % exc)
@@ -1077,13 +1179,28 @@ if snapshot_raw:
         if not values:
             fail("[%s] has an empty Files: evidence" % marker)
         return values
-    actual_raw = subprocess.run(
-        git_command(("git", "diff", "--name-only", "-z", "%s..%s" % (data["reviewBaseCommit"], data["taskBranchHead"]))),
-        cwd=repo, capture_output=True, env=GIT_ENV,
-    )
-    if actual_raw.returncode:
-        fail("cannot calculate exact reviewed file set")
-    actual_files = {item.decode("utf-8", "surrogateescape") for item in actual_raw.stdout.split(b"\0") if item}
+    try:
+        actual_raw = safe_git(
+            repo,
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+            data["reviewBaseCommit"],
+            data["taskBranchHead"],
+            "--",
+            max_output_bytes=8 * 1024 * 1024,
+            timeout_seconds=30.0,
+        )
+        actual_files = {
+            item.decode("utf-8", "strict")
+            for item in actual_raw.split(b"\0")
+            if item
+        }
+    except (DeliveryProfileError, UnicodeError) as exc:
+        fail("cannot calculate exact reviewed file set: %s" % exc)
     approval_file_markers = (
         ("review-request", request),
         ("team-lead-approval", team_lead),
@@ -1124,7 +1241,9 @@ if snapshot_raw:
             continue
         signer_match = re.search(
             r"(?:\u2014|-)\s*([\w-]+)(?:\s*\((?:posted by[^)]*|as [^)]+)\))?\s*$",
-            str(comments[marker_index].get("body") or "").strip(),
+            strip_publication_trailer(
+                str(comments[marker_index].get("body") or "")
+            ),
         )
         if not signer_match or signer_match.group(1) != expected_signer:
             fail("current %s signer does not match its protocol role" % marker_name)
@@ -1209,19 +1328,9 @@ PY
 }
 
 worktree_registered() {
-  python3 - "$repo" "$1" <<'PY'
-import os, subprocess, sys
-repo, wanted=sys.argv[1:]
-env={name:os.environ[name] for name in ("PATH","TMPDIR","LANG","LC_ALL") if name in os.environ}
-env.setdefault("PATH","/usr/bin:/bin")
-env.update({"GIT_CONFIG_GLOBAL":os.devnull,"GIT_CONFIG_NOSYSTEM":"1"})
-out=subprocess.check_output(
-    ["git","-c","core.hooksPath=/dev/null","-c","core.fsmonitor=false","worktree","list","--porcelain"],
-    cwd=repo,text=True,env=env,
-)
-paths=[line[len("worktree "):] for line in out.splitlines() if line.startswith("worktree ")]
-raise SystemExit(0 if wanted in paths else 1)
-PY
+  local listing
+  listing="$(git_unprivileged -C "$repo" worktree list --porcelain)" || return 1
+  printf '%s\n' "$listing" | grep -Fqx -- "worktree $1"
 }
 
 finalize_one() {

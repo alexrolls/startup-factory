@@ -14,9 +14,15 @@ import time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
+from delivery_profile import assess_review_diff, assess_task, repository_root
 from product_acceptance import ProductAcceptancePending, evaluate as evaluate_product_acceptance, validate_request
-from review_evidence import strip_publication_trailer
-from task_metadata import effective_review_gates, parse_task_metadata, required_review_gates
+from review_evidence import EvidenceError, request_binding, strip_publication_trailer
+from task_metadata import (
+    effective_review_gates,
+    normalize_review_gates,
+    parse_task_metadata,
+    required_review_gates,
+)
 
 
 MARKER_RE = re.compile(r"^\s*\[([\w-]+)\]")
@@ -53,6 +59,34 @@ def design_request(task: dict) -> int:
 
 def metadata(task: dict) -> dict:
     return parse_task_metadata(task.get("description"), task.get("title"))
+
+
+def delivery_profile_decision(task: dict, task_metadata: dict | None = None) -> dict:
+    """Return the one authoritative task-time delivery-profile decision."""
+    return assess_task(task, task_metadata or metadata(task))
+
+
+def implementation_parallel_safe(task: dict) -> bool:
+    task_metadata = metadata(task)
+    decision = delivery_profile_decision(task, task_metadata)
+    return bool(task_metadata["parallelSafe"]) and (
+        decision["deliveryPolicy"]["implementationConcurrency"] != "exclusive"
+    )
+
+
+def review_delivery_profile_decision(
+    task: dict,
+    request_index: int,
+    repo: Path | None,
+) -> tuple[dict, list[str], bool]:
+    """Classify the exact review diff and return its bound gate declaration."""
+    try:
+        body = str((task.get("comments") or [])[request_index].get("body") or "")
+        binding = request_binding(body)
+    except (EvidenceError, IndexError, TypeError):
+        return assess_review_diff(repo or "", None, None, task), [], False
+    decision = assess_review_diff(repo or "", binding["base"], binding["head"], task)
+    return decision, list(binding["reviewGates"]), True
 
 
 def resources(task: dict) -> set[str]:
@@ -295,6 +329,12 @@ def main() -> None:
     skill = Path(args.skill)
     workdir = Path(args.workdir)
     workdir_fd = open_directory(workdir, "team workspace")
+    try:
+        review_repo: Path | None = repository_root(workdir)
+    except (OSError, ValueError):
+        # Review routing remains available and fail-closed: every bound diff
+        # will classify high-risk when the repository cannot be authenticated.
+        review_repo = None
     board = json.loads((skill / "config" / "statuses.config.json").read_text())
     payload = json.loads(read_regular_at(workdir_fd, "tasks.json", "tracker snapshot"))
     try:
@@ -580,7 +620,29 @@ def main() -> None:
         architecture_approval = last(task, "architecture-approval")
         sceptical_approval = last(task, "sceptical-architecture-approval")
         security_approval = last(task, "security-approval")
-        gates = effective_review_gates(metadata(task), preset_text or "")
+        try:
+            task_metadata = metadata(task)
+        except ValueError:
+            task_metadata = parse_task_metadata("", task.get("title"))
+        profile_decision, bound_gates, binding_valid = review_delivery_profile_decision(
+            task, request, review_repo
+        )
+        computed_gates = effective_review_gates(
+            task_metadata,
+            preset_text or "",
+            profile_decision,
+        )
+        gates = normalize_review_gates(
+            tuple(set(computed_gates) | set(bound_gates))
+        )
+        binding_current = binding_valid and set(bound_gates) == set(computed_gates)
+        if not binding_current:
+            anomalies.append(task_id)
+            print(
+                "dispatch: warning - %s [review-request] exact-diff Review-Gates are invalid or stale"
+                % task_id,
+                file=sys.stderr,
+            )
         security_required = "security" in gates
         qa_required = "qa" in gates
         qa_approval = last(task, "review-approval")
@@ -652,7 +714,11 @@ def main() -> None:
                 protocol_sceptical_architect,
             ),
         }
-        if supporting_current and all(index > request for index, _ in approvals.values()):
+        if (
+            binding_current
+            and supporting_current
+            and all(index > request for index, _ in approvals.values())
+        ):
             invalid = False
             for marker_name, (index, expected_signer) in approvals.items():
                 signer = approval_signer(task, index)
@@ -870,7 +936,7 @@ def main() -> None:
         and not task_is_held(str(task["taskId"]))
     ]
     held = set().union(*(resources(task) for task in unintegrated)) if unintegrated else set()
-    held_unsafe = any(not metadata(task)["parallelSafe"] for task in unintegrated)
+    held_unsafe = any(not implementation_parallel_safe(task) for task in unintegrated)
     if args.execution == "sequential":
         slots = 0 if unintegrated else 1
     else:
@@ -916,12 +982,17 @@ def main() -> None:
             missing_gate.append(task_id)
             continue
         data = metadata(task)
+        profile_decision = delivery_profile_decision(task, data)
+        parallel_safe = bool(data["parallelSafe"]) and (
+            profile_decision["deliveryPolicy"]["implementationConcurrency"]
+            != "exclusive"
+        )
         claims = resources(task)
         if args.execution == "parallel":
             if held_unsafe or selected_unsafe:
                 constrained.append(task_id)
                 continue
-            if not data["parallelSafe"]:
+            if not parallel_safe:
                 if unintegrated or selected_count or selected_unsafe:
                     constrained.append(task_id)
                     continue

@@ -21,10 +21,23 @@ git config user.name Test
 printf '/.startup-factory-retrospective.md\n/.startup-factory-retrospective.lock\n' > .gitignore
 git add .gitignore
 git commit -q -m init; git checkout -q -b feat-team
+REVIEW_BASE="$(git rev-parse HEAD)"
+printf 'value = 1\n' > app.py
+git add app.py
+git commit -q -m 'safe review fixture'
+REVIEW_HEAD="$(git rev-parse HEAD)"
+REVIEW_PACKAGE="sha256:$(printf '0%.0s' {1..64})"
+RISK_REVIEW_BASE="$REVIEW_HEAD"
+mkdir -p src
+printf 'enabled = true\n' > src/auth.py
+git add src/auth.py
+git commit -q -m 'security-sensitive review fixture'
+RISK_REVIEW_HEAD="$(git rev-parse HEAD)"
 LIFECYCLE_ROOT="$TMP/protected-lifecycle"
 mkdir -m 700 "$LIFECYCLE_ROOT"
 mkdir -p .claude/skills/pm
-cp -R "$SKILL_DIR/roles" "$SKILL_DIR/reference" "$SKILL_DIR/bin" "$SKILL_DIR/teams" .claude/skills/pm/
+cp -R "$SKILL_DIR/roles" "$SKILL_DIR/reference" "$SKILL_DIR/bin" \
+  "$SKILL_DIR/src" "$SKILL_DIR/teams" .claude/skills/pm/
 mkdir -p .claude/skills/pm/config
 cp "$DEFAULT_STATUS_FIXTURE" .claude/skills/pm/config/statuses.config.json
 cp "$SKILL_DIR/config/automation.config.json" .claude/skills/pm/config/
@@ -52,6 +65,44 @@ VALIDATE_LINT=null
 EOF
 sed_i "s|^BROKER_LIFECYCLE_ROOT=.*|BROKER_LIFECYCLE_ROOT=\"$LIFECYCLE_ROOT\"|" .claude/skills/pm/config/team.config.md
 DISPATCH=".claude/skills/pm/bin/dispatch.sh"
+
+bind_review_requests() { # markdown path [preset gates]
+  python3 - "$1" "$REVIEW_BASE" "$REVIEW_HEAD" "$REVIEW_PACKAGE" \
+    "$PWD" "$PWD/.claude/skills/pm/bin" "${2:-}" <<'PY'
+import re, sys
+from pathlib import Path
+
+path, base, head, package, repo, bin_dir, preset_gates = sys.argv[1:]
+sys.path.insert(0, bin_dir)
+from delivery_profile import assess_review_diff
+from task_metadata import effective_review_gates, parse_task_metadata
+
+parts = re.split(r"(?m)(?=^## )", Path(path).read_text())
+result = [parts[0]]
+for part in parts[1:]:
+    heading = re.match(r"^##\s+\S+\s+(.+?)\s+\[[^\]]+\]", part)
+    description = part.split("\n>", 1)[0]
+    task = {"title": heading.group(1) if heading else "", "description": description}
+    decision = assess_review_diff(repo, base, head, task)
+    metadata = parse_task_metadata(description, task["title"])
+    preset = "REQUIRED_REVIEW_GATES=%s\n" % preset_gates if preset_gates else ""
+    gates = effective_review_gates(metadata, preset, decision)
+    fields = [
+        "> Review-Base-Commit: " + base,
+        "> Task-Branch-Head: " + head,
+        "> Review-Package-SHA256: " + package,
+        "> Review-Gates: " + (",".join(gates) if gates else "none"),
+    ]
+    lines = part.splitlines()
+    expanded = []
+    for line in lines:
+        expanded.append(line)
+        if re.match(r"^>\s*\[review-request\]", line):
+            expanded.extend(fields)
+    result.append("\n".join(expanded) + ("\n" if part.endswith("\n") else ""))
+Path(path).write_text("".join(result))
+PY
+}
 
 protect_preset() { # team feature preset: write canonical projection and protect it
   local team="$1" feature="$2" preset="$3" workspace="$PWD/.teamwork/$1"
@@ -115,6 +166,8 @@ Independent.
 
 **Assignee:** backend
 
+files: app.py
+
 > [review-request] round 1 — backend
 
 > [team-lead-approval] files ok — team-lead
@@ -127,7 +180,41 @@ Independent.
 
 > [team-lead-approval] final gate after independent reviews — team-lead
 EOF
+bind_review_requests feat/feature.md
 FID="feat/feature.md"
+
+# Authority-bearing environment values are assertions, never selectors.
+FORGED_LIFECYCLE_ROOT="$TMP/forged-lifecycle"
+mkdir -m 700 "$FORGED_LIFECYCLE_ROOT"
+for case_name in lifecycle adapter labels; do
+  case "$case_name" in
+    lifecycle) authority_env=(env STARTUP_FACTORY_LIFECYCLE_STATE_ROOT="$FORGED_LIFECYCLE_ROOT"); needle='must exactly repeat canonical BROKER_LIFECYCLE_ROOT' ;;
+    adapter) authority_env=(env TRACKER_ADAPTER=GitHubIssues); needle='must exactly repeat configured PRODUCT_MANAGEMENT_TOOL' ;;
+    labels) authority_env=(env STARTUP_FACTORY_IGNORED_TASK_LABELS_JSON='[]'); needle='must exactly repeat configured ignoredTaskLabels' ;;
+  esac
+  if authority_out="$("${authority_env[@]}" "$DISPATCH" feat-team "$FID" --once --dry-run 2>&1)"; then
+    echo "FAIL: dispatch accepted $case_name authority override"; FAILURES=$((FAILURES+1))
+  elif printf '%s' "$authority_out" | grep -q "$needle"; then
+    echo "ok: dispatch rejects $case_name authority override"
+  else
+    echo "FAIL: dispatch $case_name authority override reported wrong error: $authority_out"; FAILURES=$((FAILURES+1))
+  fi
+done
+
+HOSTILE_PATH_DIR="$PWD/hostile-path"
+HOSTILE_PATH_CANARY="$TMP/hostile-path-python-ran"
+mkdir "$HOSTILE_PATH_DIR"
+cat > "$HOSTILE_PATH_DIR/python3" <<EOF
+#!/bin/sh
+touch "$HOSTILE_PATH_CANARY"
+exit 91
+EOF
+chmod +x "$HOSTILE_PATH_DIR/python3"
+filtered_path_plan="$(PATH="$HOSTILE_PATH_DIR:$TMP/does-not-exist:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:$PATH" \
+  TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once --dry-run)"
+check "dispatch filters hostile/Codex/unavailable PATH entries and still plans" \
+  grep -q "keep $FID#2" <<<"$filtered_path_plan"
+check "dispatch never executes hostile PATH python" test ! -e "$HOSTILE_PATH_CANARY"
 
 # -- dry-run prints the full action plan, changes nothing ----------------------
 plan="$(TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once --dry-run)"
@@ -726,6 +813,8 @@ review-gates: security
 
 > [security-approval] LGTM — reviewer
 
+> [review-approval] verified — senior-qa-engineer
+
 > [team-lead-approval] LGTM — team-lead
 
 ## 3 Security reviewer approved [Review]
@@ -742,8 +831,11 @@ review-gates: security
 
 > [security-approval] LGTM — senior-security-engineer
 
+> [review-approval] verified — senior-qa-engineer
+
 > [team-lead-approval] LGTM — team-lead
 EOF
+bind_review_requests feat/signer-test.md
 SIG_FID="feat/signer-test.md"
 mkdir -p .teamwork/feat-signer-team
 cat > .teamwork/feat-signer-team/preset.env <<'EOF'
@@ -772,6 +864,42 @@ echo "$signer_plan" | grep -q "launch team-lead" \
   && echo "ok: signer anomaly notifies team-lead" \
   || { echo "FAIL: team-lead not in plan"; FAILURES=$((FAILURES+1)); }
 
+# Exact committed scope may only raise rigor. A docs/micro declaration cannot
+# hide an authentication diff behind a request that omitted supporting gates.
+cat > feat/exact-diff-gate-test.md <<EOF
+# Exact Diff Gate Test [Active]
+
+## 1 Innocent wording [Review]
+
+**Assignee:** senior-full-stack-engineer
+
+delivery-profile: micro
+
+> [review-request] ready — senior-full-stack-engineer
+> Review-Base-Commit: $RISK_REVIEW_BASE
+> Task-Branch-Head: $RISK_REVIEW_HEAD
+> Review-Package-SHA256: $REVIEW_PACKAGE
+> Review-Gates: none
+
+> [architecture-approval] LGTM — principal-software-architect
+
+> [sceptical-architecture-approval] LGTM — sceptical-architect
+
+> [team-lead-approval] LGTM — team-lead
+EOF
+EXACT_FID="feat/exact-diff-gate-test.md"
+protect_preset feat-exact-diff-team "$EXACT_FID" full-stack
+exact_plan="$(TEAM_RUNNER=background "$DISPATCH" feat-exact-diff-team "$EXACT_FID" --once --dry-run 2>&1)"
+echo "$exact_plan" | grep -q "launch senior-security-engineer.*exact-diff-gate-test.md#1" \
+  && echo "ok: undeclared authentication diff forces Security" \
+  || { echo "FAIL: exact diff omitted Security: $exact_plan"; FAILURES=$((FAILURES+1)); }
+echo "$exact_plan" | grep -q "launch senior-qa-engineer.*exact-diff-gate-test.md#1" \
+  && echo "ok: undeclared authentication diff forces QA" \
+  || { echo "FAIL: exact diff omitted QA: $exact_plan"; FAILURES=$((FAILURES+1)); }
+echo "$exact_plan" | grep "launch integrator" | grep -q "exact-diff-gate-test.md#1" \
+  && { echo "FAIL: stale exact-diff gates reached integrator"; FAILURES=$((FAILURES+1)); } \
+  || echo "ok: stale exact-diff gates cannot reach integrator"
+
 # -- D2.4: multiline [security-approval] with signer on last line --------------
 cat > feat/ml-signer-test.md <<'EOF'
 # Multiline Signer Test [Active]
@@ -792,6 +920,8 @@ review-gates: security
 > verdict: approved
 > — senior-security-engineer
 
+> [review-approval] verified — senior-qa-engineer
+
 > [team-lead-approval] LGTM — team-lead
 
 ## 2 Multiline wrong security signer [Review]
@@ -809,6 +939,8 @@ review-gates: security
 > [security-approval] round 1
 > verdict: approved
 > — reviewer
+
+> [review-approval] verified — senior-qa-engineer
 
 > [team-lead-approval] LGTM — team-lead
 
@@ -828,6 +960,8 @@ review-gates: security
 > verdict: approved
 > — senior-security-engineer (as security-reviewer)
 
+> [review-approval] verified — senior-qa-engineer
+
 > [team-lead-approval] LGTM — team-lead
 
 ## 4 Posted-by suffix [Review]
@@ -846,8 +980,11 @@ review-gates: security
 > verdict: approved
 > — senior-security-engineer (posted by team-lead)
 
+> [review-approval] verified — senior-qa-engineer
+
 > [team-lead-approval] LGTM — team-lead
 EOF
+bind_review_requests feat/ml-signer-test.md
 ML_FID="feat/ml-signer-test.md"
 mkdir -p .teamwork/feat-ml-team
 cat > .teamwork/feat-ml-team/preset.env <<'EOF'
@@ -890,7 +1027,7 @@ cat > feat/parallel-test.md <<'EOF'
 track: backend
 parallel-safe: true
 files: src/a.py
-resources: schema:a
+resources: cache:a
 
 > [design-note] round 1
 > - backend
@@ -908,7 +1045,7 @@ resources: schema:a
 track: backend
 parallel-safe: true
 files: src/b.py
-resources: schema:b
+resources: cache:b
 
 > [design-note] round 1
 > - backend
@@ -926,7 +1063,7 @@ resources: schema:b
 track: backend
 parallel-safe: true
 files: src
-resources: schema:c
+resources: cache:c
 
 > [design-note] round 1
 > - backend
@@ -1085,7 +1222,7 @@ print('dispatch-' + hashlib.sha256('\0'.join(
 PY
 )"
 python3 .claude/skills/pm/bin/runtime-state.py claim \
-  --workspace "$REMOTE_WORKSPACE" --team "$REMOTE_TEAM" --feature "$REMOTE_FID" \
+  --workspace "$REMOTE_WORKSPACE" --repo "$(pwd)" --team "$REMOTE_TEAM" --feature "$REMOTE_FID" \
   --task "$REMOTE_TASK" --role backend --attempt 1 --claim-id "$REMOTE_CLAIM_ID" \
   --target Active >/dev/null
 python3 - "$REMOTE_FID" "$REMOTE_CLAIM_ID" <<'PY'
@@ -1117,6 +1254,91 @@ elif echo "$forged_claim_out" | grep -q 'claim record does not match its team/fe
 else
   echo "FAIL: forged durable claim produced wrong error: $forged_claim_out"; FAILURES=$((FAILURES+1))
 fi
+
+# -- automatic recovery validates lineage before issuing a protected grant ----
+cat > feat/recovery-lineage.md <<'EOF'
+# Recovery lineage fence [Active]
+
+## 1 Preserve dead attempt [Active]
+
+**Assignee:** backend
+
+track: backend
+parallel-safe: true
+files: src/recovery-lineage.txt
+resources: recovery:lineage
+
+A corrupted immutable lineage must suppress automatic recovery without effects.
+EOF
+RECOVERY_FID=feat/recovery-lineage.md
+RECOVERY_TEAM=feat-recovery-lineage
+RECOVERY_TASK="$RECOVERY_FID#1"
+RECOVERY_KEY="$(python3 .claude/skills/pm/bin/runtime-state.py key "$RECOVERY_TASK")"
+RECOVERY_WORKSPACE="$PWD/.teamwork/$RECOVERY_TEAM"
+RECOVERY_CLAIM_ID="$(python3 - "$RECOVERY_TEAM" "$RECOVERY_FID" "$RECOVERY_TASK" <<'PY'
+import hashlib,sys
+team,feature,task=sys.argv[1:]
+print("dispatch-"+hashlib.sha256("\0".join(
+    (team,feature,task,"backend","1","Active")
+).encode()).hexdigest()[:32])
+PY
+)"
+git branch "$RECOVERY_TEAM"
+python3 .claude/skills/pm/bin/runtime-state.py claim \
+  --repo "$PWD" --workspace "$RECOVERY_WORKSPACE" --team "$RECOVERY_TEAM" \
+  --feature "$RECOVERY_FID" --task "$RECOVERY_TASK" --role backend \
+  --attempt 1 --claim-id "$RECOVERY_CLAIM_ID" --target Active >/dev/null
+printf '[claim]\nclaim-id: %s\nrole: backend\ntarget-status: Active\n\n— dispatcher\n' \
+  "$RECOVERY_CLAIM_ID" | \
+  .claude/skills/pm/bin/tracker-ops.sh comment "$RECOVERY_TASK" - >/dev/null
+TEAM_RUNNER=background "$LAUNCH" start-task \
+  "$RECOVERY_TEAM" "$RECOVERY_FID" backend "$RECOVERY_TASK" 1 >/dev/null
+for _i in $(seq 1 80); do
+  if "$LAUNCH" live-task "$RECOVERY_TEAM" backend "$RECOVERY_TASK" 1 >/dev/null 2>&1; then
+    sleep 0.05
+  else
+    break
+  fi
+done
+RECOVERY_EXECUTION="$RECOVERY_WORKSPACE/executions/$RECOVERY_KEY.json"
+python3 - "$RECOVERY_EXECUTION" <<'PY'
+import json,sys
+path=sys.argv[1]
+value=json.load(open(path))
+value["lineageDigest"]="sha256:"+"0"*64
+with open(path,"w",encoding="utf-8") as stream:
+    json.dump(value,stream,indent=2)
+    stream.write("\n")
+PY
+count_regular_files() {
+  if [ -d "$1" ]; then find "$1" -type f | wc -l | tr -d ' '; else printf '0\n'; fi
+}
+grant_count_before="$(count_regular_files "$LIFECYCLE_ROOT/control-grants")"
+active_count_before="$(count_regular_files "$(git rev-parse --git-common-dir)/startup-factory-broker/outbox-active")"
+record_count_before="$(python3 .claude/skills/pm/bin/process-lifecycle.py list \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$RECOVERY_TEAM" | wc -l | tr -d ' ')"
+if recovery_lineage_out="$(TEAM_RUNNER=background "$DISPATCH" "$RECOVERY_TEAM" "$RECOVERY_FID" \
+    --once 2>&1)"; then
+  echo "FAIL: dispatcher accepted corrupted lineage before automatic recovery"; FAILURES=$((FAILURES+1))
+elif printf '%s\n' "$recovery_lineage_out" | grep -qi 'lineage\|claim'; then
+  echo "ok: dispatcher rejects corrupted lineage before automatic recovery"
+else
+  echo "FAIL: dispatcher lineage refusal had wrong error: $recovery_lineage_out"; FAILURES=$((FAILURES+1))
+fi
+grant_count_after="$(count_regular_files "$LIFECYCLE_ROOT/control-grants")"
+active_count_after="$(count_regular_files "$(git rev-parse --git-common-dir)/startup-factory-broker/outbox-active")"
+record_count_after="$(python3 .claude/skills/pm/bin/process-lifecycle.py list \
+  --root "$LIFECYCLE_ROOT" --repo "$PWD" --team "$RECOVERY_TEAM" | wc -l | tr -d ' ')"
+check "failed recovery lineage check issues no protected grant" \
+  test "$grant_count_after" = "$grant_count_before"
+check "failed recovery lineage check revokes no capability" \
+  test "$active_count_after" = "$active_count_before"
+check "failed recovery lineage check forgets no lifecycle generation" \
+  test "$record_count_after" = "$record_count_before"
+check "failed recovery lineage check preserves prior worktree" \
+  test -d "$RECOVERY_WORKSPACE/worktrees/backend#1-$RECOVERY_KEY"
+check "failed recovery lineage check starts no replacement" \
+  test ! -e "$RECOVERY_WORKSPACE/worktrees/backend#2-$RECOVERY_KEY"
 
 # -- declared QA review gate: QA first, then team lead, then integration --------
 cat > feat/qa-gate-test.md <<'EOF'
@@ -1190,6 +1412,7 @@ review-gates: qa
 >
 > [security-approval] approved — senior-llm-security-engineer
 EOF
+bind_review_requests feat/qa-gate-test.md
 QA_GATE_FID="feat/qa-gate-test.md"
 mkdir -p .teamwork/feat-qa-gate-team
 cat > .teamwork/feat-qa-gate-team/preset.env <<'EOF'
@@ -1230,6 +1453,7 @@ cat > feat/infra-security-gate-test.md <<'EOF'
 >
 > [sceptical-architecture-approval] approved — sceptical-architect
 EOF
+bind_review_requests feat/infra-security-gate-test.md security
 INFRA_GATE_FID="feat/infra-security-gate-test.md"
 mkdir -p .teamwork/feat-infra-gate-team
 cat > .teamwork/feat-infra-gate-team/preset.env <<'EOF'
@@ -1258,6 +1482,7 @@ cat > feat/rk-test.md <<'EOF'
 
 > [review-request] ready — backend
 EOF
+bind_review_requests feat/rk-test.md
 RK_FID="feat/rk-test.md"
 
 # Unquoted key with inline comment: Python int(STUCK_AFTER_MINUTES) must succeed

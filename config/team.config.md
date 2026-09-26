@@ -3,7 +3,8 @@
 The **one file you edit per project to run an agent team.** It maps each role to the
 CLI command that runs it (this is the entire LLM coupling — one line per role), sets
 coordination timings, and tells the Integrator how to validate work in *your* stack.
-Read by `bin/launch-team.sh` and included in every agent's startup prompt.
+Read through the same fail-closed parser by launch, dispatch, runtime, recovery,
+readiness, and upgrade paths, and included in every agent's startup prompt.
 
 The project-management tool itself is configured separately in
 `project-management.config.md` — the team layer only consumes that port.
@@ -13,7 +14,42 @@ The project-management tool itself is configured separately in
 ## Role → command map
 
 `{prompt_file}` is replaced by the launcher with the path to the composed startup
-prompt. The examples inline the file's content with `$(cat '{prompt_file}')` because these CLIs take the prompt as a string argument; a CLI that reads a prompt from a file can use `{prompt_file}` directly. Any agentic CLI works if it can read files, run shell commands, and use git.
+prompt. The examples inline the file's content with `$(cat '{prompt_file}')`
+because these CLIs take the prompt as a string argument. Shell command
+substitution removes every trailing newline from that content. A CLI that reads
+a prompt from a file can use `{prompt_file}` directly and preserve the file
+bytes, including trailing newlines. Any agentic CLI works if it can read files,
+run shell commands, and use git.
+Configuration parsing is inert — it never runs a shell, expands `$(...)`, or
+classifies a runtime — and normalizes exactly one `KEY=value` line per key:
+
+- Spaces and horizontal tabs around the value are trimmed. Interior horizontal
+  tabs are permitted and preserved along with ordinary command characters.
+- An **unquoted** value is kept byte-for-byte, minus a true trailing comment
+  (a `#` preceded by a space or tab and outside any quotes).
+- One matching pair of **outer double quotes** is removed and only the two
+  documented escapes are folded to the single byte they denote: `\"` → `"` and
+  `\\` → `\`. This is what makes the shipped
+  `"claude -p \"$(cat '{prompt_file}')\" ..."` form work: the parsed value is the
+  command string `claude -p "$(cat '{prompt_file}')" ...`, so the interior quotes
+  still group the prompt into one argument when the launcher later executes it.
+  Any other `\x` sequence is rejected rather than guessed.
+- One matching pair of **outer single quotes** is removed with no escape
+  handling at all; every interior byte, including `"` and `\`, is literal.
+- After an outer quote only a true trailing comment may follow.
+- Assignment prefixes such as `STARTUP_FACTORY_LLM_RUNTIME=other cli ...` are
+  ordinary value bytes and survive unchanged.
+- After whitespace and outer-quote normalization, the exact token `null` means
+  "absent" and disables the mapping. Spaced or outer-quoted `null` therefore has
+  the same disable semantics and never falls back to `TEAM_DEFAULT_CMD`.
+- A value that normalizes to an empty string is rejected; `null` is the only
+  supported absent-value spelling.
+- Unmatched quotes, unsupported escapes, trailing bytes after an outer quote,
+  control characters other than horizontal tab, and duplicate keys are rejected
+  before any launch.
+
+`launch-team.sh config-value <KEY>` exposes that shared parser read-only, so an
+operator can confirm what a template normalizes to without starting an agent.
 Set an implementation or optional specialist role to `null` to exclude it from
 launches (e.g. no frontend [tasks] → no frontend agent). Team Lead, Principal
 Architect, and Sceptical Principal Architect are mandatory, distinct rostered
@@ -114,20 +150,31 @@ WORKTREE_SETUP=null              # Run once inside every freshly created task wo
                                  # null = bare worktree. Provisioning is what makes
                                  # implementer validation claims executable — an
                                  # unprovisioned tree produces misleading dependency/type failures.
-AGENT_SANDBOX_RUNNER=null        # Absolute executable outside the agent repository. In enforced mode
+AGENT_SANDBOX_RUNNER=null        # Canonical absolute, root-owned executable under a root-owned,
+                                 # operator/group/world-non-writable system path outside the agent
+                                 # repository. In enforced mode
                                  # the launcher invokes: runner --workdir <absolute> -- /usr/bin/env -i ...
-                                 # It rejects symlinks, non-regular/non-executable files, foreign
-                                 # owners, and group/world-writable runners.
+                                 # It rejects symlinks, non-regular/non-executable files, any
+                                 # non-root-owned/writable file or ancestor, and rechecks immediately
+                                 # before each execution. Operator-owned mode-0700 wrappers are unsafe.
 AGENT_SANDBOX_ENFORCED=false     # true routes every LLM command and WORKTREE_SETUP through the runner.
                                  # Keep false only for manual/test execution without that boundary;
                                  # the autonomous PM supervisor refuses to launch while false.
 BROKER_LIFECYCLE_ROOT=null       # Absolute pre-created mode-0700 directory, external and disjoint
-                                 # from the repository. Required when AGENT_SANDBOX_ENFORCED=true
-                                 # (or supply STARTUP_FACTORY_LIFECYCLE_STATE_ROOT to the broker).
+                                 # from the repository. Required by the team doctor, whenever
+                                 # AGENT_SANDBOX_ENFORCED=true, and for dispatch/integration/release
+                                 # authority. The doctor diagnoses but never creates or configures
+                                 # this directory. An ambient
+                                 # STARTUP_FACTORY_LIFECYCLE_STATE_ROOT may only repeat this exact
+                                 # canonical configured path; it can never replace this setting.
                                  # Authenticated PID/start-time/tmux records, control receipts, and
                                  # preserved dirty-attempt worktrees live here; size it accordingly.
                                  # .teamwork contains non-authoritative markers/manifests only.
                                  # Agent sandboxes must not be able to read or write this directory.
+                                 # Publication needs one narrow exception: connect-only access to
+                                 # the exact socket locator injected for that launch. Keep listing
+                                 # and every read/write/create/rename/unlink operation on this root
+                                 # denied to workers.
 ```
 
 `bin/launch-team.sh health [--json] [--watch]` renders only lifecycle-authenticated
@@ -187,8 +234,9 @@ is "no new failures", not "all green".
 
 ## Rules
 
-- These keys are read with a plain `grep '^KEY='` — keep one `KEY=value` per line
-  inside the fenced blocks, no spaces around `=`.
+- These keys are read by the inert configuration parser described above. Keep
+  exactly one uppercase `KEY=value` assignment per line inside the fenced
+  blocks, beginning in column one with no spaces around `=`.
 - `TEAMWORK_ROOT` must be repository-relative and contain no `..`. Managed paths
   are resolved before use; an absolute root or any existing symlink component is
   rejected, including links between two in-repository team workspaces.
@@ -206,8 +254,9 @@ is "no new failures", not "all green".
   home. Normal `team` and `gate-team` launches run it automatically after the
   tracker preflight and before any persistent role starts. A successful binary
   lookup without a prompt/authentication round trip is not a viable team.
-- `AGENT_SANDBOX_RUNNER` must be an absolute protected executable outside the
-  repository, owned by the executor or root, and not group/world-writable. It is
+- `AGENT_SANDBOX_RUNNER` must be a canonical absolute protected executable
+  outside the repository. The file and its complete ancestor chain must be
+  root-owned and not writable by the executor, group, or world. It is
   responsible for enforcing worktree-only writes, hiding host/broker state, and
   applying network and process isolation before it executes the argv after `--`.
 - Provision `BROKER_LIFECYCLE_ROOT` with mode `0700` under a path whose parent
