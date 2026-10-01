@@ -14,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import unittest.mock
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -35,6 +36,23 @@ RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 PACKAGE_CI_WORKFLOW = ROOT / ".github" / "workflows" / "package-ci.yml"
 RESOURCE_ARCHIVE = "startup_factory_cli/resources/startup-factory.tar.gz"
 RESOURCE_CHECKSUM = f"{RESOURCE_ARCHIVE}.sha256"
+PRERELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "prerelease.yml"
+STABLE_VERSION = "0.2.0"
+
+
+def expected_distribution_version() -> str:
+    """Return the stable version, or a release candidate of it.
+
+    The pre-release workflow builds `X.Y.ZrcN` from an unchanged stable tree, so
+    it names the candidate it built. Anything else is rejected rather than
+    trusted: the override can only add an rc suffix to the stable version.
+    """
+    override = os.environ.get("STARTUP_FACTORY_EXPECTED_VERSION")
+    if override is None:
+        return STABLE_VERSION
+    if re.fullmatch(rf"{re.escape(STABLE_VERSION)}rc[1-9][0-9]{{0,2}}", override) is None:
+        raise AssertionError(f"unexpected release-candidate version override: {override!r}")
+    return override
 
 
 def sha256_bytes(payload: bytes) -> str:
@@ -155,7 +173,7 @@ class ProjectMetadataTests(unittest.TestCase):
     def test_public_package_metadata(self) -> None:
         project = self.config["project"]
         self.assertEqual(project["name"], "startup-factory")
-        self.assertEqual(project["version"], "0.2.0")
+        self.assertEqual(project["version"], STABLE_VERSION)
         self.assertEqual(project["requires-python"], ">=3.10")
         self.assertEqual(project["license"], "MIT")
         self.assertEqual(project["license-files"], ["LICENSE"])
@@ -300,6 +318,45 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("if: github.event_name == 'pull_request'", workflow)
         self.assertIn("project.version must increase before merge", workflow)
         self.assertIn('refs/tags/v$VERSION^{commit}', workflow)
+
+    def test_pull_requests_may_keep_an_unreleased_base_version(self) -> None:
+        workflow = PACKAGE_CI_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn('refs/tags/v$base_version^{commit}', workflow)
+        self.assertIn('proposed_key == base_key and base_released == "true"', workflow)
+
+    def test_prerelease_publishes_only_release_candidates(self) -> None:
+        workflow = PRERELEASE_WORKFLOW.read_text(encoding="utf-8")
+        triggers = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("workflow_dispatch:", triggers)
+        self.assertNotIn("push:", triggers)
+        self.assertIn('version="${stable}rc${RC_NUMBER}"', workflow)
+        self.assertIn('refs/tags/v$stable^{commit}', workflow)
+        self.assertIn("a candidate cannot follow it", workflow)
+        self.assertIn("name: pypi-prerelease", workflow)
+        self.assertNotIn("name: pypi\n", workflow)
+        self.assertIn(
+            r'[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+rc[1-9][0-9]{0,2}$ ]]', workflow
+        )
+        self.assertIn("--prerelease", workflow)
+        self.assertIn("--latest=false", workflow)
+
+    def test_expected_distribution_version_only_accepts_release_candidates(self) -> None:
+        for value, accepted in (
+            ("0.2.0rc1", True),
+            ("0.2.0rc12", True),
+            ("0.2.0", False),
+            ("0.2.1rc1", False),
+            ("0.2.0rc0", False),
+            ("0.2.0.post1", False),
+        ):
+            with self.subTest(value=value), unittest.mock.patch.dict(
+                os.environ, {"STARTUP_FACTORY_EXPECTED_VERSION": value}
+            ):
+                if accepted:
+                    self.assertEqual(expected_distribution_version(), value)
+                else:
+                    with self.assertRaises(AssertionError):
+                        expected_distribution_version()
 
     def test_pull_requests_prove_source_compatibility_on_python_310(self) -> None:
         workflow = PACKAGE_CI_WORKFLOW.read_text(encoding="utf-8")
@@ -621,7 +678,7 @@ class BuiltDistributionIdentityTests(unittest.TestCase):
             license_bytes = archive.read(license_names[0])
 
         self.assertEqual(metadata["Name"], "startup-factory")
-        self.assertEqual(metadata["Version"], "0.2.0")
+        self.assertEqual(metadata["Version"], expected_distribution_version())
         self.assertEqual(metadata["Requires-Python"], ">=3.10")
         self.assertEqual(metadata["License-Expression"], "MIT")
         self.assertEqual(metadata.get_all("License-File", []), ["LICENSE"])
