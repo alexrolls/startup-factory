@@ -37,6 +37,7 @@ PACKAGE_CI_WORKFLOW = ROOT / ".github" / "workflows" / "package-ci.yml"
 RESOURCE_ARCHIVE = "startup_factory_cli/resources/startup-factory.tar.gz"
 RESOURCE_CHECKSUM = f"{RESOURCE_ARCHIVE}.sha256"
 PRERELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "prerelease.yml"
+PROMOTE_WORKFLOW = ROOT / ".github" / "workflows" / "promote.yml"
 STABLE_VERSION = "0.2.0"
 
 
@@ -339,6 +340,21 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         self.assertIn("--prerelease", workflow)
         self.assertIn("--latest=false", workflow)
+
+    def test_promotion_requires_a_verified_candidate_on_the_same_commit(self) -> None:
+        workflow = PROMOTE_WORKFLOW.read_text(encoding="utf-8")
+        triggers = workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("workflow_dispatch:", triggers)
+        self.assertNotIn("push:", triggers)
+        self.assertIn("group: release-main", workflow)
+        self.assertIn('test "$candidate_commit" = "$RELEASE_COMMIT"', workflow)
+        self.assertIn('--json isPrerelease,isDraft', workflow)
+        self.assertIn('test "$stable_status" = "404"', workflow)
+        self.assertIn("actions/workflows/package-ci.yml/runs?head_sha=$RELEASE_COMMIT", workflow)
+        self.assertIn("name: pypi-promote", workflow)
+        self.assertNotIn("name: pypi\n", workflow)
+        self.assertNotIn("STARTUP_FACTORY_EXPECTED_VERSION", workflow)
+        self.assertIn('uvx --refresh "startup-factory@latest" version --json', workflow)
 
     def test_expected_distribution_version_only_accepts_release_candidates(self) -> None:
         for value, accepted in (
