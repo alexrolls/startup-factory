@@ -84,7 +84,11 @@ comments have no authenticated broker receipt.
 5. **Record the baseline.** At feature-branch creation, write
    `<TEAMWORK_ROOT>/<team>/BASELINE.md` (protocol: *Baseline manifest*): test
    counts, known failures with cause, available validation commands, and the
-   default branch's required CI/CD state. Immediately file each known failure as
+   default branch's required CI/CD state, plus one immutable
+   `DELIVERY_BASE_COMMIT` and branch/ref for the delivery batch. Record intentional
+   rebases and refresh affected evidence; the destination development-branch
+   merge is a separate reviewed integration. This is an operator protocol, not
+   a newly enforced launcher field. Immediately file each known failure as
    a Scenario-6 `[Planned]` [task]; a red default branch blocks release and is
    never normalized by the baseline. Point briefs and assignments at the
    manifest instead of restating branch lore in messages.
@@ -122,6 +126,21 @@ rung as a comment on the affected [task] → act on every pending dispatch decis
 (claims, queues, holds) → exit. Never promise to "check back later" — the
 dispatcher owns time. After `ESCALATE_AFTER_ATTEMPTS` failed rungs on the same
 problem, escalate.
+
+Record Sceptical Architect pushback as review rounds, default two per decision;
+one round may contain many findings. Have the operator/external timer measure
+each per-task review's 45-minute default wall-clock limit. At expiry request
+partial checks, findings, and gaps, then reassign, narrow scope, or record an
+explicit extension. A deadline or exhausted round budget never supplies a
+missing verdict, waives CI, or accepts unresolved Critical risk.
+
+Use `bin/tracker-ops.sh` for supported scriptable adapter operations rather than
+ad-hoc API calls or word-split shell loops: `export <featureId> <outfile>`,
+`comment <taskId> <bodyfile>`, and `state <taskId> <Status>`. Validate the intended
+target list is non-empty, preserve each exact id, check every exit status, and
+confirm writes through the adapter. MCP-only sessions use the adapter's native
+tools. In broker mode agents still submit artifacts/controls through the outbox;
+these helpers do not authorize a direct write or bypass ownership.
 
 Use the protected health/control path for lifecycle actions:
 
@@ -189,6 +208,12 @@ Verify:
 9. every required CI/CD check for the exact PR/commit is green. Red, pending,
    skipped, missing, stale, or unverifiable CI is blocking and cannot be waived
    by any agent.
+10. applicable target-environment acceptance is current for the exact candidate
+    and deployment, with check/transcript ids, preconditions, and limitations;
+    reasoned non-applicability is limited to non-executable work. LLM-consuming
+    changes include captured-real-output fixtures and authorized real-model
+    traces with relevant persistence, locale, and paraphrase coverage. A live
+    miss changes the verification method, not just the run number.
 
 Any unmet requirement or standard → one numbered `[review-findings]` comment
 with evidence, impact, and required remediation; request the transition

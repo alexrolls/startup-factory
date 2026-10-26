@@ -73,6 +73,28 @@ def die(msg):
 SKILL_DIR = sys.argv[1]
 ARGS = sys.argv[2:]
 
+# Refuse blank identities before loading an adapter or reading a body. In
+# particular, an adapter must never interpret a blank target as board-wide work.
+# scan's first argument is an output path and deliberately has no target check.
+TARGETED_OPERATIONS = {
+    'probe', 'change-token', 'state', 'feature-state', 'feature-reopen',
+    'task-reopen', 'comment', 'comment-once', 'update-comment', 'upsert-progress',
+    'upsert-digest', 'upsert-deployment', 'claim', 'record-denial', 'integrate',
+    'export',
+}
+if ARGS and ARGS[0] in TARGETED_OPERATIONS:
+    target_arguments = ARGS[1:]
+    # These two operations accept options before their positional target too.
+    for flag in {
+        'claim': ('--to', '--expected', '--claim-id'),
+        'record-denial': ('--actor', '--reason', '--denial-id'),
+    }.get(ARGS[0], ()):
+        if flag in target_arguments:
+            index = target_arguments.index(flag)
+            target_arguments = target_arguments[:index] + target_arguments[index + 2:]
+    if not target_arguments or not target_arguments[0].strip():
+        die("target taskId/featureId must not be empty or whitespace-only — andon")
+
 # Tracker writes are a data-loss-prevention boundary.  Reuse the same bounded,
 # standard-library scanner that protects inbound ticket packets so no backend or
 # project-owned adapter can receive a raw credential from agent-authored text.

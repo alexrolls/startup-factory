@@ -1,0 +1,1 @@
+Entry path /search: the empty response is displayed in de-DE.

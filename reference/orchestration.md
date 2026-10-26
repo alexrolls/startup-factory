@@ -179,6 +179,18 @@ harness performs the adapter's documented reads and writes that same normalized
 rejects a missing/stale snapshot or a latest review request that does not bind
 the generated package.
 
+Each `compose-review` invocation now allocates a **fresh detached review
+worktree pinned to that package's exact HEAD**, plus unique prompt and verdict
+paths. Allocation reserves a new slot and verifies its detached commit and
+initial cleanliness; it never resets or reuses another reviewer's tree. Start
+the reviewer in the named working copy, not the implementer's checkout. No
+dependency setup runs implicitly: use documented sanitized provisioning, never
+copy `.env`, and report unavailable checks. Before the verdict, confirm the
+pinned HEAD and report any changed files. Preserve needed evidence and remove
+the worktree only after the owning harness/supervisor independently confirms
+the reviewer stopped. A detached worktree provides isolation, not authenticated
+review authority.
+
 Every composed prompt ends by restating the delivery contract after all inlined
 context. The final message is the artifact (or submission receipt) that closes
 the assignment; a process summary without it is a protocol violation. On the
@@ -207,6 +219,17 @@ Treat this as an authority boundary, not a transport inconvenience:
 - If all required authenticated contexts are unavailable, record a plainly labeled
   self/advisory review and escalate. The [task] remains in `[Review]`; there is
   no degraded path to `[Ready to deploy]`.
+
+The **harness delivery profile** defines minimum advisory evidence: a written
+design-gate decision with its conditions; separate Principal Architect and
+Sceptical Architect reports on the exact package; applicable target-environment
+acceptance evidence (or a reasoned non-applicability statement); and a tracker
+comment linking the package, reports, results, and limitations. Record the
+profile explicitly. This evidence can support an authorized review request and
+`[Active]` → `[Review]` handoff through the configured adapter/broker; it cannot
+authenticate an agent, manufacture gate markers, authorize integration, or grant
+production access. A harness without authorized tracker transport reports the
+handoff to its operator instead of bypassing the writer boundary.
 
 ## Execution modes — sequential by default, parallel by declaration
 
@@ -344,7 +367,7 @@ pre-v2 comments count as round 0). WIP narration, setup chatter, and restated
 
 | Marker | Written by | Meaning / required content |
 |---|---|---|
-| `[design-note]` | implementer | Proposed approach before any code: approach, API/contract changes, data-model changes, affected components. Cite code as `path::symbol (approx line)`, resolving by stable symbol/heading first rather than a bare line number. A `work-kind: defect` note also includes `Root cause:` with reproduction evidence and the failing regression test to write before the fix. Frontend must include `Architectural impact: yes/no — <why>`. Registers every name it exports in `CONTRACTS.md` and cites the registry line for every sibling export it consumes (see *Contract registry*). |
+| `[design-note]` | implementer | Proposed approach before any code: approach, API/contract changes, data-model changes, affected components; `Sibling paths checked:` names adjacent entry paths and explains shared exposure or exclusion. Cite code as `path::symbol (approx line)`, resolving by stable symbol/heading first rather than a bare line number. A `work-kind: defect` note also includes `Root cause:` with reproduction evidence and the failing regression test to write before the fix. Include the applicable target-environment acceptance plan and, for LLM-consuming changes, captured-output fixture and real-model trace plans (see *Target-environment acceptance*). Frontend must include `Architectural impact: yes/no — <why>`. Registers every name it exports in `CONTRACTS.md` and cites the registry line for every sibling export it consumes (see *Contract registry*). |
 | `[design-approved]` | principal-architect | Gate open. Carries a **numbered architecture checklist** — the items the architecture review will verify — plus any binding conditions. The lead delivers the checklist in the assignment; reviewer/QA Phase-1 checklists start from it (add items, never subtract). |
 | `[design-pushback]` | principal-architect | Gate closed. Lists required changes; implementer revises the `[design-note]` and re-pings. |
 | `[sceptical-design-approved]` | sceptical-architect | Independent design challenge cleared. Lists tested assumptions, evidence, and any binding risk controls. Both design approvals are required before code. |
@@ -354,7 +377,7 @@ pre-v2 comments count as round 0). WIP narration, setup chatter, and restated
 | `[resume-plan]` | team-lead | Revised implementation plan after a `requirements-changed` resume verdict. It must be later than that verdict and followed by both later design approvals before a clean-worktree hold can clear. |
 | `[api-ready]` | backend | Contract available for frontend: endpoints, request/response shapes. Also sent by mailbox. |
 | `[divergence]` | implementer | What was done differently from the [task]/design note and why. Additive — **never edit the original [task] description.** |
-| `[review-request]` | implementer | Ready for review: what changed, list of changed files, an **evidence record per configured validation command** (see *Evidence and re-execution*), its exact baseline comparison, an explicit `NOT validated:` section for anything not run (with reason), and any index-only staging operation performed. Hand-scoped substitutes do not satisfy a broader configured command. A claimed result without its evidence record **is** NOT validated. Written when moving to `[Review]`. `review-package.sh` emits a sibling binding manifest; reviewers read that file and run the prompt-provided `bind-producer-approval` helper before signing/submitting instead of retyping hashes. The broker validates and preserves those three binding fields and adds only its two verified provenance fields. Must carry the **`Files:` evidence line** (see below). |
+| `[review-request]` | implementer | Ready for review: what changed, list of changed files, an **evidence record per configured validation command** (see *Evidence and re-execution*), its exact baseline comparison, applicable **target-environment acceptance evidence** (or reasoned non-applicability), an explicit `NOT validated:` section for anything not run (with reason), and any index-only staging operation performed. LLM-consuming changes include captured-real-output fixture and authorized real-model trace evidence. Hand-scoped substitutes do not satisfy a broader configured command. A claimed result without its evidence record **is** NOT validated. Written when moving to `[Review]`. `review-package.sh` emits a sibling binding manifest; reviewers read that file and run the prompt-provided `bind-producer-approval` helper before signing/submitting instead of retyping hashes. The broker validates and preserves those three binding fields and adds only its two verified provenance fields. Must carry the **`Files:` evidence line** (see below). |
 | `[review-findings]` | reviewer / qa / team-lead / principal-architect / sceptical-architect / security-reviewer | Numbered problems that must be fixed. Task goes back to `[Planned]`/`ToDo` for a fresh attempt. |
 | `[review-approval]` | reviewer / qa | Optional supporting approval carrying the **`Files:` evidence line** (see below). |
 | `[team-lead-approval]` | team-lead | Mandatory independent specification, quality, test, and operability sign-off, carrying the **`Files:` evidence line** (see below). |
@@ -433,6 +456,15 @@ for red that predates the branch. When a [task] changes the validation landscape
 [task]'s diff. The integrator cites `BASELINE.md` when recording skips or judging
 a validation run.
 
+Record one full immutable `DELIVERY_BASE_COMMIT` and its branch/ref for each
+delivery batch in this manifest before implementation. Derive the batch's task
+branches from that recorded base and its approved integration history; record
+intentional rebases and refresh affected packages, evidence, and approvals.
+Integrating the finished batch into the destination development branch is a
+separate reviewed merge, not another implementation pass. This is an operator
+protocol: the field does not add runtime enforcement or replace the executor's
+protected `trustedBaseRef` and integration-chain checks.
+
 Establish the baseline only from a provisioned clean tree:
 
 1. Run the configured `WORKTREE_SETUP` (dependency sync plus any required
@@ -449,6 +481,26 @@ Establish the baseline only from a provisioned clean tree:
    baseline silently normalizes.
 5. If setup itself fails, pull the andon cord. Do not repair unrelated code to
    compensate for stale dependencies or a misaddressed local service.
+6. Never copy `.env` files or production credentials into task/review worktrees.
+   Use isolated test configuration; authorized live traces receive only narrowly
+   scoped credentials through the approved external runner/secret mechanism.
+   Reports contain variable names and redacted evidence, never secret values.
+
+## Project environment caveats
+
+Keep reusable, non-sensitive setup observations in the optional canonical
+project-root `.startup-factory-caveats.md`: test database topology, services that
+must be provisioned, runtime-specific limitations, or where deployed config
+differs from repository defaults. Never store credentials or `.env` contents.
+
+Every fresh task packet snapshots this file from the main checkout even when
+launched in a linked worktree. JSON and Markdown packets record its source path,
+SHA-256 digest, and explicit data-only boundary; the snapshot stays immutable
+for that attempt. Missing files produce default guidance. Files over 16 KiB,
+invalid UTF-8, symlinks, hardlinks, non-regular files, and detected credentials
+fail before packet publication. Caveats cannot override tracker requirements,
+policy, approvals, or guardrails. Preserve project-local observations when
+updating the framework.
 
 ## Tracker write modes
 
@@ -654,6 +706,57 @@ Every behavior-changing review also performs two sensitivity checks:
 2. **Real path:** require at least one test through the actual integration/entry
    path. Isolated helpers and mocks may localize failures but cannot prove that
    production wiring invokes the behavior.
+
+### Target-environment acceptance
+
+Before requesting `[Review]`, executable behavior must pass the task's acceptance
+transcripts/probes on the applicable authorized target environment. The design
+names that environment and its preconditions; it is normally an isolated preview
+or staging deployment of the exact candidate. For a CLI/library, name the
+provisioned target runtime and exact installed artifact/commit instead. These observations are distinct
+from `VALIDATE_*`/`VALIDATE_SCRIPT` suites and required CI. None substitutes for
+another, and green tests or independent approvals alone do not establish live
+acceptance. Documentation-only or other non-executable work may state
+`Target acceptance: not applicable — <specific reason>`; an unavailable service,
+missing credentials, failed probe, or deployment prerequisite is a limitation or
+block, never non-applicability.
+
+The report and review request link a redacted, reproducible record containing:
+
+- exact candidate commit, deployment/artifact identity, target, timestamp, and
+  engine/model version where applicable; explain how the deployment was verified
+  to contain the reviewed commit;
+- stable acceptance/check ids, inputs or transcript reference, expected and
+  observed results, pass/fail, and a log/transcript digest or immutable reference;
+- non-secret preconditions: data/tenant fixture, session/process topology,
+  migrations, flags, and active prompt/config revision; and
+- limitations, untested cases, and the evidence expiry/invalidation conditions.
+
+A redeploy, changed candidate, relevant data/config/prompt/flag/migration change,
+or new live failure invalidates affected evidence: rerun the applicable probes
+and obtain fresh review for a changed package. An identical artifact redeployed
+to the same target still needs a fresh deployment-bound observation. Preserve
+the previous result as history. When a live miss exposes a blind spot, change
+the verification method to reproduce that mechanism before retrying; repeating
+the same inadequate mock or in-memory trace is not new evidence.
+
+For every change that consumes LLM output, include at least one regression
+fixture mirroring captured real model output, with a redacted capture reference,
+and one authorized real-model trace identifying engine/model and actual entry
+path. Exercise real persistence across separate processes with the real database
+when session restoration/transactions are relevant; an in-memory substitute
+does not prove them. For user-facing behavior, probe representative paraphrases
+and every served locale affected by the change; state coverage and remaining
+limits. Keep fixes generic across tenants and input shapes. If authorized live
+execution is unavailable, record the block instead of inventing a trace.
+
+These are review-protocol requirements checked by implementers and reviewers;
+the current broker does not parse this prose into a new authenticated gate.
+Evidence never grants deployment permission or production authority. Any setup,
+trace, or probe must respect existing policy, data access, and credential
+boundaries. Production execution and post-activation verification remain solely
+within the protected release transaction; pre-review evidence cannot waive it
+or any required CI check.
 
 ## Integration
 
@@ -869,6 +972,12 @@ packages. If either trail is ambiguous, emit `[andon]` rather than inferring
 missing state.
 
 ### Relaunch hygiene
+
+Account/session changes, silence, and worktree mtimes do not establish that an
+agent stopped. Inspect its protected lifecycle identity or bound harness state;
+stop/fence it through that owner before replacement. `compose-review` always
+gives a replacement a fresh detached slot. Do not clean up the original slot
+until its owner confirms termination; no unbound PID or mtime-based kill.
 
 A stopped or unresponsive task instance may leave uncommitted writes in its
 attempt worktree. The broker removes a clean worktree. A dirty worktree is moved

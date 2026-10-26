@@ -1,0 +1,103 @@
+{
+  "provider": {
+    "id": "startup-factory.live-probe",
+    "version": "0.1.0",
+    "procedureSha256": "sha256:2bb41761a8f6d083ab8bce01f5b396878fe6141f117f26ef62071811197197f1"
+  },
+  "subject": {
+    "taskId": "TASK-EXAMPLE",
+    "attempt": 1,
+    "commit": "1111111111111111111111111111111111111111"
+  },
+  "capability": "live-probe",
+  "target": {
+    "origin": "https://preview.example.test",
+    "deploymentId": "preview-42"
+  },
+  "schemaVersion": 1,
+  "collection": {
+    "method": "operator",
+    "engine": null,
+    "startedAt": "2026-10-25T10:00:00Z",
+    "finishedAt": "2026-10-25T10:00:10Z"
+  },
+  "status": "passed",
+  "probes": [
+    {
+      "id": "search.de-DE.empty",
+      "acceptanceCriterionId": "AC-1",
+      "entryPath": "/search",
+      "locale": "de-DE",
+      "variantId": "empty-state",
+      "startedAt": "2026-10-25T10:00:01Z",
+      "finishedAt": "2026-10-25T10:00:09Z",
+      "status": "passed",
+      "precondition": {
+        "status": "passed",
+        "checks": [
+          {
+            "id": "empty-catalog",
+            "status": "passed",
+            "observedAt": "2026-10-25T10:00:02Z",
+            "artifactId": "baseline"
+          }
+        ]
+      },
+      "behavioral": {
+        "status": "passed",
+        "checks": [
+          {
+            "id": "empty-response",
+            "status": "passed",
+            "observedAt": "2026-10-25T10:00:05Z",
+            "artifactId": "response"
+          }
+        ]
+      }
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "baseline",
+      "probeId": "search.de-DE.empty",
+      "phase": "precondition",
+      "kind": "transcript",
+      "path": "baseline.txt",
+      "mimeType": "text/plain",
+      "sizeBytes": 54,
+      "sha256": "sha256:fa3be65fcc29603dbda3d3c0e2318e9404b000936e5f3ec3c1800515b77fab74"
+    },
+    {
+      "id": "response",
+      "probeId": "search.de-DE.empty",
+      "phase": "behavioral",
+      "kind": "transcript",
+      "path": "response.txt",
+      "mimeType": "text/plain",
+      "sizeBytes": 62,
+      "sha256": "sha256:adb806ef3fcfa9913d8d1eee776577e6a02142ca96ebb30503dbd0ebfdb1aba4"
+    }
+  ],
+  "redactions": [
+    {
+      "kind": "credentials",
+      "method": "removed"
+    },
+    {
+      "kind": "personal-data",
+      "method": "masked"
+    },
+    {
+      "kind": "request-query",
+      "method": "removed"
+    },
+    {
+      "kind": "environment-value",
+      "method": "omitted"
+    },
+    {
+      "kind": "artifact-path",
+      "method": "basename-only"
+    }
+  ]
+}

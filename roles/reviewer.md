@@ -17,6 +17,11 @@ rigor as one-at-a-time; batching shares the boot, never the judgment) — then e
 
 ## Trigger
 
+For a one-package harness review use `compose-review` and its fresh detached,
+commit-pinned working copy and unique verdict paths. Never share the implementer
+or another reviewer's tree. Setup is explicit and sanitized; never copy `.env`.
+Only the owning harness/supervisor may confirm termination before tree cleanup.
+
 A [task] moves to `[Review]` with a `[review-request]` comment. The mandatory
 four-role board reviews independently in parallel; you review the specialist
 surface assigned to you. Do not coordinate verdicts.
@@ -35,6 +40,12 @@ requirements, not from the diff.
 stat, and full diff at the exact task-branch HEAD. Read outside the package only
 for a concrete cross-cutting risk you can name. Check your Phase-1 items, correctness,
 tests (do they test the rule, or just execute the code?), naming, error handling.
+Inspect applicable target-environment acceptance records separately from suites:
+exact commit/deployment, check/transcript ids, preconditions, limitations, and
+freshness. For LLM-consuming work inspect captured-real-output fixtures and
+authorized real-model traces with engine/model and relevant persistence,
+locale/paraphrase coverage. Non-executable work may explain non-applicability;
+missing applicable evidence is a finding, never permission to bypass CI.
 Send problems immediately as one `[review-findings]` comment with numbered items —
 the [task] goes back to `[Planned]` for a fresh attempt. On a clean optional pass,
 your `[review-approval]` is supporting evidence only; integration still requires

@@ -757,6 +757,21 @@ assert len(binding["taskBranchHead"]) == 40
 ' "$package" "$bindings"
 review_prompt="$($LAUNCH compose-review feature-runtime "$FID" reviewer "$TID")"
 check "lean review prompt exists" test -f "$review_prompt"
+review_tree="$(sed -n 's/^- Working copy: //p' "$review_prompt")"
+check "lean review runs in a detached tree at the exact package HEAD" \
+  python3 - "$review_tree" "$bindings" <<'PY'
+import json,subprocess,sys
+tree,binding_path=sys.argv[1:]
+binding=json.load(open(binding_path))
+assert subprocess.check_output(['git','-C',tree,'rev-parse','HEAD'],text=True).strip() == binding['taskBranchHead']
+assert subprocess.check_output(['git','-C',tree,'branch','--show-current'],text=True).strip() == ''
+PY
+second_review_prompt="$($LAUNCH compose-review feature-runtime "$FID" reviewer "$TID")"
+second_review_tree="$(sed -n 's/^- Working copy: //p' "$second_review_prompt")"
+check "repeated review composition allocates a fresh worktree" test "$review_tree" != "$second_review_tree"
+check "repeated review composition allocates a unique prompt" test "$review_prompt" != "$second_review_prompt"
+check "repeated review composition allocates a unique verdict" \
+  test "$(sed -n 's/^- Verdict body file: //p' "$review_prompt")" != "$(sed -n 's/^- Verdict body file: //p' "$second_review_prompt")"
 check "lean review prompt points to binding manifest" grep -q "Binding manifest (read; never retype digests): $bindings" "$review_prompt"
 check "lean review prompt names exact verdict marker" grep -Fq '[review-approval] or [review-findings]' "$review_prompt"
 check "lean review prompt requires a producer-bound verdict file" \

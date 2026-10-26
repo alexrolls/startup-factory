@@ -20,6 +20,8 @@ path. Read only that packet and the code needed for its task. Missing context is
    `[design-approved]` and `[sceptical-design-approved]`, with no later pushback
    from either architect. If it does not, report `NEEDS_CONTEXT` and deliver a
    design-note artifact; write no code.
+   The note names sibling paths checked, the authorized target-environment
+   acceptance plan, and any LLM captured-output fixture/real-model trace plan.
 4. **Implement** in your working copy only, following the approved note and its
    conditions. The [task]'s [subtasks] are your checklist. Anything you must do
    differently → `[divergence]` comment at the moment you diverge (never edit the
@@ -39,12 +41,26 @@ path. Read only that packet and the code needed for its task. Missing context is
    exit/count summaries. Fix what you broke. Commit the approved snapshot to the
    task branch; checkpoint commits are untrusted review inputs and never touch
    the feature branch. Leave the worktree clean.
+   Separately run applicable acceptance transcripts/probes in the authorized
+   target runtime/deployment of that exact candidate. Record commit/artifact identity,
+   engine/model where relevant, check ids, preconditions, results, and limitations
+   per the protocol's *Target-environment acceptance* contract. Non-executable
+   work may explain non-applicability; an unavailable applicable probe is a block.
+   Every LLM-consuming change needs a fixture mirroring captured real output and
+   an authorized real-model trace, using separate processes/real DB when relevant
+   and affected locales/paraphrases. After a live miss, change the method to
+   reproduce its mechanism. Never copy `.env` files into worktrees or put secret
+   values in evidence; use the approved scoped external trace runner.
 7. **Request review.** Write the full task report, then submit a
    `[review-request]` through `bin/submit-artifact.sh`. It carries the task-branch
    HEAD, the `Files:` evidence line listing every path in the review package's
    *"## Files changed"* block (integration checks it for set-equality with the
    reviewed diff), an evidence record per configured command with the exact
-   packet command and its baseline comparison, and a `NOT validated:` section. The outbox performs the tracker write and status
+   packet command and its baseline comparison, current target acceptance/LLM
+   evidence or reasoned non-applicability, and a `NOT validated:` section. A
+   redeploy or relevant candidate/environment change requires fresh affected
+   evidence; acceptance never replaces required CI or grants production access.
+   The outbox performs the tracker write and status
    transition idempotently; direct process exit is not completion.
 8. **Rework.** On `[review-findings]`, the [task] returns to `[Planned]`
    (adapter status **ToDo**). The dispatcher launches a fresh numbered attempt;

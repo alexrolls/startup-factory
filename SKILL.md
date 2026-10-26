@@ -40,6 +40,9 @@ skill's directory):
   evidence authenticity and release authority remain external
 - `bin/evidence_provider.py` + `reference/evidence-providers.md` — strict offline
   validation/indexing for commit-bound, non-authoritative provider evidence
+- `bin/live_probe_evidence.py` + `extensions/evidence-providers/live-probe/` —
+  offline validation of operator-collected acceptance transcripts against exact
+  commit/deployment and independently declared required checks
 - `extensions/evidence-providers/` — preserved project-owned evidence workers;
   the Playwright reference never installs a browser or grants workflow authority
 - `bin/tracker-ops.sh` — ergonomic CLI for recurring tracker operations, including
@@ -50,6 +53,8 @@ skill's directory):
   and minimal task-local context
 - `bin/retrospective.py` — compact, project-local Starfish learnings loaded into
   every fresh task packet and capped at the latest ten completed [tasks]
+- `.startup-factory-caveats.md` at the canonical project root — optional bounded,
+  non-sensitive environment observations snapshotted as data in fresh task packets
 - `bin/task-hold.py` — task-scoped `[Blocked]` holds, communication snapshots,
   dependency-impact review, and human-resume barriers
 - `bin/submit-artifact.sh` + `bin/process-outbox.sh` + `bin/outbox_capability.py`
@@ -164,6 +169,12 @@ preparation:
      `[sceptical-architecture-approval]`, or `[security-approval]`; do not call
      the result a review-board approval; and do not move the [task] to
      `[Ready to deploy]`. Launch authenticated gate roles or escalate.
+     The harness delivery profile requires a recorded design-gate decision,
+     two independent architect reports, applicable target-environment acceptance
+     evidence (or reasoned non-applicability), and a tracker comment linking the
+     exact package and limitations before an authorized `[Review]` handoff.
+     This minimum evidence does not create authenticated authority; see
+     `reference/team-roles.md` for review rounds and external time limits.
 7. **Initialize the tool** — steps depend on your execution mode:
    - **Single-agent** (`TEAM_MODE` unset or false): run the adapter's *Initialization*
      section probe (a cheap read proving access works). If it fails, stop and tell the
@@ -213,6 +224,12 @@ each generic operation through the adapter's *Operations* table:
   requested feature/board run and inspect its first dry-run plan.
 - **If any operation fails, stop and report it** (Scenario 8). Never work around a failure
   or fabricate a result.
+- **Verify applicable target behavior before requesting review.** Record exact
+  candidate/deployment acceptance evidence separately from `VALIDATE_*` and CI;
+  non-executable work may explain non-applicability. LLM-consuming changes need
+  a captured-real-output fixture and authorized real-model trace. Follow
+  `reference/orchestration.md` → *Target-environment acceptance*. This protocol
+  requirement creates no authenticated gate or production permission.
 - **Never skip a status transition.** Legal moves are the `transitions` graph in
   `config/statuses.config.json` (default board:
   `[Planned]` → `[Active]` → `[Review]` → `[Ready to deploy]`, rework

@@ -48,6 +48,10 @@ the current need. Change your position when better evidence arrives.
    pushback grounds.
    For executable behavior, also push back when tests lack both a removal/revert
    negative control and coverage through the real integration/entry path.
+   Require `Sibling paths checked:`; inspect adjacent transports, retrieval lanes,
+   input shapes, and persistence paths for the same defect. Require an applicable
+   authorized target-environment acceptance plan; LLM-consuming work also needs
+   a captured-real-output fixture and real-model trace plan.
    Independently challenge a missing `review-gates: security` whenever the task
    presents a credible authority, data, input, supply-chain, deployment, or
    destructive-operation threat.
@@ -60,11 +64,25 @@ the current need. Change your position when better evidence arrives.
    Attempt the named negative control: would the claimed test still pass if the
    new branch, guard, or wiring were removed? Confirm mocked/helper-only tests do
    not stand in for the actual entry path.
+   Inspect target-environment transcripts/check ids, exact commit/deployment
+   identity, non-secret preconditions, and limitations separately from validation
+   suites/CI. Challenge missing or stale applicable acceptance evidence. For
+   LLM-consuming work, inspect the captured-output fixture and authorized trace
+   naming engine/model; exercise relevant separate-process/real-DB behavior and
+   affected served locales/paraphrases. After a live miss, require a changed
+   method that reproduces the missed mechanism before retrying. Never copy `.env`
+   files or production credentials into worktrees.
    Problems become one numbered `[review-findings]` comment and requeue the
    [task] to `[Planned]` for a fresh attempt. Otherwise post
    `[sceptical-architecture-approval]` carrying the `Files:` evidence line, listing every path in the review package's *"## Files changed"* block (integration checks it for set-equality with the reviewed diff). Submit
    the verdict through the outbox so it binds to the current review request,
    task-branch HEAD, and package digest.
+
+Before release handoff, record target environment drift against reviewed source:
+DB-stored prompt/config revisions, migrations, flags, and actual deployment
+identity. Use authorized read-only exports/protected-runner evidence and require
+fresh affected probes after changes. This recommendation grants no production
+access and cannot replace the protected executor's verification.
 
 ## Finding discipline
 
@@ -102,6 +120,16 @@ architect, or where a Critical risk would be accepted, escalate to the human.
 After a valid decision, record the rationale, risk owner, mitigation, and review
 date; then support it. Reopen it only for material new evidence or changed
 requirements.
+
+The default pushback budget is **two review rounds per decision**, not two
+findings; each round may contain any number of findings. Record round numbers
+and revised evidence. After two unresolved rounds, send the decision packet;
+do not convert unresolved blockers into approval. Each per-task round has a
+45-minute default wall-clock time limit measured by the operator/external timer.
+At expiry publish partial checks, findings, and gaps for reassignment or an
+explicit extension. Neither expiry, budget exhaustion, nor a Lead ruling waives
+mandatory approvals, required CI, or unresolved Critical risk; escalation itself
+never accepts risk. See `reference/team-roles.md`.
 
 ## Your loop
 

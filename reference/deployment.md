@@ -12,6 +12,32 @@ manifest, and evidence. It is a runbook and checklist, never authority: every
 protected CI, policy, approval/attestation, credential-isolation, and executor
 gate below still applies.
 
+## Delivery batch and environment review
+
+Before implementation, record one immutable `DELIVERY_BASE_COMMIT` and branch/ref
+in the team's `BASELINE.md`; use that base and the approved integration history
+throughout the batch. Document intentional rebases and merge the finished batch
+into the destination development branch through a separate reviewed integration.
+Refresh evidence for the resulting exact commit. This field is an operator
+protocol, not a runtime check or a replacement for protected `trustedBaseRef`
+provenance and the gap-free integration chain.
+
+Before release handoff, the Sceptical Architect records a read-only environment
+drift review: active DB-stored prompt/config revisions against reviewed source,
+pending/applied migrations, feature flags, actual artifact/deployment identity,
+and the acceptance probes' data/session preconditions. Use only authorized
+read-only exports or protected-runner evidence; no production credentials enter
+an agent or worktree. Unexpected drift blocks the recommendation until resolved
+through the appropriate task/release path and affected probes are rerun.
+Recheck after redeploy or relevant environment change; an earlier transcript is
+historical evidence, not proof of the current deployment.
+
+Pre-review target-environment acceptance and authorized real-model traces are
+separate from configured validation, protected CI, and the executor's required
+post-activation acceptance attestation. They grant no deployment permission.
+The current executor does not enforce the prose drift review or batch-base
+field; the protected gates below remain mandatory without exceptions.
+
 ## Trust boundary and preconditions
 
 Deployment is disabled by default. Disabled means **awaiting deployment**, not

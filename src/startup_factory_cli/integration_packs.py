@@ -35,7 +35,7 @@ from .secret_safety import contains_secret_like, redact_secret_like
 SCHEMA_VERSION = 1
 PLAN_SCHEMA_VERSION = 2
 VALIDATOR_VERSION = 2
-RUNTIME_VERSION = "0.2.0"
+RUNTIME_VERSION = "0.2.1"
 MAX_PACK_BYTES = 64 * 1024
 MAX_TARGET_BYTES = 1024 * 1024
 MAX_PLAN_BYTES = 64 * 1024

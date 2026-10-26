@@ -38,7 +38,7 @@ Startup Factory does not replace your coding agent, repository, project-manageme
 - [Bring your own agents, tracker, and stack](#bring-your-own-agents-tracker-and-stack)
 - [Choose how much autonomy you want](#choose-how-much-autonomy-you-want)
 - [Safety is part of the architecture](#safety-is-part-of-the-architecture)
-- [What's new](#whats-new-in-020)
+- [What's new](#whats-new-in-021)
 - [Documentation](#documentation)
 - [Project status](#project-status)
 - [Contributing](#contributing)
@@ -417,6 +417,31 @@ Read the full contracts before enabling unattended or production operation:
 - [`reference/automation.md`](reference/automation.md)
 - [`reference/deployment.md`](reference/deployment.md)
 - [`reference/orchestration.md`](reference/orchestration.md)
+
+## What's new in 0.2.1
+
+Delivery experience highlighted three gaps between a passing test suite and a
+verified outcome:
+
+- **Isolated harness reviews:** `compose-review` now creates a fresh detached
+  worktree at the package's exact commit, with unique prompt and verdict paths.
+  Repeated or concurrent compositions never reuse another reviewer's tree.
+- **Target-environment evidence:** a strict offline
+  [live-probe transcript validator](extensions/evidence-providers/live-probe/README.md)
+  checks commit, deployment, acceptance ids, preconditions, locale/variant
+  coverage, and transcript digests against independent expectations. It collects
+  no live data and grants no workflow authority. Pre-review live verification,
+  captured model-output fixtures, and real-model traces are now explicit
+  [review-protocol requirements](reference/orchestration.md#target-environment-acceptance);
+  their admission is not yet enforced by the broker.
+- **Reusable environment context:** task packets snapshot the canonical
+  project's optional `.startup-factory-caveats.md`, bounded to 16 KiB and marked
+  as untrusted data. Unsafe files or potential credentials fail visibly.
+
+The role briefs also define review budgets in rounds, a default 45-minute
+operator-measured review limit, sibling-path checks, recorded batch bases, and
+environment-drift checks. Timeouts and advisory harness reviews never replace
+mandatory approvals, required CI, or protected release verification.
 
 ## What's new in 0.2.0
 

@@ -2931,7 +2931,7 @@ compose_review_prompt() { # <team> <featureId> <role> <taskId> [preset]
     validate_review_board_independence "$preset"
   fi
   local dir key brief marker package bindings execution attempt packet tasks
-  local prompts out verdict bound_verdict tool_prefix runtime
+  local prompts out verdict bound_verdict tool_prefix runtime review_head review_tree review_id review_slot
   dir="$(teamroot "$team")" || die "unsafe team workspace"
   key="$(task_key "$task")"
   brief="$(role_brief "$role")"
@@ -2998,10 +2998,20 @@ expected = (
 if (binding["base"], binding["head"], binding["package"]) != expected:
     raise SystemExit("latest review request does not match the package binding manifest")
 PY
+  review_head="$(python3 - "$bindings" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1]))["taskBranchHead"])
+PY
+)" || die "could not read pinned review HEAD"
+  review_slot="$(python3 "$SKILL_DIR/bin/review-worktree.py" \
+    --repo "$REPO_ROOT" --workspace "$dir" --role "$role" --task-key "$key" \
+    --commit "$review_head")" || die "could not allocate an isolated review worktree"
+  review_tree="$(printf '%s' "$review_slot" | python3 -c 'import json,sys; print(json.load(sys.stdin)["worktree"])')"
+  review_id="$(printf '%s' "$review_slot" | python3 -c 'import json,sys; print(json.load(sys.stdin)["reviewId"])')"
   prompts="$(team_path "$dir" prompts/reviews)" || die "unsafe review prompt path"
-  out="$(team_path "$dir" "prompts/reviews/$role--$key.md")" || die "unsafe review prompt path"
-  verdict="$(team_path "$dir" "artifacts/$key/verdict-$attempt-$role.md")" || die "unsafe verdict path"
-  bound_verdict="$(team_path "$dir" "artifacts/$key/verdict-$attempt-$role.bound.md")" || die "unsafe bound verdict path"
+  out="$(team_path "$dir" "prompts/reviews/$review_id.md")" || die "unsafe review prompt path"
+  verdict="$(team_path "$dir" "artifacts/$key/verdict-$attempt-$review_id.md")" || die "unsafe verdict path"
+  bound_verdict="$(team_path "$dir" "artifacts/$key/verdict-$attempt-$review_id.bound.md")" || die "unsafe bound verdict path"
   tool_prefix="$(team_path "$dir" preflight/tool-prefix.txt)" || die "unsafe preflight path"
   runtime="$(harness_runtime)"
   mkdir -p "$prompts" "$(dirname "$verdict")"
@@ -3014,6 +3024,8 @@ PY
     echo "- taskId: $task"
     echo "- Attempt: $attempt"
     echo "- LLM runtime family: $runtime"
+    echo "- Working copy: $review_tree"
+    echo "- Pinned detached HEAD: $review_head"
     echo "- Task packet: $packet"
     echo "- Current tracker snapshot: $tasks"
     echo "- Exact review package: $package"
@@ -3025,6 +3037,11 @@ PY
     fi
     echo
     echo "Review only this package. Do not edit, stage, merge, or commit product files."
+    echo "Run code inspection and checks only in the named detached working copy, never the implementer's tree."
+    echo "This invocation owns a fresh review slot and unique verdict files; do not reuse another reviewer's slot."
+    echo "Dependencies are not provisioned automatically. Use the documented sanitized setup; never copy .env files."
+    echo "Before reporting a verdict, confirm HEAD still equals the pinned commit and report any changed files."
+    echo "After the harness confirms this reviewer has stopped, preserve needed evidence and remove its worktree with git worktree remove."
     echo "For this one-shot command, this task is your entire queue: apply only your role brief's"
     echo "review checkpoint and checklist, not its planning, implementation, supervision, or batch loops."
     echo "Before reading the diff, derive your checklist from the task packet, current tracker task,"

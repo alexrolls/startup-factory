@@ -60,6 +60,9 @@ FULL_PYTHON_TESTS=(
   published-artifact-parsing-test.py
   delivery-profile-test.py
   evidence-provider-test.py
+  live-probe-evidence-test.py
+  review-worktree-test.py
+  environment-caveats-test.py
   release-lifecycle-test.py
   tracker-adapter-pagination-test.py
   heartbeat-status-test.py
@@ -110,6 +113,9 @@ SMOKE_PYTHON_TESTS=(
   published-artifact-parsing-test.py
   delivery-profile-test.py
   evidence-provider-test.py
+  live-probe-evidence-test.py
+  review-worktree-test.py
+  environment-caveats-test.py
   tracker-adapter-pagination-test.py
   heartbeat-status-test.py
   task-hold-test.py

@@ -1,0 +1,32 @@
+{
+  "provider": {
+    "id": "startup-factory.live-probe",
+    "version": "0.1.0",
+    "procedureSha256": "sha256:2bb41761a8f6d083ab8bce01f5b396878fe6141f117f26ef62071811197197f1"
+  },
+  "subject": {
+    "taskId": "TASK-EXAMPLE",
+    "attempt": 1,
+    "commit": "1111111111111111111111111111111111111111"
+  },
+  "capability": "live-probe",
+  "target": {
+    "origin": "https://preview.example.test",
+    "deploymentId": "preview-42"
+  },
+  "requiredProbes": [
+    {
+      "id": "search.de-DE.empty",
+      "acceptanceCriterionId": "AC-1",
+      "entryPath": "/search",
+      "locale": "de-DE",
+      "variantId": "empty-state",
+      "preconditionCheckIds": [
+        "empty-catalog"
+      ],
+      "behavioralCheckIds": [
+        "empty-response"
+      ]
+    }
+  ]
+}
