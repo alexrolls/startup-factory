@@ -930,7 +930,7 @@ launch_gate_submission() { # role marker body output-file [target] -> entry path
   fi
   rm -f ".teamwork/feature-runtime/$output_file"
   launch_output="$(TEAM_RUNNER=background "$LAUNCH" start feature-runtime "$FID" "$role" 2>&1)" || {
-    echo "FAIL: could not launch fresh $role gate: $launch_output" >&2
+    echo "FAIL: could not launch fresh $role gate ($output_file): $launch_output" >&2
     # The private supervisor log can contain runtime output.  Report only a
     # fixed classification, never log lines or command arguments, on CI.
     local supervisor_log=".teamwork/feature-runtime/pids/$role.log" log_class=absent
@@ -944,6 +944,18 @@ launch_gate_submission() { # role marker body output-file [target] -> entry path
         log_class=ready-publication
       elif grep -Fq 'publication-supervisor: publication transport' "$supervisor_log"; then
         log_class=transport
+      elif grep -Fq 'publication-supervisor: process generation is unavailable' "$supervisor_log"; then
+        log_class=process-generation
+      elif grep -Fq 'publication-supervisor: producer capability' "$supervisor_log"; then
+        log_class=capability
+      elif grep -Fq 'publication-supervisor: publication supervisor session' "$supervisor_log"; then
+        log_class=session
+      elif grep -Eq 'publication-supervisor: \[Errno (11|12|24)\]' "$supervisor_log"; then
+        log_class=resource-unavailable
+      elif grep -Fq 'publication-supervisor:' "$supervisor_log"; then
+        log_class=other-supervisor-error
+      elif grep -Fq 'Traceback (most recent call last):' "$supervisor_log"; then
+        log_class=python-traceback
       fi
     fi
     echo "gate diagnostic: supervisor-log-class=$log_class (contents withheld)" >&2

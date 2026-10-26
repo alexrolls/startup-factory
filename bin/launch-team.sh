@@ -1228,7 +1228,12 @@ if child == 0:
         released = b""
         deadline = time.monotonic() + 15.0
         while len(released) < 3:
-            chunk = os.read(descriptor, 4 - len(released))
+            try:
+                chunk = os.read(descriptor, 4 - len(released))
+            except BlockingIOError:
+                # A connected writer may not have published the token yet.
+                # Keep the same bounded wait as an absent writer/empty read.
+                chunk = b""
             if chunk:
                 released += chunk
                 continue

@@ -49,6 +49,7 @@ FULL_PYTHON_TESTS=(
   team-policy-test.py
   process-lifecycle-generation-test.py
   launch-lane-lock-test.py
+  launch-barrier-test.py
   release-worker-test.py
   safe-turbo-readiness-test.py
   retrospective-test.py
@@ -102,6 +103,7 @@ SMOKE_PYTHON_TESTS=(
   team-policy-test.py
   process-lifecycle-generation-test.py
   launch-lane-lock-test.py
+  launch-barrier-test.py
   release-worker-test.py
   safe-turbo-readiness-test.py
   retrospective-test.py
