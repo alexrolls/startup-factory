@@ -64,7 +64,10 @@ runtime is not Claude Code, begin directly with the native workflow.
    comment (approach, contract/data-model changes, affected components), citing
    code as stable `path::symbol (approx line)`, and exit. A `work-kind: defect`
    note first records reproduction evidence, `Root cause:`, and the failing
-   regression test to write before the fix. Then
+   regression test to write before the fix. Every note names `Sibling paths
+   checked:` and an applicable target-environment acceptance plan; LLM-consuming
+   changes plan a captured-real-output fixture and authorized real-model trace.
+   Then
    the dispatcher/harness relaunches you when both architects' design approvals
    arrive — see `reference/orchestration.md`. Single-agent mode
    skips this step.
@@ -97,6 +100,13 @@ Reality rarely matches the plan. When you must deviate from what the [task] desc
 
 1. Before requesting review, leave the task worktree clean with checkpoint
    commits on the task branch. Write the task report and evidence records.
+   Include passing applicable target-environment acceptance probes at that exact
+   commit/deployment, with check/transcript ids, preconditions, and limitations,
+   separately from configured validation and required CI. Non-executable work
+   may give a reasoned non-applicability statement. LLM-consuming changes also
+   need a captured-real-output fixture and authorized real-model trace. Follow
+   `reference/orchestration.md` → *Target-environment acceptance*; inability to
+   run an applicable probe is a block, not a successful review request.
 2. Submit `[review-request]` through `bin/submit-artifact.sh`; the durable outbox
    posts the comment and moves the [task] to `[Review]` idempotently.
 3. Single-agent: you now switch hats and review, or hand to the user. Team mode:
@@ -117,8 +127,11 @@ is forbidden to author them.
 ## Scenario 5 — Finalize a [task]
 
 Only after all three core reviewers and every declared supporting reviewer
-approve the exact package and the work is verified (tests/build green, change
-actually does what the [task] asked):
+approve the exact package and the work is verified (tests/build green, current
+applicable target-environment evidence, change actually does what the [task]
+asked). Redeployment or relevant code/config/data changes invalidate affected
+observations; a new live miss requires an improved verification method. Neither
+acceptance evidence nor non-applicability waives required CI:
 
 1. Confirm the [task] is in `[Review]`. If not, andon cord.
 2. The terminal status carries `requiresCommit: true`. The integrator runs
@@ -341,6 +354,15 @@ snapshot exposes; no agent sleeps or owns a polling loop.
 
 After every [task] is `[Ready to deploy]`, run the provider-neutral transaction
 from `reference/deployment.md`:
+
+Before that handoff, confirm the batch's recorded `DELIVERY_BASE_COMMIT` and
+intentional rebases/merges, and have the Sceptical Architect inspect target
+environment drift: active DB-stored prompts/config versus reviewed revisions,
+pending/applied migrations, flags, and artifact identity. Record discrepancies
+and rerun affected acceptance checks after authorized corrections. These are
+operator protocol checks, not additional runtime enforcement or production
+access. Merging the batch into the destination development branch is a separate
+reviewed integration; changed final commits require fresh applicable evidence.
 
 1. Verify every [task] has exactly one completed integration transaction and
    that all transactions form a gap-free chain from history under the protected

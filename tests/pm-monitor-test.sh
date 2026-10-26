@@ -22,7 +22,7 @@ check() {
 
 # Run the production module against an isolated skill config. The shipped team
 # config is intentionally unsafe-by-default and must remain that way.
-PM_SANDBOX_RUNNER=/usr/bin/env
+PM_SANDBOX_RUNNER="$(python3 -c 'from pathlib import Path; print(Path("/usr/bin/env").resolve(strict=True))')"
 TEST_SKILL="$TMP/skill"
 PM_LIFECYCLE_ROOT="$TMP/protected-lifecycle"
 mkdir -m 700 "$PM_LIFECYCLE_ROOT"

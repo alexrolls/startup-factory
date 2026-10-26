@@ -10,6 +10,11 @@ The reference provider is [`playwright/`](playwright/README.md). It requires a
 consuming project to pin and provision Playwright; the Startup Factory bundle
 does not install Node packages or browsers.
 
+[`live-probe/`](live-probe/README.md) adds offline validation of manually collected
+transcripts for acceptance behavior through a deployed application's real entry
+path. Its separate expected binding pins commit, deployment, required probes and
+checks, locales, and variants. It supplies no live runner or credentials.
+
 Validate a manifest offline with the standard-library host validator:
 
 ```sh
@@ -25,3 +30,8 @@ index. The expected binding must contain exactly `provider`, `subject`,
 than from the manifest being checked. See
 [`reference/evidence-providers.md`](../../reference/evidence-providers.md) for
 the schema and security boundary.
+
+For operator-collected live evidence, use `bin/live_probe_evidence.py` with the
+same command flags and its distinct live-probe binding schema. A schema-valid
+collection can have `status: failed` or `status: error`; neither validator's
+exit status alone establishes behavioral success.

@@ -50,6 +50,10 @@ import os
 class Backend:
     def __init__(self, context):
         self.context = context
+        path = os.environ.get('CUSTOM_INITIALIZATION_OUT')
+        if path:
+            with open(path, 'a') as handle:
+                handle.write('initialized\n')
 
     def current_status(self, task_id):
         return os.environ.get('ACME_STATUS', 'Planned')
@@ -105,6 +109,70 @@ check "custom backend never receives a raw credential" \
   bash -c "! grep -Fq '$OUTBOUND_SECRET' '$TMP/custom-backend.out'"
 check "custom backend receives the redacted comment" \
   grep -Fq '[REDACTED POTENTIAL SECRET]' "$TMP/custom-backend.out"
+
+# -- blank targets fail before custom code or comment-body reads ---------------
+check "every targeted operation refuses blank IDs before backend/body access; scan keeps its outfile" \
+  python3 - "$CUSTOM_OPS" "$TMP" <<'PY'
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+ops, temporary = sys.argv[1], pathlib.Path(sys.argv[2])
+initialization = temporary / 'blank-target-initializations'
+mutations = temporary / 'blank-target-mutations'
+comments = temporary / 'blank-target-comments'
+missing_body = str(temporary / 'body-must-not-be-read')
+environment = dict(os.environ, CUSTOM_INITIALIZATION_OUT=str(initialization),
+                   CUSTOM_MUTATION_OUT=str(mutations), CUSTOM_BACKEND_OUT=str(comments))
+operations = {
+    'probe': [],
+    'change-token': [],
+    'state': ['Active'],
+    'feature-state': ['Active'],
+    'feature-reopen': ['Planned'],
+    'task-reopen': ['Planned'],
+    'comment': [missing_body],
+    'comment-once': ['delivery-blank-test', missing_body],
+    'update-comment': ['comment-1', missing_body],
+    'upsert-progress': [missing_body],
+    'upsert-digest': [missing_body],
+    'upsert-deployment': [missing_body],
+    'claim': ['backend'],
+    'record-denial': ['--actor', 'backend', '--reason', 'test', missing_body],
+    'integrate': ['a' * 40, missing_body],
+    'export': [str(temporary / 'blank-target-export.json')],
+}
+expected = 'tracker-ops: target taskId/featureId must not be empty or whitespace-only — andon\n'
+for operation, rest in operations.items():
+    for target in ('', ' \t\r\n', '\u2003'):
+        result = subprocess.run([ops, operation, target, *rest], env=environment,
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode != 0, operation
+        assert result.stdout == '' and result.stderr == expected, (operation, result.stderr)
+for arguments in (
+    ['claim', '--to', 'Active', '', 'backend'],
+    ['record-denial', '--actor', 'backend', '--reason', 'test', ' \t', missing_body],
+):
+    result = subprocess.run([ops, *arguments], env=environment,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0 and result.stderr == expected, result.stderr
+assert not initialization.exists(), 'blank target loaded the custom backend'
+assert not mutations.exists() and not comments.exists(), 'blank target reached a mutation'
+assert not (temporary / 'blank-target-export.json').exists()
+
+# A whitespace-only scan argument is a literal output filename, not a target.
+project = temporary / 'scan-project'
+project.mkdir()
+subprocess.run(['git', 'init', '-q', str(project)], check=True)
+result = subprocess.run([ops, 'scan', ' ', '--status', 'Planned'], cwd=project,
+                        env=environment, capture_output=True, text=True, timeout=10)
+assert result.returncode == 0, result.stderr
+assert json.loads((project / ' ').read_text())['items'] == []
+assert initialization.read_text() == 'initialized\n', 'scan did not reach the backend'
+assert not mutations.exists() and not comments.exists()
+PY
 
 ln -s Acme.py "$CUSTOM_SKILL/extensions/tracker-backends/AcmeLink.py"
 cat > "$CUSTOM_SKILL/config/project-management.config.md" <<'EOF'

@@ -25,6 +25,15 @@ claimed QA/test [tasks]; there is no implicit universal QA gate.
    the feature/guard were removed or reverted and identify the test that
    traverses the real integration/entry path. A helper-only test is supporting
    evidence, not proof of production wiring.
+   Check applicable target-environment acceptance separately from suites/CI:
+   exact candidate/deployment, stable check or transcript ids, engine/model where
+   relevant, preconditions, results, and limitations. Rerun affected probes after
+   redeploy or relevant code/config/data changes; document non-applicability only
+   for non-executable work. LLM-consuming changes need captured-real-output
+   fixtures and authorized real-model traces, relevant real-DB/separate-process
+   persistence, and affected locale/paraphrase coverage. A live miss requires a
+   revised verification method. Never copy `.env` or production credentials into
+   worktrees; live evidence grants no production authority.
 2. **Bugs are [tasks], never patches.** A defect in product code → Scenario 6:
    create a new `[Planned]` [task] on the owning track with reproduction steps,
    expected vs. actual, and severity; mailbox the team-lead. Never fix product

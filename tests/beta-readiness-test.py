@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -205,6 +206,15 @@ class Fixture:
             destination = self.root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes((ROOT / relative).read_bytes())
+        # The synthetic evidence below deliberately describes release 0.2.0.
+        # Keep its candidate fixed when the real package version advances.
+        metadata = self.root / "pyproject.toml"
+        content, replacements = re.subn(
+            r'(?m)^version = "[^"]+"$', 'version = "0.2.0"',
+            metadata.read_text(encoding="utf-8"), count=1,
+        )
+        assert replacements == 1, "fixture project version must be explicit"
+        metadata.write_text(content, encoding="utf-8")
         self.commit("beta documents")
 
     def close(self) -> None:

@@ -40,6 +40,38 @@ Lead, Principal Architect, and Sceptical Principal Architect remain three
 distinct rostered agents. A separately mapped Security Engineer remains
 launchable on demand and is rostered by default for Deep Infra and Deep Security.
 
+## Review rounds and time limits
+
+The Sceptical Architect's pushback budget defaults to **two review rounds per
+decision**, not two findings. One round is an independent assessment of the
+current design or package and its evidence; it may contain any number of
+findings. A response to revised evidence begins the next round. Record the
+round number, scope, findings, and resolution in the tracker/decision ledger.
+After two unresolved rounds, send a neutral decision packet to an independent
+Team Lead; a conflict of interest or unresolved Critical risk goes to the human.
+Track non-blocking follow-ups with owners and deadlines instead of expanding
+the current task silently.
+
+Each per-task review round has a **45-minute default wall-clock time limit**.
+The operator or external timer records its start/deadline and triggers the
+escalation; an LLM must not promise to wake itself. At expiry the reviewer
+publishes completed checks, findings, missing evidence, and remaining work. The
+Lead may narrow scope, assign help, or record an explicit extension and owner.
+Partial evidence is not approval: neither a timer nor an exhausted budget
+waives validation/CI, any mandatory independent verdict, production policy, or
+an unresolved Critical finding. Escalation itself never accepts risk.
+
+## Harness delivery evidence
+
+Without protected per-instance capabilities, harness subagents provide advisory
+reports only. The minimum handoff is a recorded design-gate decision, two
+independent architect reports, applicable target-environment acceptance evidence
+(or reasoned non-applicability), and a tracker comment linking the exact package
+and limitations. The configured writer may place this work in `[Review]`; only
+authenticated gate roles may authorize the later integration. This profile
+creates no broker identity, mandatory approval, `[Ready to deploy]` authority,
+or production access. See `reference/orchestration.md` for the evidence contract.
+
 ---
 
 ## Status ownership — derived from the board config

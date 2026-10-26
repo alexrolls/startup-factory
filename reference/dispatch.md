@@ -23,6 +23,20 @@ before any status write, outbox processing, integration, or launch.
 owns that process**, explicitly. Hiding this ownership is how a pipeline
 silently stalls for hours.
 
+Review time belongs to the operator/external timer too: record a per-task round
+start/deadline (45 minutes by default), request partial evidence at expiry, and
+route it to the Team Lead for reassignment or an explicit extension. The current
+dispatcher does not enforce this review timer. Expiry never synthesizes an
+approval, waives CI, or advances the task past a missing mandatory gate.
+
+An operator account/session switch or lost harness notification does not prove
+an agent is dead. Check protected lifecycle status (or the harness's bound agent
+state) before replacement; worktree mtimes are diagnostic only. Stop/fence the
+original through its owning supervisor before reusing a task lane, or leave it
+quarantined and use a fresh isolated worktree. Never put a presumed replacement
+into a worktree another process may still own. If ownership cannot be proved,
+escalate instead of guessing a PID or issuing an unbound kill.
+
 ## What an idle pass costs
 
 The [feature] export dominates a pass. On a [feature] with hundreds of [tasks]

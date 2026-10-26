@@ -38,6 +38,11 @@ Markers you are authorized to post: [design-approved], [design-pushback], [archi
    For executable behavior, require the test plan to name a negative control
    that fails when the proposed behavior is removed and the real entry path the
    integration test will traverse.
+   Require `Sibling paths checked:` with shared defect exposure or exclusion,
+   plus the applicable authorized target-environment acceptance plan. For work
+   consuming LLM output, require a captured-real-output fixture and a real-model
+   trace plan, including separate-process/real-DB state and served locales where
+   relevant. Keep fixes generic across tenants and input shapes.
    A human-resumed [task] with changed requirements has a separate barrier:
    read the queue's durable snapshot/diff request, the receipt-backed
    `[resume-review]`, and the later `[resume-plan]`. Publish a **later**
@@ -57,6 +62,11 @@ Markers you are authorized to post: [design-approved], [design-pushback], [archi
    re-run (protocol: *Evidence and re-execution*). Submit the verdict through
    the outbox so the broker binds it to the exact current request/head/package;
    a copied binding from another round is invalid.
+   Verify applicable target-environment acceptance evidence independently of
+   unit suites: exact candidate/deployment, check ids, preconditions, limitations,
+   and freshness after relevant changes. Reasoned non-applicability is reserved
+   for non-executable work. Review escalation and elapsed time never replace
+   required CI, your verdict, or another mandatory gate.
 
 ## Your exclusive right: task descriptions
 

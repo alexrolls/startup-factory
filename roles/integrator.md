@@ -27,6 +27,10 @@ by mailbox, but only this mechanically complete tracker evidence triggers work.
    and all approval sets must
    be identical. Any extra, missing, renamed, or post-approval change requires
    fresh review.
+   Confirm the report includes current applicable target-environment acceptance
+   evidence or a reasoned non-applicability statement. Missing, failed, or stale
+   applicable observations return to review; suite success does not replace them.
+   This is a protocol check, not a new broker-authenticated evidence field.
 3. **Authorization check** (skip only if the board config has no `markers`
    table). For each required approval comment, read its signature (`— <role>`;
    for legacy scribe comments, use the authoring role before an optional

@@ -620,12 +620,6 @@ class GitExecutionSafetyTests(unittest.TestCase):
             "        os.write(1, b'x' * 65536)\n"
             "elif mode == 'hang':\n"
             "    time.sleep(30)\n"
-            "elif mode == 'hang-child':\n"
-            "    code = ('import pathlib,sys,time; time.sleep(0.6); '"
-            "            'pathlib.Path(sys.argv[1]).write_text(\\\"survived\\\")')\n"
-            "    child = subprocess.Popen([sys.executable, '-c', code, sys.argv[-2]])\n"
-            "    pathlib.Path(sys.argv[-3]).write_text(str(child.pid))\n"
-            "    time.sleep(30)\n"
             "elif mode == 'stdin':\n"
             "    os.write(1, sys.stdin.buffer.read())\n"
             "elif mode == 'environment':\n"
@@ -678,14 +672,52 @@ class GitExecutionSafetyTests(unittest.TestCase):
     def test_git_deadline_terminates_the_child_process_group(self):
         pid_file = self.root / "child.pid"
         survivor_file = self.root / "child-survived"
-        with self.assertRaisesRegex(DeliveryProfileError, "timed out"):
-            _git(
-                self.root,
-                str(pid_file),
-                str(survivor_file),
-                "hang-child",
-                timeout_seconds=0.2,
-            )
+        # Use a minimal descendant, then synchronize readiness before _git's
+        # deadline starts: cold executable startup can exceed 200 ms. The
+        # background shell writes its canary if only its parent is terminated.
+        self.fake_git.write_text(
+            "#!/bin/sh\n"
+            'while [ "$#" -gt 3 ]; do shift; done\n'
+            'pid_file="$1"\n'
+            'survivor_file="$2"\n'
+            '( /bin/sleep 0.6; printf survived > "$survivor_file" ) &\n'
+            'printf %s "$!" > "$pid_file"\n'
+            "wait\n",
+            encoding="utf-8",
+        )
+        original_popen = subprocess.Popen
+
+        def start_with_ready_descendant(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            readiness_deadline = time.monotonic() + 5
+            ready = False
+            try:
+                while process.poll() is None and time.monotonic() < readiness_deadline:
+                    if pid_file.exists() and pid_file.stat().st_size:
+                        ready = True
+                        return process
+                    time.sleep(0.005)
+                self.fail("fixture descendant did not start before readiness deadline")
+            finally:
+                if not ready:
+                    try:
+                        delivery_profile._terminate_process_group(process)
+                    finally:
+                        for stream in (process.stdin, process.stdout, process.stderr):
+                            if stream is not None:
+                                stream.close()
+
+        with mock.patch.object(
+            delivery_profile.subprocess, "Popen", side_effect=start_with_ready_descendant
+        ):
+            with self.assertRaisesRegex(DeliveryProfileError, "timed out"):
+                _git(
+                    self.root,
+                    str(pid_file),
+                    str(survivor_file),
+                    "hang-child",
+                    timeout_seconds=0.2,
+                )
         self.assertRegex(pid_file.read_text(), r"^[0-9]+$")
         time.sleep(0.8)
         self.assertFalse(

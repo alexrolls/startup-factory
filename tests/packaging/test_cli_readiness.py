@@ -80,11 +80,17 @@ class CliReadinessTest(unittest.TestCase):
         self.target = self.root / "installed" / "startup-factory"
         self.lifecycle = self.root / "protected-lifecycle"
         self.lifecycle.mkdir(mode=0o700)
-        # The production contract deliberately refuses operator-owned test
-        # wrappers. /usr/bin/env is never executed by the offline doctor, but
-        # provides a portable root-owned, root-ancestor structural fixture on
-        # the supported macOS/Linux platforms.
-        self.sandbox_runner = Path("/usr/bin/env")
+        # Use a controlled executable instead of depending on the host's
+        # system binaries, which may be symlinks or writable through ACLs.
+        # Positive structural checks simulate root ownership only within a
+        # scoped mock; no privileged filesystem changes are required.
+        self.sandbox_runner = self.root / "sandbox-runner"
+        self.sandbox_execution_marker = self.root / "sandbox-runner-executed"
+        self.sandbox_runner.write_text(
+            f"#!/bin/sh\ntouch '{self.sandbox_execution_marker}'\nexit 98\n",
+            encoding="utf-8",
+        )
+        self.sandbox_runner.chmod(0o755)
         payload = base_payload()
         payload["config/project-management.config.md"] = (PROJECT_CONFIG, 0o640)
         payload["adapters/Markdown.md"] = (b"markdown\n", 0o644)
@@ -175,6 +181,31 @@ class CliReadinessTest(unittest.TestCase):
             str(self.target),
             *extra,
         )
+
+    @contextlib.contextmanager
+    def root_protected_sandbox_runner(self, *, writable: Path | None = None):
+        protected_paths = {self.sandbox_runner, *self.sandbox_runner.parents}
+        original_lstat = Path.lstat
+        original_access = os.access
+
+        def protected_lstat(path: Path):
+            metadata = original_lstat(path)
+            if path not in protected_paths:
+                return metadata
+            fields = list(metadata)
+            fields[stat.ST_UID] = 0
+            fields[stat.ST_MODE] &= ~0o022
+            return os.stat_result(fields)
+
+        def protected_access(path, mode, *args, **kwargs):
+            if Path(path) in protected_paths and mode == os.W_OK:
+                return Path(path) == writable
+            return original_access(path, mode, *args, **kwargs)
+
+        with mock.patch.object(Path, "lstat", protected_lstat), mock.patch(
+            "startup_factory_cli.readiness.os.access", side_effect=protected_access
+        ):
+            yield
 
     def test_installed_integration_pack_cli_has_json_and_human_surfaces(self) -> None:
         code, output, error = self.invoke_pack("list", "--json")
@@ -638,7 +669,8 @@ class CliReadinessTest(unittest.TestCase):
 
     def test_team_doctor_is_non_green_when_runtime_proof_is_unknown(self) -> None:
         before = self.target.stat().st_mtime_ns
-        code, output, error = self.invoke("doctor", "--mode", "team", "--json")
+        with self.root_protected_sandbox_runner():
+            code, output, error = self.invoke("doctor", "--mode", "team", "--json")
         self.assertEqual((code, error), (1, ""), output + error)
         report = json.loads(output)
         self.assertEqual(report["overall"], "yellow")
@@ -656,9 +688,68 @@ class CliReadinessTest(unittest.TestCase):
             for check in report["checks"]
             if check["id"] == "sandbox-runner.configured"
         )
-        self.assertEqual((sandbox["level"], sandbox["status"]), ("configured", "pass"))
+        self.assertEqual(
+            (sandbox["level"], sandbox["status"]),
+            ("configured", "pass"),
+            sandbox["message"],
+        )
         self.assertIn("was not executed", sandbox["message"])
+        self.assertFalse(self.sandbox_execution_marker.exists())
         self.assertEqual(self.target.stat().st_mtime_ns, before)
+
+    def test_team_doctor_rejects_operator_writable_runner_or_ancestor(self) -> None:
+        for writable in (self.sandbox_runner, self.sandbox_runner.parent):
+            with self.subTest(writable=writable):
+                with self.root_protected_sandbox_runner(writable=writable):
+                    code, output, error = self.invoke(
+                        "doctor", "--mode", "team", "--json"
+                    )
+                self.assertEqual((code, error), (1, ""), output + error)
+                report = json.loads(output)
+                sandbox = next(
+                    check
+                    for check in report["checks"]
+                    if check["id"] == "sandbox-runner.configured"
+                )
+                self.assertEqual(sandbox["status"], "warn")
+                self.assertIn("writable by the operator", sandbox["message"])
+                self.assertFalse(self.sandbox_execution_marker.exists())
+
+    def test_team_doctor_rejects_symlinked_runner_ancestor(self) -> None:
+        alias = self.root / "runner-alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        aliased_runner = alias / self.sandbox_runner.name
+        team_config = self.target / "config/team.config.md"
+        team_config.write_text(
+            team_config.read_text(encoding="utf-8").replace(
+                f'AGENT_SANDBOX_RUNNER="{self.sandbox_runner}"',
+                f'AGENT_SANDBOX_RUNNER="{aliased_runner}"',
+            ),
+            encoding="utf-8",
+        )
+        original_lstat = Path.lstat
+
+        def root_owned_runner(path: Path):
+            metadata = original_lstat(path)
+            if path == aliased_runner:
+                fields = list(metadata)
+                fields[stat.ST_UID] = 0
+                return os.stat_result(fields)
+            return metadata
+
+        with mock.patch.object(Path, "lstat", root_owned_runner):
+            code, output, error = self.invoke("doctor", "--mode", "team", "--json")
+
+        self.assertEqual((code, error), (1, ""), output + error)
+        report = json.loads(output)
+        sandbox = next(
+            check
+            for check in report["checks"]
+            if check["id"] == "sandbox-runner.configured"
+        )
+        self.assertEqual(sandbox["status"], "warn")
+        self.assertIn("not its canonical absolute path", sandbox["message"])
+        self.assertFalse(self.sandbox_execution_marker.exists())
 
     def test_team_doctor_warns_when_external_sandbox_runner_is_absent(self) -> None:
         team_config = self.target / "config/team.config.md"
@@ -739,10 +830,7 @@ class CliReadinessTest(unittest.TestCase):
                 self.assertEqual(sandbox["status"], "warn")
                 self.assertIn(expected, sandbox["message"])
 
-        # This system executable would not understand the sandbox-runner
-        # protocol. Reaching this assertion proves the offline doctor only
-        # inspected metadata and never executed it.
-        self.assertTrue(self.sandbox_runner.exists())
+        self.assertFalse(self.sandbox_execution_marker.exists())
 
     def test_team_doctor_reports_broker_writer_boundary_explicitly(self) -> None:
         team_config = self.target / "config/team.config.md"
