@@ -158,15 +158,25 @@ jobs:
             git show "origin/$BASE_REF:pyproject.toml" |
               python -c 'import sys,tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])'
           )"
-          python - "$base_version" "$VERSION" <<'PY'
+          # A base version with no tag has not been released yet, so a PR may
+          # keep it; it only has to move forward once the base is published.
+          base_released=false
+          if git rev-parse -q --verify "refs/tags/v$base_version^{commit}" >/dev/null; then
+            base_released=true
+          fi
+          python - "$base_version" "$VERSION" "$base_released" <<'PY'
           import re
           import sys
 
-          base, proposed = sys.argv[1:]
+          base, proposed, base_released = sys.argv[1:]
           stable = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
           if stable.fullmatch(base) is None or stable.fullmatch(proposed) is None:
               raise SystemExit("release versions must use stable numeric SemVer")
-          if tuple(map(int, proposed.split("."))) <= tuple(map(int, base.split("."))):
+          base_key = tuple(map(int, base.split(".")))
+          proposed_key = tuple(map(int, proposed.split(".")))
+          if proposed_key < base_key or (
+              proposed_key == base_key and base_released == "true"
+          ):
               raise SystemExit(
                   f"project.version must increase before merge: {base} -> {proposed}"
               )

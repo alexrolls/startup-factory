@@ -1,0 +1,409 @@
+name: Pre-release
+
+# Publishes a release candidate (X.Y.ZrcN) of the stable version on main
+# without the stable release's beta-readiness evidence gate. It exists so a
+# candidate can be installed with `uvx startup-factory@X.Y.ZrcN` while that
+# evidence is gathered. It cannot publish a stable version:
+# - the published version always carries an rc suffix, so `@latest` and plain
+#   `pip install startup-factory` keep resolving to the last stable release;
+# - it refuses once vX.Y.Z is tagged, so a candidate never follows its release;
+# - it publishes through its own `pypi-prerelease` environment and trusted
+#   publisher, leaving the `pypi` environment to the gated release workflow.
+#
+# Required repository settings:
+# - a `pypi-prerelease` environment limited to the main branch;
+# - a PyPI trusted publisher for this workflow and that environment.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_commit:
+        description: Exact current main commit to build and publish
+        required: true
+        type: string
+      rc_number:
+        description: Release-candidate number N, published as X.Y.ZrcN
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prerelease-main
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Validate main and build the release candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      source_commit: ${{ steps.release.outputs.commit }}
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - name: Check out the requested main commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Bind the commit and derive an unreleased candidate version
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+          RC_NUMBER: ${{ inputs.rc_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RC_NUMBER" =~ ^[1-9][0-9]{0,2}$ ]]
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$RELEASE_COMMIT" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          test "$(git rev-parse origin/main)" = "$RELEASE_COMMIT"
+          stable="$(python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          [[ "$stable" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version="${stable}rc${RC_NUMBER}"
+          if git rev-parse -q --verify "refs/tags/v$stable^{commit}" >/dev/null; then
+            echo "v$stable is already released; a candidate cannot follow it" >&2
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$version^{commit}" >/dev/null; then
+            echo "v$version is already tagged; choose the next rc_number" >&2
+            exit 1
+          fi
+          status="$(curl -sS -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/startup-factory/$version/json")"
+          test "$status" = "404" || {
+            echo "PyPI already has startup-factory $version (HTTP $status); choose the next rc_number" >&2
+            exit 1
+          }
+          # The full runtime suite takes about an hour; Package CI already ran
+          # it on this exact commit when it landed on main.
+          passed="$(gh api "repos/$GH_REPO/actions/workflows/package-ci.yml/runs?head_sha=$RELEASE_COMMIT&event=push&status=success" --jq '.total_count')"
+          test "$passed" -ge 1 || {
+            echo "Package CI has not passed on $RELEASE_COMMIT as a push to main" >&2
+            exit 1
+          }
+          {
+            echo "version=$version"
+            echo "stable=$stable"
+            echo "commit=$RELEASE_COMMIT"
+          } >> "$GITHUB_OUTPUT"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$RELEASE_COMMIT")" >> "$GITHUB_ENV"
+
+      - name: Run packaging unit tests
+        run: python -m unittest discover -s tests/packaging -p "test_*.py" -v
+
+      - name: Build the source bundle twice and prove reproducibility
+        env:
+          COMMIT: ${{ steps.release.outputs.commit }}
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/repro-a build/repro-b release-assets
+          for slot in a b; do
+            python packaging/build_bundle.py \
+              --repo . \
+              --commit "$COMMIT" \
+              --version "$VERSION" \
+              --output "build/repro-$slot/startup-factory-$VERSION.tar.gz"
+            (
+              cd "build/repro-$slot"
+              sha256sum --check "startup-factory-$VERSION.tar.gz.sha256"
+            )
+          done
+          cmp \
+            "build/repro-a/startup-factory-$VERSION.tar.gz" \
+            "build/repro-b/startup-factory-$VERSION.tar.gz"
+          cp build/repro-a/* release-assets/
+
+      - name: Prepare two package trees carrying the candidate version
+        env:
+          COMMIT: ${{ steps.release.outputs.commit }}
+          STABLE: ${{ steps.release.outputs.stable }}
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for slot in a b; do
+            package_tree="build/package-$slot"
+            resource_dir="$package_tree/src/startup_factory_cli/resources"
+            mkdir -p "$package_tree" "$resource_dir"
+            git archive "$COMMIT" | tar -x -C "$package_tree"
+            python - "$package_tree/pyproject.toml" "$STABLE" "$VERSION" <<'PY'
+          import pathlib
+          import sys
+
+          path, stable, version = sys.argv[1:]
+          pyproject = pathlib.Path(path)
+          text = pyproject.read_text(encoding="utf-8")
+          line = f'version = "{stable}"\n'
+          if text.count(line) != 1:
+              raise SystemExit(f"expected exactly one {line.strip()!r} in pyproject.toml")
+          pyproject.write_text(text.replace(line, f'version = "{version}"\n'), encoding="utf-8")
+          PY
+            cp \
+              "release-assets/startup-factory-$VERSION.tar.gz" \
+              "$resource_dir/startup-factory.tar.gz"
+            (
+              cd "$resource_dir"
+              sha256sum startup-factory.tar.gz > startup-factory.tar.gz.sha256
+            )
+          done
+
+      - name: Build wheel and sdist twice with a pinned toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_env="$(mktemp -d "$RUNNER_TEMP/startup-factory-build.XXXXXX")"
+          python -I -B -m venv --copies "$build_env"
+          build_python="$build_env/bin/python"
+          "$build_python" -I -B -m pip install --disable-pip-version-check \
+            build==1.3.0 packaging==26.2 pyproject-hooks==1.2.0 \
+            setuptools==83.0.0 wheel==0.47.0
+          "$build_python" -I -B -m build --no-isolation --outdir "$PWD/build/dist-a" "$PWD/build/package-a"
+          "$build_python" -I -B -m build --no-isolation --outdir "$PWD/build/dist-b" "$PWD/build/package-b"
+          python tests/packaging/test_packaging_metadata.py \
+            --canonicalize-sdist build/dist-a/*.tar.gz "$SOURCE_DATE_EPOCH"
+          python tests/packaging/test_packaging_metadata.py \
+            --canonicalize-sdist build/dist-b/*.tar.gz "$SOURCE_DATE_EPOCH"
+
+      - name: Prove distribution reproducibility and promote one set
+        shell: bash
+        run: |
+          set -euo pipefail
+          first=(build/dist-a/*)
+          second=(build/dist-b/*)
+          test "${#first[@]}" -eq 2
+          test "${#second[@]}" -eq 2
+          for artifact in "${first[@]}"; do
+            name="$(basename "$artifact")"
+            test -f "build/dist-b/$name"
+            cmp "$artifact" "build/dist-b/$name"
+          done
+          mkdir -p dist
+          cp build/dist-a/* dist/
+
+      - name: Test wheel and sdist identity against the candidate bundle
+        env:
+          STARTUP_FACTORY_BUNDLE: ${{ github.workspace }}/release-assets/startup-factory-${{ steps.release.outputs.version }}.tar.gz
+          STARTUP_FACTORY_DIST_DIR: ${{ github.workspace }}/dist
+          STARTUP_FACTORY_EXPECTED_VERSION: ${{ steps.release.outputs.version }}
+        run: python -m unittest discover -s tests/packaging -p "test_*.py" -v
+
+      - name: Assemble the release-candidate asset set
+        run: cp dist/* release-assets/
+
+      - name: Upload Python distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: python-distributions
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload the GitHub pre-release asset set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: github-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+          compression-level: 0
+
+  smoke:
+    name: Install and smoke-test the wheel on Python 3.10
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Set up the minimum supported Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.10"
+
+      - name: Download the exact built distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: python-distributions
+          path: dist
+
+      - name: Install the wheel and exercise the console command
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel=(dist/*.whl)
+          test "${#wheel[@]}" -eq 1
+          python -m pip install --disable-pip-version-check --no-deps "${wheel[0]}"
+          test "$(startup-factory version --json)" = "{\"ok\":true,\"version\":\"$VERSION\"}"
+          project="$RUNNER_TEMP/startup-factory-smoke"
+          mkdir -p "$project"
+          git -C "$project" init --quiet
+          startup-factory install --agent codex --project "$project" --json
+          test -f "$project/.agents/skills/startup-factory/SKILL.md"
+          startup-factory verify --agent codex --project "$project" --json
+          startup-factory init \
+            --agent codex \
+            --project "$project" \
+            --mode team \
+            --product-management-tool Markdown \
+            --apply \
+            --json
+          startup-factory integration-pack list --agent codex --project "$project"
+
+  attest:
+    name: Attest the release-candidate assets
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+
+    steps:
+      - name: Download the release-candidate asset set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: github-release-assets
+          path: release-assets
+
+      - name: Attest every release-candidate artifact
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: "release-assets/*"
+
+  publish:
+    name: Publish the release candidate to PyPI
+    needs:
+      - build
+      - smoke
+      - attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi-prerelease
+      url: https://pypi.org/project/startup-factory/${{ needs.build.outputs.version }}/
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download the exact tested distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: python-distributions
+          path: dist
+
+      - name: Refuse anything but this release candidate
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+rc[1-9][0-9]{0,2}$ ]]
+          test -f "dist/startup_factory-$VERSION-py3-none-any.whl"
+          test -f "dist/startup_factory-$VERSION.tar.gz"
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
+
+      - name: Publish with PyPI trusted publishing
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: dist/
+          attestations: true
+
+  verify-uvx:
+    name: Verify the public uvx installation
+    needs:
+      - build
+      - publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Install the pinned uv client
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.6"
+          enable-cache: "false"
+
+      - name: Resolve the published candidate through uvx
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          output=""
+          # Index propagation lags the upload, so the version check is part of
+          # the retry condition rather than its body.
+          for attempt in $(seq 1 18); do
+            if output="$(uvx --refresh "startup-factory@$VERSION" version --json 2>&1)" &&
+              test "$(printf '%s\n' "$output" | tail -n 1)" = "{\"ok\":true,\"version\":\"$VERSION\"}"
+            then
+              printf '%s\n' "$output"
+              exit 0
+            fi
+            printf 'uvx has not resolved startup-factory %s yet (attempt %s/18)\n' \
+              "$VERSION" "$attempt" >&2
+            sleep 10
+          done
+          printf '%s\n' "$output" >&2
+          exit 1
+
+  github-release:
+    name: Publish the GitHub pre-release
+    needs:
+      - build
+      - verify-uvx
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the release-candidate asset set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: github-release-assets
+          path: release-assets
+
+      - name: Create the pre-release with the exact tested assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: v${{ needs.build.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --prerelease \
+            --latest=false \
+            --target "$SOURCE_COMMIT" \
+            --title "Startup Factory v$VERSION (release candidate)" \
+            --generate-notes
+          test "$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)" = "$SOURCE_COMMIT"
