@@ -589,7 +589,8 @@ expect_runner_refused "operator-owned sandbox runner" "$SANDBOX_RUNNER" "must be
 
 # A root-owned system executable satisfies the same structural trust contract
 # used by recovery validation. Status never executes it as a sandbox runner.
-sed_i 's|^AGENT_SANDBOX_RUNNER=.*|AGENT_SANDBOX_RUNNER="/usr/bin/env"|' "$CFG_SANDBOX"
+SYSTEM_SANDBOX_RUNNER="$(python3 -c 'from pathlib import Path; print(Path("/usr/bin/env").resolve(strict=True))')"
+sed_i "s|^AGENT_SANDBOX_RUNNER=.*|AGENT_SANDBOX_RUNNER=\"$SYSTEM_SANDBOX_RUNNER\"|" "$CFG_SANDBOX"
 if "$LAUNCH" validate-board >/dev/null 2>&1; then
   echo "ok: root-protected system runner is accepted"
 else

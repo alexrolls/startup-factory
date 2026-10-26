@@ -28,7 +28,9 @@ class SafeTurboReadinessTests(unittest.TestCase):
         # These cases fail before worker execution. Use a real system-owned
         # executable so the production runner trust check itself stays active;
         # the offline/preflight paths must never execute it as a runner.
-        self.runner = Path("/usr/bin/env")
+        # Some supported systems expose env through a symlink. The configured
+        # protected runner must name the actual canonical executable.
+        self.runner = Path("/usr/bin/env").resolve(strict=True)
 
         self.skill = self.repo / ".claude" / "skills" / "startup-factory"
         self.skill.mkdir(parents=True)
@@ -125,6 +127,18 @@ class SafeTurboReadinessTests(unittest.TestCase):
         self.assertIn("forbids SKIP_PREFLIGHT=1", result.stderr)
         self.assertFalse((self.repo / ".teamwork" / "skip-team").exists())
         self.assert_no_lifecycle_record("skip-team")
+
+    def test_runner_symlink_is_rejected_before_readiness(self) -> None:
+        alias = self.base / "runner-alias"
+        alias.symlink_to(self.runner)
+        self.replace_setting("AGENT_SANDBOX_RUNNER", f'"{alias}"')
+        result = self.run_launcher(
+            "compose", "symlink-runner", "FEATURE-1", "backend", "full-stack"
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("path must not be a symlink", result.stderr)
+        self.assertFalse((self.repo / ".teamwork" / "symlink-runner").exists())
+        self.assert_no_lifecycle_record("symlink-runner")
 
     def test_safe_turbo_gate_team_forbids_skip_preflight(self) -> None:
         result = self.run_launcher(

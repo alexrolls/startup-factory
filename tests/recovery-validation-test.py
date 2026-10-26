@@ -372,16 +372,21 @@ class RecoveryValidationTests(unittest.TestCase):
         ):
             original.revalidate(self.repo)
 
-        protected = recovery_validation.validate_runner("/usr/bin/env", self.repo)
+        # System executables may themselves be symlinks (including env on
+        # newer Ubuntu images). The positive fixture must use the canonical
+        # path required by the runner trust contract.
+        runner = Path("/usr/bin/env").resolve(strict=True)
+        protected = recovery_validation.validate_runner(str(runner), self.repo)
         protected.revalidate(self.repo)
 
     def test_runner_trust_contract_matches_doctor_autonomous_and_recovery(self) -> None:
         target = self.base / "installed"
         (target / "config").mkdir(parents=True)
         team_config = target / "config" / "team.config.md"
+        runner = Path("/usr/bin/env").resolve(strict=True)
         team_config.write_text(
             "AGENT_SANDBOX_ENFORCED=true\n"
-            'AGENT_SANDBOX_RUNNER="/usr/bin/env"\n',
+            f'AGENT_SANDBOX_RUNNER="{runner}"\n',
             encoding="utf-8",
         )
 
@@ -391,10 +396,31 @@ class RecoveryValidationTests(unittest.TestCase):
         self.assertTrue(ready, message)
         self.assertIsNone(remediation)
         pm_agent.validate_agent_sandbox_runner(
-            self.repo, {"AGENT_SANDBOX_RUNNER": "/usr/bin/env"}
+            self.repo, {"AGENT_SANDBOX_RUNNER": str(runner)}
         )
-        binding = recovery_validation.validate_runner("/usr/bin/env", self.repo)
+        binding = recovery_validation.validate_runner(str(runner), self.repo)
         binding.revalidate(self.repo)
+
+        # All entry points must still reject a symlink to that same protected
+        # executable, regardless of how the host installs its system tools.
+        runner_alias = self.base / "system-runner-alias"
+        runner_alias.symlink_to(runner)
+        team_config.write_text(
+            "AGENT_SANDBOX_ENFORCED=true\n"
+            f'AGENT_SANDBOX_RUNNER="{runner_alias}"\n',
+            encoding="utf-8",
+        )
+        ready, message, _ = _sandbox_runner_readiness(target, self.repo)
+        self.assertFalse(ready)
+        self.assertIn("non-symlink regular file", message)
+        with self.assertRaisesRegex(pm_agent.MonitorError, "must not be a symlink"):
+            pm_agent.validate_agent_sandbox_runner(
+                self.repo, {"AGENT_SANDBOX_RUNNER": str(runner_alias)}
+            )
+        with self.assertRaisesRegex(
+            recovery_validation.RecoveryValidationError, "canonical absolute path"
+        ):
+            recovery_validation.validate_runner(str(runner_alias), self.repo)
 
         operator_runner = self.base / "operator-owned-runner"
         operator_runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
