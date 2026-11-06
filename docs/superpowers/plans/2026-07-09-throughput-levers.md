@@ -27,7 +27,7 @@
 - [ ] **Step 1: Branch**
 
 ```bash
-cd /Users/aischenko/Projects/startup-factory
+cd "$(git rev-parse --show-toplevel)"
 git checkout -b feature/throughput-levers main
 ```
 
