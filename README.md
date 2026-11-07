@@ -38,7 +38,7 @@ Startup Factory does not replace your coding agent, repository, project-manageme
 - [Bring your own agents, tracker, and stack](#bring-your-own-agents-tracker-and-stack)
 - [Choose how much autonomy you want](#choose-how-much-autonomy-you-want)
 - [Safety is part of the architecture](#safety-is-part-of-the-architecture)
-- [What's new](#whats-new-in-021)
+- [What's new](#whats-new-in-022)
 - [Documentation](#documentation)
 - [Project status](#project-status)
 - [Contributing](#contributing)
@@ -465,6 +465,17 @@ Read the full contracts before enabling unattended or production operation:
 - [`reference/automation.md`](reference/automation.md)
 - [`reference/deployment.md`](reference/deployment.md)
 - [`reference/orchestration.md`](reference/orchestration.md)
+
+## What's new in 0.2.2
+
+- **Clearer quick start:** [Quick start](#quick-start-local-markdown-no-tracker-account)
+  now defaults to Claude Code, shows the Codex variant side by side, verifies
+  the installation, and includes a copy-paste prompt that lets Claude Code run
+  the install for you.
+- **No personal paths in the package:** a maintainer's machine path was removed
+  from the shipped documentation, and a packaging test now fails if any tracked
+  file contains a non-placeholder `/Users/<name>`, `/home/<name>`, or
+  `C:\Users\<name>` path.
 
 ## What's new in 0.2.1
 
