@@ -38,7 +38,7 @@ Startup Factory does not replace your coding agent, repository, project-manageme
 - [Bring your own agents, tracker, and stack](#bring-your-own-agents-tracker-and-stack)
 - [Choose how much autonomy you want](#choose-how-much-autonomy-you-want)
 - [Safety is part of the architecture](#safety-is-part-of-the-architecture)
-- [What's new](#whats-new-in-021)
+- [What's new](#whats-new-in-022)
 - [Documentation](#documentation)
 - [Project status](#project-status)
 - [Contributing](#contributing)
@@ -58,15 +58,61 @@ Use your coding agent directly for a one-line fix. Startup Factory earns its kee
 
 ## Quick start (local Markdown, no tracker account)
 
-Start with one agent and the local Markdown tracker. From your project root:
+Start with one agent and the local Markdown tracker. You need
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/) and a git
+repository. Pick **one** of the three options below.
+
+#### Option A: Claude Code (default)
+
+From your project root:
+
+```bash
+uvx startup-factory@latest install --agent claude-code
+uvx startup-factory@latest init --agent claude-code --mode solo \
+  --product-management-tool Markdown --apply
+uvx startup-factory@latest verify --agent claude-code
+```
+
+The skill is installed into `.claude/skills/startup-factory/`. Restart Claude
+Code (or open a new session) so it picks up the skill.
+
+#### Option B: Codex
+
+Same commands, different `--agent`:
 
 ```bash
 uvx startup-factory@latest install --agent codex
 uvx startup-factory@latest init --agent codex --mode solo \
   --product-management-tool Markdown --apply
+uvx startup-factory@latest verify --agent codex
 ```
 
-Use `--agent claude-code` for Claude Code. Then ask your agent:
+The skill is installed into `.agents/skills/startup-factory/`. Other supported
+values are `aider` and `deepseek-harness`.
+
+#### Option C: Ask Claude Code to install it for you
+
+Open Claude Code in your project root and paste this prompt:
+
+```text
+Install Startup Factory in this project for Claude Code, using the local
+Markdown tracker:
+
+1. Run: uvx startup-factory@latest install --agent claude-code
+2. Run: uvx startup-factory@latest init --agent claude-code --mode solo --product-management-tool Markdown --apply
+3. Run: uvx startup-factory@latest verify --agent claude-code
+
+Stop and show me the output if any step fails. Do not pass --overwrite-config.
+When done, tell me which files were created and remind me to restart Claude Code
+so the startup-factory skill loads.
+```
+
+For Codex, paste the same prompt into Codex and replace `claude-code` with
+`codex` in all three commands.
+
+#### Your first feature
+
+Ask your agent:
 
 ```text
 Plan a feature: add CSV export to the reports page.
@@ -86,10 +132,12 @@ example is in
 Preview, apply, and verify an update with the same release CLI:
 
 ```bash
-uvx startup-factory@latest update --agent codex --dry-run
-uvx startup-factory@latest update --agent codex
-uvx startup-factory@latest verify --agent codex
+uvx startup-factory@latest update --agent claude-code --dry-run
+uvx startup-factory@latest update --agent claude-code
+uvx startup-factory@latest verify --agent claude-code
 ```
+
+Use `--agent codex` for a Codex installation.
 
 Updates are staged, locked, verified, and rollback-capable. Existing project
 configuration and project-owned extensions are preserved by default; conflicts
@@ -417,6 +465,17 @@ Read the full contracts before enabling unattended or production operation:
 - [`reference/automation.md`](reference/automation.md)
 - [`reference/deployment.md`](reference/deployment.md)
 - [`reference/orchestration.md`](reference/orchestration.md)
+
+## What's new in 0.2.2
+
+- **Clearer quick start:** [Quick start](#quick-start-local-markdown-no-tracker-account)
+  now defaults to Claude Code, shows the Codex variant side by side, verifies
+  the installation, and includes a copy-paste prompt that lets Claude Code run
+  the install for you.
+- **No personal paths in the package:** a maintainer's machine path was removed
+  from the shipped documentation, and a packaging test now fails if any tracked
+  file contains a non-placeholder `/Users/<name>`, `/home/<name>`, or
+  `C:\Users\<name>` path.
 
 ## What's new in 0.2.1
 

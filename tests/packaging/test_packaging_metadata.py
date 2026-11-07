@@ -38,7 +38,7 @@ RESOURCE_ARCHIVE = "startup_factory_cli/resources/startup-factory.tar.gz"
 RESOURCE_CHECKSUM = f"{RESOURCE_ARCHIVE}.sha256"
 PRERELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "prerelease.yml"
 PROMOTE_WORKFLOW = ROOT / ".github" / "workflows" / "promote.yml"
-STABLE_VERSION = "0.2.1"
+STABLE_VERSION = "0.2.2"
 
 
 def expected_distribution_version() -> str:
