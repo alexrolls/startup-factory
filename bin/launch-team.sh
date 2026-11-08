@@ -6,7 +6,8 @@
 #   launch-team.sh team          <preset> <team> <featureId>     # launch a preset roster (teams/<preset>.md)
 #   launch-team.sh gate-team     <preset> <team> <featureId>     # launch only long-lived supervision/gate roles
 #   launch-team.sh preflight     <team> <featureId>              # verify adapter, workspace, UTC pin
-#   launch-team.sh doctor        <preset> <team> <featureId>     # smoke-test every configured CLI in its real agent environment
+#   launch-team.sh doctor        [preset [team [featureId]]]    # defaults: full-stack doctor-check doctor-check
+#   launch-team.sh login         [claude|codex] [--share-macos-keychain]  # authenticate inside the dedicated agent home
 #   launch-team.sh start         <team> <featureId> <role>...
 #   launch-team.sh start-task    <team> <featureId> <role> <taskId> [attempt] [preset]
 #   launch-team.sh relaunch      <team> <featureId> <role> [preset]
@@ -75,6 +76,13 @@ TEAM_FENCE_PID=""
 SUPERPOWERS_ENABLED=""
 TMUX_BIN=""
 TMUX_BIN_IDENTITY=""
+DOCTOR_RESULT_WORKSPACE=""
+DOCTOR_RESULT_STARTED_AT=""
+DOCTOR_RESULT_PRESET=""
+DOCTOR_RESULT_TEAM=""
+DOCTOR_RESULT_FEATURE=""
+DOCTOR_VERIFIED_COMMANDS=0
+DOCTOR_COVERED_ROLES=0
 
 die() { echo "launch-team: $*" >&2; exit 1; }
 
@@ -229,8 +237,11 @@ prepare_agent_env() { # role team feature preset kind task attempt -> global AGE
     case "$value" in *$'\n'*|*$'\r'*) die "allowlisted environment variable '$name' contains a newline" ;; esac
     AGENT_ENV_ARGS+=("$name=$value")
   done
-  [ -z "$AGENT_SANDBOX_HOME_PATH" ] \
-    || AGENT_ENV_ARGS+=("HOME=$AGENT_SANDBOX_HOME_PATH")
+  if [ -n "$AGENT_SANDBOX_HOME_PATH" ]; then
+    value="$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.geteuid()).pw_name)')" \
+      || die "could not determine the executor account for the dedicated agent home"
+    AGENT_ENV_ARGS+=("HOME=$AGENT_SANDBOX_HOME_PATH" "USER=$value" "LOGNAME=$value")
+  fi
   AGENT_ENV_ARGS+=(
     "AWS_EC2_METADATA_DISABLED=true"
     "STARTUP_FACTORY_ROLE=$role"
@@ -2423,16 +2434,45 @@ preflight() { # preflight <team> <featureId> — fail before five agents do
   fi
 }
 
-run_doctor_execution() { # label token timeout; EXECUTION_ARGS is already prepared
-  local label="$1" token="$2" timeout="$3" output rc
+doctor_result_write() { # running|passed|failed; diagnostic evidence, never launch authority
+  python3 "$SKILL_DIR/bin/doctor-result.py" \
+    --repo "$REPO_ROOT" --workspace "$DOCTOR_RESULT_WORKSPACE" \
+    --preset "$DOCTOR_RESULT_PRESET" --team "$DOCTOR_RESULT_TEAM" \
+    --feature "$DOCTOR_RESULT_FEATURE" --started-at "$DOCTOR_RESULT_STARTED_AT" \
+    --status "$1" --verified-commands "$DOCTOR_VERIFIED_COMMANDS" \
+    --covered-roles "$DOCTOR_COVERED_ROLES"
+}
+
+doctor_result_on_exit() {
+  local rc="$1"
+  if [ -n "$DOCTOR_RESULT_WORKSPACE" ]; then
+    doctor_result_write failed || echo "launch-team: could not save failed doctor diagnostic" >&2
+  fi
+  exit "$rc"
+}
+
+doctor_result_begin() { # preset team featureId; called before doctor validation clears prior success
+  validate_team_id "$2"
+  DOCTOR_RESULT_WORKSPACE="$(teamroot "$2")" || die "unsafe doctor workspace"
+  DOCTOR_RESULT_PRESET="$1"; DOCTOR_RESULT_TEAM="$2"; DOCTOR_RESULT_FEATURE="$3"
+  DOCTOR_RESULT_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  DOCTOR_VERIFIED_COMMANDS=0; DOCTOR_COVERED_ROLES=0
+  doctor_result_write running || die "could not start doctor diagnostic record"
+  trap 'doctor_result_on_exit "$?"' EXIT
+}
+
+run_doctor_execution() { # label token timeout command-template; EXECUTION_ARGS is already prepared
+  local label="$1" token="$2" timeout="$3" command_template="$4" output rc
   set +e
-  output="$(python3 - "$timeout" "$token" "$label" "${EXECUTION_ARGS[@]}" <<'PY'
+  output="$(python3 - "$timeout" "$token" "$label" "$AGENT_SANDBOX_HOME_PATH" "$SKILL_DIR/bin/launch-team.sh" "$command_template" "${EXECUTION_ARGS[@]}" <<'PY'
 import os
+import re
 import signal
+import shlex
 import subprocess
 import sys
 
-timeout, token, label, *argv = sys.argv[1:]
+timeout, token, label, sandbox_home, launcher, command_template, *argv = sys.argv[1:]
 try:
     process = subprocess.Popen(
         argv,
@@ -2458,6 +2498,15 @@ except subprocess.TimeoutExpired:
 bounded = (output or "")[-2000:]
 if process.returncode != 0:
     print("doctor FAILED for %s: exit %s\n%s" % (label, process.returncode, bounded))
+    lowered = bounded.lower()
+    if any(value in lowered for value in (
+        "not logged in", "not signed in", "please run /login", "authentication required",
+        "run `codex login`", "run codex login", "unauthorized", "authentication failed",
+    )):
+        print("The agent CLI is not signed in inside AGENT_SANDBOX_HOME=%s." % (sandbox_home or "<unset>"))
+        print("Sign in using the dedicated agent home; a login in your normal home does not cover it.")
+        login_cli = "codex" if re.search(r"(?:^|[ /])codex(?:[ .]|$)", command_template) else "claude"
+        print("Next: %s login %s" % (shlex.quote(launcher), login_cli))
     raise SystemExit(1)
 response = output or ""
 if response.endswith("\n"):
@@ -2482,6 +2531,7 @@ doctor() { # doctor <preset> <team> <featureId>
   local preset="$1" team="$2" fid="$3"
   local roster role key cmd_tpl digest seen=" " token timeout dir preflight_dir prompt cmd
   local security_role verified_commands=0 covered_roles=0
+  [ -n "$DOCTOR_RESULT_WORKSPACE" ] || doctor_result_begin "$preset" "$team" "$fid"
   [ "$LIFECYCLE_ENABLED" = true ] \
     || die "doctor: BROKER_LIFECYCLE_ROOT must name a pre-created protected external directory"
   validate_preset_id "$preset"; validate_team_id "$team"
@@ -2519,6 +2569,7 @@ doctor() { # doctor <preset> <team> <featureId>
     key="$(role_cmd_key "$role")"
     key_is_null "$key" && continue
     covered_roles=$((covered_roles + 1))
+    DOCTOR_COVERED_ROLES="$covered_roles"
     cmd_tpl="$(role_command_template "$role")"
     [ -n "$cmd_tpl" ] || die "doctor: no configured command for roster role '$role'"
     digest="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$cmd_tpl")"
@@ -2526,8 +2577,9 @@ doctor() { # doctor <preset> <team> <featureId>
     seen="$seen$digest "
     cmd="${cmd_tpl//\{prompt_file\}/$prompt}"
     prepare_execution "$REPO_ROOT" "$cmd" "$role" "$team" "$fid" "$preset" doctor - 0
-    run_doctor_execution "role $role" "$token" "$timeout"
+    run_doctor_execution "role $role" "$token" "$timeout" "$cmd_tpl"
     verified_commands=$((verified_commands + 1))
+    DOCTOR_VERIFIED_COMMANDS="$verified_commands"
   done
 
   for key in TASK_FAST_CMD TASK_STANDARD_CMD TASK_STRONG_CMD; do
@@ -2539,10 +2591,62 @@ doctor() { # doctor <preset> <team> <featureId>
     role="$(printf '%s' "$key" | tr 'A-Z_' 'a-z-' | sed 's/-cmd$//')"
     cmd="${cmd_tpl//\{prompt_file\}/$prompt}"
     prepare_execution "$REPO_ROOT" "$cmd" "$role" "$team" "$fid" "$preset" doctor - 0
-    run_doctor_execution "$key override" "$token" "$timeout"
+    run_doctor_execution "$key override" "$token" "$timeout" "$cmd_tpl"
     verified_commands=$((verified_commands + 1))
+    DOCTOR_VERIFIED_COMMANDS="$verified_commands"
   done
+  doctor_result_write passed || die "doctor completed but could not save its diagnostic result"
+  DOCTOR_RESULT_WORKSPACE=""
+  trap - EXIT
   echo "doctor OK: $verified_commands distinct command(s) verified, covering $covered_roles enabled roster role(s), under the real agent environment"
+}
+
+login() { # login [claude|codex] [--share-macos-keychain]
+  local cli=claude selected=false share=false argument key configured executable interpreter prepared
+  local -a preparation login_argv
+  for argument in "$@"; do
+    case "$argument" in
+      claude|codex)
+        [ "$selected" = false ] || die "usage: login [claude|codex] [--share-macos-keychain]"
+        cli="$argument"; selected=true
+        ;;
+      --share-macos-keychain)
+        [ "$share" = false ] || die "duplicate --share-macos-keychain flag"
+        share=true
+        ;;
+      *) die "usage: login [claude|codex] [--share-macos-keychain]" ;;
+    esac
+  done
+  [ -n "$AGENT_SANDBOX_HOME_PATH" ] \
+    || die "login requires AGENT_SANDBOX_HOME; run bin/setup-machine.sh first"
+  case "$cli" in claude) key=CLAUDE_CLI_PATH ;; codex) key=CODEX_CLI_PATH ;; esac
+  configured="$(read_key "$key")"
+  interpreter="$(read_key "${key%_PATH}_INTERPRETER_PATH")"
+  if [ -z "$configured" ]; then
+    configured="$(type -P "$cli" || true)"
+  fi
+  [ -n "$configured" ] \
+    || die "$cli is unavailable on protected PATH; run bin/setup-machine.sh to discover it and set $key"
+  preparation=(--home "$AGENT_SANDBOX_HOME_PATH" --cli "$cli" --executable "$configured")
+  [ -z "$interpreter" ] || preparation+=(--interpreter "$interpreter")
+  [ "$share" = false ] || preparation+=(--share-macos-keychain)
+  prepared="$(python3 "$SKILL_DIR/bin/machine-login.py" "${preparation[@]}")" \
+    || die "login could not prepare the dedicated agent credential store"
+  IFS=$'\x1f' read -r executable interpreter <<< "$prepared"
+  case "$cli" in
+    claude) login_argv=("$executable" auth login) ;;
+    codex) login_argv=("$executable" login) ;;
+  esac
+  [ -z "$interpreter" ] || login_argv=("$interpreter" "${login_argv[@]}")
+  prepare_agent_env login machine-setup machine-setup full-stack setup - 0
+  echo "Signing in $cli inside AGENT_SANDBOX_HOME=$AGENT_SANDBOX_HOME_PATH"
+  if [ "$(read_key AGENT_SANDBOX_ENFORCED)" = true ]; then
+    validate_sandbox_runner_config
+    ( cd "$REPO_ROOT" && "$AGENT_SANDBOX_RUNNER_PATH" --workdir "$REPO_ROOT" -- \
+      /usr/bin/env "${AGENT_ENV_ARGS[@]}" "${login_argv[@]}" )
+  else
+    ( cd "$REPO_ROOT" && /usr/bin/env "${AGENT_ENV_ARGS[@]}" "${login_argv[@]}" )
+  fi
 }
 
 teamroot() {
@@ -3914,6 +4018,17 @@ print(json.dumps(matches[0],sort_keys=True,separators=(",",":")) if matches else
 
 case "${1:-}" in
   validate-board|config-value|'') ;;
+  login)
+    validate_agent_env_allowlist
+    validate_agent_sandbox_home
+    validate_sandbox_runner_config
+    configure_runtime_path
+    ;;
+  doctor)
+    [ $# -le 4 ] || die "usage: doctor [preset [team [featureId]]]"
+    doctor_result_begin "${2:-full-stack}" "${3:-doctor-check}" "${4:-doctor-check}"
+    validate_config
+    ;;
   planning-handoff) validate_planning_config ;;
   *) validate_config ;;
 esac
@@ -4415,8 +4530,11 @@ PY
     preflight "$2" "$3"
     ;;
   doctor)
-    [ $# -eq 4 ] || die "usage: doctor <preset> <team> <featureId>"
-    doctor "$2" "$3" "$4"
+    doctor "${2:-full-stack}" "${3:-doctor-check}" "${4:-doctor-check}"
+    ;;
+  login)
+    shift
+    login "$@"
     ;;
   validate-board)
     [ $# -le 2 ] || die "usage: validate-board [config-path]"
@@ -4431,6 +4549,6 @@ PY
     printf '\n'
     ;;
   *)
-    die "usage: launch-team.sh {planning-handoff|team|gate-team|preflight|doctor|start|start-task|restart-task|relaunch|retire-role|restart-role|compose|compose-review|compose-task|worktree|worktree-remove|validate-board|config-value|status|health|stop|stop-task} ..."
+    die "usage: launch-team.sh {planning-handoff|team|gate-team|preflight|doctor|login|start|start-task|restart-task|relaunch|retire-role|restart-role|compose|compose-review|compose-task|worktree|worktree-remove|validate-board|config-value|status|health|stop|stop-task} ..."
     ;;
 esac

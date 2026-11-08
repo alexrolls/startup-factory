@@ -33,6 +33,9 @@ esac
 }
 
 FULL_PYTHON_TESTS=(
+  authority-bootstrap-test.py
+  machine-setup-test.py
+  machine-login-test.py
   config-values-test.py
   authority-config-test.py
   beta-readiness-test.py
@@ -87,6 +90,9 @@ FULL_SHELL_TESTS=(
   deployment-test.sh
 )
 SMOKE_PYTHON_TESTS=(
+  authority-bootstrap-test.py
+  machine-setup-test.py
+  machine-login-test.py
   config-values-test.py
   authority-config-test.py
   beta-readiness-test.py

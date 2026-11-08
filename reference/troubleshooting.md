@@ -7,6 +7,10 @@ evidence rather than to bypass the check.
 
 | Symptom | Fix |
 |---|---|
+| New machine needs CLI-state/lifecycle directories or absolute CLI paths | Run the installed `bin/setup-machine.sh --skip-doctor`, then `bin/launch-team.sh login claude` (or `codex`) and `bin/launch-team.sh doctor`. See [machine setup](machine-setup.md). |
+| `trusted canonical Python >=3.10 is unavailable` | Read the candidate rejection reasons. Versioned Homebrew Python is discovered automatically; install a supported protected Python using the printed next command, then rerun setup. |
+| Doctor reports `Not logged in` | Run the installed `bin/launch-team.sh login claude` (or `codex`) so authentication uses `AGENT_SANDBOX_HOME`. On macOS, review the explicit keychain-sharing option in [machine setup](machine-setup.md). |
+| macOS displays `Keychain Not Found` during agent login | Cancel the dialog; never choose **Reset To Defaults** for Startup Factory setup. Provision credential storage using the [machine setup guide](machine-setup.md) before retrying. |
 | Agent says the tracker is unavailable | Re-check the adapter's *Access mechanisms* (MCP block or exported API-key env vars); the agent stops rather than fabricating — that's by design |
 | Preflight reports a typed tracker failure | Treat `AUTH`/`NOT_FOUND` as credential or exact-scope configuration problems. Respect the provider reset hint for `RATELIMITED`; retry `NETWORK`, `TIMEOUT`, or `SERVER` only after checking service health. `MALFORMED_RESPONSE` is an andon: inspect the adapter/provider contract instead of retrying blindly. |
 | `start-task` reports that the feature branch is missing | Run the exact `git branch '<branch>' <base-commit>` command printed by the launcher, inspect the branch, then retry. No task worktree was created. |
