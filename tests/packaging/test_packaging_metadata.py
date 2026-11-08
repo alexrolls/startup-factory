@@ -358,7 +358,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("include:", runtime)
         self.assertIn("TEST_SHARD: ${{ matrix.shard }}", runtime)
         self.assertIn('tests/run-all.sh --shard "$TEST_SHARD"', runtime)
-        self.assertIn('runtime_home="$RUNNER_TEMP/startup-factory-home"', runtime)
+        self.assertIn('runtime_home="$(mktemp -d "$HOME/.h.XXXXXX")"', runtime)
+        self.assertIn('trap \'rm -rf "$runtime_home"\' EXIT', runtime)
         self.assertIn('install -d -m 700 "$runtime_tmp" "$runtime_home"', runtime)
         self.assertIn('HOME="$runtime_home"', runtime)
 

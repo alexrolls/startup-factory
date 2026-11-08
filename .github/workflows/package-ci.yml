@@ -137,7 +137,10 @@ jobs:
         run: |
           set -euo pipefail
           runtime_tmp="$RUNNER_TEMP/startup-factory-runtime"
-          runtime_home="$RUNNER_TEMP/startup-factory-home"
+          # Lifecycle sockets must fit AF_UNIX limits. Keep HOME short and
+          # below the protected runner home, outside shared temporary roots.
+          runtime_home="$(mktemp -d "$HOME/.h.XXXXXX")"
+          trap 'rm -rf "$runtime_home"' EXIT
           install -d -m 700 "$runtime_tmp" "$runtime_home"
           PATH="$SETUP_PREFIX/bin:/usr/bin:/bin" HOME="$runtime_home" \
             TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh --shard "$TEST_SHARD"
