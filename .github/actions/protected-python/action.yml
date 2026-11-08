@@ -1,0 +1,89 @@
+name: Protected Python
+description: Set up and verify the pinned root-owned Python runtime used by CI.
+outputs:
+  prefix:
+    description: Verified Python installation prefix
+    value: ${{ steps.protect.outputs.prefix }}
+  python:
+    description: Verified Python executable
+    value: ${{ steps.protect.outputs.python }}
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      with:
+        python-version: "3.14"
+    - name: Protect and verify Python
+      id: protect
+      shell: bash
+      run: |
+        set -euo pipefail
+        setup_prefix="$(python -I -S -E -s -c 'import sys; print(sys.base_prefix)')"
+        test "$RUNNER_TOOL_CACHE" = "/opt/hostedtoolcache"
+        case "$setup_prefix" in
+          "$RUNNER_TOOL_CACHE"/Python/3.14.*/x64) ;;
+          *) echo "unexpected setup-python prefix: $setup_prefix" >&2; exit 1 ;;
+        esac
+        version_root="$(dirname "$setup_prefix")"
+        python_root="$(dirname "$version_root")"
+        test "$python_root" = "$RUNNER_TOOL_CACHE/Python"
+        sudo chown root:root /opt "$RUNNER_TOOL_CACHE" "$python_root" "$version_root"
+        sudo chmod go-w /opt "$RUNNER_TOOL_CACHE" "$python_root" "$version_root"
+        sudo chown -R root:root "$setup_prefix"
+        sudo chmod -R go-w "$setup_prefix"
+        protected_python="$setup_prefix/bin/python3"
+        "$protected_python" -I -B -S -E -s - "$setup_prefix" <<'PY'
+        import bz2
+        import ctypes
+        import hashlib
+        import lzma
+        import sqlite3
+        import ssl
+        import stat
+        import sys
+        import sysconfig
+        from pathlib import Path
+
+        root = Path(sys.argv[1]).resolve(strict=True)
+        assert sys.version_info[:2] == (3, 14), sys.version
+        assert Path(sys.executable).resolve(strict=True).is_relative_to(root)
+        assert Path(sys.prefix).resolve(strict=True) == root
+        assert Path(sys.base_prefix).resolve(strict=True) == root
+        assert Path(sysconfig.get_path("stdlib")).resolve(strict=True).is_relative_to(root)
+        current = root
+        while True:
+            info = current.lstat()
+            assert not stat.S_ISLNK(info.st_mode), current
+            assert info.st_uid == 0, current
+            assert not stat.S_IMODE(info.st_mode) & 0o022, current
+            if current == Path("/"):
+                break
+            current = current.parent
+        for path in (root, *root.rglob("*")):
+            if path.is_symlink():
+                assert path.resolve(strict=True).is_relative_to(root), path
+                continue
+            info = path.stat()
+            assert info.st_uid == 0, path
+            assert not stat.S_IMODE(info.st_mode) & 0o022, path
+        maps = Path("/proc/self/maps")
+        assert maps.is_file()
+        mapped = {
+            Path(fields[-1]).resolve(strict=True)
+            for line in maps.read_text(encoding="utf-8").splitlines()
+            if len(fields := line.split(maxsplit=5)) == 6
+            and fields[-1].startswith("/")
+            and Path(fields[-1]).exists()
+        }
+        toolcache = Path("/opt/hostedtoolcache")
+        for path in mapped:
+            if path.is_relative_to(toolcache):
+                assert path.is_relative_to(root), path
+        assert any(
+            path.name.startswith("libpython3.14") and path.is_relative_to(root)
+            for path in mapped
+        )
+        PY
+        echo "prefix=$setup_prefix" >> "$GITHUB_OUTPUT"
+        echo "python=$protected_python" >> "$GITHUB_OUTPUT"

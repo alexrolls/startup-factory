@@ -90,8 +90,8 @@ jobs:
             echo "PyPI already has startup-factory $version (HTTP $status); choose the next rc_number" >&2
             exit 1
           }
-          # The full runtime suite takes about an hour; Package CI already ran
-          # it on this exact commit when it landed on main.
+          # Package CI already validated every runtime shard on this exact
+          # commit when it landed on main.
           passed="$(gh api "repos/$GH_REPO/actions/workflows/package-ci.yml/runs?head_sha=$RELEASE_COMMIT&event=push&status=success" --jq '.total_count')"
           test "$passed" -ge 1 || {
             echo "Package CI has not passed on $RELEASE_COMMIT as a push to main" >&2

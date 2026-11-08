@@ -145,9 +145,10 @@ privileged_agent_env_name() {
 }
 
 validate_agent_env_allowlist() {
-  local names name seen=" "
+  local names name tracker_writers seen=" "
   names="$(read_key AGENT_ENV_ALLOWLIST)"
   [ -n "$names" ] || die "AGENT_ENV_ALLOWLIST must explicitly name the non-secret environment variables agents may inherit"
+  tracker_writers="$(read_key TRACKER_WRITERS)"
   for name in $names; do
     case "$name" in ''|*[!A-Za-z0-9_]*) die "unsafe AGENT_ENV_ALLOWLIST name '$name'" ;; esac
     case "$name" in [0-9]*) die "unsafe AGENT_ENV_ALLOWLIST name '$name'" ;; esac
@@ -156,7 +157,7 @@ validate_agent_env_allowlist() {
     [ "$name" != HOME ] \
       || die "AGENT_ENV_ALLOWLIST may not inherit ambient HOME; configure AGENT_SANDBOX_HOME instead"
     privileged_agent_env_name "$name" && die "AGENT_ENV_ALLOWLIST may not expose privileged variable '$name' to an LLM agent"
-    if [ "$(read_key TRACKER_WRITERS)" != "all" ] && tracker_credential_name "$name"; then
+    if [ "$tracker_writers" != "all" ] && tracker_credential_name "$name"; then
       die "AGENT_ENV_ALLOWLIST may not expose tracker credential '$name' while TRACKER_WRITERS is broker/lead"
     fi
   done

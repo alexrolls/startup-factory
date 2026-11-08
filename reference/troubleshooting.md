@@ -30,3 +30,10 @@ evidence rather than to bypass the check.
 | Release is fenced after an uncertain apply, detached-worker loss (exit 125), post-launch authority change, or target mismatch | Inspect the protected transaction and target `status` evidence. Repair the provider hook/target state and let the transaction reconcile; never blindly re-run apply or delete the fence |
 | Want to verify the plumbing | `bash tests/run-all.sh --smoke` for a fast core check; `bash tests/run-all.sh` for the full offline suite (stub agents + local files; no LLM, no cost) |
 
+Package CI runs the full suite in six separate jobs: `dispatch`, `launcher`,
+`parallel-integration`, `task-runtime`, `deployment`, and `core`. Reproduce one
+job locally with `bash tests/run-all.sh --shard dispatch`, or inspect its test
+list with `bash tests/run-all.sh --shard dispatch --list`. Each test reports its
+elapsed time and exit status; GitHub also displays these in the job summary.
+All six jobs must pass the aggregate required check before merging.
+

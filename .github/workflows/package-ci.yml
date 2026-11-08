@@ -15,38 +15,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  minimum-python:
-    name: Python 3.10 source compatibility
-    if: github.event_name == 'pull_request'
+  version:
+    name: Validate package version
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    steps:
-      - name: Check out the tested commit
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          persist-credentials: false
-
-      - name: Set up the minimum supported Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.10"
-
-      - name: Prove source compatibility on Python 3.10
-        env:
-          PYTHONPATH: src
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -c 'import sys; assert sys.version_info[:2] == (3, 10), sys.version'
-          python -m startup_factory_cli version --json
-          python -m unittest discover -s tests/packaging -p "test_*.py" -v
-
-  package:
-    name: Runtime, package, and reproducible artifacts
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.package.outputs.version }}
     steps:
       - name: Check out the tested commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -58,84 +32,6 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.14"
-
-      - name: Run the full runtime suite
-        shell: bash
-        run: |
-          set -euo pipefail
-          runtime_tmp="$RUNNER_TEMP/startup-factory-runtime"
-          install -d -m 700 "$runtime_tmp"
-          setup_prefix="$(python -I -S -E -s -c 'import sys; print(sys.base_prefix)')"
-          test "$RUNNER_TOOL_CACHE" = "/opt/hostedtoolcache"
-          case "$setup_prefix" in
-            "$RUNNER_TOOL_CACHE"/Python/3.14.*/x64) ;;
-            *) echo "unexpected setup-python prefix: $setup_prefix" >&2; exit 1 ;;
-          esac
-          version_root="$(dirname "$setup_prefix")"
-          python_root="$(dirname "$version_root")"
-          test "$python_root" = "$RUNNER_TOOL_CACHE/Python"
-          sudo chown root:root /opt "$RUNNER_TOOL_CACHE" "$python_root" "$version_root"
-          sudo chmod go-w /opt "$RUNNER_TOOL_CACHE" "$python_root" "$version_root"
-          sudo chown -R root:root "$setup_prefix"
-          sudo chmod -R go-w "$setup_prefix"
-          protected_python="$setup_prefix/bin/python3"
-          "$protected_python" -I -B -S -E -s - "$setup_prefix" <<'PY'
-          import bz2
-          import ctypes
-          import hashlib
-          import lzma
-          import sqlite3
-          import ssl
-          import stat
-          import sys
-          import sysconfig
-          from pathlib import Path
-
-          root = Path(sys.argv[1]).resolve(strict=True)
-          assert sys.version_info[:2] == (3, 14), sys.version
-          assert Path(sys.executable).resolve(strict=True).is_relative_to(root)
-          assert Path(sys.prefix).resolve(strict=True) == root
-          assert Path(sys.base_prefix).resolve(strict=True) == root
-          assert Path(sysconfig.get_path("stdlib")).resolve(strict=True).is_relative_to(root)
-          current = root
-          while True:
-              info = current.lstat()
-              assert not stat.S_ISLNK(info.st_mode), current
-              assert info.st_uid == 0, current
-              assert not stat.S_IMODE(info.st_mode) & 0o022, current
-              if current == Path("/"):
-                  break
-              current = current.parent
-          for path in (root, *root.rglob("*")):
-              if path.is_symlink():
-                  assert path.resolve(strict=True).is_relative_to(root), path
-                  continue
-              info = path.stat()
-              assert info.st_uid == 0, path
-              assert not stat.S_IMODE(info.st_mode) & 0o022, path
-          maps = Path("/proc/self/maps")
-          assert maps.is_file()
-          mapped = {
-              Path(fields[-1]).resolve(strict=True)
-              for line in maps.read_text(encoding="utf-8").splitlines()
-              if len(fields := line.split(maxsplit=5)) == 6
-              and fields[-1].startswith("/")
-              and Path(fields[-1]).exists()
-          }
-          toolcache = Path("/opt/hostedtoolcache")
-          for path in mapped:
-              if path.is_relative_to(toolcache):
-                  assert path.is_relative_to(root), path
-          assert any(
-              path.name.startswith("libpython3.14") and path.is_relative_to(root)
-              for path in mapped
-          )
-          PY
-          PATH="$setup_prefix/bin:/usr/bin:/bin" \
-            TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh
-
-      - name: Run packaging unit tests
-        run: python -m unittest discover -s tests/packaging -p "test_*.py" -v
 
       - name: Read the package version
         id: package
@@ -186,9 +82,87 @@ jobs:
             exit 1
           fi
 
+  minimum-python:
+    name: Python 3.10 source compatibility
+    if: github.event_name == 'pull_request'
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up the minimum supported Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.10"
+
+      - name: Prove source compatibility on Python 3.10
+        env:
+          PYTHONPATH: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -c 'import sys; assert sys.version_info[:2] == (3, 10), sys.version'
+          python -m startup_factory_cli version --json
+          python -m unittest discover -s tests/packaging -p "test_*.py" -v
+
+  runtime:
+    name: Runtime (${{ matrix.shard }})
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [dispatch, launcher, parallel-integration, task-runtime, deployment, core]
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up protected Python
+        id: runtime-python
+        uses: ./.github/actions/protected-python
+
+      - name: Run the runtime shard
+        env:
+          TEST_SHARD: ${{ matrix.shard }}
+          SETUP_PREFIX: ${{ steps.runtime-python.outputs.prefix }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_tmp="$RUNNER_TEMP/startup-factory-runtime"
+          runtime_home="$RUNNER_TEMP/startup-factory-home"
+          install -d -m 700 "$runtime_tmp" "$runtime_home"
+          PATH="$SETUP_PREFIX/bin:/usr/bin:/bin" HOME="$runtime_home" \
+            TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh --shard "$TEST_SHARD"
+
+  artifacts:
+    name: Package and reproducible artifacts
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up protected Python
+        uses: ./.github/actions/protected-python
+
+      - name: Run packaging unit tests
+        run: python -m unittest discover -s tests/packaging -p "test_*.py" -v
+
       - name: Build the source bundle twice
         env:
-          VERSION: ${{ steps.package.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -207,7 +181,7 @@ jobs:
 
       - name: Verify byte-for-byte bundle reproducibility
         env:
-          VERSION: ${{ steps.package.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -228,7 +202,7 @@ jobs:
 
       - name: Prepare two clean package source trees
         env:
-          VERSION: ${{ steps.package.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -327,6 +301,33 @@ jobs:
 
       - name: Verify wheel and sdist bundle identity
         env:
-          STARTUP_FACTORY_BUNDLE: ${{ github.workspace }}/build/repro-a/startup-factory-${{ steps.package.outputs.version }}.tar.gz
+          STARTUP_FACTORY_BUNDLE: ${{ github.workspace }}/build/repro-a/startup-factory-${{ needs.version.outputs.version }}.tar.gz
           STARTUP_FACTORY_DIST_DIR: ${{ github.workspace }}/dist
         run: python -m unittest discover -s tests/packaging -p "test_*.py" -v
+
+  package:
+    # Preserve the required check configured in the main branch ruleset.
+    name: Runtime, package, and reproducible artifacts
+    if: always()
+    needs: [version, minimum-python, runtime, artifacts]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all validation jobs to pass
+        env:
+          VERSION_RESULT: ${{ needs.version.result }}
+          MINIMUM_RESULT: ${{ needs.minimum-python.result }}
+          RUNTIME_RESULT: ${{ needs.runtime.result }}
+          ARTIFACTS_RESULT: ${{ needs.artifacts.result }}
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$VERSION_RESULT" = success
+          test "$RUNTIME_RESULT" = success
+          test "$ARTIFACTS_RESULT" = success
+          if [ "$EVENT_NAME" = pull_request ]; then
+            test "$MINIMUM_RESULT" = success
+          else
+            test "$MINIMUM_RESULT" = skipped
+          fi
