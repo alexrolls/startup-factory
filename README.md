@@ -28,6 +28,7 @@ Startup Factory does not replace your coding agent, repository, project-manageme
 
 - [Who it is for](#who-it-is-for)
 - [Quick start (local Markdown, no tracker account)](#quick-start-local-markdown-no-tracker-account)
+  - [Installing on a new machine](#installing-on-a-new-machine)
   - [Safe updates](#safe-updates)
 - [Ten easy prompts for startup delivery](#ten-easy-prompts-for-startup-delivery)
 - [See the factory work](#see-the-factory-work)
@@ -126,6 +127,30 @@ the explicit non-production boundary, follow the
 [`governed delivery benchmark path`](reference/quickstart.md). A reproducible
 example is in
 [`reference/governed-delivery-example.md`](reference/governed-delivery-example.md).
+
+### Installing on a new machine
+
+After installing the skill, run its machine setup command from your project
+root. For Claude Code:
+
+```bash
+bash .claude/skills/startup-factory/bin/setup-machine.sh --skip-doctor
+bash .claude/skills/startup-factory/bin/launch-team.sh login claude
+bash .claude/skills/startup-factory/bin/launch-team.sh doctor
+```
+
+For Codex, use `.agents/skills/startup-factory/` and `login codex`. Setup creates
+private CLI-state and lifecycle directories, configures their paths, resolves
+bare agent commands to installed executables, and creates the Markdown tracker
+directory. It is safe to rerun; without `--skip-doctor`, it finishes with the
+real CLI authentication check.
+
+Python discovery includes versioned Homebrew installs, so a missing unversioned
+`python3` no longer requires a shell-profile edit. Login uses the configured
+agent home. On macOS, Claude keychain sharing requires an explicit opt-in;
+read the [machine setup guide](reference/machine-setup.md) before choosing it.
+The guide also covers installing through an AI agent and existing config paths
+copied from another laptop.
 
 ### Safe updates
 
@@ -468,6 +493,16 @@ Read the full contracts before enabling unattended or production operation:
 
 ## What's new in 0.2.2
 
+- **Repeatable machine setup:** `bin/setup-machine.sh` provisions private CLI
+  state and lifecycle directories, creates the Markdown tracker directory, and
+  resolves installed CLI and Node paths without editing every role by hand.
+- **Clearer authentication:** `launch-team.sh login claude|codex` signs in
+  inside the dedicated agent home. macOS keychain sharing requires an explicit
+  opt-in and preserves the original credential store.
+- **Earlier, clearer diagnosis:** versioned Homebrew Python is discovered
+  automatically. `launch-team.sh doctor` accepts no arguments, explains sandbox
+  login failures, and saves timestamped diagnostic results. See the
+  [new-machine setup guide](reference/machine-setup.md).
 - **Clearer quick start:** [Quick start](#quick-start-local-markdown-no-tracker-account)
   now defaults to Claude Code, shows the Codex variant side by side, verifies
   the installation, and includes a copy-paste prompt that lets Claude Code run

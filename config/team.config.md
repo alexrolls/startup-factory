@@ -50,6 +50,12 @@ classifies a runtime — and normalizes exactly one `KEY=value` line per key:
 
 `launch-team.sh config-value <KEY>` exposes that shared parser read-only, so an
 operator can confirm what a template normalizes to without starting an agent.
+`bin/setup-machine.sh` can resolve supported bare CLI executables to absolute
+paths on a new machine, leaving the prompt and flags unchanged. It also records
+`CLAUDE_CLI_PATH` / `CODEX_CLI_PATH` for `launch-team.sh login`; those optional
+keys select only the login executable, not any role command. For npm CLIs,
+setup may also record `CLAUDE_CLI_INTERPRETER_PATH` /
+`CODEX_CLI_INTERPRETER_PATH` to start them with a validated Node interpreter.
 Set an implementation or optional specialist role to `null` to exclude it from
 launches (e.g. no frontend [tasks] → no frontend agent). Team Lead, Principal
 Architect, and Sceptical Principal Architect are mandatory, distinct rostered
@@ -108,11 +114,16 @@ AGENT_ENV_ALLOWLIST="PATH TMPDIR LANG LC_ALL TERM NO_COLOR"
                                  # Complete environment inherited by LLM processes. The launcher
                                  # starts them with env -i, then adds only these non-secret names
                                  # plus fixed STARTUP_FACTORY_* role metadata and the hardening
-                                 # value AWS_EC2_METADATA_DISABLED=true. PATH is required.
+                                 # value AWS_EC2_METADATA_DISABLED=true. With a dedicated HOME,
+                                 # USER/LOGNAME come from the OS executor account. PATH is required.
 AGENT_SANDBOX_HOME=null          # Optional absolute mode-0700 directory outside the repository
                                  # containing only the minimum CLI login/state needed by configured
                                  # agent commands. The launcher passes it as HOME without inheriting
                                  # the operator's ambient home. Keep null when CLIs do not need HOME.
+                                 # Run bin/setup-machine.sh to provision it, then
+                                 # bin/launch-team.sh login claude (or codex) to sign in here.
+CLAUDE_CLI_PATH=null             # Optional absolute login executable; discovered by setup-machine.sh.
+CODEX_CLI_PATH=null              # Optional absolute login executable; discovered by setup-machine.sh.
 DOCTOR_TIMEOUT_SECONDS=60        # Per distinct configured command. team/gate-team runs one
                                  # non-mutating prompt/auth round trip before launching any role.
 POLL_INTERVAL_SECONDS=120        # Fallback only; local runtime events wake dispatch within ~1s
@@ -164,7 +175,7 @@ BROKER_LIFECYCLE_ROOT=null       # Absolute pre-created mode-0700 directory, ext
                                  # from the repository. Required by the team doctor, whenever
                                  # AGENT_SANDBOX_ENFORCED=true, and for dispatch/integration/release
                                  # authority. The doctor diagnoses but never creates or configures
-                                 # this directory. An ambient
+                                 # this directory; bin/setup-machine.sh provisions it. An ambient
                                  # STARTUP_FACTORY_LIFECYCLE_STATE_ROOT may only repeat this exact
                                  # canonical configured path; it can never replace this setting.
                                  # Authenticated PID/start-time/tmux records, control receipts, and

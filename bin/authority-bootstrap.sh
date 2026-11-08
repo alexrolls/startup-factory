@@ -69,11 +69,30 @@ authority_python_parent_chain_is_protected() {
   done
 }
 
+authority_python_homebrew_candidates() {
+  local prefix="$1" candidate version
+  # Versioned Homebrew formulas do not always install an unversioned python3
+  # in bin. Only the two fixed prefixes below are used by the selector.
+  for candidate in "$prefix"/opt/python@3.[0-9]*/libexec/bin/python3 \
+    "$prefix"/bin/python3.[0-9]*; do
+    [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+    case "$candidate" in
+      "$prefix"/bin/python3.*)
+        version="${candidate##*/python3.}"
+        case "$version" in ''|*[!0-9]*) continue ;; esac
+        ;;
+    esac
+    printf '%s\n' "$candidate"
+  done
+}
+
 select_authority_python() {
-  local candidate canonical identity observed caller_entry
-  local candidates=() caller_entries=()
+  local candidate canonical identity observed caller_entry prefix probe_message
+  local seen=$'\n'
+  local candidates=() caller_entries=() rejections=()
   IFS=: read -r -a caller_entries <<< "${STARTUP_FACTORY_CALLER_PATH:-}"
-  for caller_entry in "${caller_entries[@]}"; do
+  # Bash 3.2 treats an empty array as unset under nounset.
+  for caller_entry in "${caller_entries[@]-}"; do
     case "$caller_entry" in
       /*) candidates+=("$caller_entry/python3") ;;
     esac
@@ -81,49 +100,79 @@ select_authority_python() {
   # Known platform paths remain deterministic fallbacks. Caller-PATH entries
   # are considered first so actions/setup-python's protected toolcache runtime
   # is not silently replaced by an older distribution interpreter.
-  candidates+=(/opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3)
+  candidates+=(/opt/homebrew/bin/python3 /usr/local/bin/python3)
+  for prefix in /opt/homebrew /usr/local; do
+    while IFS= read -r candidate; do
+      candidates+=("$candidate")
+    done < <(authority_python_homebrew_candidates "$prefix")
+  done
+  candidates+=(/usr/bin/python3)
   for candidate in "${candidates[@]}"; do
+    case "$seen" in *$'\n'"$candidate"$'\n'*) continue ;; esac
+    seen="${seen}${candidate}"$'\n'
     case "$candidate" in
-      "$SKILL_DIR"/*|/tmp/*|/private/tmp/*) continue ;;
+      "$SKILL_DIR"/*|/tmp/*|/private/tmp/*)
+        rejections+=("$candidate: outside the approved executable locations")
+        continue ;;
     esac
     canonical="$(canonical_authority_executable "$candidate" 2>/dev/null || true)"
-    [ -n "$canonical" ] && [ -f "$canonical" ] && [ -x "$canonical" ] || continue
+    if [ -z "$canonical" ] || [ ! -f "$canonical" ] || [ ! -x "$canonical" ]; then
+      rejections+=("$candidate: missing, not executable, or cannot resolve its canonical path")
+      continue
+    fi
     case "$canonical" in
-      "$SKILL_DIR"/*|/tmp/*|/private/tmp/*) continue ;;
+      "$SKILL_DIR"/*|/tmp/*|/private/tmp/*)
+        rejections+=("$candidate: canonical path is outside the approved executable locations")
+        continue ;;
       /usr/*|/opt/homebrew/Cellar/*|/opt/hostedtoolcache/*|/Library/Frameworks/Python.framework/*) ;;
-      *) continue ;;
+      *) rejections+=("$candidate: canonical path is outside the approved executable locations"); continue ;;
     esac
-    authority_python_parent_chain_is_protected "$candidate" || continue
-    [ "$candidate" = "$canonical" ] \
-      || authority_python_parent_chain_is_protected "$canonical" \
-      || continue
+    if ! authority_python_parent_chain_is_protected "$candidate" \
+      || { [ "$candidate" != "$canonical" ] \
+        && ! authority_python_parent_chain_is_protected "$canonical"; }; then
+      rejections+=("$candidate: parent directory ownership or permissions are unsafe")
+      continue
+    fi
     identity="$(authority_python_file_identity "$canonical" 2>/dev/null || true)"
-    [ -n "$identity" ] || continue
-    if /usr/bin/env -i PATH=/usr/bin:/bin TMPDIR=/tmp LANG=C LC_ALL=C \
+    if [ -z "$identity" ]; then
+      rejections+=("$candidate: cannot inspect executable identity")
+      continue
+    fi
+    if probe_message="$(/usr/bin/env -i PATH=/usr/bin:/bin TMPDIR=/tmp LANG=C LC_ALL=C \
       "$canonical" -I -B -c '
 import os, stat, sys
 path = sys.argv[1]
 info = os.stat(path)
-valid = (
-    sys.version_info >= (3, 10)
-    and os.path.realpath(sys.executable) == path
+if sys.version_info < (3, 10):
+    raise SystemExit("Python %s is too old; version 3.10 or newer is required" % sys.version.split()[0])
+if not (
+    os.path.realpath(sys.executable) == path
     and stat.S_ISREG(info.st_mode)
     and not info.st_mode & 0o022
     and info.st_uid in {0, os.geteuid()}
-)
-raise SystemExit(0 if valid else 1)
-' "$canonical"; then
+):
+    raise SystemExit("executable identity, ownership, or permissions are unsafe")
+' "$canonical" 2>&1)"; then
       observed="$(authority_python_file_identity "$canonical" 2>/dev/null || true)"
-      [ -n "$observed" ] && [ "$observed" = "$identity" ] || continue
+      if [ -z "$observed" ] || [ "$observed" != "$identity" ]; then
+        rejections+=("$candidate: executable identity changed during verification")
+        continue
+      fi
       printf '%s\t%s\n' "$canonical" "$identity"
       return 0
+    else
+      rejections+=("$candidate: ${probe_message:-isolated Python verification failed}")
     fi
   done
+  printf 'authority-bootstrap: Python candidates rejected:\n' >&2
+  printf '  - %s\n' "${rejections[@]}" >&2
   return 1
 }
 
 authority_python_selection="$(select_authority_python)" || {
   echo "authority-bootstrap: trusted canonical Python >=3.10 is unavailable" >&2
+  echo "On macOS, install a supported Python with: brew install python" >&2
+  echo "Or add an existing protected Python >=3.10 directory to PATH and rerun the command." >&2
   exit 1
 }
 AUTHORITY_PYTHON="${authority_python_selection%%$'\t'*}"

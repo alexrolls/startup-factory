@@ -29,6 +29,9 @@ skill's directory):
   implementation [task] or one exact review package
 - `bin/launch-team.sh doctor` — non-mutating CLI authentication/startup smoke
   test under the real sanitized agent environment
+- `bin/setup-machine.sh` + `bin/launch-team.sh login` — repeatable machine
+  provisioning and authentication in the dedicated agent home; see
+  `reference/machine-setup.md`
 - `bin/delivery_profile.py` + `reference/delivery-profiles.md` — authoritative,
   monotonic `micro` / `standard` / `high-risk` task and exact-committed-diff
   classification; a requested profile may raise rigor but cannot lower it, and
@@ -121,6 +124,21 @@ preparation:
 5. Report the selected release version/source commit, target path, and plan or
    diff summary. Do not commit unless
    the user asks.
+
+## New-machine setup request
+
+For installation, Python discovery, missing CLI-state/lifecycle directories, or
+agent login failures, use `reference/machine-setup.md`. The installed
+`bin/setup-machine.sh` provisions and validates local paths, resolves supported
+bare CLI commands, and runs the launcher doctor. `--skip-doctor` provisions
+offline before the operator signs in with `bin/launch-team.sh login`.
+
+Do not fix discovery by editing a shell profile or copy credentials into
+project config. A normal-session login does not authenticate the dedicated
+`AGENT_SANDBOX_HOME`. macOS keychain sharing is an explicit operator choice
+with credential exposure explained by the login command. If permissions block
+home/keychain setup, finish repository-local work and give the operator the
+exact shipped command to run in their terminal.
 
 ## Mandatory Preparation (every invocation)
 

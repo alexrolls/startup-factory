@@ -15,8 +15,8 @@ evidence.
 - macOS or Linux; native Windows is unsupported and WSL is currently untested;
 - Git, Bash, and `uv` with the `uvx` command available (`uvx --version` must
   succeed), plus a protected CPython in the 3.10 through 3.14 beta support range
-  at `/opt/homebrew/bin/python3`,
-  `/usr/local/bin/python3`, or `/usr/bin/python3`; an environment-managed Python
+  at a protected caller-PATH or platform path, including versioned Homebrew
+  `python@3.x/libexec/bin/python3` and `bin/python3.x` installations; an environment-managed Python
   can run the installer but does not by itself satisfy the governed broker
   runtime boundary;
 - a root-managed OS isolation runner that accepts
@@ -48,6 +48,11 @@ uvx startup-factory@0.2.0 init --agent codex --mode team \
 Use `--agent claude-code` for Claude Code.
 
 ## 2. Configure the protected publication boundary
+
+For a new laptop, first follow [machine setup](machine-setup.md) to provision
+the CLI home and lifecycle directory, resolve local CLI paths, and sign in.
+`bin/setup-machine.sh --skip-doctor` prepares those directories before the
+remaining publication-boundary settings below are ready.
 
 The broker lifecycle directory is mandatory for a governed team. Create it as
 the human operator, outside both the project and installed runtime. This
