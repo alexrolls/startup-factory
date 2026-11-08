@@ -54,6 +54,40 @@ wait_for_nonempty() { # path description
   return 1
 }
 
+concurrent_broker_results_ok() { # status stderr-file status stderr-file
+  # A competing broker may fail its protected phase compare-and-swap after
+  # another broker finishes the same delivery. Require a successful drain and
+  # recognize only that exact fail-closed outcome; never ignore either wait.
+  [ "$#" -eq 4 ] || return 1
+  [ "$1" = 0 ] || [ "$3" = 0 ] || return 1
+  local status diagnostics line last_line phase_errors
+  while [ "$#" -gt 0 ]; do
+    status="$1"; diagnostics="$2"; shift 2
+    case "$status" in 0|1) ;; *) return 1 ;; esac
+    [ -f "$diagnostics" ] || return 1
+    last_line=""; phase_errors=0
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        'warning: templates not found in '*) ;; # Benign macOS Git template warning.
+        "git: warning: confstr() failed with code 5: couldn't get path of DARWIN_USER_TEMP_DIR; using /tmp instead") ;;
+        'process-outbox: broker delivery phase changed')
+          phase_errors=$((phase_errors + 1))
+          ;;
+        *) return 1 ;;
+      esac
+      last_line="$line"
+    done < "$diagnostics"
+    if [ "$status" = 0 ]; then
+      [ "$phase_errors" -eq 0 ] || return 1
+    else
+      [ "$phase_errors" -eq 1 ] \
+        && [ "$last_line" = 'process-outbox: broker delivery phase changed' ] \
+        || return 1
+      echo "expected concurrent broker contender outcome: protected delivery phase changed"
+    fi
+  done
+}
+
 cd "$TMP"; git init -q repo && cd repo
 git config user.email test@example.com
 git config user.name Test
@@ -718,9 +752,23 @@ hostile_broker_env=(env
   "HOSTILE_TRUSTED_PATH_CANARY=$hostile_trusted_path_canary"
   "EXPECTED_LIFECYCLE_ROOT=$LIFECYCLE_ROOT"
   "TRACKER_AUTHORITY_CANARY=$tracker_authority_canary")
-"${hostile_broker_env[@]}" .agent-squad/bin/process-outbox.sh feature-runtime "$FID" >/dev/null & outbox_pid_1=$!
-"${hostile_broker_env[@]}" .agent-squad/bin/process-outbox.sh feature-runtime "$FID" >/dev/null & outbox_pid_2=$!
-wait "$outbox_pid_1" "$outbox_pid_2"
+outbox_stderr_1="$TMP/concurrent-outbox-1.stderr"
+outbox_stderr_2="$TMP/concurrent-outbox-2.stderr"
+"${hostile_broker_env[@]}" .agent-squad/bin/process-outbox.sh feature-runtime "$FID" \
+  >/dev/null 2>"$outbox_stderr_1" & outbox_pid_1=$!
+"${hostile_broker_env[@]}" .agent-squad/bin/process-outbox.sh feature-runtime "$FID" \
+  >/dev/null 2>"$outbox_stderr_2" & outbox_pid_2=$!
+outbox_status_1=0; outbox_status_2=0
+if wait "$outbox_pid_1"; then :; else outbox_status_1=$?; fi
+if wait "$outbox_pid_2"; then :; else outbox_status_2=$?; fi
+if concurrent_broker_results_ok "$outbox_status_1" "$outbox_stderr_1" \
+    "$outbox_status_2" "$outbox_stderr_2"; then
+  echo "ok: concurrent brokers complete or stop only at the protected phase fence"
+else
+  echo "FAIL: unexpected concurrent broker outcomes ($outbox_status_1, $outbox_status_2)"
+  cat "$outbox_stderr_1" "$outbox_stderr_2"
+  FAILURES=$((FAILURES+1))
+fi
 sed_i 's/^TRACKER_WRITERS=all/TRACKER_WRITERS=lead/' "$CFG"
 mv .agent-squad/bin/tracker-ops.sh.real .agent-squad/bin/tracker-ops.sh
 check "broker ignores ambient and unauthenticated override Python while holding authority" \
@@ -793,6 +841,7 @@ check "concurrent outbox drains keep one tracker comment" test "$(grep -c 'deliv
 check "broker binds request to exact base/head/package" python3 - "$done_entry" <<'PY'
 import json,re,sys
 d=json.load(open(sys.argv[1])); body=open(d['publishBodyPath']).read()
+assert d['brokerPhase'] == 'published'
 assert d['deliveryId'].startswith('delivery-') and d['deliveryId'] != d['id']
 assert re.search(r'(?m)^Review-Base-Commit: [0-9a-f]{40}$', body)
 assert re.search(r'(?m)^Task-Branch-Head: [0-9a-f]{40}$', body)

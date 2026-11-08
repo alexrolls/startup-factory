@@ -10,6 +10,7 @@ import io
 import os
 import re
 import shlex
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -34,11 +35,12 @@ AUTOMATION_REFERENCE = ROOT / "reference" / "automation.md"
 PM_PRODUCTION_ENV_EXAMPLE = ROOT / "config" / "pm-agent.production.env.example"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 PACKAGE_CI_WORKFLOW = ROOT / ".github" / "workflows" / "package-ci.yml"
+PROTECTED_PYTHON_ACTION = ROOT / ".github" / "actions" / "protected-python" / "action.yml"
 RESOURCE_ARCHIVE = "startup_factory_cli/resources/startup-factory.tar.gz"
 RESOURCE_CHECKSUM = f"{RESOURCE_ARCHIVE}.sha256"
 PRERELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "prerelease.yml"
 PROMOTE_WORKFLOW = ROOT / ".github" / "workflows" / "promote.yml"
-STABLE_VERSION = "0.2.2"
+STABLE_VERSION = "0.2.3"
 
 
 def expected_distribution_version() -> str:
@@ -290,11 +292,18 @@ class BundledDefaultsTests(unittest.TestCase):
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def job(self, workflow: str, name: str) -> str:
+        match = re.search(
+            rf"(?ms)^  {re.escape(name)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            workflow,
+        )
+        self.assertIsNotNone(match, f"missing {name!r} job")
+        assert match is not None
+        return match.group(1)
+
     def test_full_validation_jobs_have_sufficient_timeout_budget(self) -> None:
         def job_timeout(workflow: str, job: str) -> int:
-            prefix, marker, tail = workflow.partition(f"  {job}:\n")
-            self.assertTrue(marker, f"missing {job!r} job")
-            header, steps_marker, _steps = tail.partition("    steps:\n")
+            header, steps_marker, _steps = self.job(workflow, job).partition("    steps:\n")
             self.assertTrue(steps_marker, f"missing steps for {job!r} job")
             matches = re.findall(
                 r"(?m)^    timeout-minutes: ([1-9][0-9]*)$", header
@@ -302,16 +311,107 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertEqual(len(matches), 1, f"expected one timeout for {job!r}")
             return int(matches[0])
 
-        package_timeout = job_timeout(
-            PACKAGE_CI_WORKFLOW.read_text(encoding="utf-8"), "package"
-        )
+        package_ci = PACKAGE_CI_WORKFLOW.read_text(encoding="utf-8")
+        runtime_timeout = job_timeout(package_ci, "runtime")
+        artifacts_timeout = job_timeout(package_ci, "artifacts")
         release_timeout = job_timeout(
             RELEASE_WORKFLOW.read_text(encoding="utf-8"), "build"
         )
 
-        self.assertGreaterEqual(package_timeout, 60)
+        # The slowest measured full shard took about 23 minutes. The aggregate
+        # has no runtime work; its budget must not stand in for shard budgets.
+        self.assertGreaterEqual(runtime_timeout, 30)
+        self.assertGreaterEqual(artifacts_timeout, 10)
         self.assertGreaterEqual(release_timeout, 60)
-        self.assertGreaterEqual(release_timeout, package_timeout)
+        self.assertGreaterEqual(release_timeout, runtime_timeout)
+
+    def test_all_package_ci_work_waits_for_early_version_validation(self) -> None:
+        workflow = PACKAGE_CI_WORKFLOW.read_text(encoding="utf-8")
+        version = self.job(workflow, "version")
+        version_header = version.split("    steps:\n", 1)[0]
+        self.assertNotIn("    if:", version_header)
+        self.assertIn("version: ${{ steps.package.outputs.version }}", version_header)
+        self.assertIn("Require an unreleased version before merge", version)
+        self.assertIn("if: github.event_name == 'pull_request'", version)
+        self.assertIn("fetch-depth: 0", version)
+        for name in ("minimum-python", "runtime", "artifacts"):
+            with self.subTest(job=name):
+                header = self.job(workflow, name).split("    steps:\n", 1)[0]
+                self.assertRegex(header, r"(?m)^    needs: version$")
+        artifacts = self.job(workflow, "artifacts")
+        self.assertIn("${{ needs.version.outputs.version }}", artifacts)
+        self.assertNotIn("${{ steps.package.outputs.version }}", artifacts)
+
+    def test_runtime_matrix_covers_six_isolated_shards_without_fail_fast(self) -> None:
+        runtime = self.job(PACKAGE_CI_WORKFLOW.read_text(encoding="utf-8"), "runtime")
+        match = re.search(r"(?m)^        shard: \[([^\]]+)\]$", runtime)
+        self.assertIsNotNone(match)
+        assert match is not None
+        shards = [value.strip() for value in match.group(1).split(",")]
+        self.assertEqual(len(shards), len(set(shards)))
+        self.assertEqual(set(shards), {
+            "dispatch", "launcher", "parallel-integration", "task-runtime", "deployment", "core",
+        })
+        self.assertIn("fail-fast: false", runtime)
+        self.assertNotIn("continue-on-error", runtime)
+        self.assertNotIn("exclude:", runtime)
+        self.assertNotIn("include:", runtime)
+        self.assertIn("TEST_SHARD: ${{ matrix.shard }}", runtime)
+        self.assertIn('tests/run-all.sh --shard "$TEST_SHARD"', runtime)
+        self.assertIn('runtime_home="$(mktemp -d "$HOME/.h.XXXXXX")"', runtime)
+        self.assertIn('trap \'rm -rf "$runtime_home"\' EXIT', runtime)
+        self.assertIn('install -d -m 700 "$runtime_tmp" "$runtime_home"', runtime)
+        self.assertIn('HOME="$runtime_home"', runtime)
+
+    def test_required_package_check_waits_for_every_validation_job(self) -> None:
+        package = self.job(PACKAGE_CI_WORKFLOW.read_text(encoding="utf-8"), "package")
+        header = package.split("    steps:\n", 1)[0]
+        self.assertIn("name: Runtime, package, and reproducible artifacts", header)
+        self.assertRegex(header, r"(?m)^    if: always\(\)$")
+        match = re.search(r"(?m)^    needs: \[([^\]]+)\]$", header)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual({value.strip() for value in match.group(1).split(",")}, {
+            "version", "minimum-python", "runtime", "artifacts",
+        })
+        for name, context in (
+            ("VERSION_RESULT", "needs.version.result"),
+            ("MINIMUM_RESULT", "needs.minimum-python.result"),
+            ("RUNTIME_RESULT", "needs.runtime.result"),
+            ("ARTIFACTS_RESULT", "needs.artifacts.result"),
+            ("EVENT_NAME", "github.event_name"),
+        ):
+            self.assertIn(name + ": ${{ " + context + " }}", package)
+        self.assertNotIn("continue-on-error", package)
+
+    def test_aggregate_gate_fails_on_failed_cancelled_missing_or_unexpectedly_skipped_work(self) -> None:
+        package = self.job(PACKAGE_CI_WORKFLOW.read_text(encoding="utf-8"), "package")
+        script_match = re.search(r"(?ms)^        run: \|\n((?:          .*\n|\n)+)", package)
+        self.assertIsNotNone(script_match)
+        assert script_match is not None
+        script = "\n".join(line[10:] if line.startswith("          ") else line
+                           for line in script_match.group(1).splitlines())
+        base = {"VERSION_RESULT": "success", "MINIMUM_RESULT": "success",
+                "RUNTIME_RESULT": "success", "ARTIFACTS_RESULT": "success", "EVENT_NAME": "pull_request"}
+
+        def accepts(values: dict[str, str]) -> bool:
+            result = subprocess.run(
+                ["/bin/bash", "--noprofile", "--norc", "-s"], input=script,
+                env={"PATH": "/usr/bin:/bin", **values}, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            return result.returncode == 0
+
+        self.assertTrue(accepts(base))
+        for event in ("push", "workflow_dispatch"):
+            self.assertTrue(accepts({**base, "EVENT_NAME": event, "MINIMUM_RESULT": "skipped"}))
+        for variable in ("VERSION_RESULT", "MINIMUM_RESULT", "RUNTIME_RESULT", "ARTIFACTS_RESULT"):
+            for status in ("failure", "cancelled", "skipped", ""):
+                with self.subTest(variable=variable, status=status):
+                    self.assertFalse(accepts({**base, variable: status}))
+        for status in ("failure", "cancelled", "", "success"):
+            with self.subTest(non_pr_minimum=status):
+                self.assertFalse(accepts({**base, "EVENT_NAME": "push", "MINIMUM_RESULT": status}))
 
     def test_pull_requests_must_use_an_unreleased_version(self) -> None:
         workflow = PACKAGE_CI_WORKFLOW.read_text(encoding="utf-8")
@@ -376,9 +476,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
     def test_pull_requests_prove_source_compatibility_on_python_310(self) -> None:
         workflow = PACKAGE_CI_WORKFLOW.read_text(encoding="utf-8")
-        minimum = workflow.split("  minimum-python:\n", 1)[1].split(
-            "\n  package:\n", 1
-        )[0]
+        minimum = self.job(workflow, "minimum-python")
         self.assertIn("if: github.event_name == 'pull_request'", minimum)
         self.assertIn('python-version: "3.10"', minimum)
         self.assertIn("sys.version_info[:2] == (3, 10)", minimum)
@@ -493,11 +591,47 @@ class ReleaseWorkflowTests(unittest.TestCase):
         for path in (PACKAGE_CI_WORKFLOW, RELEASE_WORKFLOW):
             with self.subTest(workflow=path.name):
                 workflow = path.read_text(encoding="utf-8")
+                if path == PACKAGE_CI_WORKFLOW:
+                    hardening = PROTECTED_PYTHON_ACTION.read_text(encoding="utf-8")
+                    self.assertIn("using: composite", hardening)
+                    self.assertIn("actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1", hardening)
+                    self.assertIn("value: ${{ steps.protect.outputs.prefix }}", hardening)
+                    self.assertIn("value: ${{ steps.protect.outputs.python }}", hardening)
+                    self.assertLess(hardening.index('"$protected_python" -I -B -S -E -s -'),
+                                    hardening.index('echo "prefix=$setup_prefix"'))
+                    self.assertLess(hardening.index('"$protected_python" -I -B -S -E -s -'),
+                                    hardening.index('echo "python=$protected_python"'))
+                    for name in ("runtime", "artifacts"):
+                        self.assertIn("uses: ./.github/actions/protected-python", self.job(workflow, name))
+                    runtime = self.job(workflow, "runtime")
+                    self.assertIn("SETUP_PREFIX: ${{ steps.runtime-python.outputs.prefix }}", runtime)
+                    self.assertIn('PATH="$SETUP_PREFIX/bin:/usr/bin:/bin"', runtime)
+                    self.assertIn('TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh --shard "$TEST_SHARD"', runtime)
+                    self.assertLess(runtime.index("uses: ./.github/actions/protected-python"),
+                                    runtime.index("tests/run-all.sh --shard"))
+                    artifact_build = self.job(workflow, "artifacts")
+                    self.assertLess(artifact_build.index("uses: ./.github/actions/protected-python"),
+                                    artifact_build.index('build_env="$(mktemp -d'))
+                else:
+                    hardening = workflow
+                    self.assertLess(
+                        workflow.index('sudo chown -R root:root "$setup_prefix"'),
+                        workflow.index('"$build_python" -I -B -m pip install'),
+                    )
+                    self.assertLess(
+                        workflow.index('TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh'),
+                        workflow.index('build_env="$(mktemp -d'),
+                    )
+                    self.assertIn(
+                        'PATH="$setup_prefix/bin:/usr/bin:/bin" \\\n'
+                        '            TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh',
+                        workflow,
+                    )
                 self.assertIn(
                     'runtime_tmp="$RUNNER_TEMP/startup-factory-runtime"', workflow
                 )
                 self.assertIn('install -d -m 700 "$runtime_tmp"', workflow)
-                self.assertIn('python-version: "3.14"', workflow)
+                self.assertIn('python-version: "3.14"', hardening)
                 self.assertIn(
                     'build_env="$(mktemp -d "$RUNNER_TEMP/startup-factory-build.XXXXXX")"',
                     workflow,
@@ -514,55 +648,45 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 self.assertIn(
                     '"$build_python" -I -B -m build --no-isolation', workflow
                 )
-                self.assertIn('setup_prefix="$(python -I -S -E -s', workflow)
+                self.assertIn('setup_prefix="$(python -I -S -E -s', hardening)
                 self.assertIn(
-                    'test "$RUNNER_TOOL_CACHE" = "/opt/hostedtoolcache"', workflow
+                    'test "$RUNNER_TOOL_CACHE" = "/opt/hostedtoolcache"', hardening
                 )
                 self.assertIn(
-                    '"$RUNNER_TOOL_CACHE"/Python/3.14.*/x64', workflow
+                    '"$RUNNER_TOOL_CACHE"/Python/3.14.*/x64', hardening
                 )
                 self.assertIn(
                     'sudo chown root:root /opt "$RUNNER_TOOL_CACHE" "$python_root" '
                     '"$version_root"',
-                    workflow,
+                    hardening,
                 )
                 self.assertIn(
                     'sudo chmod go-w /opt "$RUNNER_TOOL_CACHE" "$python_root" '
                     '"$version_root"',
-                    workflow,
+                    hardening,
                 )
-                self.assertIn('sudo chown -R root:root "$setup_prefix"', workflow)
-                self.assertIn('sudo chmod -R go-w "$setup_prefix"', workflow)
-                self.assertIn("sys.version_info[:2] == (3, 14)", workflow)
-                self.assertIn('assert info.st_uid == 0', workflow)
-                self.assertIn('assert not stat.S_IMODE(info.st_mode) & 0o022', workflow)
-                self.assertIn('path.resolve(strict=True).is_relative_to(root)', workflow)
-                self.assertIn('maps = Path("/proc/self/maps")', workflow)
-                self.assertIn('path.name.startswith("libpython3.14")', workflow)
-                self.assertLess(
-                    workflow.index('sudo chown -R root:root "$setup_prefix"'),
-                    workflow.index('"$build_python" -I -B -m pip install'),
-                )
-                self.assertLess(
-                    workflow.index('TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh'),
-                    workflow.index('build_env="$(mktemp -d'),
-                )
+                self.assertIn('sudo chown -R root:root "$setup_prefix"', hardening)
+                self.assertIn('sudo chmod -R go-w "$setup_prefix"', hardening)
+                self.assertIn("sys.version_info[:2] == (3, 14)", hardening)
+                self.assertIn('assert info.st_uid == 0', hardening)
+                self.assertIn('assert not stat.S_IMODE(info.st_mode) & 0o022', hardening)
+                self.assertIn('path.resolve(strict=True).is_relative_to(root)', hardening)
+                self.assertIn('maps = Path("/proc/self/maps")', hardening)
+                self.assertIn('path.name.startswith("libpython3.14")', hardening)
+                self.assertLess(hardening.index('sudo chown -R root:root "$setup_prefix"'),
+                                hardening.index('"$protected_python" -I -B -S -E -s -'))
                 self.assertLess(
                     workflow.index('Prepare two clean package source trees'),
                     workflow.index('build_env="$(mktemp -d'),
                 )
-                self.assertIn(
-                    'PATH="$setup_prefix/bin:/usr/bin:/bin" \\\n'
-                    '            TMPDIR="$runtime_tmp" /bin/bash tests/run-all.sh',
-                    workflow,
-                )
-                self.assertNotIn('protected_python_root=', workflow)
-                self.assertNotIn('sudo cp -a "$setup_prefix/."', workflow)
-                self.assertNotIn('BUILD_PYTHON=', workflow)
-                self.assertNotIn('setup_python="$(command -v python3)"', workflow)
-                self.assertNotIn('PATH="$setup_python_dir:/usr/bin:/bin"', workflow)
-                self.assertNotIn("/usr/bin/python3 -c", workflow)
-                self.assertNotIn("        run: bash tests/run-all.sh", workflow)
+                effective = workflow + hardening
+                self.assertNotIn('protected_python_root=', effective)
+                self.assertNotIn('sudo cp -a "$setup_prefix/."', effective)
+                self.assertNotIn('BUILD_PYTHON=', effective)
+                self.assertNotIn('setup_python="$(command -v python3)"', effective)
+                self.assertNotIn('PATH="$setup_python_dir:/usr/bin:/bin"', effective)
+                self.assertNotIn("/usr/bin/python3 -c", effective)
+                self.assertNotIn("        run: bash tests/run-all.sh", effective)
 
     def test_github_release_commands_have_explicit_repository_context(self) -> None:
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")

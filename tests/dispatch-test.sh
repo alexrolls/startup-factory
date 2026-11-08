@@ -378,16 +378,27 @@ check "security queue in mailbox"    grep -rq "$FID#3" .teamwork/feat-team/mailb
 check "PA queue in mailbox"          grep -rq "$FID#4" .teamwork/feat-team/mailbox/principal-architect/
 check "sceptical queue in mailbox"   grep -rq "$FID#4" .teamwork/feat-team/mailbox/sceptical-architect/
 check "security reviewer launched"   test -f .teamwork/feat-team/pids/senior-security-engineer.pid
+check "first pass recorded a change token" test -s .teamwork/feat-team/dispatch.change-token
+check "first pass recorded a pass marker"  test -s .teamwork/feat-team/dispatch.last-pass
 
 # -- idle passes reuse the cached export instead of re-reading the tracker -----
 # The export dominates a pass; re-reading an unchanged [feature] every cadence
 # is what exhausts a hosted tracker's request budget.
-check "first pass recorded a change token" test -s .teamwork/feat-team/dispatch.change-token
-check "first pass recorded a pass marker"  test -s .teamwork/feat-team/dispatch.last-pass
-# A pass that acts on the board also writes to it, so its own token is stale by
-# the time it is recorded. Settle first, then assert the next pass reuses.
-TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once >/dev/null 2>&1
-reuse_out="$(TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once 2>&1)"
+# Exercise this policy on a quiet feature. The real queue/launch assertions
+# above remain end-to-end; repeating those actionable gates here would keep
+# relaunching their deliberately short-lived stub agents on every cache pass.
+CACHE_TEAM=feat-cache-team
+CACHE_FID=feat/cache.md
+CACHE_WORKSPACE=".teamwork/$CACHE_TEAM"
+cat > "$CACHE_FID" <<'EOF'
+# Cache policy [Active]
+
+## 1 Already complete [Ready to deploy]
+
+**Assignee:** backend
+EOF
+TEAM_RUNNER=background "$DISPATCH" "$CACHE_TEAM" "$CACHE_FID" --once >/dev/null 2>&1
+reuse_out="$(TEAM_RUNNER=background "$DISPATCH" "$CACHE_TEAM" "$CACHE_FID" --once 2>&1)"
 if echo "$reuse_out" | grep -q "tracker unchanged; reusing the cached feature export"; then
   echo "ok: unchanged tracker reuses the cached export"
 else
@@ -397,20 +408,19 @@ fi
 # A pass now refreshes twice (before planning and after the brokers), and the
 # second read legitimately reuses when the first just exported, so the evidence
 # of a full export is the stamp, not the log line.
-echo 0 > .teamwork/feat-team/dispatch.export-at
-printf '\n## 9 Fresh work [Planned]\n' >> "$FID"
-TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once >/dev/null 2>&1
-if [ "$(cat .teamwork/feat-team/dispatch.export-at)" != "0" ]; then
+echo 0 > "$CACHE_WORKSPACE/dispatch.export-at"
+printf '\n## 9 Fresh work [Ready to deploy]\n' >> "$CACHE_FID"
+TEAM_RUNNER=background "$DISPATCH" "$CACHE_TEAM" "$CACHE_FID" --once >/dev/null 2>&1
+if [ "$(cat "$CACHE_WORKSPACE/dispatch.export-at")" != "0" ]; then
   echo "ok: an edited [feature] forces a fresh export"
 else
   echo "FAIL: an edited [feature] was skipped as unchanged"; FAILURES=$((FAILURES+1))
 fi
-check "edited task reached the snapshot" grep -q "Fresh work" .teamwork/feat-team/tasks.json
+check "edited task reached the snapshot" grep -q "Fresh work" "$CACHE_WORKSPACE/tasks.json"
 # An elapsed reuse window forces a full export even when the token has not moved.
-TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once >/dev/null 2>&1
-echo 0 > .teamwork/feat-team/dispatch.export-at
-TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once >/dev/null 2>&1
-if [ "$(cat .teamwork/feat-team/dispatch.export-at)" != "0" ]; then
+echo 0 > "$CACHE_WORKSPACE/dispatch.export-at"
+TEAM_RUNNER=background "$DISPATCH" "$CACHE_TEAM" "$CACHE_FID" --once >/dev/null 2>&1
+if [ "$(cat "$CACHE_WORKSPACE/dispatch.export-at")" != "0" ]; then
   echo "ok: reuse is bounded even when the token has not moved"
 else
   echo "FAIL: reuse was not bounded by EXPORT_MAX_REUSE_SECONDS"; FAILURES=$((FAILURES+1))
@@ -418,17 +428,16 @@ fi
 # Queued broker work forces the post-broker export. The brokers' writes are our
 # own, and a hosted tracker does not promise a read microseconds later reflects
 # them, so the token must not be allowed to vouch for that snapshot.
-TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once >/dev/null 2>&1
-mkdir -p .teamwork/feat-team/outbox/pending
-echo '{}' > .teamwork/feat-team/outbox/pending/probe-entry.json
-echo 0 > .teamwork/feat-team/dispatch.export-at
-TEAM_RUNNER=background "$DISPATCH" feat-team "$FID" --once >/dev/null 2>&1 || true
-if [ "$(cat .teamwork/feat-team/dispatch.export-at)" != "0" ]; then
+mkdir -p "$CACHE_WORKSPACE/outbox/pending"
+echo '{}' > "$CACHE_WORKSPACE/outbox/pending/probe-entry.json"
+echo 0 > "$CACHE_WORKSPACE/dispatch.export-at"
+TEAM_RUNNER=background "$DISPATCH" "$CACHE_TEAM" "$CACHE_FID" --once >/dev/null 2>&1 || true
+if [ "$(cat "$CACHE_WORKSPACE/dispatch.export-at")" != "0" ]; then
   echo "ok: queued broker work forces a fresh post-broker export"
 else
   echo "FAIL: pending broker work still reused a cached export"; FAILURES=$((FAILURES+1))
 fi
-rm -f .teamwork/feat-team/outbox/pending/probe-entry.json
+rm -f "$CACHE_WORKSPACE/outbox/pending/probe-entry.json"
 
 # -- agent-writable PID text is not a liveness authority -----------------------
 mkdir -p .teamwork/feat-team/pids

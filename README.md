@@ -491,6 +491,15 @@ Read the full contracts before enabling unattended or production operation:
 - [`reference/deployment.md`](reference/deployment.md)
 - [`reference/orchestration.md`](reference/orchestration.md)
 
+## What's new in 0.2.3
+
+- **Faster CI feedback:** the full runtime suite runs in six isolated jobs,
+  with per-test timings and an aggregate required check. Version validation
+  runs before the runtime tests so release mistakes fail early.
+- **Less repeated work:** dispatcher cache checks use a quiet fixture, and
+  launcher environment validation reads the tracker-writer policy once per
+  validation instead of once per environment variable.
+
 ## What's new in 0.2.2
 
 - **Repeatable machine setup:** `bin/setup-machine.sh` provisions private CLI
