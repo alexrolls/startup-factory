@@ -246,7 +246,8 @@ class DoctorResultTest(unittest.TestCase):
         # State cannot live in shared /tmp. A disposable workspace directory
         # contains the independent Git project, installed skill, fake CLI,
         # synthetic operator HOME, and private state, and is removed afterward.
-        with tempfile.TemporaryDirectory(prefix=".i-", dir=ROOT) as directory:
+        # GitHub's checkout path leaves only a small Unix socket path budget.
+        with tempfile.TemporaryDirectory(prefix=".", dir=ROOT) as directory:
             base = Path(directory).resolve()
             project, skill, binaries, operator = (base / name for name in ("project", "skill", "cli-bin", "operator-home"))
             for path in (project, skill, binaries, operator):

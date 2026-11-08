@@ -22,7 +22,9 @@ class MachineSetupTest(unittest.TestCase):
     def setUp(self) -> None:
         # Never provision the developer's actual HOME; lifecycle state also
         # deliberately cannot use the shared system temporary directory.
-        self.temporary = tempfile.TemporaryDirectory(prefix=".sm-", dir=ROOT)
+        # Keep the fixture name short enough for GitHub's longer checkout path
+        # plus the production Unix socket locator's fixed suffix.
+        self.temporary = tempfile.TemporaryDirectory(prefix=".", dir=ROOT)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         self.project = self.root / "project"
