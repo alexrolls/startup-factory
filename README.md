@@ -39,7 +39,7 @@ Startup Factory does not replace your coding agent, repository, project-manageme
 - [Bring your own agents, tracker, and stack](#bring-your-own-agents-tracker-and-stack)
 - [Choose how much autonomy you want](#choose-how-much-autonomy-you-want)
 - [Safety is part of the architecture](#safety-is-part-of-the-architecture)
-- [What's new](#whats-new-in-022)
+- [What's new](#whats-new-in-024)
 - [Documentation](#documentation)
 - [Project status](#project-status)
 - [Contributing](#contributing)
@@ -492,6 +492,15 @@ Read the full contracts before enabling unattended or production operation:
 - [`reference/automation.md`](reference/automation.md)
 - [`reference/deployment.md`](reference/deployment.md)
 - [`reference/orchestration.md`](reference/orchestration.md)
+
+## What's new in 0.2.4
+
+- **Command compatibility:** quoted configuration preserves literal shell and
+  regex backslashes such as `printf '%s\n'` and `.*\.ipynb`.
+- **Safer source updates:** malformed team configuration is rejected before
+  activation, leaving the existing installation intact.
+- **Custom-board migration:** lineage authorization accepts a unique integrated
+  status even when a later human-owned status closes the task.
 
 ## What's new in 0.2.3
 
