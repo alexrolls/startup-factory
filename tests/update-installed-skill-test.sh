@@ -416,6 +416,75 @@ git -C "$UPSTREAM" add .
 git -C "$UPSTREAM" commit -qm fixture-v2
 V2_COMMIT="$(git -C "$UPSTREAM" rev-parse HEAD)"
 
+# A malformed preserved command must fail while the candidate is still staged,
+# including on a real update. Compare the entire install so runtime, ownership,
+# provenance, and project files cannot change unnoticed.
+for invalid_form in unmatched-quote duplicate-key; do
+  INVALID_TEAM_INSTALL="$TARGET/.agents/skills/invalid-team-$invalid_form"
+  cp -R "$INSTALL" "$INVALID_TEAM_INSTALL"
+  case "$invalid_form" in
+    unmatched-quote)
+      printf 'WORKTREE_SETUP="unterminated\n' > "$INVALID_TEAM_INSTALL/config/team.config.md"
+      expected_problem='malformed configuration value for WORKTREE_SETUP'
+      ;;
+    duplicate-key)
+      printf 'TEAM_RUNNER=background\nTEAM_RUNNER=tmux\n' > "$INVALID_TEAM_INSTALL/config/team.config.md"
+      expected_problem='duplicate configuration key TEAM_RUNNER'
+      ;;
+  esac
+  TEAM_SNAPSHOT="$TMP/team-before-$invalid_form"
+  cp -R "$INVALID_TEAM_INSTALL" "$TEAM_SNAPSHOT"
+  for update_mode in preview apply; do
+    update_args=(--install-dir "$INVALID_TEAM_INSTALL")
+    if [ "$update_mode" = preview ]; then
+      update_args+=(--dry-run)
+    fi
+    team_output="$TMP/team-$invalid_form-$update_mode.out"
+    if env STARTUP_FACTORY_REMOTE_URL="$UPSTREAM" STARTUP_FACTORY_REF=main \
+        bash "$INVALID_TEAM_INSTALL/bin/update-installed-skill.sh" \
+          "${update_args[@]}" > "$team_output" 2>&1; then
+      echo "FAIL: $update_mode accepted $invalid_form in preserved team config"
+      FAILURES=$((FAILURES + 1))
+    elif grep -q "staged team config:.*$expected_problem" "$team_output" && \
+        diff -r "$TEAM_SNAPSHOT" "$INVALID_TEAM_INSTALL" >/dev/null && \
+        ! grep -q 'Updated Startup Factory skill at:' "$team_output" && \
+        test -z "$(find "$TARGET/.agents/skills" -maxdepth 1 \
+          \( -name ".invalid-team-$invalid_form.stage.*" \
+             -o -name ".invalid-team-$invalid_form.backup.*" \
+             -o -name ".invalid-team-$invalid_form.startup-factory.lock" \) -print -quit)"; then
+      echo "ok: $update_mode rejects $invalid_form before activation and cleans up"
+    else
+      echo "FAIL: $update_mode changed the install or misreported $invalid_form"
+      FAILURES=$((FAILURES + 1))
+    fi
+  done
+done
+
+# These ordinary shell backslashes must survive both preflight and activation.
+SHELL_CONFIG_INSTALL="$TARGET/.agents/skills/shell-config-startup-factory"
+cp -R "$INSTALL" "$SHELL_CONFIG_INSTALL"
+cat > "$SHELL_CONFIG_INSTALL/config/team.config.md" <<'EOF'
+WORKTREE_SETUP="printf '%s\n' 'A=1' 'B=2' > some/.env"
+VALIDATE_FORMAT="python -m black --check src --exclude '.*\.ipynb'"
+AGENT_SANDBOX_ENFORCED=false
+BROKER_LIFECYCLE_ROOT=/var/lib/startup-factory/lifecycle
+EOF
+cp "$SHELL_CONFIG_INSTALL/config/team.config.md" "$TMP/shell-config-before"
+env STARTUP_FACTORY_REMOTE_URL="$UPSTREAM" STARTUP_FACTORY_REF=main \
+  bash "$SHELL_CONFIG_INSTALL/bin/update-installed-skill.sh" --dry-run \
+    > "$TMP/shell-config-preview.out"
+check "shell-command preview leaves the runtime untouched" \
+  test ! -e "$SHELL_CONFIG_INSTALL/runtime-v2.txt"
+env STARTUP_FACTORY_REMOTE_URL="$UPSTREAM" STARTUP_FACTORY_REF=main \
+  bash "$SHELL_CONFIG_INSTALL/bin/update-installed-skill.sh" > "$TMP/shell-config-update.out"
+check "shell-command config allows the staged runtime to activate" \
+  test -f "$SHELL_CONFIG_INSTALL/runtime-v2.txt"
+check "shell-command backslashes remain byte-identical after update" \
+  cmp -s "$TMP/shell-config-before" "$SHELL_CONFIG_INSTALL/config/team.config.md"
+check "activated shell-command config passes its installed parser" \
+  python3 "$SHELL_CONFIG_INSTALL/bin/config-value.py" \
+    --config "$SHELL_CONFIG_INSTALL/config/team.config.md" validate
+
 LEGACY_SANDBOX_RUNNER="$TMP/legacy-sandbox-runner"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$LEGACY_SANDBOX_RUNNER"
 chmod 0700 "$LEGACY_SANDBOX_RUNNER"

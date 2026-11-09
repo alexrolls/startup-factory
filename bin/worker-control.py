@@ -992,6 +992,8 @@ def lineage_migration_contract(workspace: Path) -> dict[str, str]:
 
 
 def integrated_task_status() -> str:
+    # Integration authorizes the package; a custom board can leave production
+    # completion to a later human-owned terminal status.
     board_path = Path(__file__).resolve().parent.parent / "config" / "statuses.config.json"
     board = strict_json(
         regular_bytes(board_path, "status board", 1024 * 1024), "status board"
@@ -999,10 +1001,10 @@ def integrated_task_status() -> str:
     matches = [
         str(item.get("name"))
         for item in board.get("tasks", {}).get("statuses", [])
-        if item.get("kind") == "integrated" and item.get("terminal") is True
+        if item.get("kind") == "integrated"
     ]
     if len(matches) != 1:
-        raise ControlError("integrated terminal task status must resolve exactly once")
+        raise ControlError("integrated task status must resolve exactly once")
     return matches[0]
 
 

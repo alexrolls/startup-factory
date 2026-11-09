@@ -49,9 +49,10 @@ def _scan_double_quoted(value: str) -> tuple[str, int]:
                 raise ConfigValueError("unmatched outer quote or escape")
             following = value[index + 1]
             if following not in ('"', "\\"):
-                raise ConfigValueError(
-                    f"unsupported escape \\{following} inside an outer double-quoted value"
-                )
+                # Commands and regular expressions own escapes such as \n and
+                # \.; preserve them for the eventual consumer, without decoding
+                # control characters or interpreting shell syntax here.
+                output.append("\\")
             output.append(following)
             index += 2
             continue

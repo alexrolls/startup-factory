@@ -385,7 +385,16 @@ copy_preserved_path() {
 }
 
 validate_staged_runtime() {
-  local staged_pm_config selected_tool selected_adapter staged_status_path validation_error
+  local staged_team_config staged_pm_config selected_tool selected_adapter staged_status_path validation_error
+  staged_team_config="$stage_dir/config/team.config.md"
+  # Validate the copied configuration before the live installation or its
+  # backup changes. Use the updater's trusted parser, never fetched code.
+  if ! validation_error="$(python3 "$trusted_config_parser" \
+      --config "$staged_team_config" --label "staged team config" \
+      --prefix "staged team config" validate 2>&1)"; then
+    die "$validation_error"
+  fi
+
   staged_pm_config="$stage_dir/config/project-management.config.md"
   [ -f "$staged_pm_config" ] && [ ! -L "$staged_pm_config" ] || \
     die "staged project-management config is missing or invalid"
