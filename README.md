@@ -166,7 +166,9 @@ Use `--agent codex` for a Codex installation.
 
 Updates are staged, locked, verified, and rollback-capable. Existing project
 configuration and project-owned extensions are preserved by default; conflicts
-fail before mutation. Replacing preserved configuration requires the explicit
+fail before mutation. The source updater validates the staged team configuration
+before activation; malformed values leave the existing installation untouched.
+Replacing preserved configuration requires the explicit
 `--overwrite-config` flag. Both supported updaters report preserved 0.1.x
 authority settings that need migration in dry-run and applied output. The
 release CLI also returns them as structured `migrationDiagnostics`; it never

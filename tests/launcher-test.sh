@@ -474,7 +474,7 @@ expect_config_refused() { # description KEY raw-value expected-error-fragment
 }
 expect_config_refused "unmatched outer quote" TEAMWORK_ROOT '"unterminated' "unmatched outer quote"
 expect_config_refused "trailing bytes after an outer quote" TEAMWORK_ROOT '".teamwork" junk' "trailing bytes"
-expect_config_refused "ambiguous escape inside an outer quoted value" TEAMWORK_ROOT '".teamwork\q"' "unsupported escape"
+expect_config_refused "escaped closing quote leaves an unmatched outer quote" TEAMWORK_ROOT '".teamwork\"' "unmatched outer quote"
 expect_config_refused "outer-quoted empty value" TEAMWORK_ROOT '""' "empty value"
 
 expect_config_start_refused() { # description raw-value team
@@ -536,6 +536,15 @@ expect_config_value "outer-quoted escapes normalize to shell-grouping quotes" TE
   'claude -p "$(cat '"'"'{prompt_file}'"'"')" --permission-mode acceptEdits'
 expect_config_value "escaped backslash normalizes to one backslash" TEAM_DEFAULT_CMD \
   '"printf %s\\\\ {prompt_file}"' 'printf %s\\ {prompt_file}'
+expect_config_value "worktree setup preserves literal printf newline escapes" WORKTREE_SETUP \
+  '"printf '\''%s\n'\'' '\''A=1'\'' '\''B=2'\'' > some/.env"' \
+  'printf '\''%s\n'\'' '\''A=1'\'' '\''B=2'\'' > some/.env'
+expect_config_value "format validation preserves literal regex backslashes" VALIDATE_FORMAT \
+  '"python -m black --check src --exclude '\''.*\.ipynb'\''"' \
+  'python -m black --check src --exclude '\''.*\.ipynb'\'''
+expect_config_value "shell and control escape spellings stay literal" TEAM_DEFAULT_CMD \
+  '"printf '\''%s\t\r\q\$HOME\`literal\`'\''"' \
+  'printf '\''%s\t\r\q\$HOME\`literal\`'\'''
 expect_config_value "assignment-prefixed command values survive" TEAM_DEFAULT_CMD \
   '"STARTUP_FACTORY_LLM_RUNTIME=other dsh \"$(cat '"'"'{prompt_file}'"'"')\""' \
   'STARTUP_FACTORY_LLM_RUNTIME=other dsh "$(cat '"'"'{prompt_file}'"'"')"'

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, ExitStack
 import fcntl
 import hashlib
 import importlib.util
@@ -13,6 +14,7 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -329,6 +331,128 @@ class LineageMigrationTest(unittest.TestCase):
             )
         finally:
             for patch in reversed(patches): patch.stop()
+
+    @contextmanager
+    def custom_status_board(self):
+        """Read an actual custom board without replacing the installed config."""
+        board = json.loads((ROOT / "config" / "statuses.config.json").read_text())
+        integrated = next(
+            status for status in board["tasks"]["statuses"]
+            if status.get("kind") == "integrated"
+        )
+        previous_name = integrated["name"]
+        integrated["name"] = "Integrated"
+        integrated["terminal"] = False
+        integrated["transitions"] = ["Live"]
+        integrated["tool"] = {
+            "Linear": "Integrated", "Jira": "Integrated",
+            "GitHubIssues": "open + label status:integrated", "Markdown": "[Integrated]",
+        }
+        for status in board["tasks"]["statuses"]:
+            status["transitions"] = [
+                "Integrated" if target == previous_name else target
+                for target in status["transitions"]
+            ]
+        board["tasks"]["statuses"].append({
+            "name": "Live", "kind": "completed", "terminal": True,
+            "requiresCommit": True, "owner": {"role": "human"}, "transitions": [],
+            "tool": {
+                "Linear": "Live", "Jira": "Live",
+                "GitHubIssues": "closed + label status:live", "Markdown": "[Live]",
+            },
+        })
+        custom_path = self.base / "statuses.config.json"
+        custom_path.write_text(json.dumps(board) + "\n", encoding="utf-8")
+        installed_path = ROOT / "config" / "statuses.config.json"
+
+        # Exercise the launcher's actual board checks while keeping this test
+        # independent of the host's protected-Python bootstrap configuration.
+        launcher = (ROOT / "bin" / "launch-team.sh").read_text(encoding="utf-8")
+        validator = launcher.split("validate_board() {", 1)[1].split(
+            "<<'PYEOF'\n", 1
+        )[1].split("\nPYEOF", 1)[0]
+        validated = subprocess.run(
+            [sys.executable, "-B", "-c", validator, str(custom_path), str(ROOT)],
+            check=False, capture_output=True, text=True,
+        )
+        self.assertEqual(validated.returncode, 0, validated.stdout + validated.stderr)
+        self.assertIn("board config OK:", validated.stdout)
+
+        def redirected_reader(original):
+            def read(path, *args, **kwargs):
+                return original(
+                    custom_path if path == installed_path else path, *args, **kwargs
+                )
+            return read
+
+        with ExitStack() as stack:
+            for module in (migration, worker_control):
+                stack.enter_context(mock.patch.object(
+                    module, "regular_bytes",
+                    side_effect=redirected_reader(module.regular_bytes),
+                ))
+            yield custom_path
+
+    def test_nonterminal_integrated_package_authorizes_staging_and_migration(self) -> None:
+        self.control_path.unlink()
+        self.tasks["tasks"][1]["status"] = "Integrated"
+        (self.workspace / "tasks.json").write_text(
+            json.dumps(self.tasks) + "\n", encoding="utf-8"
+        )
+        environment, capability, transport = self.producer_context("team-lead")
+        args = argparse.Namespace(
+            task=self.target_task, authorization_task=self.authorization_task,
+            expected_attempt=self.attempt,
+            observed_created_at=self.generation["createdAt"],
+        )
+        with self.custom_status_board(), transport, mock.patch.dict(
+            os.environ, environment, clear=False
+        ), mock.patch("sys.stdout"):
+            self.assertEqual(worker_control.migration_request_command(args), 0)
+            self.control_path = next(
+                (self.workspace / "lineage-migration-outbox" / "pending").iterdir()
+            )
+            staged = json.loads(self.control_path.read_text(encoding="utf-8"))
+            self.assertEqual(staged["authorizationTaskStatus"], "Integrated")
+            self.assertEqual(self.migrate(), "consumed")
+        target = json.loads(self.execution_path.read_text(encoding="utf-8"))
+        self.assertEqual(target["claimLineage"]["claimId"], self.claim["claimId"])
+        self.assertEqual(self.tasks["tasks"][1]["status"], "Integrated")
+
+    def test_terminal_live_status_does_not_substitute_for_integrated_authorization(self) -> None:
+        self.tasks["tasks"][1]["status"] = "Live"
+        self.request["authorizationTaskStatus"] = "Live"
+        self.request["controlBodySha256"] = migration.digest(
+            migration.canonical(migration.request_body(self.request))
+        )
+        self.write_request()
+        before = self.execution_path.read_bytes()
+        with self.custom_status_board(), self.assertRaisesRegex(
+            migration.MigrationError, "not an integrated exact package"
+        ):
+            self.migrate()
+        self.assertEqual(self.execution_path.read_bytes(), before)
+
+    def test_missing_or_ambiguous_integrated_status_is_rejected(self) -> None:
+        with self.custom_status_board() as custom_path:
+            board = json.loads(custom_path.read_text(encoding="utf-8"))
+            statuses = board["tasks"]["statuses"]
+            integrated = next(status for status in statuses if status.get("kind") == "integrated")
+            for invalid_statuses in (
+                [status for status in statuses if status is not integrated],
+                [*statuses, {**integrated, "name": "Other integrated", "terminal": True}],
+            ):
+                board["tasks"]["statuses"] = invalid_statuses
+                custom_path.write_text(json.dumps(board), encoding="utf-8")
+                for module, error in (
+                    (migration, migration.MigrationError),
+                    (worker_control, worker_control.ControlError),
+                ):
+                    with self.subTest(module=module.__name__, count=len(invalid_statuses)):
+                        with self.assertRaisesRegex(
+                            error, "integrated task status must resolve exactly once"
+                        ):
+                            module.integrated_task_status()
 
     def test_exact_two_field_migration_and_domain_separated_receipt(self) -> None:
         claim_before = self.claim_path.read_bytes()
@@ -1318,7 +1442,7 @@ class LineageMigrationTest(unittest.TestCase):
             self.migrate()
         self.assertEqual(self.execution_path.read_bytes(), before)
 
-    def test_broker_rejects_helper_bypass_for_nonterminal_authorization(self) -> None:
+    def test_broker_rejects_helper_bypass_for_unintegrated_authorization(self) -> None:
         """The executor must not trust the producer's signed status assertion."""
         before = self.execution_path.read_bytes()
         self.tasks["tasks"][1]["status"] = "Active"

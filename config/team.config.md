@@ -33,7 +33,10 @@ classifies a runtime — and normalizes exactly one `KEY=value` line per key:
   `"claude -p \"$(cat '{prompt_file}')\" ..."` form work: the parsed value is the
   command string `claude -p "$(cat '{prompt_file}')" ...`, so the interior quotes
   still group the prompt into one argument when the launcher later executes it.
-  Any other `\x` sequence is rejected rather than guessed.
+  Any other `\x` sequence is preserved literally, including the backslash.
+  Commands such as `printf '%s\n'` and regular expressions such as `.*\.ipynb`
+  therefore reach their consumers unchanged; parsing never turns `\n` or `\t`
+  into control characters or expands shell expressions.
 - One matching pair of **outer single quotes** is removed with no escape
   handling at all; every interior byte, including `"` and `\`, is literal.
 - After an outer quote only a true trailing comment may follow.
@@ -44,7 +47,7 @@ classifies a runtime — and normalizes exactly one `KEY=value` line per key:
   the same disable semantics and never falls back to `TEAM_DEFAULT_CMD`.
 - A value that normalizes to an empty string is rejected; `null` is the only
   supported absent-value spelling.
-- Unmatched quotes, unsupported escapes, trailing bytes after an outer quote,
+- Unmatched quotes, dangling escapes, trailing bytes after an outer quote,
   control characters other than horizontal tab, and duplicate keys are rejected
   before any launch.
 

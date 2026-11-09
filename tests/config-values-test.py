@@ -48,6 +48,39 @@ QUOTED_NULL="null"
         self.assertEqual(state_for(parsed, "SPACED_NULL"), "null")
         self.assertEqual(state_for(parsed, "ABSENT"), "missing")
 
+    def test_double_quoted_commands_preserve_literal_backslash_sequences(self) -> None:
+        commands = {
+            "WORKTREE_SETUP": r"printf '%s\n' 'A=1' 'B=2' > some/.env",
+            "VALIDATE_FORMAT": r"python -m black --check src --exclude '.*\.ipynb'",
+            "LITERAL_COMMAND": r"printf '%s\t\r\q\$HOME\`literal\`'",
+        }
+        raw = "".join(f'{key}="{command}"\n' for key, command in commands.items())
+        parsed = parse_config_bytes(raw.encode("utf-8"), "fixture")
+        for key, command in commands.items():
+            with self.subTest(key=key):
+                self.assertEqual(value_for(parsed, key), command)
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "team.config.md"
+            config.write_text(raw, encoding="utf-8")
+            for key, command in commands.items():
+                with self.subTest(cli_key=key):
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(ROOT / "bin/config-value.py"),
+                            "--config",
+                            str(config),
+                            "value",
+                            key,
+                        ],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, command)
+
     def test_whole_file_validation_rejects_ambiguity_and_guessing(self) -> None:
         failures = (
             (b"SAFE=true\nSAFE=false\n", "duplicate configuration key SAFE"),
@@ -55,9 +88,11 @@ QUOTED_NULL="null"
             (b"safe=true\n", "malformed configuration assignment"),
             (b"SAFE =true\n", "malformed configuration assignment"),
             (b"SAFE=\"unterminated\n", "unmatched outer quote"),
-            (b"SAFE=\"bad\\n\"\n", "unsupported escape"),
+            (b"SAFE=\"dangling\\\n", "unmatched outer quote or escape"),
+            (b"SAFE=\"escaped-closing-quote\\\"\n", "unmatched outer quote or escape"),
             (b"SAFE=\"ok\"garbage\n", "trailing bytes"),
             (b"SAFE=\x00\n", "control character"),
+            (b"SAFE=\"actual\rcontrol\"\n", "control character"),
             (b"SAFE=\n", "empty value"),
         )
         for raw, message in failures:
