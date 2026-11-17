@@ -29,6 +29,20 @@ case "$first" in
   *) echo "submit-artifact: body must begin with [$marker]" >&2; exit 1 ;;
 esac
 
+# A mountless guest has a private repository and no host workspace or signing
+# endpoint. The native relay supplies authoritative identity and output paths.
+# These arguments remain CLI assertions only; none are sent as authority.
+if [ -n "${STARTUP_FACTORY_GUEST_SOCKET:-}" ]; then
+  if [ -n "${STARTUP_FACTORY_OUTBOX_TRANSPORT:-}${STARTUP_FACTORY_OUTBOX_CAPABILITY_ID:-}${STARTUP_FACTORY_OUTBOX_CAPABILITY_SECRET:-}${STARTUP_FACTORY_OUTBOX_CAPABILITY_EXPIRES_AT:-}" ]; then
+    echo "submit-artifact: guest and host publication transports cannot be combined" >&2
+    exit 1
+  fi
+  guest_args=(--socket "$STARTUP_FACTORY_GUEST_SOCKET" --marker "$marker" --body "$source")
+  [ "$target" = - ] || guest_args+=(--target-status "$target")
+  [ -z "${STARTUP_FACTORY_GUEST_REQUEST_ID:-}" ] || guest_args+=(--request-id "$STARTUP_FACTORY_GUEST_REQUEST_ID")
+  exec python3 -I -B "$SKILL_DIR/bin/sandbox_guest_client.py" "${guest_args[@]}"
+fi
+
 # When invoked by a launched role, bind the producer-supplied identity to the
 # launcher's fixed runtime context. The broker repeats this check against its
 # protected execution record; this early check makes accidental or opportunistic

@@ -122,6 +122,7 @@ AGENT_SANDBOX_HOME=null          # Optional absolute mode-0700 directory outside
                                  # the operator's ambient home. Keep null when CLIs do not need HOME.
                                  # Run bin/setup-machine.sh to provision it, then
                                  # bin/launch-team.sh login claude (or codex) to sign in here.
+                                 # Native/protected-runner only; Docker credentials use its deployment.
 CLAUDE_CLI_PATH=null             # Optional absolute login executable; discovered by setup-machine.sh.
 CODEX_CLI_PATH=null              # Optional absolute login executable; discovered by setup-machine.sh.
 DOCTOR_TIMEOUT_SECONDS=60        # Per distinct configured command. team/gate-team runs one
@@ -161,16 +162,6 @@ WORKTREE_SETUP=null              # Run once inside every freshly created task wo
                                  # null = bare worktree. Provisioning is what makes
                                  # implementer validation claims executable — an
                                  # unprovisioned tree produces misleading dependency/type failures.
-AGENT_SANDBOX_RUNNER=null        # Canonical absolute, root-owned executable under a root-owned,
-                                 # operator/group/world-non-writable system path outside the agent
-                                 # repository. In enforced mode
-                                 # the launcher invokes: runner --workdir <absolute> -- /usr/bin/env -i ...
-                                 # It rejects symlinks, non-regular/non-executable files, any
-                                 # non-root-owned/writable file or ancestor, and rechecks immediately
-                                 # before each execution. Operator-owned mode-0700 wrappers are unsafe.
-AGENT_SANDBOX_ENFORCED=false     # true routes every LLM command and WORKTREE_SETUP through the runner.
-                                 # Keep false only for manual/test execution without that boundary;
-                                 # the autonomous PM supervisor refuses to launch while false.
 BROKER_LIFECYCLE_ROOT=null       # Absolute pre-created mode-0700 directory, external and disjoint
                                  # from the repository. Required by the team doctor, whenever
                                  # AGENT_SANDBOX_ENFORCED=true, and for dispatch/integration/release
@@ -182,10 +173,11 @@ BROKER_LIFECYCLE_ROOT=null       # Absolute pre-created mode-0700 directory, ext
                                  # preserved dirty-attempt worktrees live here; size it accordingly.
                                  # .teamwork contains non-authoritative markers/manifests only.
                                  # Agent sandboxes must not be able to read or write this directory.
-                                 # Publication needs one narrow exception: connect-only access to
+                                 # Protected-runner publication needs connect-only access to
                                  # the exact socket locator injected for that launch. Keep listing
                                  # and every read/write/create/rename/unlink operation on this root
-                                 # denied to workers.
+                                 # denied to workers. Docker guests use the host relay and never
+                                 # access this root or its sockets.
 ```
 
 `bin/launch-team.sh health [--json] [--watch]` renders only lifecycle-authenticated
@@ -209,6 +201,36 @@ warns while the new complete generation remains published.
 Review depth (`REVIEW_MODE=sequential|parallel|tiered`) is a **per-team** choice
 and lives in the team file (`teams/<preset>.md`, next to `ROSTER=`), not here —
 see `teams/_PLAYBOOK.md` → *Review modes*.
+
+## Agent sandbox isolation (optional)
+
+Additional operating-system isolation is **disabled by default** to keep manual
+runs fast and avoid VM startup, repeated setup, and extra resource costs. Task
+worktrees still separate working copies when this option is off.
+
+To enable Docker Sandboxes, set `AGENT_SANDBOX_ENFORCED` to `true` and
+`AGENT_EXECUTION_BACKEND` to `docker-sandboxes`, then supply the enrolled
+deployment path and Linux agent command below. Each implementation, review, and
+validation job receives a fresh VM. Follow the
+[deployment and qualification guide](../reference/docker-sandboxes-deployment.md)
+before enabling it; configuration alone does not grant execution authority.
+Restore both default settings below to disable it. Autonomous operation still
+requires enforced isolation and all readiness checks.
+
+```
+AGENT_SANDBOX_ENFORCED=false     # Opt-in: true requires the selected isolation backend.
+                                 # The autonomous PM supervisor refuses to launch while false.
+AGENT_EXECUTION_BACKEND=protected-runner  # protected-runner | docker-sandboxes; no automatic fallback.
+AGENT_SANDBOX_DEPLOYMENT=null    # Docker: absolute root-owned enrolled deployment manifest.
+SANDBOX_DEFAULT_CMD=null        # Docker: explicit Linux model command consuming {prompt_file}.
+                                 # SANDBOX_<ROLE>_CMD and SANDBOX_TASK_<PROFILE>_CMD override it.
+                                 # Agent commands and WORKTREE_SETUP run in each fresh guest.
+AGENT_SANDBOX_RUNNER=null        # Protected-runner only: canonical absolute root-owned executable
+                                 # outside the repository, under protected root-owned ancestors.
+                                 # Invoked as: runner --workdir <absolute> -- /usr/bin/env -i ...
+                                 # Symlinks, non-executable files, and executor/group/world-writable
+                                 # files or ancestors are rejected and rechecked before execution.
+```
 
 ## Validation commands (framework-agnostic Integrator)
 
@@ -265,7 +287,7 @@ is "no new failures", not "all green".
   home. Normal `team` and `gate-team` launches run it automatically after the
   tracker preflight and before any persistent role starts. A successful binary
   lookup without a prompt/authentication round trip is not a viable team.
-- `AGENT_SANDBOX_RUNNER` must be a canonical absolute protected executable
+- For `protected-runner`, `AGENT_SANDBOX_RUNNER` must be a canonical absolute protected executable
   outside the repository. The file and its complete ancestor chain must be
   root-owned and not writable by the executor, group, or world. It is
   responsible for enforcing worktree-only writes, hiding host/broker state, and

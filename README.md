@@ -461,8 +461,9 @@ Start small and add authority only when the environment is ready.
 `init --apply` configures the safe `solo` and `team` starting modes; the full flag list is in [Safe updates](#safe-updates). Autonomous board processing and production release are intentionally off by default and require external configuration, identities, sandboxes, hooks, and readiness checks. Read [Safety is part of the architecture](#safety-is-part-of-the-architecture) before turning either on.
 
 Team initialization alone does not grant authenticated publication authority.
-That requires the separately provisioned external sandbox runner, broker-only
-tracker writes, lifecycle authority, and successful doctor probes documented in
+That requires a separately provisioned isolation backend (a protected runner or
+enrolled Docker Sandboxes deployment), broker-only tracker writes, lifecycle
+authority, and successful doctor probes documented in
 the [governed delivery benchmark path](reference/quickstart.md). Without that
 boundary, team processes are manually supervised and cannot publish governed
 review, integration, or release evidence.
@@ -483,6 +484,13 @@ Startup Factory provides:
 - Fail-closed behavior when evidence is missing, stale, malformed, or inconsistent.
 
 Startup Factory is not an operating-system sandbox. Run agents with real filesystem, process, network, and identity isolation appropriate to your environment. Repository-level policy is an additional boundary, not a replacement for host security.
+
+**Optional Docker Sandboxes isolation is disabled by default** to avoid VM startup
+overhead, repeated setup, and extra resource costs. Enable it in the
+[Agent sandbox isolation configuration](config/team.config.md#agent-sandbox-isolation-optional)
+by selecting `docker-sandboxes`, setting `AGENT_SANDBOX_ENFORCED=true`, and supplying
+an enrolled deployment and Linux agent command. Each agent job gets a fresh VM;
+see the [setup and qualification guide](reference/docker-sandboxes-deployment.md).
 
 Read the full contracts before enabling unattended or production operation:
 
@@ -589,7 +597,8 @@ mandatory. These safeguards do not themselves authorize a production release.
 **0.1.x upgrade action:** project configuration is preserved during updates.
 Before restarting autonomous or release services, update the protected
 installed `config/team.config.md`: set `BROKER_LIFECYCLE_ROOT` to the exact
-canonical external lifecycle path and, when `AGENT_SANDBOX_ENFORCED=true`,
+canonical external lifecycle path and, for `protected-runner` with
+`AGENT_SANDBOX_ENFORCED=true`,
 replace a missing, null, or legacy operator-owned `AGENT_SANDBOX_RUNNER` with a
 canonical external executable whose file and complete ancestor chain are
 root-owned and not writable by the executor, group, or world. The scheduler's
@@ -762,6 +771,8 @@ reviews, integration, or releases.
 | [`reference/vocabulary.md`](reference/vocabulary.md) | Tool-neutral entities, statuses, mappings, and naming rules |
 | [`reference/automation.md`](reference/automation.md) | Deterministic board monitoring and bounded task dispatch |
 | [`reference/guardrails.md`](reference/guardrails.md) | Denied actions, exact human approvals, and allowed operations |
+| [`reference/docker-sandboxes.md`](reference/docker-sandboxes.md) | Per-agent Docker execution, external broker isolation, and live qualification gates |
+| [`reference/docker-sandboxes-deployment.md`](reference/docker-sandboxes-deployment.md) | Dedicated account, protected installation, independent watchdog, and enrollment |
 | [`reference/deployment.md`](reference/deployment.md) | Provider-neutral, recoverable production delivery |
 | [`reference/evidence-providers.md`](reference/evidence-providers.md) | Commit-bound external evidence and provider contracts |
 | [`reference/compatibility.md`](reference/compatibility.md) | Tested, declared, untested, and unsupported platform/runtime positions |

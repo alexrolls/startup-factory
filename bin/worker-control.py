@@ -36,6 +36,7 @@ from startup_factory_cli.config_values import (  # noqa: E402
     parse_config_bytes,
     value_for,
 )
+from execution_descriptor import ExecutionDescriptorError, execution_version
 
 
 CONTROL_ID = re.compile(r"control-[0-9a-f]{32}")
@@ -804,11 +805,15 @@ def bound_task_state(
     execution_path = workspace / "executions" / f"{key}.json"
     execution_raw = regular_bytes(execution_path, "task execution", 1024 * 1024)
     execution_record = strict_json(execution_raw, "task execution")
+    try:
+        version = execution_version(execution_record)
+    except ExecutionDescriptorError as exc:
+        raise ControlError(str(exc)) from exc
     role = execution_record.get("role")
     attempt = execution_record.get("attempt")
     worktree = execution_record.get("worktree")
     expected_execution = {
-        "schemaVersion": 1,
+        "schemaVersion": version,
         "featureId": feature,
         "taskId": task_id,
         "taskKey": key,

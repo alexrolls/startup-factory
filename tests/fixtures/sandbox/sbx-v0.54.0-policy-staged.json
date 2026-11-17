@@ -1,0 +1,126 @@
+{
+  "rules": [
+    {
+      "actions": [
+        "fs:mount:read"
+      ],
+      "applies_to": "all",
+      "decision": "allow",
+      "editable": false,
+      "id": "default-fs-read-allow-all",
+      "layer": "local",
+      "name": "default-fs-read-allow-all",
+      "origin": "local",
+      "policy_id": "local-policy",
+      "provenance": {
+        "created_via": "default"
+      },
+      "resource_type": "filesystem:read",
+      "resources": [
+        "**"
+      ],
+      "scope": "global",
+      "status": "active"
+    },
+    {
+      "actions": [
+        "fs:mount:read",
+        "fs:mount:write"
+      ],
+      "applies_to": "all",
+      "decision": "allow",
+      "editable": false,
+      "id": "default-fs-write-allow-all",
+      "layer": "local",
+      "name": "default-fs-write-allow-all",
+      "origin": "local",
+      "policy_id": "local-policy",
+      "provenance": {
+        "created_via": "default"
+      },
+      "resource_type": "filesystem:write",
+      "resources": [
+        "**"
+      ],
+      "scope": "global",
+      "status": "active"
+    },
+    {
+      "actions": [
+        "net:connect:tcp",
+        "net:connect:udp"
+      ],
+      "applies_to": "sandbox:sfq-policy-20261117-27f520c1",
+      "decision": "deny",
+      "editable": true,
+      "id": "c430aa5c-7159-44ac-a5dd-52980ebddc50",
+      "layer": "local",
+      "name": "c430aa5c-7159-44ac-a5dd-52980ebddc50",
+      "origin": "scoped",
+      "policy_id": "48fd2133-6feb-48a2-8561-ef1b236a1c04",
+      "provenance": {
+        "created_via": "added"
+      },
+      "resource_type": "network",
+      "resources": [
+        "**"
+      ],
+      "sandbox_id": "sfq-policy-20261117-27f520c1",
+      "scope": "sandbox:sfq-policy-20261117-27f520c1",
+      "status": "active"
+    },
+    {
+      "actions": [
+        "http:request:post"
+      ],
+      "applies_to": "sandbox:sfq-policy-20261117-27f520c1",
+      "decision": "allow",
+      "editable": true,
+      "http_targets": [
+        {
+          "host": "api.openai.com:443",
+          "path": "/v1/responses"
+        }
+      ],
+      "id": "55bd4dfb-e7ad-4399-a797-7416bad31e02",
+      "layer": "local",
+      "methods": [
+        "POST"
+      ],
+      "name": "55bd4dfb-e7ad-4399-a797-7416bad31e02",
+      "origin": "scoped",
+      "policy_id": "48fd2133-6feb-48a2-8561-ef1b236a1c04",
+      "provenance": {
+        "created_via": "added"
+      },
+      "resource_type": "http",
+      "resources": [
+        "api.openai.com:443"
+      ],
+      "sandbox_id": "sfq-policy-20261117-27f520c1",
+      "scope": "sandbox:sfq-policy-20261117-27f520c1",
+      "status": "active"
+    },
+    {
+      "actions": [
+        "net:connect:tcp",
+        "net:connect:udp"
+      ],
+      "applies_to": "all",
+      "decision": "deny",
+      "editable": false,
+      "id": "default-deny-all",
+      "layer": "local",
+      "name": "default-deny-all",
+      "origin": "local",
+      "policy_name": "default-deny-all",
+      "reason": "Implicit fallback when no applicable policy decides the request.",
+      "resource_type": "network",
+      "resources": [
+        "**"
+      ],
+      "scope": "global",
+      "status": "active"
+    }
+  ]
+}

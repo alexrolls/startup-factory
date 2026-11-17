@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://startup-factory.local/schemas/docker-sandbox-profile-v1.json",
+  "title": "Startup Factory protected Docker Sandbox profile v1",
+  "description": "Data contract only. Digests bind configuration; they never establish enrollment, qualification, or permission to launch.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "backend", "protocolVersion", "controllerUid", "sbxPath",
+    "sbxSha256", "namespace", "image", "guestWorkdir", "limits", "policyDigest",
+    "qualificationDigest"
+  ],
+  "properties": {
+    "schemaVersion": {"type": "integer", "const": 1},
+    "backend": {"const": "docker-sandboxes"},
+    "protocolVersion": {"type": "integer", "const": 1},
+    "controllerUid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+    "sbxPath": {
+      "type": "string", "minLength": 2, "maxLength": 4096,
+      "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*[\\\\\u0000-\u001f\u007f])/.*[^/]$",
+      "description": "Normalized absolute POSIX path. Loading additionally verifies no symlinks, root ownership, protected ancestors, executable permission, and the SHA-256."
+    },
+    "sbxSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "namespace": {
+      "type": "string", "maxLength": 20, "pattern": "^sf-[a-z0-9]+(?:-[a-z0-9]+)*$",
+      "not": {"const": "sf-qualification"}
+    },
+    "image": {
+      "type": "string", "maxLength": 512,
+      "pattern": "^(?=[^/]*[a-z])[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+(?::[1-9][0-9]{0,4})?/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*@sha256:[0-9a-f]{64}$",
+      "description": "Fully qualified OCI registry/repository pin without a tag, URL, credentials, or implicit default registry. Python validation additionally checks canonical registry host and port bounds."
+    },
+    "guestWorkdir": {"const": "/workspace/project"},
+    "limits": {
+      "type": "object", "additionalProperties": false,
+      "required": ["cpus", "memoryMiB", "rootDiskMiB", "dockerDiskMiB", "wallSeconds", "maxOutputBytes"],
+      "properties": {
+        "cpus": {"type": "integer", "minimum": 1, "maximum": 64},
+        "memoryMiB": {"type": "integer", "minimum": 512, "maximum": 262144},
+        "rootDiskMiB": {"type": "integer", "minimum": 512, "maximum": 1048576},
+        "dockerDiskMiB": {"type": "integer", "minimum": 512, "maximum": 1048576},
+        "wallSeconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+        "maxOutputBytes": {"type": "integer", "minimum": 1, "maximum": 16777216}
+      }
+    },
+    "policyDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "qualificationDigest": {
+      "type": "string", "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "Binding to separately authenticated evidence. A syntactically valid digest is never proof or permission."
+    }
+  }
+}

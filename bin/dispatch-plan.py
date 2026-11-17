@@ -15,6 +15,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 from delivery_profile import assess_review_diff, assess_task, repository_root
+from execution_descriptor import ExecutionDescriptorError, execution_version
 from product_acceptance import ProductAcceptancePending, evaluate as evaluate_product_acceptance, validate_request
 from review_evidence import EvidenceError, request_binding, strip_publication_trailer
 from task_metadata import (
@@ -194,6 +195,10 @@ def execution_identity(
     except FileNotFoundError:
         return None
     record = strict_object(body, "task execution record")
+    try:
+        version = execution_version(record)
+    except ExecutionDescriptorError as exc:
+        raise RuntimeError(str(exc)) from exc
     role = record.get("role")
     attempt = record.get("attempt")
     if not isinstance(role, str) or not re.fullmatch(r"[a-z0-9-]{1,63}", role):
@@ -201,7 +206,7 @@ def execution_identity(
     if type(attempt) is not int or attempt < 1:
         raise RuntimeError("task execution record has an invalid attempt")
     expected = {
-        "schemaVersion": 1,
+        "schemaVersion": version,
         "featureId": feature_id,
         "taskId": task_id,
         "taskKey": key,
@@ -324,7 +329,10 @@ def main() -> None:
     parser.add_argument("--max-active", type=int)
     parser.add_argument("--ignored-labels-json", default="[]")
     parser.add_argument("--task", action="append", dest="task_scope", default=[])
+    parser.add_argument("--sandbox-jobs", action="store_true", help="emit explicit single-task gate job assignments")
     args = parser.parse_args()
+    def job_assignments(ids):
+        return json.dumps(list(ids), separators=(",", ":")) if args.sandbox_jobs else "|".join(ids)
 
     skill = Path(args.skill)
     workdir = Path(args.workdir)
@@ -747,6 +755,7 @@ def main() -> None:
     # commentable, so the feature-level verdict lives on its deterministic
     # anchor task and is routed here like every other gate queue.
     product_closeout_role = None
+    product_anchor = None
     product_closeout_detail = None
     product_request = workdir / "product-acceptance-request.json"
     all_terminal = bool(evidence_tasks) and all(
@@ -772,6 +781,7 @@ def main() -> None:
                 if not isinstance(request, dict):
                     raise ProductAcceptancePending("request must be a JSON object")
                 validate_request(request, payload)
+                product_anchor = str(request["anchorTaskId"])
                 try:
                     evaluate_product_acceptance(
                         payload,
@@ -820,7 +830,7 @@ def main() -> None:
             "principal-architect",
             "Dispatch queue - design gates: %s; architecture reviews: %s. Drain every item and exit."
             % (", ".join(design_queue) or "none", ", ".join(selected_architecture) or "none"),
-            "|".join(selected_architecture),
+            job_assignments((design_queue + selected_architecture) if args.sandbox_jobs else selected_architecture),
         )
     if sceptical_design_queue or selected_sceptical:
         emit(
@@ -831,7 +841,7 @@ def main() -> None:
                 ", ".join(sceptical_design_queue) or "none",
                 ", ".join(selected_sceptical) or "none",
             ),
-            "|".join(selected_sceptical),
+            job_assignments((sceptical_design_queue + selected_sceptical) if args.sandbox_jobs else selected_sceptical),
         )
     if selected_security:
         emit(
@@ -839,7 +849,7 @@ def main() -> None:
             protocol_security_reviewer,
             "Dispatch queue - independent security reviews: %s. Drain every item and exit."
             % ", ".join(selected_security),
-            "|".join(selected_security),
+            job_assignments(selected_security),
         )
     if selected_qa:
         emit(
@@ -847,7 +857,7 @@ def main() -> None:
             protocol_qa or "qa",
             "Dispatch queue - required specialist QA reviews: %s. Drain every item and exit."
             % ", ".join(selected_qa),
-            "|".join(selected_qa),
+            job_assignments(selected_qa),
         )
     if selected_team_lead:
         emit(
@@ -855,7 +865,7 @@ def main() -> None:
             "team-lead",
             "Dispatch queue - final quality reviews: %s. Drain every item and exit."
             % ", ".join(selected_team_lead),
-            "|".join(selected_team_lead),
+            job_assignments(selected_team_lead),
         )
     if merge_queue:
         emit(
@@ -863,10 +873,11 @@ def main() -> None:
             "integrator",
             "Dispatch queue - all mandatory and declared supporting review gates approved; integrate in dependency order: %s."
             % ", ".join(merge_queue),
-            "|".join(merge_queue),
+            job_assignments(merge_queue),
         )
     if product_closeout_role and product_closeout_detail:
-        emit("launch", product_closeout_role, product_closeout_detail)
+        emit("launch", product_closeout_role, product_closeout_detail,
+             job_assignments([product_anchor] if product_anchor else []) if args.sandbox_jobs else "")
 
     # Relaunch task-scoped workers that own active implementation or rework.
     for task in tasks:
@@ -1138,7 +1149,12 @@ def main() -> None:
                 "; human resumed directly into a non-queued status: %s "
                 "(manual takeover; do not claim or launch)" % ", ".join(manual_takeovers)
             )
-        emit("launch", "team-lead", detail + ". One supervision pass, then exit.")
+        anchors = [*resume_pending, *missing_gate, *constrained, *anomalies]
+        # Blocked/manual takeover tasks never authorize a guest. Their impact
+        # remains visible in the deterministic dispatcher diagnostic above.
+        selected_anchor = next((str(t) for t in anchors if str(t) in {str(row['taskId']) for row in tasks} and str(t) not in set(blocked_tasks + manual_takeovers)), "")
+        emit("launch", "team-lead", detail + ". One supervision pass, then exit.",
+             job_assignments([selected_anchor] if selected_anchor else []) if args.sandbox_jobs else "")
 
 
 if __name__ == "__main__":

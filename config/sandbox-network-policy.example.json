@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "namespace": "sf-example",
+  "preset": "deny-all",
+  "provider": "openai",
+  "rules": [
+    {"host": "api.openai.com:443", "method": "POST", "path": "/v1/responses"}
+  ]
+}

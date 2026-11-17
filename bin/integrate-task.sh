@@ -256,11 +256,14 @@ assert_task_not_held
 
 # Rebuild the immutable execution identity rather than trusting arbitrary fields
 # copied from the producer-owned transaction.
-execution_fields="$(python3 - "$execution" "$workspace" "$team" "$feature" "$task" "$role" "$attempt" "$key" <<'PY'
+execution_fields="$(python3 - "$execution" "$workspace" "$team" "$feature" "$task" "$role" "$attempt" "$key" "$SKILL_DIR" "$repo" <<'PY'
 import hashlib, json, os, re, stat, sys
 from pathlib import Path
 
-path_raw, workspace_raw, team, feature, task, role, attempt_raw, key = sys.argv[1:]
+path_raw, workspace_raw, team, feature, task, role, attempt_raw, key, skill_raw, repo_raw = sys.argv[1:]
+sys.path[:0] = [str(Path(skill_raw) / "bin"), str(Path(skill_raw) / "src")]
+from execution_descriptor import expected_execution_identity
+from sandbox_acceptance import verify_configured_execution
 path, workspace, attempt = Path(path_raw), Path(workspace_raw), int(attempt_raw)
 try: mode=path.lstat().st_mode
 except OSError as exc: raise SystemExit("integrate-task: no execution record for %s: %s" % (task, exc))
@@ -270,22 +273,12 @@ try: path.resolve().relative_to(workspace.resolve())
 except (OSError, ValueError): raise SystemExit("integrate-task: execution record escapes team workspace")
 try: execution=json.loads(path.read_text())
 except (OSError, ValueError) as exc: raise SystemExit("integrate-task: invalid execution record: %s" % exc)
-expected = {
-    "schemaVersion": 1,
-    "featureId": feature,
-    "taskId": task,
-    "taskKey": key,
-    "attempt": attempt,
-    "role": role,
-    "branch": "agent-task/" + team + "/" + key,
-    "worktree": str(workspace / "worktrees" / ("%s#%s-%s" % (role, attempt, key))),
-    "packetPath": str(workspace / "artifacts" / key / ("attempt-%s" % attempt) / "task-packet.md"),
-    "packetJsonPath": str(workspace / "artifacts" / key / ("attempt-%s" % attempt) / "task-packet.json"),
-    "reportPath": str(workspace / "artifacts" / key / ("attempt-%s" % attempt) / "task-report.md"),
-}
+expected = expected_execution_identity(execution, workspace=workspace, team=team,
+    feature=feature, task=task, key=key, role=role, attempt=attempt)
 for name, value in expected.items():
     if execution.get(name) != value:
         raise SystemExit("integrate-task: execution record %s does not match invocation" % name)
+verify_configured_execution(execution, Path(repo_raw), workspace, team, feature, task, Path(skill_raw))
 canonical=json.dumps(expected, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 print(expected["branch"])
 print(expected["worktree"])
@@ -323,7 +316,20 @@ if [ -e "$transaction" ]; then
 fi
 
 run_validation() {
-  local where="$1" changed_file="$2" command value
+  local where="$1" changed_file="$2" command value backend candidate_tree
+  backend="$(read_key AGENT_EXECUTION_BACKEND)"
+  if [ "$backend" = docker-sandboxes ]; then
+    candidate_tree="$(git_unprivileged -C "$where" write-tree)" || return $?
+    # The exact current index covers both a committed task checkpoint and an
+    # uncommitted feature merge. Never validate the stale feature HEAD.
+    git_unprivileged -C "$repo" diff --name-only -z --no-ext-diff --no-textconv \
+      "$review_base_commit" "$task_branch_head" -- | \
+      python3 -I -B "$SKILL_DIR/bin/sandbox-validation.py" \
+        --repo "$repo" --workspace "$workspace" --team "$team" --feature "$feature" \
+        --role validator --tree "$candidate_tree" --config "$CONFIG" --changed-files -
+    return $?
+  fi
+  case "$backend" in ''|protected-runner) ;; *) echo "integrate-task: unsupported validation backend" >&2; return 1 ;; esac
   value="$(read_key VALIDATE_SCRIPT)"
   if [ -n "$value" ]; then
     local changed_files=() item

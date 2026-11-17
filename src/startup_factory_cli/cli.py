@@ -28,6 +28,7 @@ from .integration_packs import (
     preview_pack,
 )
 from .readiness import MODES, diagnose, initialize
+from .sandbox_qualification import QualificationReport, qualify
 
 
 AGENTS = ("codex", "aider", "claude", "claude-code", "deepseek-harness")
@@ -119,6 +120,16 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor", help="inspect offline readiness without mutation")
     _target_arguments(doctor)
     doctor.add_argument("--mode", choices=MODES, required=True)
+    sandbox = subparsers.add_parser(
+        "sandbox", help="inspect sandbox qualification requirements without enabling execution"
+    )
+    sandbox_commands = sandbox.add_subparsers(dest="sandbox_command", required=True)
+    sandbox_qualify = sandbox_commands.add_parser(
+        "qualify", help="report unproven Docker Sandbox gates without executing Docker"
+    )
+    sandbox_qualify.add_argument(
+        "--json", action="store_true", help="emit one machine-readable JSON report"
+    )
     integration_pack = subparsers.add_parser(
         "integration-pack",
         help="list, validate, preview, apply, and diagnose data-only integration packs",
@@ -242,6 +253,23 @@ def _print_doctor_report(report: object, *, as_json: bool) -> None:
         print(f"  [{check['status']}] {check['level']} {check['id']}: {check['message']}")
         if "remediation" in check:
             print(f"    {check['remediation']}")
+
+
+def _print_sandbox_qualification_report(report: QualificationReport, *, as_json: bool) -> None:
+    data = report.as_dict()
+    if as_json:
+        print(json.dumps(data, sort_keys=True, separators=(",", ":")))
+        return
+    print("Docker Sandboxes qualification: needs validation (offline)")
+    print(data["message"])
+    runtime = data["runtime"]
+    if runtime["detected"]:
+        print(f"  Runtime location: {runtime['path']} (not executed or trust-verified)")
+    else:
+        print("  Runtime location: no executable sbx detected; no live checks were attempted.")
+    for check in data["checks"]:
+        print(f"  [{check['status']}] {check['id']}: {check['title']}")
+        print(f"    {check['remediation']}")
 
 
 def _pack_catalog(target: Path, project: Path) -> tuple[IntegrationPack, ...]:
@@ -371,6 +399,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(__version__)
         return 0
+    if args.command == "sandbox":
+        report = qualify()
+        _print_sandbox_qualification_report(report, as_json=bool(args.json))
+        return 0 if report.ready else 1
     json_output = bool(args.json)
     try:
         target = resolve_target(

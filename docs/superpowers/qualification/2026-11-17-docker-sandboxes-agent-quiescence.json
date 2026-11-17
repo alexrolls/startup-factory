@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-11-17",
+  "scope": "operator-live-exporter-fixture",
+  "qualified": false,
+  "autonomousReady": false,
+  "productionBackendAllowed": false,
+  "runtimeVersion": "0.54.0",
+  "runtimeSha256": "d811a4366d81420b0b060972a51216d450c7634af62b71f0985d04cd69e3d59a",
+  "namespace": "sf-qualification",
+  "image": "docker.io/sbx/shell@sha256:89ed5d63def6bfb2373d408e3ab6ad55aa5c010f884a182a78299fcf85ea42d1",
+  "sandboxName": "sfq-export-20261117-a0de71cf",
+  "sandboxId": "edfe3ac9-aa61-4eb3-9b42-714eb1bd27a0",
+  "createdAt": "2026-11-17T12:44:42+01:00",
+  "resources": {
+    "cpus": 1,
+    "memoryMiB": 512,
+    "rootDiskMiB": 2048,
+    "dockerDiskMiB": 512,
+    "hostMounts": [],
+    "runtimeMounts": [],
+    "mcpServers": [],
+    "skills": "off",
+    "network": "explicit deny all"
+  },
+  "input": {
+    "fixtureFiles": 1,
+    "projectSourceIncluded": false,
+    "credentialsIncluded": false,
+    "helpers": {
+      "sandbox_source.py": "sha256:aab224b906211a3d47b89706e8c32c4d6dbf98407378edc9ca4f99d29fe5d8f2",
+      "sandbox_export.py": "sha256:f955886bd0900f3dbe2ba30d70c54ca7e601b0e46c8aba26887c2cef3b996483"
+    }
+  },
+  "observations": {
+    "guestAccountName": "sf-agent",
+    "guestAccountUid": 2000,
+    "guestAccountGid": 2000,
+    "lockedGuestPasswdAndGroupVerified": true,
+    "pidfdOpenAvailable": true,
+    "pidfdSendSignalAvailable": true,
+    "setsidOrphanUid": 2000,
+    "orphanParentDifferentFromLauncher": true,
+    "orphanSessionIdEqualsPid": true,
+    "twoCleanWorkerProcessCensuses": true,
+    "liveWorkerProcessesAfterRetirement": [],
+    "orphanPulseStopped": true,
+    "collectorUid": 0,
+    "collectorPreserved": true,
+    "imageInitUid": 1000,
+    "imageInitPreserved": true,
+    "exactManifestBodyAndResultingTreeVerified": true,
+    "exportBytes": 567,
+    "symlinkExportRejected": true,
+    "globalPolicyUnchanged": true,
+    "globalPolicyCanonicalSha256": "sha256:b889c5e3f4f61de0ea5d774e9b488c04dafff9299d3a4ebab92f812cd3c89c1d"
+  },
+  "cleanup": {
+    "exactIdentityCheckedBeforeStopAndRemove": true,
+    "fixtureRemoved": true,
+    "namespaceInventoryEmpty": true,
+    "scopedDaemonStopped": true
+  },
+  "limitations": [
+    "This operator fixture is not a root-issued production enrollment receipt.",
+    "An earlier UID1000 trial exited 137 because the pinned image itself uses UID1000 for infrastructure; its VM was removed and scoped daemon stopped. The implementation now assigns the worker the distinct locked UID2000 identity.",
+    "No real model CLI, model credential, provider quota, dedicated host account or complete production workflow was qualified by this probe."
+  ]
+}

@@ -1,0 +1,99 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-11-17",
+  "scope": "main-based-software-candidate-validation",
+  "reportKind": "diagnostic-only",
+  "qualified": false,
+  "autonomousReady": false,
+  "productionBackendAllowed": false,
+  "baseCommit": "7ca7e356df85976441cabc512b907f464ceb2611",
+  "testedTreeBeforeThisDiagnostic": "cd6e16d0fdd80d0efae5dfd9bbfdb8c875dc97c1",
+  "testEnvironment": {
+    "runtime": "offline Docker Engine container",
+    "imageId": "sha256:dcc5531e97840b9b5e794f2814476b21571c5124a3fca2267d73041f56e7580e",
+    "python": "3.12",
+    "uid": 1000,
+    "readOnlyRoot": true,
+    "network": "none",
+    "capabilities": "none",
+    "noNewPrivileges": true,
+    "pidsLimit": 128,
+    "memoryMiB": 768,
+    "cpus": 1,
+    "initReaper": true,
+    "scratchMiB": 512,
+    "hostGitHistoryIncluded": false,
+    "wallSeconds": 600
+  },
+  "candidateResults": {
+    "packagingAndSandboxBoundaryTests": {
+      "run": 348,
+      "passed": 347,
+      "skipped": 1,
+      "skipReason": "Existing installer test has no suitable protected system runner fixture in this container."
+    },
+    "runtimeAndNativeBrokerTests": {
+      "run": 214,
+      "passed": 214,
+      "skipped": 0
+    },
+    "totalRun": 562,
+    "totalPassed": 561,
+    "totalSkipped": 1,
+    "bundleBuiltTwiceByteIdentical": true,
+    "syntheticSnapshotBundleSha256": "101ca72db9ec7f32885fb6c8729c1979a33ad9b1d2c0a91349c2ee61ee4b43a9"
+  },
+  "additionalRegressionRuns": {
+    "scope": "implementation workspace before clean-main assembly",
+    "passedShellSuites": [
+      "tests/dispatch-test.sh",
+      "tests/launcher-test.sh",
+      "tests/task-runtime-test.sh",
+      "tests/parallel-integration-test.sh"
+    ],
+    "existingBrokerReviewRecoveryPythonTestsPassed": 175,
+    "notes": [
+      "The launcher suite requires the normal orphan reaper; an initial container without --init conservatively refused process-group retirement. The unchanged lifecycle proof was retained, and the suite passed with the init reaper.",
+      "An initial task-runtime run found that the new guard replaced the sanitized duplicate-key diagnostic. Moving it after existing structural/signature verification preserved the diagnostic and the complete suite passed."
+    ]
+  },
+  "liveDiagnosticEvidence": [
+    "2026-11-17-docker-sandboxes-agent-quiescence.json",
+    "2026-11-17-docker-sandboxes-model-policy.json",
+    "2026-11-17-docker-sandboxes-startup-factory-smoke.json"
+  ],
+  "remainingActivationBlockers": [
+    "Administrator-provisioned dedicated macOS account, private daemon endpoints and quota volume with reviewed root installation.",
+    "Actual UID2000 model CLI, proxy sentinel and CA, no global credential fallback and independently enforced hard quota evidence.",
+    "Separate independent pre-enrollment fixture for real macOS broker, watchdog, daemon queue and storage fault recovery; complete fixture command is not supplied.",
+    "Current root-reviewed evidence and enrollment matching the exact deployed bytes."
+  ],
+  "authorization": "This report is not enrollment or containment evidence. Test success, example configuration and the earlier personal-account probes grant no production authority.",
+  "packageMetadataFollowup": {
+    "projectVersion": "0.3.0",
+    "reason": "The base 0.2.3 version is published; keep this feature candidate unreleased.",
+    "run": 94,
+    "passed": 93,
+    "skipped": 1,
+    "bundleBuiltTwiceByteIdentical": true,
+    "syntheticSnapshotBundleSha256": "3e1c6d5e419d5563eacb2a4b3c9f6fb684d6d4cec31af3c3111fbb58525bd2d2",
+    "releaseTagCreated": false
+  },
+  "ciIntegrationFollowup": {
+    "protectedReleaseSnapshot": "New receipt dependencies included in both release and PM supervisor digest-pinned snapshots.",
+    "pmSupervisor": "Docker backend validates exact protected deployment/enrollment instead of requiring a legacy runner.",
+    "runtimeVersion": "0.3.0",
+    "fullPackagingWithFixtureRootOverrideUnset": {
+      "run": 378,
+      "passed": 377,
+      "skipped": 1
+    },
+    "runtimeAndReleaseFollowupTestsPassed": 199,
+    "deploymentShellSuite": "ALL PASS",
+    "fixturePortability": {
+      "uid1001gid1001LongCheckoutAndTmpdirOverridesUnset": 82,
+      "uid1001gid1002JobTestsPassed": 23
+    },
+    "productionChecksWeakened": false
+  }
+}

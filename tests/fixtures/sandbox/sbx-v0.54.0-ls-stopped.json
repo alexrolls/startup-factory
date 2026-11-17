@@ -1,0 +1,13 @@
+[
+  {
+    "name": "sfq-meta-d-719c0d23",
+    "id": "b1d36d36-49e9-402a-b488-7ecabe477a93",
+    "agent": "shell",
+    "status": "stopped",
+    "last_used_at": "2026-11-17T00:01:13.013655Z",
+    "cpus": 1,
+    "memory": "512m",
+    "memory_mib": 512,
+    "created_at": "2026-11-17T00:01:11Z"
+  }
+]

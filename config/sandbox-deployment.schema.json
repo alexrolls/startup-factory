@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://startup-factory.local/schemas/docker-sandbox-deployment-v1.json",
+  "title": "Root-managed dedicated Docker Sandbox deployment",
+  "description": "Static installation data only. Root receipt plus semantic live evidence and current anchors remain mandatory; this document never enables execution.",
+  "type": "object", "additionalProperties": false,
+  "required": ["schemaVersion", "backend", "namespace", "profilePath", "profileBasisDigest", "receiptPath", "registryRoot", "nativeJournalRoot", "socketPath", "jobRoot", "evidenceRoot", "controllerUid", "controllerGid", "accountName", "accountHome", "bundleRoot", "bundleDigest", "programs", "projects", "maxActiveJobs", "maxQueuedJobs", "jobRequestMaxBytes", "storage", "watchdogSocketPath", "watchdogRoot", "runtimeRoot", "runtimeDigest", "modelCredentials", "credentialRoot", "networkPolicyPath", "lifecycleRoot"],
+  "properties": {
+    "schemaVersion": {"type": "integer", "const": 1},
+    "backend": {"const": "docker-sandboxes"},
+    "namespace": {"type": "string", "maxLength": 20, "pattern": "^sf-[a-z0-9]+(?:-[a-z0-9]+)*$", "not": {"const": "sf-qualification"}},
+    "profilePath": {"$ref": "#/$defs/path"}, "receiptPath": {"$ref": "#/$defs/path"},
+    "profileBasisDigest": {"$ref": "#/$defs/digest"}, "bundleDigest": {"$ref": "#/$defs/digest"},
+    "registryRoot": {"$ref": "#/$defs/path"}, "nativeJournalRoot": {"$ref": "#/$defs/path"},
+    "socketPath": {"$ref": "#/$defs/path"}, "jobRoot": {"$ref": "#/$defs/path"},
+    "evidenceRoot": {"$ref": "#/$defs/path"}, "accountHome": {"$ref": "#/$defs/path"},
+    "bundleRoot": {"$ref": "#/$defs/path"}, "watchdogSocketPath": {"$ref": "#/$defs/path"},
+    "runtimeRoot": {"$ref": "#/$defs/path"}, "runtimeDigest": {"$ref": "#/$defs/digest"},
+    "credentialRoot": {"$ref": "#/$defs/path"},
+    "networkPolicyPath": {"$ref": "#/$defs/path"},
+    "lifecycleRoot": {"$ref": "#/$defs/path"},
+    "watchdogRoot": {"$ref": "#/$defs/path"},
+    "controllerUid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+    "controllerGid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+    "accountName": {"type": "string", "pattern": "^_sf_[a-z][a-z0-9_]{0,23}$"},
+    "programs": {
+      "type": "object", "additionalProperties": false,
+      "required": ["python", "gate", "lifecycleHelper", "runner", "watchdog"],
+      "properties": {"python": {"$ref": "#/$defs/pin"}, "gate": {"$ref": "#/$defs/pin"}, "lifecycleHelper": {"$ref": "#/$defs/pin"}, "runner": {"$ref": "#/$defs/pin"}, "watchdog": {"$ref": "#/$defs/pin"}}
+    },
+    "projects": {"type": "array", "minItems": 1, "maxItems": 128, "items": {
+      "type": "object", "additionalProperties": false, "required": ["projectId", "repository", "workspaceRoot"],
+      "properties": {"projectId": {"$ref": "#/$defs/digest"}, "repository": {"$ref": "#/$defs/path"}, "workspaceRoot": {"$ref": "#/$defs/path"}}
+    }},
+    "maxActiveJobs": {"type": "integer", "minimum": 1, "maximum": 32},
+    "maxQueuedJobs": {"type": "integer", "minimum": 1, "maximum": 1024},
+    "jobRequestMaxBytes": {"type": "integer", "minimum": 1024, "maximum": 4194304},
+    "modelCredentials": {"type": "object", "additionalProperties": false, "required": ["providers", "roles"], "properties": {
+      "providers": {"type": "object", "additionalProperties": false, "properties": {"openai": {"type": "object", "additionalProperties": false, "required": ["sourceFile"], "properties": {"sourceFile": {"$ref": "#/$defs/path"}}}}},
+      "roles": {"type": "object", "maxProperties": 128, "propertyNames": {"pattern": "^[a-z0-9][a-z0-9-]{1,79}$"}, "additionalProperties": {"const": "openai"}}
+    }},
+    "storage": {"type": "object", "additionalProperties": false, "required": ["mountPoint", "volumeUuid", "quotaBytes", "minimumFreeBytes"],
+      "properties": {"mountPoint": {"$ref": "#/$defs/path"}, "volumeUuid": {"type": "string", "pattern": "^[A-Fa-f0-9]{8}(?:-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12}$"}, "quotaBytes": {"type": "integer", "minimum": 1073741824, "maximum": 1099511627776}, "minimumFreeBytes": {"type": "integer", "minimum": 1073741824, "maximum": 1099511627776}}}
+  },
+  "$defs": {
+    "path": {"type": "string", "minLength": 2, "maxLength": 4096, "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*[\\\\\u0000-\u001f\u007f])/.*[^/]$"},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "pin": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {"path": {"$ref": "#/$defs/path"}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}}
+  }
+}

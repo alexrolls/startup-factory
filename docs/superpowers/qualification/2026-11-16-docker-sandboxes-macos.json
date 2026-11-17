@@ -1,0 +1,225 @@
+{
+  "schemaVersion": 1,
+  "reportKind": "manual-runtime-qualification-observations",
+  "date": "2026-11-16",
+  "backend": "docker-sandboxes",
+  "qualified": false,
+  "autonomousReady": false,
+  "containmentChecksExecuted": true,
+  "allRequiredChecksPassed": false,
+  "platform": {
+    "system": "Darwin",
+    "architecture": "arm64",
+    "productVersion": "26.5.1"
+  },
+  "existingPlugin": {
+    "interface": "docker sandbox",
+    "clientVersion": "v0.12.0",
+    "serverVersion": "unavailable",
+    "selectedProfileSupported": false
+  },
+  "candidateArtifact": {
+    "source": "https://github.com/docker/sbx-releases/releases/download/v0.54.0/DockerSandboxes-darwin.dmg",
+    "expectedSha256": "670a8a4e1f81496463f1c38e4da351903168c1dacdf101e61036517588f89255",
+    "observedSha256": "670a8a4e1f81496463f1c38e4da351903168c1dacdf101e61036517588f89255",
+    "checksumSource": "https://raw.githubusercontent.com/docker/homebrew-tap/main/Casks/sbx.rb",
+    "dmgCodesignVerified": true,
+    "gatekeeperAccepted": true,
+    "gatekeeperSource": "Notarized Developer ID",
+    "executableCodesignVerified": true,
+    "executableSha256": "d811a4366d81420b0b060972a51216d450c7634af62b71f0985d04cd69e3d59a",
+    "cliVersionOutput": "sbx version v0.54.0 4bec4a5ce093466e54b034146965b143d065dc09",
+    "systemInstallationChanged": false
+  },
+  "namespaceProbe": {
+    "appName": "sf-qualification",
+    "interactiveLoginAttempted": true,
+    "initialDeviceLoginOutcome": "context deadline exceeded",
+    "retryDeviceLoginOutcome": "signed in",
+    "authenticationState": "observed-success",
+    "governance": "not active; local policies"
+  },
+  "daemonProbe": {
+    "appName": "sf-qualification",
+    "state": "stopped",
+    "version": "v0.54.0",
+    "revision": "4bec4a5ce093466e54b034146965b143d065dc09",
+    "apiVersion": "0.52.0",
+    "startupPolicyRequested": "deny-all",
+    "defaultDenyRuleObserved": true,
+    "liveNetworkEnforcementQualified": false,
+    "fixtureVmsCreated": 5,
+    "fixtureVmsRemoved": 5,
+    "remainingQualificationVms": 0,
+    "daemonStoppedAfterCleanup": true,
+    "signInPreserved": true
+  },
+  "integrationSettingsProbe": {
+    "sshForwardingDisableAcknowledged": true,
+    "sshForwardingRestartCompleted": true,
+    "hostBrowserDisableAcknowledged": true,
+    "clipboardEffectiveSettingVerified": true,
+    "effectiveSettings": {
+      "ssh.agentForwardingEnabled": false,
+      "browser.enabled": false,
+      "clipboard.imagePaste": false,
+      "sandbox.fuse": false
+    },
+    "administratorSettingsUnavailableBeforeLogin": true,
+    "administratorSettingsAvailableAfterLogin": true
+  },
+  "vmObservations": {
+    "imageDigest": "sha256:89ed5d63def6bfb2373d408e3ab6ad55aa5c010f884a182a78299fcf85ea42d1",
+    "secondCreationPinnedToDigest": true,
+    "hostMounts": [],
+    "runtimeMounts": [],
+    "mcpMode": "static",
+    "mcpServers": [],
+    "cpusPerVm": 1,
+    "memoryPerVm": "512m",
+    "guestRootFilesystemBytes": 2040373248,
+    "guestDockerFilesystemBytes": 510873600,
+    "capacityIsNotTotalHostStorageQualification": true,
+    "privateFileCanariesSeparate": true,
+    "dummyHostCanaryVisibleToGuestRoot": false,
+    "dummyHostCanaryUnchangedAndRemoved": true,
+    "filesystemCheckScope": "Direct access to fixed dummy host and guest paths; not exhaustive filesystem containment."
+  },
+  "execChannelProbe": {
+    "realDockerExec": true,
+    "nonTTY": true,
+    "strictFramesReceived": 4,
+    "binaryEchoBytes": 16384,
+    "stderrSeparated": true,
+    "acknowledgedGuestExitStatus": 7,
+    "slowReaderAndCancellationQualified": false
+  },
+  "reusableOperatorProbe": {
+    "entryPoint": "bin/sandbox-exec-probe.py",
+    "scope": "exec-channel-only",
+    "passedAgainstRealVm": true,
+    "runtimeDigestPinned": true,
+    "fixtureSha256": "3fca397ca12fb0f7f0962c91ba1bd0e64fd47526e8731d7ad74e389a5949d57d",
+    "metadataInspections": 3,
+    "observedStates": [
+      "stopped",
+      "running",
+      "running"
+    ],
+    "strictFramesReceived": 4,
+    "binaryEchoBytes": 16384,
+    "acknowledgedExitStatus": 7,
+    "qualified": false,
+    "autonomousReady": false,
+    "productionBackendAllowed": false,
+    "informationalUptimeFieldObservedOnlyWhileRunning": true
+  },
+  "identityAddressingProbe": {
+    "immutableIdsReportedByInspect": true,
+    "inspectByUuidAccepted": false,
+    "inspectByUuidExitCode": 1,
+    "execByUuidAccepted": false,
+    "execByUuidExitCode": 125,
+    "observedError": "sandbox not found",
+    "productionRequirement": "Qualified atomic identity targeting or an enrolled dedicated-account exclusive-controller namespace with permanent non-reuse of names and protected identity records.",
+    "dedicatedAccountExclusiveControllerQualified": false
+  },
+  "cleanupObservations": {
+    "identityCheckedBeforeCleanup": true,
+    "explicitStoppedStateObserved": true,
+    "removedObjects": [
+      {
+        "name": "sfq-20261116-a-6d17e4c2",
+        "id": "d9f44bce-019d-43c3-b8c2-dcf7ac05258b",
+        "createdAt": "2026-11-16T23:52:57+01:00",
+        "postRemovalInspect": "not found"
+      },
+      {
+        "name": "sfq-20261116-b-8c91f253",
+        "id": "48340273-3d47-464e-96d6-86c3f5d7dc31",
+        "createdAt": "2026-11-16T23:57:13+01:00",
+        "postRemovalInspect": "not found"
+      },
+      {
+        "name": "sfq-probe-c-d402c948",
+        "id": "d9d3f17f-afb0-45ad-8869-2e3b846aa302",
+        "createdAt": "2026-11-17T00:15:38+01:00",
+        "postRemovalInspect": "not found"
+      },
+      {
+        "name": "sfq-meta-d-719c0d23",
+        "id": "b1d36d36-49e9-402a-b488-7ecabe477a93",
+        "createdAt": "2026-11-17T01:01:11+01:00",
+        "postRemovalInspect": "not found",
+        "postRemovalNamespaceList": []
+      },
+      {
+        "name": "sfq-smoke-20261117-4f9d7a62",
+        "id": "02418900-048d-44e9-86dc-9e036e546554",
+        "createdAt": "2026-11-17T10:08:29+01:00",
+        "postRemovalInspect": "not found",
+        "postRemovalNamespaceList": [],
+        "purpose": "Startup Factory fixed-suite smoke"
+      }
+    ],
+    "controllerCrashAndOrphanRecoveryQualified": false
+  },
+  "implementationTests": {
+    "passed": 367,
+    "environment": "Disposable unprivileged Docker Engine container, cached Ubuntu image, no network, read-only source, bounded writable scratch, CPU/memory/process/output/time limits, no credentials",
+    "dockerSandboxesContainmentEvidence": false,
+    "sourceSnapshotBundleBuiltAndValidated": true,
+    "qualificationRuntimeAndDocumentationFilesInBundle": 7,
+    "sandboxRuntimeDocsAndTestRequiredFilesInBundle": 32,
+    "nativePublicationSupervisorIntegrationPassed": true,
+    "finiteSourceAndAuthorizedRawGitPromotionPassed": true,
+    "nativeGateCrashAndPersistenceFailureTestsPassed": true
+  },
+  "remainingGates": [
+    "Host-account and exclusive controller enrollment",
+    "Full mount and integration abuse checks",
+    "Live DNS, IPv4/IPv6 and private-network enforcement checks",
+    "Identity-safe operations under a qualified namespace ownership model",
+    "Real exec slow readers, interrupted frames and cancellation",
+    "Host-enforced storage and aggregate resource limits",
+    "Orphan reconciliation and confirmed cleanup",
+    "Fixture credential isolation without global fallback"
+  ],
+  "authorization": "Diagnostic observations only. This repository file is not an authenticated qualification receipt and grants no execution authority.",
+  "lastUpdated": "2026-11-17",
+  "metadataSchemaProbe": {
+    "realStoppedInspectFixture": "tests/fixtures/sandbox/sbx-v0.54.0-inspect-stopped.json",
+    "realStoppedListFixture": "tests/fixtures/sandbox/sbx-v0.54.0-ls-stopped.json",
+    "memoryEncoding": "string with m suffix",
+    "listCreatedAtNormalizedToUtc": true,
+    "networkPolicyMetadataOnlyReportsScope": true,
+    "diskLimitsReportedByInspect": false,
+    "requiresSeparateEffectivePolicyAndStorageEvidence": true
+  },
+  "implementationProgress": {
+    "stage": "tested-core-primitives-and-qualification",
+    "launchTeamUsesDockerBackend": false,
+    "productionBackendIntegrated": false,
+    "runtimeQualificationComplete": false,
+    "remainingImplementation": [
+      "Connect the adapter to the durable native-client custody service",
+      "Implement independent watchdog and server/namespace/storage reconciliation",
+      "Wire bounded source provisioning and output import into the controller",
+      "Migrate execution records and launcher consumers together",
+      "Route independent review, validation and integration through qualified sandbox jobs"
+    ]
+  },
+  "startupFactorySmoke": {
+    "report": "docs/superpowers/qualification/2026-11-17-docker-sandboxes-startup-factory-smoke.json",
+    "date": "2026-11-17",
+    "runtime": "actual Docker Sandboxes v0.54.0 microVM",
+    "testsPassed": 368,
+    "skipped": 0,
+    "elapsedSeconds": 70.94,
+    "realModelAgentsExecuted": false,
+    "externalMacOSBrokerBoundaryValidated": false,
+    "productionBackendAllowed": false,
+    "vmRemoved": true,
+    "daemonStopped": true
+  }
+}

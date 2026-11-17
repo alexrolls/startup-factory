@@ -505,8 +505,13 @@ PY
 }
 
 run_recovery_validation() {
-  [ $# -eq 0 ] || die "recovery validation reads one NUL-delimited changed-file list from stdin"
+  [ $# -le 1 ] || die "recovery validation reads changed files from stdin and an optional exact staged tree"
   [ -x "$RECOVERY_PYTHON" ] || die "trusted recovery interpreter is unavailable: $RECOVERY_PYTHON"
+  local sandbox_tree=()
+  if [ "$(read_key AGENT_EXECUTION_BACKEND)" = docker-sandboxes ]; then
+    [ -n "${1:-}" ] || die "Docker recovery validation requires its exact staged tree"
+    sandbox_tree=(--tree "$1")
+  fi
   /usr/bin/env -i \
     "PATH=/usr/bin:/bin" \
     "TMPDIR=${TMPDIR:-/tmp}" \
@@ -519,6 +524,8 @@ run_recovery_validation() {
     "$RECOVERY_PYTHON" -I -B "$SKILL_DIR/bin/recovery_validation.py" \
     --repo "$repo" \
     --config "$CONFIG" \
+    --workspace "$workspace" --team "$team" --feature "$feature" --role validator \
+    "${sandbox_tree[@]}" \
     --changed-files -
 }
 
@@ -605,10 +612,20 @@ PY
       git_unprivileged -C "$repo" revert --abort >/dev/null 2>&1 || true
       die "late-invalidation revert conflicts; preserved recovery journal requires human resolution"
     fi
+    local sandbox_recovery_tree=""
+    if [ "$(read_key AGENT_EXECUTION_BACKEND)" = docker-sandboxes ]; then
+      sandbox_recovery_tree="$(git_unprivileged -C "$repo" write-tree)"
+    fi
     if ! git_unprivileged -C "$repo" diff --name-only -z --no-ext-diff --no-textconv \
-      --ignore-submodules=none HEAD -- | run_recovery_validation; then
+      --ignore-submodules=none HEAD -- | run_recovery_validation "$sandbox_recovery_tree"; then
       git_unprivileged -C "$repo" revert --abort >/dev/null 2>&1 || true
       die "late-invalidation revert failed project validation; recovery journal preserved"
+    fi
+    if [ -n "$sandbox_recovery_tree" ] && { \
+      [ "$(git_unprivileged -C "$repo" write-tree)" != "$sandbox_recovery_tree" ] || \
+      ! git_unprivileged -C "$repo" diff --quiet --no-ext-diff --no-textconv --ignore-submodules=none --; }; then
+      git_unprivileged -C "$repo" revert --abort >/dev/null 2>&1 || true
+      die "recovery candidate changed during Docker validation; revert aborted"
     fi
     if ! assert_task_not_held "$task"; then
       git_unprivileged -C "$repo" revert --abort >/dev/null 2>&1 || true
@@ -718,6 +735,8 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(review_module_raw).resolve().parent))
 from review_evidence import EvidenceError, SUPPORTING_GATE_MARKERS, parse_files_evidence, request_binding, strip_publication_trailer, validate as validate_review_evidence
 from delivery_profile import DeliveryProfileError, _git as safe_git, _repository_root, build_review_package, canonical_merge_tree
+from execution_descriptor import expected_execution_identity
+from sandbox_acceptance import verify_configured_execution
 from task_metadata import required_review_gates
 from team_policy import TeamPolicyError, load_team_policy
 repo = _repository_root(repo)
@@ -808,22 +827,12 @@ try:
     execution = json.loads(execution_path.read_text())
 except (OSError, ValueError) as exc:
     fail("invalid execution record: %s" % exc)
-expected_exec = {
-    "schemaVersion": 1,
-    "featureId": feature,
-    "taskId": task,
-    "taskKey": key,
-    "attempt": attempt,
-    "role": role,
-    "branch": expected_branch,
-    "worktree": str(expected_worktree),
-    "packetPath": str(workspace / "artifacts" / key / ("attempt-%s" % attempt) / "task-packet.md"),
-    "packetJsonPath": str(workspace / "artifacts" / key / ("attempt-%s" % attempt) / "task-packet.json"),
-    "reportPath": str(workspace / "artifacts" / key / ("attempt-%s" % attempt) / "task-report.md"),
-}
+expected_exec = expected_execution_identity(execution, workspace=workspace, team=team,
+    feature=feature, task=task, key=key, role=role, attempt=attempt)
 for name, value in expected_exec.items():
     if execution.get(name) != value:
         fail("execution record %s does not match transaction identity" % name)
+verify_configured_execution(execution, repo, workspace, team, feature, task, Path(skill_raw))
 canonical_exec = json.dumps(expected_exec, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 execution_digest = "sha256:" + hashlib.sha256(canonical_exec).hexdigest()
 if data.get("executionDigest") != execution_digest:

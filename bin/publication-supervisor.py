@@ -502,14 +502,20 @@ def peer_identity(
             raise SupervisorError("stable Darwin publication peer token is unavailable")
         try:
             bsm = ctypes.CDLL("/usr/lib/libbsm.dylib")
-            array = (ctypes.c_uint32 * 8).from_buffer_copy(token)
-            pointer = ctypes.POINTER(ctypes.c_uint32)
-            bsm.audit_token_to_pid.argtypes = [pointer]
-            bsm.audit_token_to_euid.argtypes = [pointer]
-            bsm.audit_token_to_pidversion.argtypes = [pointer]
-            pid = int(bsm.audit_token_to_pid(array))
-            uid = int(bsm.audit_token_to_euid(array))
-            version = int(bsm.audit_token_to_pidversion(array))
+            # Apple libbsm takes audit_token_t (mach/message.h's eight-word
+            # struct) by value. Passing an array/pointer uses a different ABI.
+            class AuditToken(ctypes.Structure):
+                _fields_ = [("val", ctypes.c_uint32 * 8)]
+            value = AuditToken.from_buffer_copy(token)
+            bsm.audit_token_to_pid.argtypes = [AuditToken]
+            bsm.audit_token_to_pid.restype = ctypes.c_int
+            bsm.audit_token_to_euid.argtypes = [AuditToken]
+            bsm.audit_token_to_euid.restype = ctypes.c_uint32
+            bsm.audit_token_to_pidversion.argtypes = [AuditToken]
+            bsm.audit_token_to_pidversion.restype = ctypes.c_int
+            pid = int(bsm.audit_token_to_pid(value))
+            uid = int(bsm.audit_token_to_euid(value))
+            version = int(bsm.audit_token_to_pidversion(value))
         except (OSError, AttributeError, ValueError) as exc:
             raise SupervisorError("Darwin peer audit token is unavailable") from exc
         if pid <= 1 or uid != os.geteuid() or version <= 0:
