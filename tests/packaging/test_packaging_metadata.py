@@ -40,7 +40,7 @@ RESOURCE_ARCHIVE = "startup_factory_cli/resources/startup-factory.tar.gz"
 RESOURCE_CHECKSUM = f"{RESOURCE_ARCHIVE}.sha256"
 PRERELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "prerelease.yml"
 PROMOTE_WORKFLOW = ROOT / ".github" / "workflows" / "promote.yml"
-STABLE_VERSION = "0.2.3"
+STABLE_VERSION = "0.3.0"
 
 
 def expected_distribution_version() -> str:
@@ -461,7 +461,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             (f"{STABLE_VERSION}rc1", True),
             (f"{STABLE_VERSION}rc12", True),
             (STABLE_VERSION, False),
-            ("0.3.0rc1", False),
+            (f"{int(STABLE_VERSION.split('.')[0]) + 1}.0.0rc1", False),
             (f"{STABLE_VERSION}rc0", False),
             (f"{STABLE_VERSION}.post1", False),
         ):

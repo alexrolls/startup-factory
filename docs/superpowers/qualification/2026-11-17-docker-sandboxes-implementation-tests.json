@@ -68,5 +68,15 @@
     "Separate independent pre-enrollment fixture for real macOS broker, watchdog, daemon queue and storage fault recovery; complete fixture command is not supplied.",
     "Current root-reviewed evidence and enrollment matching the exact deployed bytes."
   ],
-  "authorization": "This report is not enrollment or containment evidence. Test success, example configuration and the earlier personal-account probes grant no production authority."
+  "authorization": "This report is not enrollment or containment evidence. Test success, example configuration and the earlier personal-account probes grant no production authority.",
+  "packageMetadataFollowup": {
+    "projectVersion": "0.3.0",
+    "reason": "The base 0.2.3 version is published; keep this feature candidate unreleased.",
+    "run": 94,
+    "passed": 93,
+    "skipped": 1,
+    "bundleBuiltTwiceByteIdentical": true,
+    "syntheticSnapshotBundleSha256": "3e1c6d5e419d5563eacb2a4b3c9f6fb684d6d4cec31af3c3111fbb58525bd2d2",
+    "releaseTagCreated": false
+  }
 }
