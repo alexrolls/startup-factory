@@ -762,6 +762,8 @@ reviews, integration, or releases.
 | [`reference/vocabulary.md`](reference/vocabulary.md) | Tool-neutral entities, statuses, mappings, and naming rules |
 | [`reference/automation.md`](reference/automation.md) | Deterministic board monitoring and bounded task dispatch |
 | [`reference/guardrails.md`](reference/guardrails.md) | Denied actions, exact human approvals, and allowed operations |
+| [`reference/docker-sandboxes.md`](reference/docker-sandboxes.md) | Per-agent Docker execution, external broker isolation, and live qualification gates |
+| [`reference/docker-sandboxes-deployment.md`](reference/docker-sandboxes-deployment.md) | Dedicated account, protected installation, independent watchdog, and enrollment |
 | [`reference/deployment.md`](reference/deployment.md) | Provider-neutral, recoverable production delivery |
 | [`reference/evidence-providers.md`](reference/evidence-providers.md) | Commit-bound external evidence and provider contracts |
 | [`reference/compatibility.md`](reference/compatibility.md) | Tested, declared, untested, and unsupported platform/runtime positions |

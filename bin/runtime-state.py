@@ -31,6 +31,9 @@ from startup_factory_cli.config_values import (  # noqa: E402
 )
 
 from authority_config import AuthorityConfigError, configured_lifecycle_root
+from execution_descriptor import (
+    ExecutionDescriptorError, execution_extensions, execution_version,
+)
 from delivery_profile import assess_review_diff, assess_task
 from outbox_capability import CapabilityError, authority_lock
 from retrospective import (
@@ -1625,6 +1628,10 @@ def validate_lineage(
 
 
 def execution_shape(record: dict) -> tuple[set[str], bool]:
+    try:
+        extensions = execution_extensions(record)
+    except ExecutionDescriptorError as exc:
+        raise SystemExit(f"runtime-state: {exc}") from exc
     fields = set(record)
     has_lineage = "claimLineage" in fields or "lineageDigest" in fields
     lineage_fields = {"claimLineage", "lineageDigest"}
@@ -1634,7 +1641,7 @@ def execution_shape(record: dict) -> tuple[set[str], bool]:
     if not EXECUTION_REQUIRED_FIELDS.issubset(base):
         raise SystemExit("runtime-state: execution has an unsupported schema")
     extras = base - EXECUTION_REQUIRED_FIELDS
-    if not extras.issubset(EXECUTION_OPTIONAL_FIELDS):
+    if not extras.issubset(EXECUTION_OPTIONAL_FIELDS | extensions):
         raise SystemExit("runtime-state: execution has unexpected fields")
     return base, has_lineage
 
@@ -1655,7 +1662,7 @@ def validate_execution(
         raise SystemExit("runtime-state: execution has an invalid attempt")
     artifact = workspace / "artifacts" / key / f"attempt-{attempt}"
     expected = {
-        "schemaVersion": 1,
+        "schemaVersion": execution_version(record),
         "featureId": feature,
         "taskId": task,
         "taskKey": key,
@@ -2869,6 +2876,9 @@ def _cmd_packet_locked(args, config: dict[str, str | None]) -> None:
         print(json.dumps(existing, ensure_ascii=False))
         return
 
+    if existing and execution_version(existing) == 2 and previous_attempt == args.attempt:
+        raise SystemExit("runtime-state: a sandbox attempt with incomplete packet files cannot be rebuilt or downgraded")
+
     # Reject unsafe project context before publishing any packet artifacts.
     try:
         caveats = read_project_caveats(Path(args.repo))
@@ -3090,7 +3100,7 @@ def _cmd_packet_locked(args, config: dict[str, str | None]) -> None:
         )
 
     execution = {
-        **existing,
+        **{name: value for name, value in existing.items() if name != "sandbox"},
         "schemaVersion": 1,
         "featureId": args.feature,
         "taskId": args.task,

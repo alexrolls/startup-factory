@@ -1,0 +1,112 @@
+{
+  "activation": {
+    "globalBeforeDigest": "sha256:e0a4624ffec2e30c6f431f6064c01c33d654fa6f5df34f53841ab05efe449c48",
+    "globalDuringActiveDigest": "sha256:e0a4624ffec2e30c6f431f6064c01c33d654fa6f5df34f53841ab05efe449c48",
+    "globalPolicyComparison": "all global rows before creation equal all global rows during active scoped policy",
+    "globalPolicyUnchanged": true,
+    "globalPolicyWrites": [],
+    "initialState": "implicit deny-all fallback plus one editable scoped explicit deny **",
+    "installedRule": {
+      "host": "api.openai.com:443",
+      "method": "POST",
+      "path": "/v1/responses",
+      "resourceType": "http"
+    },
+    "orderedSteps": [
+      "inspect exact fixture identity and empty mounts",
+      "install scoped HTTP allow while explicit deny lock remains",
+      "verify complete staged policy includes HTTP allow and original explicit lock",
+      "remove only original scoped deny lock by UUID with --force",
+      "verify complete active policy has exact scoped HTTP allow and implicit deny-all fallback"
+    ]
+  },
+  "autonomousReady": false,
+  "cleanup": {
+    "daemonStopped": true,
+    "fixtureRemoved": true,
+    "fixtureStopped": true,
+    "nameAndIdAbsentFromPositiveList": true,
+    "namespaceEmpty": true
+  },
+  "dryDecisionCases": [
+    {
+      "action": "http:request:post",
+      "allowed": true,
+      "case": "approved-model-responses",
+      "denyKind": null,
+      "method": "POST",
+      "reason": null,
+      "resourceType": "http:endpoint",
+      "target": "https://api.openai.com:443/v1/responses"
+    },
+    {
+      "action": "http:request:get",
+      "allowed": false,
+      "case": "unapproved-same-host-admin",
+      "denyKind": "implicit",
+      "method": "GET",
+      "reason": "No matching allow rule (default deny)",
+      "resourceType": "http:endpoint",
+      "target": "https://api.openai.com:443/v1/organization/admin_api_keys"
+    },
+    {
+      "action": "net:connect:tcp",
+      "allowed": false,
+      "case": "unapproved-host",
+      "denyKind": "implicit",
+      "method": "POST",
+      "reason": "No matching allow rule (default deny)",
+      "resourceType": "net:domain",
+      "target": "https://example.invalid:443/v1/responses"
+    },
+    {
+      "action": "net:connect:tcp",
+      "allowed": false,
+      "case": "loopback-ip",
+      "denyKind": "implicit",
+      "method": "POST",
+      "reason": "No matching allow rule (default deny)",
+      "resourceType": "net:domain",
+      "target": "https://127.0.0.1:443/v1/responses"
+    }
+  ],
+  "fixture": {
+    "cpus": 1,
+    "createdAt": "2026-11-17T12:35:38+01:00",
+    "dockerDiskMiB": 512,
+    "hostMounts": [],
+    "id": "e0237605-f211-4699-a262-b18430ff5221",
+    "mcpMode": "static",
+    "mcpServers": [],
+    "memoryMiB": 512,
+    "name": "sfq-policy-20261117-27f520c1",
+    "namespace": "sf-qualification",
+    "rootDiskMiB": 2048,
+    "runtimeMounts": [],
+    "skills": "off"
+  },
+  "notEstablished": [
+    "No real HTTP request or model response was attempted.",
+    "No credential or model key was installed.",
+    "No guest model CLI, proxy-managed sentinel, CA trust or nonroot worker access was qualified.",
+    "Dry policy checks do not establish DNS, TCP, TLS, redirect, transparent proxy, daemon alias or actual egress enforcement.",
+    "The personal qualification namespace is not a dedicated production deployment and cannot enroll it.",
+    "Live transport, identity, resource, crash cleanup and provider quota gates remain mandatory."
+  ],
+  "observedDate": "2026-11-17",
+  "productionReady": false,
+  "qualified": false,
+  "runtime": {
+    "cliVersion": "v0.54.0",
+    "daemonVersion": "v0.54.0",
+    "image": "docker.io/sbx/shell@sha256:89ed5d63def6bfb2373d408e3ab6ad55aa5c010f884a182a78299fcf85ea42d1",
+    "sha256": "d811a4366d81420b0b060972a51216d450c7634af62b71f0985d04cd69e3d59a"
+  },
+  "schemaVersion": 1,
+  "scope": "operator-model-policy-schema-and-dry-decisions-only",
+  "sources": [
+    "https://docs.docker.com/ai/governance/local/",
+    "https://docs.docker.com/ai/governance/local/network-rules/",
+    "https://docs.docker.com/ai/sandboxes/customize/use-kits/"
+  ]
+}

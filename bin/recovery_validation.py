@@ -46,10 +46,13 @@ VALIDATION_KEYS = (
     "VALIDATE_FORMAT",
 )
 RELEVANT_KEYS = {
+    "AGENT_EXECUTION_BACKEND",
+    "AGENT_SANDBOX_DEPLOYMENT",
     "AGENT_ENV_ALLOWLIST",
     "AGENT_SANDBOX_ENFORCED",
     "AGENT_SANDBOX_RUNNER",
     "VALIDATE_SCRIPT",
+    "WORKTREE_SETUP",
     *VALIDATION_KEYS,
 }
 # Recovery intentionally uses a positive list.  A deny-list cannot recognize
@@ -509,7 +512,29 @@ def run_validation(
     repo: Path,
     config: dict[str, Optional[str]],
     changed: list[bytes],
+    *,
+    workspace: Optional[Path] = None,
+    team: Optional[str] = None,
+    feature: Optional[str] = None,
+    role: str = "validator",
+    tree: Optional[str] = None,
 ) -> int:
+    backend = config.get("AGENT_EXECUTION_BACKEND") or "protected-runner"
+    if backend == "docker-sandboxes":
+        # This branch precedes native runner/script inspection and process
+        # launch. Repository-controlled validation executes only in the VM.
+        if workspace is None or not team or not feature or tree is None:
+            fail("Docker recovery validation requires its exact tree and approved team scope")
+        try:
+            sys.path.insert(0, str(SKILL_DIR / "bin"))
+            from sandbox_validation import run_validation as sandbox_validation
+            return sandbox_validation(repository=repo, workspace=workspace,
+                team=team, feature=feature, role=role, tree=tree, config=config,
+                changed=[path.decode("utf-8", errors="strict") for path in changed])
+        except Exception as exc:
+            raise RecoveryValidationError("Docker recovery validation refused or remains uncertain") from exc
+    if backend != "protected-runner":
+        fail("unsupported configured validation backend")
     assignments = clean_environment(config)
     enforced = config["AGENT_SANDBOX_ENFORCED"]
     if enforced not in {"true", "false"}:
@@ -564,6 +589,11 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--repo", required=True, help="canonical repository root")
     result.add_argument("--config", required=True, help="repository team config")
+    result.add_argument("--workspace", help="approved team workspace for Docker validation")
+    result.add_argument("--team")
+    result.add_argument("--feature")
+    result.add_argument("--role", default="validator")
+    result.add_argument("--tree", help="exact staged tree for Docker validation")
     result.add_argument(
         "--changed-files",
         required=True,
@@ -607,7 +637,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 allow_empty=True,
             )
             changed = changed_files(changed_path)
-        return run_validation(repo, config, changed)
+        return run_validation(repo, config, changed,
+            workspace=Path(arguments.workspace) if arguments.workspace else None,
+            team=arguments.team, feature=arguments.feature,
+            role=arguments.role, tree=arguments.tree)
     except RecoveryValidationError as exc:
         print(f"recovery-validation: {exc}", file=sys.stderr)
         return 2

@@ -1,0 +1,253 @@
+{
+  "schemaVersion": 1,
+  "reportKind": "manual-startup-factory-docker-sandboxes-smoke",
+  "date": "2026-11-17",
+  "scope": "Fixed Startup Factory test suites executed inside a disposable local Docker Sandbox microVM.",
+  "passed": true,
+  "qualified": false,
+  "autonomousReady": false,
+  "productionBackendAllowed": false,
+  "realModelAgentsExecuted": false,
+  "authorization": "Diagnostic observations only. This file is not a trusted qualification or enrollment receipt and grants no execution authority.",
+  "runtime": {
+    "cliVersion": "v0.54.0",
+    "executableSha256": "d811a4366d81420b0b060972a51216d450c7634af62b71f0985d04cd69e3d59a",
+    "namespace": "sf-qualification",
+    "name": "sfq-smoke-20261117-4f9d7a62",
+    "id": "02418900-048d-44e9-86dc-9e036e546554",
+    "createdAt": "2026-11-17T10:08:29+01:00",
+    "imageDigest": "sha256:89ed5d63def6bfb2373d408e3ab6ad55aa5c010f884a182a78299fcf85ea42d1",
+    "cpus": 1,
+    "memory": "512m",
+    "requestedRootDisk": "2g",
+    "requestedDockerDisk": "512m",
+    "hostMounts": [],
+    "runtimeMounts": [],
+    "mcpMode": "static",
+    "mcpServers": [],
+    "skillsRequested": "off",
+    "denyAllRuleListedActive": true,
+    "hostIntegrationSettingsObservedFalse": [
+      "ssh.agentForwardingEnabled",
+      "browser.enabled",
+      "clipboard.imagePaste",
+      "sandbox.fuse"
+    ]
+  },
+  "source": {
+    "files": 273,
+    "bytes": 5906760,
+    "treeSha256": "569db815d8bbf13de1c0fa6ad588ef5267697a0cfecbedf6fb74dba7fb3b7d18",
+    "selection": "Tracked operational source/tests plus explicit sandbox implementation files; excludes host Git metadata, unrelated untracked files and personal credential stores.",
+    "copyMechanism": "finite sbx cp, without a workspace mount",
+    "readOnlyInputPath": "/source",
+    "writableDisposableWorkingCopy": "/scratch/repo"
+  },
+  "execution": {
+    "exitCode": 0,
+    "limitReason": null,
+    "elapsedSeconds": 70.94,
+    "stdoutBytes": 730,
+    "stderrBytes": 469
+  },
+  "suite": {
+    "autonomousReady": false,
+    "boundary": {
+      "cpuSecondsPerProcess": 180,
+      "effectiveCapabilities": 0,
+      "fileDescriptorLimit": 256,
+      "fileSizeLimitBytes": 52428800,
+      "interfaces": [
+        "lo"
+      ],
+      "noNewPrivileges": true,
+      "processLimit": 128,
+      "readOnlyInput": true,
+      "scratchLimitBytes": 268435456,
+      "sharedTmpLimitBytes": 16777216,
+      "uid": 1000,
+      "wallSeconds": 240
+    },
+    "elapsedSeconds": 70.598,
+    "errors": 0,
+    "failures": 0,
+    "gid": 1000,
+    "gitOwner": 0,
+    "passed": true,
+    "productionBackendAllowed": false,
+    "pythonVersion": "3.14.10",
+    "realModelAgentsExecuted": false,
+    "rootOwner": 0,
+    "runtime": "docker-sandboxes-v0.54.0",
+    "schemaVersion": 1,
+    "scope": "startup-factory-fixed-test-suite",
+    "skipped": 0,
+    "testsRun": 368,
+    "uidMap": "0          0      65536"
+  },
+  "testFiles": [
+    "tests/packaging/test_cli_sandbox_qualification.py",
+    "tests/packaging/test_sandbox_exec_probe.py",
+    "tests/packaging/test_execution_backend.py",
+    "tests/packaging/test_sandbox_registry.py",
+    "tests/packaging/test_docker_backend.py",
+    "tests/packaging/test_sandbox_enrollment.py",
+    "tests/packaging/test_sandbox_controller.py",
+    "tests/packaging/test_native_clients.py",
+    "tests/packaging/test_cli_readiness.py",
+    "tests/packaging/test_cli_installer.py",
+    "tests/packaging/test_bundle_builder.py",
+    "tests/sandbox-qualification-fixture-test.py",
+    "tests/sandbox-ingest-test.py",
+    "tests/sandbox-relay-test.py",
+    "tests/sandbox-native-relay-test.py",
+    "tests/sandbox-guest-transport-test.py",
+    "tests/sandbox-source-test.py",
+    "tests/sandbox-artifacts-test.py",
+    "tests/test-runner-test.py",
+    "tests/publication-supervisor-test.py",
+    "tests/outbox-capability-supersede-test.py"
+  ],
+  "guestBoundary": {
+    "uidPreservingUserNamespace": true,
+    "isolatedNamespaces": [
+      "user",
+      "mount",
+      "pid",
+      "network",
+      "ipc",
+      "uts",
+      "cgroup"
+    ],
+    "readOnlyGuestRootAndToolchain": true,
+    "maskedReadOnlyDirectories": [
+      "/run",
+      "/home",
+      "/root"
+    ],
+    "explicitEmptyGuestEnvironment": true,
+    "privateHome": "/scratch/home",
+    "privateTemp": "/scratch/tmp",
+    "scratchMiB": 256,
+    "sharedTempFixtureMiB": 16,
+    "processLimitKind": "RLIMIT_NPROC, per real UID",
+    "cpuLimitKind": "RLIMIT_CPU, per process",
+    "hostCapturedOutputLimitBytes": 1048576,
+    "hostCommandWallSeconds": 270,
+    "aggregateStorageQualified": false
+  },
+  "coverage": [
+    "CLI prerequisite/readiness/install and deterministic bundle contracts",
+    "Registry/enrollment/controller and adapter contract fixtures",
+    "Native launch gates and crash recovery",
+    "Framed guest helpers and durable artifact relay admission",
+    "Native publication supervisor peer authentication",
+    "Finite source transfer and independent private guest Git",
+    "Quarantine, accepted commit creation and authorized ref compare-and-swap"
+  ],
+  "earlierRuns": [
+    {
+      "testsRun": 367,
+      "passed": 365,
+      "failures": 1,
+      "errors": 1,
+      "skipped": 0,
+      "cause": [
+        "Read-only /tmp conflicted with an intentional shared-temp fixture.",
+        "Crash fixture incorrectly rejected diagnostic killpg(PGID, 0) after the orphan leader was reaped."
+      ]
+    },
+    {
+      "testsRun": 368,
+      "passed": 367,
+      "failures": 0,
+      "errors": 1,
+      "skipped": 0,
+      "cause": [
+        "The supervisor test wrapper published an empty PID readiness file before write completion."
+      ]
+    }
+  ],
+  "fixes": [
+    {
+      "path": "tests/packaging/test_native_clients.py",
+      "change": "Permit only exact signal-zero existence queries during recovery; add deterministic missing-leader/group-present and group-absent coverage. No nonzero signals or unblocking allowed."
+    },
+    {
+      "path": "tests/publication-supervisor-test.py",
+      "change": "Write and close the fixture PID file before atomically publishing its ready path."
+    },
+    {
+      "scope": "operator harness only",
+      "change": "Provide an isolated, size-limited 16 MiB shared /tmp fixture alongside private scratch."
+    }
+  ],
+  "productionCodeChangedForThisTrial": false,
+  "driverSha256": {
+    "smoke-runner.py": "f892f950dcd9e929c900e8ea124d7ec637c8eba1437d245caec2f3871e5afc00",
+    "smoke-bootstrap.py": "dcf89bbefa48e4142b20b473001f64e4cf21479e3f3a7c782fba92670df9251c"
+  },
+  "logSha256": {
+    "stdout.log": "95096c953a1ac3b0a8b394b29a55e750e9412a1013f8e80d3bad5262cb6e0b80",
+    "stderr.log": "36a1b169770bbdac1141e93fbc0a4af1379ce14642eb5e095403638747a325f0"
+  },
+  "cleanup": {
+    "identityCheckedBeforeStop": true,
+    "stoppedStateConfirmed": true,
+    "removeSucceeded": true,
+    "postRemovalInspect": "sandbox 'sfq-smoke-20261117-4f9d7a62' not found",
+    "postRemovalList": [],
+    "daemonStopped": true,
+    "daemonStopExitCode": 0,
+    "signInPreserved": true,
+    "verificationNote": "Initial absence matcher expected an unquoted generic message; exact named not-found response and positive empty list were verified."
+  },
+  "limitations": [
+    "Fixture controller/broker processes also ran inside the VM; this was not an external macOS controller-to-guest broker integration run.",
+    "No model credentials, model API calls, real agent task, external tracker publication or release action were used.",
+    "launch-team.sh still does not select Docker Sandboxes.",
+    "Dedicated-account enrollment, native-client adapter integration, independent watchdog/server reconciliation, provisioning/output wiring and independent review/validation integration remain incomplete.",
+    "Observed policy and inner network isolation do not qualify all runtime DNS/IPv4/IPv6/private-network, credential, storage or orphan-recovery requirements."
+  ],
+  "observationProvenance": {
+    "policy": {
+      "source": "Operator tool transcript, before test execution",
+      "command": "sbx --app-name sf-qualification policy ls --json",
+      "rawOutputRetainedAsFile": false,
+      "globalRuleId": "default-deny-all",
+      "sandboxRuleId": "63bbb3e0-e9e0-4099-9cb2-91b650081218",
+      "sandboxScope": "sandbox:sfq-smoke-20261117-4f9d7a62",
+      "resourceType": "network",
+      "decision": "deny",
+      "resources": [
+        "**"
+      ],
+      "status": "active",
+      "liveEgressAttestation": false
+    },
+    "settings": {
+      "source": "Operator tool transcript, before VM creation",
+      "command": "sbx --app-name sf-qualification settings list",
+      "rawOutputRetainedAsFile": false,
+      "observed": {
+        "ssh.agentForwardingEnabled": false,
+        "browser.enabled": false,
+        "clipboard.imagePaste": false,
+        "sandbox.fuse": false
+      },
+      "sourceColumn": "override"
+    },
+    "skills": {
+      "source": "Operator create argv",
+      "requestedFlag": [
+        "--skills",
+        "off"
+      ],
+      "independentlyInspected": false
+    }
+  },
+  "evidenceFiles": {
+    "stdout.log": "docs/superpowers/qualification/2026-11-17-docker-sandboxes-startup-factory-smoke.stdout.log",
+    "stderr.log": "docs/superpowers/qualification/2026-11-17-docker-sandboxes-startup-factory-smoke.stderr.log"
+  }
+}

@@ -13,7 +13,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 # Generic placeholder accounts that documentation and fixtures may use.
-PLACEHOLDER_USERS = frozenset({"example", "me", "operator", "runner", "user", "you", "your-user", "<user>"})
+# agent is the vendor guest account; sf-agent is the fixed isolated job UID.
+PLACEHOLDER_USERS = frozenset({"agent", "sf-agent", "example", "me", "operator", "runner", "user", "you", "your-user", "<user>"})
 
 HOME_PATH = re.compile(
     r"(?:/Users/|/home/|[A-Za-z]:\\\\?Users\\\\?)(?P<user><user>|[A-Za-z0-9._-]+)"

@@ -266,6 +266,20 @@ prepare_agent_env() { # role team feature preset kind task attempt -> global AGE
 validate_sandbox_runner_config() {
   local enforced runner
   enforced="$(read_key AGENT_SANDBOX_ENFORCED)"
+  case "$(read_key AGENT_EXECUTION_BACKEND)" in
+    docker-sandboxes)
+      [ "$enforced" = true ] || die "docker-sandboxes requires AGENT_SANDBOX_ENFORCED=true"
+      local deployment
+      deployment="$(read_key AGENT_SANDBOX_DEPLOYMENT)"
+      [ -n "$deployment" ] || die "docker-sandboxes requires AGENT_SANDBOX_DEPLOYMENT"
+      AGENT_SANDBOX_RUNNER_PATH="$(python3 "$SKILL_DIR/bin/sandbox-launch.py" verify \
+        --deployment "$deployment" --repo "$REPO_ROOT")" \
+        || die "Docker Sandbox deployment is not enrolled and qualified; no fallback was attempted"
+      return 0
+      ;;
+    protected-runner|'') ;;
+    *) die "AGENT_EXECUTION_BACKEND must be protected-runner or docker-sandboxes" ;;
+  esac
   case "$enforced" in
     false)
       AGENT_SANDBOX_RUNNER_PATH=""
@@ -1716,13 +1730,32 @@ lifecycle_stop_instance() { # team category instance expected-created-at [expect
   die "verified process group $team/$instance did not stop after identity-bound SIGKILL"
 }
 
-prepare_execution() { # workdir command role team feature preset kind task attempt -> global EXECUTION_ARGS
-  local workdir="$1" command="$2" team="$4" kind="$7"
+prepare_execution() { # workdir command role team feature preset kind task attempt [prompt] -> EXECUTION_ARGS
+  local workdir="$1" command="$2" role="$3" team="$4" feature="$5" preset="$6" kind="$7" task="$8" attempt="$9" prompt="${10:-}" command_profile="${11:-}"
   local instance category
   local -a worker_execution
   shift 2
   case "$workdir" in /*) ;; *) die "internal launch error: execution workdir must be absolute" ;; esac
-  prepare_agent_env "$@"
+  if [ "$(read_key AGENT_EXECUTION_BACKEND)" = docker-sandboxes ]; then
+    validate_sandbox_runner_config
+    local deployment request workspace
+    local -a prepare_args
+    deployment="$(read_key AGENT_SANDBOX_DEPLOYMENT)"
+    workspace="$(teamroot "$team")" || die "unsafe sandbox workspace"
+    prepare_args=(prepare --deployment "$deployment" --repo "$REPO_ROOT" --workspace "$workspace"
+      --team "$team" --feature "$feature" --role "$role" --task "$task" --attempt "$attempt" --kind "$kind" --preset "$preset")
+    [ -z "$prompt" ] || prepare_args+=(--prompt "$prompt")
+    [ -z "$command_profile" ] || prepare_args+=(--command-profile "$command_profile")
+    if [ "$kind" = gate ] || [ "$kind" = task ]; then
+      [ "$PUBLICATION_AUTHORITY_ENABLED" = true ] || die "sandbox publication requires protected lifecycle supervision"
+      prepare_args+=(--capability "$OUTBOX_CAPABILITY_ID" --transport "$OUTBOX_TRANSPORT_LOCATOR")
+    fi
+    request="$(python3 "$SKILL_DIR/bin/sandbox-launch.py" "${prepare_args[@]}")" \
+      || die "could not prepare an approved task-bound sandbox job"
+    worker_execution=(/usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C
+      "$AUTHORITY_PYTHON" -I -B "$SKILL_DIR/bin/sandbox-custody.py" client --deployment "$deployment" --request "$request")
+  else
+    prepare_agent_env "${@:1:7}"
   if [ "$(read_key AGENT_SANDBOX_ENFORCED)" = true ]; then
     # Re-run the complete trust check immediately before every enforced
     # execution. The initial configuration check is not a durable authority
@@ -1734,6 +1767,7 @@ prepare_execution() { # workdir command role team feature preset kind task attem
     )
   else
     worker_execution=(/usr/bin/env "${AGENT_ENV_ARGS[@]}" /bin/bash -c "$command")
+  fi
   fi
   if { [ "$kind" = gate ] || [ "$kind" = task ]; } && [ "$PUBLICATION_AUTHORITY_ENABLED" = true ]; then
     if [ "$kind" = gate ]; then
@@ -1888,6 +1922,12 @@ role_command_template() { # role -> configured command or empty when disabled/un
   local key command
   key="$(role_cmd_key "$1")"
   key_is_null "$key" && return 0
+  if [ "$(read_key AGENT_EXECUTION_BACKEND)" = docker-sandboxes ]; then
+    command="$(read_key "SANDBOX_$key")"
+    [ -n "$command" ] || command="$(read_key SANDBOX_DEFAULT_CMD)"
+    printf '%s' "$command"
+    return 0
+  fi
   command="$(read_key "$key")"
   [ -n "$command" ] || command="$(read_key TEAM_DEFAULT_CMD)"
   printf '%s' "$command"
@@ -1896,6 +1936,7 @@ role_command_template() { # role -> configured command or empty when disabled/un
 task_command_template() { # role profile -> selected task command or empty
   local role="$1" profile="$2" task_cmd_key command
   task_cmd_key="TASK_$(printf '%s' "$profile" | tr 'a-z-' 'A-Z_')_CMD"
+  [ "$(read_key AGENT_EXECUTION_BACKEND)" != docker-sandboxes ] || task_cmd_key="SANDBOX_$task_cmd_key"
   command="$(read_key "$task_cmd_key")"
   [ -n "$command" ] || command="$(role_command_template "$role")"
   printf '%s' "$command"
@@ -2157,8 +2198,7 @@ validate_mandatory_sceptical_architect() { # preset [launch] — fail before any
     key="$(role_cmd_key "$role")"
     key_is_null "$key" \
       && die "mandatory Sceptical Architect '$role' cannot be disabled ($key=null)"
-    command="$(read_key "$key")"
-    [ -n "$command" ] || command="$(read_key TEAM_DEFAULT_CMD)"
+    command="$(role_command_template "$role")"
     [ -n "$command" ] \
       || die "mandatory Sceptical Architect '$role' has no command ($key and TEAM_DEFAULT_CMD are null)"
   fi
@@ -2214,8 +2254,7 @@ validate_security_reviewer_mapping() { # preset [launch] — available everywher
     key="$(role_cmd_key "$role")"
     key_is_null "$key" \
       && die "on-demand security reviewer '$role' cannot be unavailable ($key=null)"
-    command="$(read_key "$key")"
-    [ -n "$command" ] || command="$(read_key TEAM_DEFAULT_CMD)"
+    command="$(role_command_template "$role")"
     [ -n "$command" ] \
       || die "on-demand security reviewer '$role' has no command ($key and TEAM_DEFAULT_CMD are null)"
   fi
@@ -2247,8 +2286,7 @@ validate_review_board_independence() { # preset [launch] — three core roles pl
       key_name="$(role_cmd_key "$role")"
       key_is_null "$key_name" \
         && die "mandatory review-board role '$role' cannot be disabled ($key_name=null)"
-      command="$(read_key "$key_name")"
-      [ -n "$command" ] || command="$(read_key TEAM_DEFAULT_CMD)"
+      command="$(role_command_template "$role")"
       [ -n "$command" ] \
         || die "mandatory review-board role '$role' has no command ($key_name and TEAM_DEFAULT_CMD are null)"
     fi
@@ -2577,21 +2615,29 @@ doctor() { # doctor <preset> <team> <featureId>
     case "$seen" in *" $digest "*) continue ;; esac
     seen="$seen$digest "
     cmd="${cmd_tpl//\{prompt_file\}/$prompt}"
-    prepare_execution "$REPO_ROOT" "$cmd" "$role" "$team" "$fid" "$preset" doctor - 0
+    prepare_execution "$REPO_ROOT" "$cmd" "$role" "$team" "$fid" "$preset" doctor - 0 "$prompt"
     run_doctor_execution "role $role" "$token" "$timeout" "$cmd_tpl"
     verified_commands=$((verified_commands + 1))
     DOCTOR_VERIFIED_COMMANDS="$verified_commands"
   done
 
-  for key in TASK_FAST_CMD TASK_STANDARD_CMD TASK_STRONG_CMD; do
+  local task_doctor_keys="TASK_FAST_CMD TASK_STANDARD_CMD TASK_STRONG_CMD"
+  [ "$(read_key AGENT_EXECUTION_BACKEND)" != docker-sandboxes ] || task_doctor_keys="SANDBOX_TASK_FAST_CMD SANDBOX_TASK_STANDARD_CMD SANDBOX_TASK_STRONG_CMD"
+  for key in $task_doctor_keys; do
     cmd_tpl="$(read_key "$key")"
     [ -n "$cmd_tpl" ] || continue
     digest="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$cmd_tpl")"
     case "$seen" in *" $digest "*) continue ;; esac
     seen="$seen$digest "
-    role="$(printf '%s' "$key" | tr 'A-Z_' 'a-z-' | sed 's/-cmd$//')"
+    local doctor_profile=""
+    if [ "$(read_key AGENT_EXECUTION_BACKEND)" = docker-sandboxes ]; then
+      doctor_profile="$(printf '%s' "$key" | sed 's/^SANDBOX_TASK_//;s/_CMD$//' | tr 'A-Z' 'a-z')"
+      role="${roster%% *}"
+    else
+      role="$(printf '%s' "$key" | tr 'A-Z_' 'a-z-' | sed 's/-cmd$//')"
+    fi
     cmd="${cmd_tpl//\{prompt_file\}/$prompt}"
-    prepare_execution "$REPO_ROOT" "$cmd" "$role" "$team" "$fid" "$preset" doctor - 0
+    prepare_execution "$REPO_ROOT" "$cmd" "$role" "$team" "$fid" "$preset" doctor - 0 "$prompt" "$doctor_profile"
     run_doctor_execution "$key override" "$token" "$timeout" "$cmd_tpl"
     verified_commands=$((verified_commands + 1))
     DOCTOR_VERIFIED_COMMANDS="$verified_commands"
@@ -2603,6 +2649,8 @@ doctor() { # doctor <preset> <team> <featureId>
 }
 
 login() { # login [claude|codex] [--share-macos-keychain]
+  [ "$(read_key AGENT_EXECUTION_BACKEND)" != docker-sandboxes ] \
+    || die "Docker model credentials must be provisioned through the enrolled scoped credential broker; host CLI/keychain login is not a Docker job"
   local cli=claude selected=false share=false argument key configured executable interpreter prepared
   local -a preparation login_argv
   for argument in "$@"; do
@@ -3193,8 +3241,8 @@ PY
   printf '%s' "$out"
 }
 
-launch_one() { # launch_one <team> <featureId> <role> [preset]
-  local team="$1" fid="$2" role="$3" preset="${4:-}" owns_lane=no
+launch_one() { # launch_one <team> <featureId> <role> [preset] [assigned-task] [attempt]
+  local team="$1" fid="$2" role="$3" preset="${4:-}" owns_lane=no assigned_task="${5:--}" assigned_attempt="${6:-0}"
   LAST_LAUNCH_CREATED_AT=""
   LAST_LAUNCH_TOKEN=""
   validate_team_id "$team"; validate_role_id "$role"
@@ -3202,12 +3250,15 @@ launch_one() { # launch_one <team> <featureId> <role> [preset]
   safe_readiness_receipt verify "$team" "$preset"
   team_context_receipt verify "$team" "$fid" "$preset"
   [ -n "$(role_brief "$role")" ] || die "unknown role: $role"
+  if [ "$(read_key AGENT_EXECUTION_BACKEND)" = docker-sandboxes ] && [ "$assigned_task" = - ]; then
+    echo "sandbox role $role waits for a concrete dispatcher task assignment"
+    return 0
+  fi
   local key; key="$(role_cmd_key "$role")"
   key_is_null "$key" && die "role '$role' is disabled ($key=null); remove it from the roster"
   # Absent key (not explicit null) falls back to TEAM_DEFAULT_CMD so preset rosters
   # don't need a key per role. An explicit null disables and never falls back.
-  local cmd_tpl; cmd_tpl="$(read_key "$key")"
-  [ -n "$cmd_tpl" ] || cmd_tpl="$(read_key TEAM_DEFAULT_CMD)"
+  local cmd_tpl; cmd_tpl="$(role_command_template "$role")"
   [ -n "$cmd_tpl" ] || die "no command for role '$role' ($key absent and TEAM_DEFAULT_CMD is null)"
   local runtime; runtime="$(classify_command_runtime "$cmd_tpl")"
   local prompt; prompt="$(compose_prompt "$team" "$fid" "$role" "$preset" "$runtime")" || return $?
@@ -3257,8 +3308,8 @@ print(json.dumps(matches[0],sort_keys=True,separators=(",",":")) if matches else
   if [ "$PUBLICATION_AUTHORITY_ENABLED" = true ]; then
     mint_outbox_capability "$role" "$team" "$fid" gate - 0 "gate:$role" "$dir"
   fi
-  prepare_execution "$REPO_ROOT" "$cmd" "$role" "$team" "$fid" "$preset" gate - 0
-  write_starting_heartbeat "$dir" "$role" -
+  prepare_execution "$REPO_ROOT" "$cmd" "$role" "$team" "$fid" "$preset" gate "$assigned_task" "$assigned_attempt" "$prompt"
+  write_starting_heartbeat "$dir" "$role" "$assigned_task"
 
   if [ "${TEAM_RUNNER:-auto}" != "background" ] && [ -n "$TMUX_BIN" ]; then
     env_cmd="$(execution_shell_command)"
@@ -3438,6 +3489,9 @@ ensure_task_worktree() { # team feature role task attempt [broker-restart]
   branch="$(task_branch "$team" "$task")"
   dir="$(teamroot "$team")" || die "unsafe team workspace"
   wt="$(team_path "$dir" "worktrees/$role#$attempt-$key")" || die "unsafe task worktree path"
+  if [ "$(read_key AGENT_EXECUTION_BACKEND)" = docker-sandboxes ]; then
+    validate_sandbox_runner_config
+  fi
   if [ -d "$wt" ]; then
     # Existing worktrees are still authority-bearing return values. Never let
     # the public helper become a lineage bypass merely because a path exists.
@@ -3457,6 +3511,15 @@ ensure_task_worktree() { # team feature role task attempt [broker-restart]
   # effect. compose-task, start-task, and the public worktree command all pass
   # through this one guarded mutation helper.
   lineage_preflight "$team" "$fid" "$role" "$task" "$attempt" "$lineage_authority"
+  if [ "$(read_key AGENT_EXECUTION_BACKEND)" = docker-sandboxes ]; then
+    local source_ref="refs/heads/$team"
+    if git_unprivileged -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
+      source_ref="refs/heads/$branch"
+    fi
+    python3 "$SKILL_DIR/bin/sandbox-launch.py" verify \
+      --deployment "$(read_key AGENT_SANDBOX_DEPLOYMENT)" --repo "$REPO_ROOT" --source-ref "$source_ref" >/dev/null \
+      || die "task source is unsupported for isolated execution; no worktree was created"
+  fi
   mkdir -p "$(dirname "$wt")"
   if git_unprivileged -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
     git_unprivileged -C "$REPO_ROOT" worktree add "$wt" "$branch" >/dev/null
@@ -3464,7 +3527,7 @@ ensure_task_worktree() { # team feature role task attempt [broker-restart]
     git_unprivileged -C "$REPO_ROOT" worktree add "$wt" -b "$branch" "$team" >/dev/null
   fi
   setup="$(read_key WORKTREE_SETUP)"
-  if [ -n "$setup" ]; then
+  if [ -n "$setup" ] && [ "$(read_key AGENT_EXECUTION_BACKEND)" != docker-sandboxes ]; then
     # Provisioning may execute repository package hooks or generators. Give
     # it the same positive, credential-free environment as a task agent so
     # scheduler tracker/cloud credentials never reach repository scripts.
@@ -3550,10 +3613,7 @@ launch_task() { # team feature role task attempt [preset] [broker-restart contro
   local execution profile task_cmd_key cmd_tpl
   execution="$(team_path "$dir" "executions/$(task_key "$task").json")" || die "unsafe execution path"
   profile="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["modelProfile"])' "$execution")"
-  task_cmd_key="TASK_$(printf '%s' "$profile" | tr 'a-z-' 'A-Z_')_CMD"
-  cmd_tpl="$(read_key "$task_cmd_key")"
-  [ -n "$cmd_tpl" ] || cmd_tpl="$(read_key "$key")"
-  [ -n "$cmd_tpl" ] || cmd_tpl="$(read_key TEAM_DEFAULT_CMD)"
+  cmd_tpl="$(task_command_template "$role" "$profile")"
   [ -n "$cmd_tpl" ] || die "no command for task role '$role' or model profile '$profile'"
   local cmd="${cmd_tpl//\{prompt_file\}/$prompt}"
   local instance; instance="$(task_instance "$role" "$task" "$attempt")"
@@ -3604,7 +3664,7 @@ launch_task() { # team feature role task attempt [preset] [broker-restart contro
   if [ "$PUBLICATION_AUTHORITY_ENABLED" = true ]; then
     mint_outbox_capability "$role" "$team" "$fid" task "$task" "$attempt" "$instance" "$dir"
   fi
-  prepare_execution "$wt" "$cmd" "$role" "$team" "$fid" "$preset" task "$task" "$attempt"
+  prepare_execution "$wt" "$cmd" "$role" "$team" "$fid" "$preset" task "$task" "$attempt" "$prompt"
 
   if [ "${TEAM_RUNNER:-auto}" != "background" ] && [ -n "$TMUX_BIN" ]; then
     env_cmd="$(execution_shell_command)"
@@ -4038,7 +4098,7 @@ esac
 # Roster preflight/doctor run before taking it; all subsequent writes and
 # launches occur under the shared side.  Other commands take it at entry.
 case "${1:-}" in
-  start|start-task|restart-task|relaunch|retire-role|restart-role|stop-task|fence-task)
+  start|start-task|start-gate-task|restart-task|relaunch|retire-role|restart-role|stop-task|fence-task)
     validate_team_id "${2:-}"
     acquire_team_fence "$2" shared
     ;;
@@ -4143,6 +4203,13 @@ case "${1:-}" in
   start-task)
     [ $# -ge 5 ] && [ $# -le 7 ] || die "usage: start-task <team> <featureId> <role> <taskId> [attempt] [preset]"
     launch_task "$2" "$3" "$4" "$5" "${6:-1}" "${7:-}"
+    ;;
+  start-gate-task)
+    [ $# -ge 6 ] && [ $# -le 7 ] || die "usage: start-gate-task <team> <featureId> <role> <taskId> <attempt> [preset]"
+    [ "$(read_key AGENT_EXECUTION_BACKEND)" = docker-sandboxes ] || die "start-gate-task requires docker-sandboxes"
+    [ "$5" != - ] || die "sandbox gate needs a concrete task"
+    case "$6" in ''|*[!0-9]*|0) die "sandbox gate needs a positive attempt" ;; esac
+    launch_one "$2" "$3" "$4" "${7:-}" "$5" "$6"
     ;;
   restart-task)
     [ $# -ge 6 ] && [ $# -le 7 ] \

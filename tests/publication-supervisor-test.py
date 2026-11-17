@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import ctypes
 import importlib.util
 import json
 import os
@@ -53,6 +54,29 @@ ROLE = "principal-architect"
 INSTANCE = "gate:principal-architect"
 BODY = b"[architecture-approval]\ntransport fixture\n"
 BODY_DIGEST = "sha256:" + hashlib.sha256(BODY).hexdigest()
+
+
+class DarwinPeerABITest(unittest.TestCase):
+    def test_audit_token_is_passed_as_a_struct_by_value(self):
+        raw = struct.pack("8I", 0, os.geteuid(), 0, 0, 0, 123, 0, 3)
+        def field(index):
+            def read(value):
+                self.assertIsInstance(value, ctypes.Structure)
+                self.assertEqual(ctypes.sizeof(value), 32)
+                return value.val[index]
+            return read
+        bsm = mock.Mock()
+        bsm.audit_token_to_pid.side_effect = field(5)
+        bsm.audit_token_to_euid.side_effect = field(1)
+        bsm.audit_token_to_pidversion.side_effect = field(7)
+        connection = mock.Mock(); connection.getsockopt.return_value = raw
+        with mock.patch.object(SUPERVISOR.sys, "platform", "darwin"), \
+             mock.patch.object(SUPERVISOR.ctypes, "CDLL", return_value=bsm), \
+             mock.patch.object(SUPERVISOR, "process_start_identity", return_value="fixed-start"):
+            peer, uid, token, pidfd = SUPERVISOR.peer_identity(connection)
+        self.assertEqual((peer.pid, peer.start, uid, token, pidfd), (123, "fixed-start", os.geteuid(), raw, None))
+        self.assertEqual(bsm.audit_token_to_euid.restype, ctypes.c_uint32)
+        self.assertEqual(bsm.audit_token_to_pid.restype, ctypes.c_int)
 
 
 class PublicationSupervisorTest(unittest.TestCase):
@@ -239,9 +263,13 @@ STATUS_CONFIG=config/statuses.config.json
         supervisor_barrier = self.lifecycle / (".launch-test-%s" % output.name)
         supervisor_barrier.mkdir(mode=0o700)
         supervisor_ready = supervisor_barrier / "supervisor.ready"
+        # Publish only after write_text has closed the complete PID file;
+        # wait_for observes existence before the parent reads its contents.
         wrapper = (
             "import os,pathlib,sys,time;"
-            "os.setsid();pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));"
+            "os.setsid();ready=pathlib.Path(sys.argv[1]);"
+            "pending=ready.with_name(ready.name+'.pending');"
+            "pending.write_text(str(os.getpid()));os.replace(pending,ready);"
             "\nwhile not pathlib.Path(sys.argv[2]).exists(): time.sleep(0.01)\n"
             "os.execv(sys.argv[3],sys.argv[3:])"
         )

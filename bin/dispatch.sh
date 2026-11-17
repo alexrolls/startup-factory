@@ -565,6 +565,11 @@ EOF
     fi
   fi
   local planner_args=(--skill "$SKILL_DIR" --workdir "$dir" --team "$team" --feature "$fid" --stuck-minutes "$stuck" --execution "$execution")
+  local sandbox_backend=no
+  if [ "$(read_key AGENT_EXECUTION_BACKEND)" = docker-sandboxes ]; then
+    sandbox_backend=yes
+    planner_args+=(--sandbox-jobs)
+  fi
   [ -z "$trusted_preset" ] || planner_args+=(--preset "$trusted_preset")
   planner_args+=(--health-json "$health_json")
   [ -z "$max_active" ] || planner_args+=(--max-active "$max_active")
@@ -587,6 +592,43 @@ EOF
         else
           echo "plan: launch $arg (→$concrete) ($detail)"
           if [ "$dry" != "yes" ]; then
+            if [ "$sandbox_backend" = yes ]; then
+              local assigned_task assigned_role assigned_attempt assignment
+              assignment="$(python3 - "$SKILL_DIR/bin" "$dir" "$extra" <<'PY'
+import json,sys
+sys.path.insert(0,sys.argv[1])
+from sandbox_execution_data import read_execution
+ids=json.loads(sys.argv[3] or '[]')
+if not isinstance(ids,list) or any(not isinstance(t,str) or not t or t=='-' for t in ids):
+    raise SystemExit('dispatch: invalid explicit sandbox job assignments')
+if not ids:
+    raise SystemExit(0)
+task=ids[0]
+try: record=read_execution(__import__('pathlib').Path(sys.argv[2]),task)
+except FileNotFoundError: record=None
+attempt=record['attempt'] if record else 1
+role=record['role'] if record else '-'
+if type(attempt) is not int or attempt<1: raise SystemExit('dispatch: invalid task attempt')
+print(json.dumps([task,role,attempt]))
+PY
+)" || die "could not bind sandbox dispatch assignment"
+              if [ -z "$assignment" ]; then
+                echo "plan: $concrete has no eligible concrete sandbox task; diagnostic retained"
+                continue
+              fi
+              assigned_task="$(printf '%s' "$assignment" | python3 -c 'import json,sys;print(json.load(sys.stdin)[0])')"
+              assigned_role="$(printf '%s' "$assignment" | python3 -c 'import json,sys;print(json.load(sys.stdin)[1])')"
+              assigned_attempt="$(printf '%s' "$assignment" | python3 -c 'import json,sys;print(json.load(sys.stdin)[2])')"
+              if [ "$arg" = integrator ]; then
+                # Merge authority remains in the deterministic trusted host
+                # integrator. Its validation commands use fresh guest jobs.
+                [ "$assigned_role" != - ] || die "integration assignment has no canonical execution"
+                "$SKILL_DIR/bin/integrate-task.sh" "$team" "$fid" "$assigned_task" "$assigned_role" "$assigned_attempt"
+              else
+                "$SKILL_DIR/bin/launch-team.sh" start-gate-task "$team" "$fid" "$concrete" "$assigned_task" "$assigned_attempt" "$trusted_preset"
+              fi
+              continue
+            fi
             if [ -n "$extra" ]; then
               local packages="" task_id package
               local _old_ifs="$IFS"; IFS='|'

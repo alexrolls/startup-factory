@@ -161,6 +161,11 @@ WORKTREE_SETUP=null              # Run once inside every freshly created task wo
                                  # null = bare worktree. Provisioning is what makes
                                  # implementer validation claims executable — an
                                  # unprovisioned tree produces misleading dependency/type failures.
+AGENT_EXECUTION_BACKEND=protected-runner  # protected-runner | docker-sandboxes; no automatic fallback.
+AGENT_SANDBOX_DEPLOYMENT=null    # Docker: absolute root-owned enrolled deployment manifest.
+SANDBOX_DEFAULT_CMD=null        # Docker: explicit Linux model command consuming {prompt_file}.
+                                 # SANDBOX_<ROLE>_CMD and SANDBOX_TASK_<PROFILE>_CMD override it.
+                                 # Commands and WORKTREE_SETUP run only inside a fresh guest.
 AGENT_SANDBOX_RUNNER=null        # Canonical absolute, root-owned executable under a root-owned,
                                  # operator/group/world-non-writable system path outside the agent
                                  # repository. In enforced mode

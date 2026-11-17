@@ -467,7 +467,7 @@ reject_entry() {
 # exhaustive feature export and validates the exact feature/task/team execution
 # scope. Call this immediately before each tracker comment or state mutation.
 refresh_authority() {
-  local entry="$1" validation_output=""
+  local entry="$1" validation_output="" sandbox_status=0
   cleanup_snapshot
   current_snapshot="$(mktemp "$authority/snapshot.XXXXXXXX")"
   if ! broker_tracker "$SKILL_DIR/bin/tracker-ops.sh" export "$feature" "$current_snapshot" >/dev/null; then
@@ -929,6 +929,17 @@ PY
       cleanup_snapshot
       return 1
     fi
+  fi
+  # Preserve the existing structural/signature diagnostics before consulting
+  # sandbox import/completion. No tracker mutation has happened here. An exact
+  # admitted intent waits for host import and a completed independent review.
+  python3 "$SKILL_DIR/bin/sandbox-execution-guard.py" \
+    --repo "$repo" --workspace "$workspace" --team "$team" --feature "$feature" \
+    --publication-entry "$entry" >/dev/null || sandbox_status=$?
+  if [ "$sandbox_status" -eq 75 ]; then
+    return 75
+  elif [ "$sandbox_status" -ne 0 ]; then
+    return 1
   fi
   return 0
 }

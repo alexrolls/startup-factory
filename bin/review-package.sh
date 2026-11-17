@@ -51,6 +51,12 @@ key="$(sf_python "$SKILL_DIR/bin/runtime-state.py" key "$task")"
 execution="$(sf_python "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "executions/$key.json")"
 artifact_dir="$(sf_python "$SKILL_DIR/bin/teamwork-path.py" child --repo "$repo" --workspace "$workspace" --relative "artifacts/$key")"
 [ -f "$execution" ] && [ ! -L "$execution" ] || { echo "review-package: no safe execution record for $task" >&2; exit 1; }
+version="$(sf_python -c 'import json,sys; print(json.load(open(sys.argv[1])).get("schemaVersion"))' "$execution")"
+if [ "$version" = 2 ]; then
+  sf_python "$SKILL_DIR/bin/sandbox-review-package.py" \
+    --repo "$repo" --workspace "$workspace" --team "$team" --task "$task"
+  exit $?
+fi
 branch="$(sf_python -c 'import json,sys; print(json.load(open(sys.argv[1]))["branch"])' "$execution")"
 read -r role attempt worktree <<EOF
 $(sf_python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["role"], d["attempt"], d["worktree"])' "$execution")

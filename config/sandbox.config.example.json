@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "backend": "docker-sandboxes",
+  "protocolVersion": 1,
+  "controllerUid": 1001,
+  "sbxPath": "/Library/StartupFactory/runtime/Sbx.app/Contents/MacOS/sbx",
+  "sbxSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "namespace": "sf-example",
+  "image": "registry.example.com/startup-factory/agent@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "guestWorkdir": "/workspace/project",
+  "limits": {
+    "cpus": 2,
+    "memoryMiB": 4096,
+    "rootDiskMiB": 16384,
+    "dockerDiskMiB": 16384,
+    "wallSeconds": 1800,
+    "maxOutputBytes": 1048576
+  },
+  "policyDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "qualificationDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+}
