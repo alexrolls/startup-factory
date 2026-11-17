@@ -2,7 +2,8 @@
 """Native relay fixtures; execute only in the assigned isolated test runner.
 
 Set SF_REGISTRY_TEST_ROOT to a private writable location with protected
-ancestors, such as /scratch. Subprocesses execute only the fixed shipped relay
+ancestors, such as /scratch; otherwise use the short protected account HOME.
+Subprocesses execute only the fixed shipped relay
 or the fixed framing harness below, with an explicit fixture environment.
 There are no Docker, tracker, external network, or real credential operations.
 """
@@ -79,7 +80,8 @@ def responses(raw: bytes) -> list[dict]:
 
 class RegistryRelayTest(unittest.TestCase):
     def setUp(self) -> None:
-        base = Path(os.environ.get("SF_REGISTRY_TEST_ROOT", os.getcwd()))
+        # A long checkout/TMPDIR must not lengthen the native socket locator.
+        base = Path(os.environ.get("SF_REGISTRY_TEST_ROOT", str(Path.home())))
         self.temporary = tempfile.TemporaryDirectory(prefix="sf-relay-", dir=base)
         self.addCleanup(self.temporary.cleanup)
         self.scratch = Path(self.temporary.name).resolve()

@@ -37,7 +37,11 @@ from sandbox_ingest import (  # noqa: E402
 
 class SandboxIngestTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="sf-ingest-")
+        # AF_UNIX locators must stay short independently of the checkout and
+        # TMPDIR lengths. HOME is a protected account directory; the fixture
+        # itself remains owner-only and production path checks stay enabled.
+        self.temporary = tempfile.TemporaryDirectory(prefix="sf-ingest-",
+            dir=os.environ.get("SF_REGISTRY_TEST_ROOT", str(Path.home())))
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         self.root.chmod(0o700)
@@ -379,6 +383,7 @@ class SandboxIngestTest(unittest.TestCase):
             self.admission()
         self.protected.unlink()
         self.protected.mkdir(mode=0o755)
+        self.protected.chmod(0o755)
         with self.assertRaises(IngestError):
             self.admission()
         self.protected.chmod(0o700)

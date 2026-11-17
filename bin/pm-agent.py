@@ -130,6 +130,15 @@ RELEASE_SNAPSHOT_FILES = {
     "teamwork-path.py": Path("bin/teamwork-path.py"),
     "launch-lane-lock.py": Path("bin/launch-lane-lock.py"),
     "review_evidence.py": Path("bin/review_evidence.py"),
+    "execution_descriptor.py": Path("bin/execution_descriptor.py"),
+    "sandbox_acceptance.py": Path("bin/sandbox_acceptance.py"),
+    "host_git.py": Path("bin/host_git.py"),
+    "execution_backend.py": Path("src/startup_factory_cli/execution_backend.py"),
+    "sandbox_deployment.py": Path("src/startup_factory_cli/sandbox_deployment.py"),
+    "sandbox_enrollment.py": Path("src/startup_factory_cli/sandbox_enrollment.py"),
+    "sandbox_qualification.py": Path("src/startup_factory_cli/sandbox_qualification.py"),
+    "sandbox_qualification_evidence.py": Path("src/startup_factory_cli/sandbox_qualification_evidence.py"),
+    "sandbox_registry.py": Path("src/startup_factory_cli/sandbox_registry.py"),
     "statuses.config.json": Path("config/statuses.config.json"),
     "guardrails.config.json": Path("config/guardrails.config.json"),
     "team.config.md": Path("config/team.config.md"),
@@ -806,6 +815,12 @@ def meaningful_command(value: str | None) -> bool:
 
 
 def validate_agent_sandbox_runner(project: Path, values: dict[str, str | None]) -> None:
+    backend = values.get("AGENT_EXECUTION_BACKEND") or "protected-runner"
+    if backend not in {"protected-runner", "docker-sandboxes"}:
+        raise MonitorError("AGENT_EXECUTION_BACKEND must be protected-runner or docker-sandboxes")
+    if backend == "docker-sandboxes":
+        validate_docker_sandbox_deployment(project, values)
+        return
     raw = values.get("AGENT_SANDBOX_RUNNER") or ""
     runner = Path(raw)
     if not raw:
@@ -893,6 +908,49 @@ def validate_agent_sandbox_runner(project: Path, values: dict[str, str | None]) 
         if ancestor == ancestor.parent:
             break
         ancestor = ancestor.parent
+
+
+def validate_docker_sandbox_deployment(project: Path, values: dict[str, str | None]) -> None:
+    """Docker uses its enrolled persistent controller, without a native fallback."""
+    if values.get("AGENT_SANDBOX_ENFORCED") != "true":
+        raise MonitorError("Docker autonomous launch requires AGENT_SANDBOX_ENFORCED=true")
+    raw = values.get("AGENT_SANDBOX_DEPLOYMENT")
+    if not raw or not Path(raw).is_absolute():
+        raise MonitorError("Docker autonomous launch requires an absolute protected AGENT_SANDBOX_DEPLOYMENT")
+    try:
+        from startup_factory_cli.execution_backend import load_profile
+        from startup_factory_cli.sandbox_deployment import load_deployment
+        from startup_factory_cli.sandbox_qualification_evidence import verify_deployment_enrollment
+        from startup_factory_cli.sandbox_registry import SandboxRegistry
+        deployment = load_deployment(Path(raw))
+        profile = load_profile(Path(deployment.profile_path))
+        if os.getuid() != deployment.controller_uid or os.geteuid() != deployment.controller_uid:
+            raise MonitorError("Docker autonomous launch must use the enrolled dedicated controller UID")
+        if Path(deployment.bundle_root) != SKILL_DIR.resolve(strict=True):
+            raise MonitorError("PM supervisor is not the enrolled root-protected Docker bundle")
+        if Path(sys.executable).resolve(strict=True) != Path(deployment.programs["python"]["path"]):
+            raise MonitorError("PM supervisor interpreter differs from the enrolled Python pin")
+        if values.get("BROKER_LIFECYCLE_ROOT") != deployment.lifecycle_root:
+            raise MonitorError("PM supervisor lifecycle root differs from the enrolled Docker deployment")
+        ambient = os.environ.get("STARTUP_FACTORY_LIFECYCLE_STATE_ROOT")
+        if ambient is not None and ambient != deployment.lifecycle_root:
+            raise MonitorError("ambient lifecycle root differs from the enrolled Docker deployment")
+        repository = project.resolve(strict=True)
+        if repository != project:
+            raise MonitorError("Docker project must use its canonical absolute path")
+        project_id = "sha256:" + hashlib.sha256(str(repository).encode()).hexdigest()
+        projects = [entry for entry in deployment.projects
+            if entry["projectId"] == project_id and Path(entry["repository"]) == repository]
+        if len(projects) != 1:
+            raise MonitorError("PM project is outside the Docker deployment allowlist")
+        # Verification rechecks the exact protected deployment, profile/runtime
+        # and Python hashes, private state roots and all mandatory live evidence.
+        with SandboxRegistry(Path(deployment.registry_root), profile.namespace) as registry:
+            verify_deployment_enrollment(deployment, profile, Path(deployment.receipt_path), registry)
+    except MonitorError:
+        raise
+    except Exception as exc:
+        raise MonitorError("Docker deployment/enrollment verification refused autonomous startup") from exc
 
 
 def validate_lifecycle_state_root(

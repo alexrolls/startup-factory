@@ -253,6 +253,15 @@ setting `enabled`):
     "requireNegativeProbe": true
   },
   "trustedCodeDigests": {
+    "execution_descriptor.py": "sha256:<sha256 of bin/execution_descriptor.py>",
+    "sandbox_acceptance.py": "sha256:<sha256 of bin/sandbox_acceptance.py>",
+    "host_git.py": "sha256:<sha256 of bin/host_git.py>",
+    "execution_backend.py": "sha256:<sha256 of src/startup_factory_cli/execution_backend.py>",
+    "sandbox_deployment.py": "sha256:<sha256 of src/startup_factory_cli/sandbox_deployment.py>",
+    "sandbox_enrollment.py": "sha256:<sha256 of src/startup_factory_cli/sandbox_enrollment.py>",
+    "sandbox_qualification.py": "sha256:<sha256 of src/startup_factory_cli/sandbox_qualification.py>",
+    "sandbox_qualification_evidence.py": "sha256:<sha256 of src/startup_factory_cli/sandbox_qualification_evidence.py>",
+    "sandbox_registry.py": "sha256:<sha256 of src/startup_factory_cli/sandbox_registry.py>",
     "release-feature.py": "sha256:<64 lowercase hex>",
     "authority_config.py": "sha256:<64 lowercase hex>",
     "config-value.py": "sha256:<64 lowercase hex>",
@@ -322,8 +331,8 @@ executor interprets normalized tracker records, not provider-specific objects.
 
 Only configured hooks need a `trustedHookDigests` entry; `plan`, `apply`,
 `status`, `verify`, and `verifyCi` are required. `verifyApproval` is required in
-`approval-required`; `verifyDelivery` is required in `automatic`. The twenty
-`trustedCodeDigests` keys above are exact and all are required whenever delivery
+`approval-required`; `verifyDelivery` is required in `automatic`. The listed
+`trustedCodeDigests` keys are exact and all are required whenever delivery
 is enabled with a shipped adapter. A custom adapter adds exactly one required
 entry, `"tracker-backend.<AdapterName>.py": "sha256:<64 lowercase hex>"`, for
 `extensions/tracker-backends/<AdapterName>.py`. Hash the installed reviewed

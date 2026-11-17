@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import importlib.util
+import hashlib
 import inspect
 import json
 import os
@@ -20,6 +21,7 @@ import threading
 import time
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,6 +76,78 @@ def managed_record(*, category, instance, state, pid):
         "tmuxPanePid": None,
         "state": state,
     }
+
+
+class DockerStartupSafetyTest(unittest.TestCase):
+    """Only explicit read-only authority fixtures authorize this unit boundary."""
+    def setUp(self):
+        from startup_factory_cli.sandbox_registry import SandboxRegistry
+        self.temporary = tempfile.TemporaryDirectory(dir=os.environ.get("SF_REGISTRY_TEST_ROOT"))
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve(); self.root.chmod(0o700)
+        self.project = self.root / "project"; self.project.mkdir(mode=0o700)
+        self.registry_root = self.root / "registry"; self.registry_root.mkdir(mode=0o700)
+        with SandboxRegistry(self.registry_root, "sf-pm"):
+            pass
+        self.before = {path.name: path.read_bytes() for path in self.registry_root.iterdir()}
+        self.profile = SimpleNamespace(namespace="sf-pm")
+        self.deployment = SimpleNamespace(profile_path="/protected/profile.json", receipt_path="/protected/enrollment.json",
+            controller_uid=os.geteuid(), bundle_root=str(ROOT), registry_root=str(self.registry_root),
+            lifecycle_root=str(self.root / "lifecycle"), programs={"python": {"path": str(Path(sys.executable).resolve())}},
+            projects=[{"projectId": "sha256:" + hashlib.sha256(str(self.project).encode()).hexdigest(),
+                "repository": str(self.project), "workspaceRoot": str(self.project / ".teamwork")}])
+        self.values = {"AGENT_EXECUTION_BACKEND": "docker-sandboxes", "AGENT_SANDBOX_ENFORCED": "true",
+            "AGENT_SANDBOX_DEPLOYMENT": "/protected/deployment.json", "AGENT_SANDBOX_RUNNER": None,
+            "BROKER_LIFECYCLE_ROOT": self.deployment.lifecycle_root}
+        environment = mock.patch.dict(os.environ, {}, clear=True); environment.start(); self.addCleanup(environment.stop)
+        loader = mock.patch("startup_factory_cli.sandbox_deployment.load_deployment", return_value=self.deployment)
+        self.loader = loader.start(); self.addCleanup(loader.stop)
+        profile_loader = mock.patch("startup_factory_cli.execution_backend.load_profile", return_value=self.profile)
+        self.profile_loader = profile_loader.start(); self.addCleanup(profile_loader.stop)
+        verifier = mock.patch("startup_factory_cli.sandbox_qualification_evidence.verify_deployment_enrollment")
+        self.verifier = verifier.start(); self.addCleanup(verifier.stop)
+
+    def test_qualified_docker_fixture_needs_no_legacy_runner_and_preserves_private_history(self):
+        pm_agent.validate_agent_sandbox_runner(self.project, self.values)
+        self.loader.assert_called_once_with(Path(self.values["AGENT_SANDBOX_DEPLOYMENT"]))
+        self.profile_loader.assert_called_once_with(Path(self.deployment.profile_path))
+        self.assertEqual(self.verifier.call_args.args[:3], (self.deployment, self.profile, Path(self.deployment.receipt_path)))
+        self.assertEqual(self.verifier.call_args.args[3].namespace, "sf-pm")
+        self.assertEqual(self.before, {path.name: path.read_bytes() for path in self.registry_root.iterdir()})
+
+    def test_docker_refuses_missing_enforcement_or_deployment_and_never_falls_back(self):
+        for changes in ({"AGENT_SANDBOX_ENFORCED": "false"}, {"AGENT_SANDBOX_DEPLOYMENT": None},
+                {"AGENT_SANDBOX_DEPLOYMENT": "relative.json"}, {"BROKER_LIFECYCLE_ROOT": "/different/lifecycle"}):
+            with self.subTest(changes=changes), self.assertRaises(pm_agent.MonitorError):
+                pm_agent.validate_agent_sandbox_runner(self.project, {**self.values, **changes, "AGENT_SANDBOX_RUNNER": "/usr/bin/true"})
+        self.verifier.side_effect = RuntimeError("fixture missing actual live qualification")
+        with self.assertRaises(pm_agent.MonitorError):
+            pm_agent.validate_agent_sandbox_runner(self.project, self.values)
+
+    def test_docker_refuses_other_uid_bundle_interpreter_project_or_ambient_authority(self):
+        for attribute, value in (("controller_uid", os.geteuid() + 1), ("bundle_root", "/unqualified/bundle"),
+                ("programs", {"python": {"path": "/unqualified/python3"}}), ("projects", [])):
+            previous = getattr(self.deployment, attribute)
+            try:
+                setattr(self.deployment, attribute, value)
+                with self.subTest(attribute=attribute), self.assertRaises(pm_agent.MonitorError):
+                    pm_agent.validate_agent_sandbox_runner(self.project, self.values)
+            finally:
+                setattr(self.deployment, attribute, previous)
+        with mock.patch.dict(os.environ, {"STARTUP_FACTORY_LIFECYCLE_STATE_ROOT": "/different/lifecycle"}), self.assertRaises(pm_agent.MonitorError):
+            pm_agent.validate_agent_sandbox_runner(self.project, self.values)
+
+    def test_unknown_backend_and_missing_native_runner_are_still_refused(self):
+        with self.assertRaisesRegex(pm_agent.MonitorError, "AGENT_EXECUTION_BACKEND"):
+            pm_agent.validate_agent_sandbox_runner(self.project, {**self.values, "AGENT_EXECUTION_BACKEND": "unrecognized"})
+        for backend in (None, "protected-runner"):
+            with self.subTest(backend=backend), self.assertRaisesRegex(pm_agent.MonitorError, "AGENT_SANDBOX_RUNNER"):
+                pm_agent.validate_agent_sandbox_runner(self.project, {**self.values, "AGENT_EXECUTION_BACKEND": backend})
+
+    def test_example_publication_transport_fits_the_native_socket_limit(self):
+        example = json.loads((ROOT / "config/sandbox-deployment.example.json").read_bytes())
+        locator = example["lifecycleRoot"] + "/p/" + "0" * 32
+        self.assertLess(len(os.fsencode(locator)), 100)
 
 
 class HealthPublisherTest(unittest.TestCase):

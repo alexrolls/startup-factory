@@ -227,6 +227,15 @@ trusted={name:digest(pathlib.Path(root)/rel) for name,rel in {
   "teamwork-path.py":"bin/teamwork-path.py",
   "launch-lane-lock.py":"bin/launch-lane-lock.py",
   "review_evidence.py":"bin/review_evidence.py",
+  "execution_descriptor.py":"bin/execution_descriptor.py",
+  "sandbox_acceptance.py":"bin/sandbox_acceptance.py",
+  "host_git.py":"bin/host_git.py",
+  "execution_backend.py":"src/startup_factory_cli/execution_backend.py",
+  "sandbox_deployment.py":"src/startup_factory_cli/sandbox_deployment.py",
+  "sandbox_enrollment.py":"src/startup_factory_cli/sandbox_enrollment.py",
+  "sandbox_qualification.py":"src/startup_factory_cli/sandbox_qualification.py",
+  "sandbox_qualification_evidence.py":"src/startup_factory_cli/sandbox_qualification_evidence.py",
+  "sandbox_registry.py":"src/startup_factory_cli/sandbox_registry.py",
 }.items()}
 json.dump({
   "schemaVersion":1,

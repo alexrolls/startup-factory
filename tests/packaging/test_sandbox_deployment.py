@@ -205,7 +205,7 @@ class DeploymentTest(unittest.TestCase):
 
 class StorageAndHistoryTest(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(dir=os.environ.get("SF_REGISTRY_TEST_ROOT"))
+        self.temporary = tempfile.TemporaryDirectory(dir=os.environ.get("SF_REGISTRY_TEST_ROOT", os.getcwd()))
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name); self.root.chmod(0o700)
         self.profile = DockerProfile.from_dict(profile_data(os.geteuid()))

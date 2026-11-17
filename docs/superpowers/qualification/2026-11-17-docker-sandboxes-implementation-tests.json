@@ -78,5 +78,22 @@
     "bundleBuiltTwiceByteIdentical": true,
     "syntheticSnapshotBundleSha256": "3e1c6d5e419d5563eacb2a4b3c9f6fb684d6d4cec31af3c3111fbb58525bd2d2",
     "releaseTagCreated": false
+  },
+  "ciIntegrationFollowup": {
+    "protectedReleaseSnapshot": "New receipt dependencies included in both release and PM supervisor digest-pinned snapshots.",
+    "pmSupervisor": "Docker backend validates exact protected deployment/enrollment instead of requiring a legacy runner.",
+    "runtimeVersion": "0.3.0",
+    "fullPackagingWithFixtureRootOverrideUnset": {
+      "run": 378,
+      "passed": 377,
+      "skipped": 1
+    },
+    "runtimeAndReleaseFollowupTestsPassed": 199,
+    "deploymentShellSuite": "ALL PASS",
+    "fixturePortability": {
+      "uid1001gid1001LongCheckoutAndTmpdirOverridesUnset": 82,
+      "uid1001gid1002JobTestsPassed": 23
+    },
+    "productionChecksWeakened": false
   }
 }

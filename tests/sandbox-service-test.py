@@ -66,7 +66,10 @@ class FakeExecutor:
 
 class SandboxServiceTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="sf-rpc-", dir=os.environ.get("SF_REGISTRY_TEST_ROOT"))
+        # Keep real AF_UNIX sockets and derived publication locators under a
+        # short protected account root, independent of checkout/TMPDIR length.
+        self.temp = tempfile.TemporaryDirectory(prefix="sf-rpc-",
+            dir=os.environ.get("SF_REGISTRY_TEST_ROOT", str(Path.home())))
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name); self.root.chmod(0o700)
         self.repo = self.root / "repo"; self.repo.mkdir(mode=0o700)
@@ -262,7 +265,8 @@ class SandboxServiceTest(unittest.TestCase):
 class NativeExecutorIntegrationTest(unittest.TestCase):
     """Only authority/VM execution are mocks; raw Git/import/projection are real."""
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=os.environ.get("SF_REGISTRY_TEST_ROOT"))
+        self.temp = tempfile.TemporaryDirectory(prefix="sf-native-rpc-",
+            dir=os.environ.get("SF_REGISTRY_TEST_ROOT", str(Path.home())))
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name); self.root.chmod(0o700)
         self.repo = self.root / "repo"; self.repo.mkdir(mode=0o700)

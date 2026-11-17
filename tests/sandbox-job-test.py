@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Job transfer fixtures; run only in the bounded offline UID1000 runner.
+"""Job transfer fixtures; run only in a bounded offline nonroot runner.
 
 Fake VM paths are mapped into this test's private scratch directory. Actual
 bootstrap, guest bridge/client, export, raw Git and bounded native pipes run;
@@ -104,10 +104,14 @@ class FakeVMController:
 
     def open_provision_session(self, handle, command):
         self.events.append("provision")
-        # This offline fixture is UID1000 and cannot provision OS accounts or
-        # chown to the production guest's distinct worker UID2000. Map only the
-        # fixed identity operations; real root provisioning is a live VM gate.
-        code = jobs.BOOTSTRAP.replace("initialize_agent_identity()", "None").replace("2000", "1000").replace("'/opt/startup-factory'", repr(str(self.app))).replace("'/workspace'", repr(str(self.workspace))).replace("'/home/sf-agent'", repr(str(self.root / "home")))
+        # This nonroot fixture cannot provision OS accounts or chown to the
+        # production guest UID/GID2000. Map only fixed identity operations to
+        # the actual test UID/GID; real provisioning remains a live VM gate.
+        uid, gid = os.geteuid(), os.getegid()
+        code = jobs.BOOTSTRAP.replace("initialize_agent_identity()", "None").replace(
+            ",2000,2000", f",{uid},{gid}").replace("{0,2000}", "{0," + str(uid) + "}").replace(
+            "'/opt/startup-factory'", repr(str(self.app))).replace("'/workspace'", repr(str(self.workspace))).replace(
+            "'/home/sf-agent'", repr(str(self.root / "home")))
         return self._start([sys.executable, "-I", "-B", "-c", code])
 
     def install_credentials(self, handle, broker, lease):
@@ -167,8 +171,16 @@ raw=json.dumps(value,separators=(',',':')).encode();sys.stdout.buffer.write(stru
 
 
 class SandboxJobTest(unittest.TestCase):
-    for _method in ("setUp", "fixture_git", "authority_lock", "authorize", "store", "manifest"):
+    for _method in ("fixture_git", "authority_lock", "authorize", "store", "manifest"):
         locals()[_method] = ARTIFACT_FIXTURE["ArtifactTests"].__dict__[_method]
+
+    def setUp(self):
+        # The shared raw-Git fixture normally permits checkout-local storage.
+        # These tests also bind real guest sockets, so choose a short private
+        # fixture root even when CI has a long checkout and TMPDIR.
+        base = os.environ.get("SF_ARTIFACT_TEST_ROOT", os.environ.get("SF_REGISTRY_TEST_ROOT", str(Path.home())))
+        with mock.patch.dict(os.environ, {"SF_ARTIFACT_TEST_ROOT": base}):
+            ARTIFACT_FIXTURE["ArtifactTests"].setUp(self)
 
     def source(self):
         return build_source_package(self.base, self.git.read_object, contains_secret=lambda _text: False)
