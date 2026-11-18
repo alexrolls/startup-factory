@@ -17,13 +17,20 @@ the adapter doesn't define.
 
 Turn an idea into a tracked feature with a task breakdown.
 
-Before step 1, select the configured planning intake. If
-`USE_SUPERPOWERS=true` and the current runtime is Claude Code, follow
-`reference/superpowers-planning.md`: use Superpowers for brainstorming and
-writing the committed specification/plan, then create the Startup Factory
-planning handoff. Treat those documents as reviewed inputs to the steps below,
-not as authority to launch Superpowers execution. If the flag is false or the
-runtime is not Claude Code, begin directly with the native workflow.
+Before step 1, resolve the configured planning provider through
+`reference/planning.md` and `bin/planning.py preflight --runtime <runtime>`.
+`PLANNING_PROVIDER=auto` preserves enabled Claude/Superpowers intake and native
+planning for other runtimes. Explicit provider selection takes precedence over
+`USE_SUPERPOWERS`; unavailable explicit providers fail without fallback. For
+`superpowers`, follow `reference/superpowers-planning.md`; for `egm`, follow
+`reference/egm-planning.md` using the configured complete external bundle.
+Reuse an already complete specification with the `spec-provided` intake instead
+of repeating discovery. For Superpowers or EGM, write the selected provider's
+specification and plan, then create the committed, digest-bound planning handoff.
+Native planning may opt into the same handoff; the existing native lifecycle
+without one remains supported. Treat documents and fresh review reports as
+inputs to the steps below; they neither launch another execution workflow nor
+replace Startup Factory's approvals.
 
 1. **Understand the goal.** Clarify scope with the user: what ships, what's explicitly out,
    and any dependencies. Research the codebase enough to size the work realistically.
@@ -255,9 +262,11 @@ For preset teams this batch is the **default opener** (`teams/_PLAYBOOK.md`
 stage 3); per-[task] gates at claim time are the opt-out for genuinely
 emergent plans.
 
-An approved Claude/Superpowers planning handoff may seed these notes, but it
-does not replace the cross-[task] consistency pass, independent architectural
-challenge, per-[task] verdicts, product scope sign-off, or tracker comments.
+An approved native, Superpowers, or EGM planning handoff may seed these notes,
+but it does not replace the cross-[task] consistency pass, independent
+architectural challenge, per-[task] verdicts, product scope sign-off, or tracker
+comments. EGM reviewers provide advisory document evidence; they are not
+authenticated architectural gate roles.
 
 1. **One `[design-note]` per [task]**, written against the real codebase (not the
    [task] text alone). Registering exports in the contract registry

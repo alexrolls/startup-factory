@@ -11,8 +11,10 @@ the operational front door; the details live in sibling files (paths are relativ
 skill's directory):
 
 - `config/project-management.config.md` — selects the active tool + settings
-- `config/planning.config.md` + `reference/superpowers-planning.md` +
-  `bin/superpowers-planning.py` — optional Claude/Superpowers planning intake
+- `config/planning.config.md` + `reference/planning.md` + `bin/planning.py` —
+  provider selection and committed specification/plan handoffs
+- `reference/superpowers-planning.md` + `reference/egm-planning.md` — optional
+  Superpowers intake or portable EGM-assisted requirements and specification review
 - `reference/vocabulary.md` — the generic contract (terms, statuses, IDs, banned words)
 - `reference/lifecycle.md` — the numbered scenarios you execute
 - `reference/team-roles.md` — status ownership (only if `TEAM_MODE=true`)
@@ -145,7 +147,9 @@ exact shipped command to run in their terminal.
 1. **Read the configs** (`config/project-management.config.md` and
    `config/planning.config.md`). Note
    `PRODUCT_MANAGEMENT_TOOL`, the per-tool settings block, and the flags `TEAM_MODE` /
-   `STRICT_STATUS` / `USE_SUPERPOWERS`.
+   `STRICT_STATUS` / `PLANNING_PROVIDER` / `USE_SUPERPOWERS`. A missing
+   `PLANNING_PROVIDER` means `auto`; explicit provider selection takes precedence
+   over the legacy `USE_SUPERPOWERS` flag.
 2. **Load the project retrospective.** Outside a dispatched task instance, run
    `python3 <skill-dir>/bin/retrospective.py init --repo <exact-project-root>`
    and read the printed Markdown path before acting on a [task]. The file is project-local,
@@ -161,17 +165,24 @@ exact shipped command to run in their terminal.
    For autonomous monitoring or production delivery, also read
    `reference/automation.md`, `reference/guardrails.md`, and
    `reference/deployment.md` before enabling anything.
-5. **Select the planning intake.** For Scenario 1 or 10, when
-   `USE_SUPERPOWERS=true` and the current runtime is Claude Code, read
-   `reference/superpowers-planning.md` and run its plugin preflight. Use
-   `superpowers:brainstorming` plus `superpowers:writing-plans` when requirements
-   need discovery. If the user already supplied a complete, internally
-   consistent specification and explicitly asked to proceed, record
-   `spec-provided`, write that specification artifact, and go directly to
-   `superpowers:writing-plans`. Then create the digest-bound handoff with the
-   selected intake and continue with Startup Factory's own team. When disabled
-   or running in another runtime, use the native lifecycle. Never hand execution,
-   worktrees, dispatch, review, integration, or release to Superpowers.
+5. **Select the planning intake.** For Scenario 1 or 10, read
+   `reference/planning.md` and run `bin/planning.py preflight --runtime <runtime>`.
+   `auto` preserves the legacy behavior: enabled Superpowers intake on Claude
+   Code, native planning elsewhere. Explicit `native`, `superpowers`, or `egm`
+   selects that provider; an unavailable explicit provider fails instead of
+   silently falling back. Read only the selected provider's reference. EGM
+   requires the complete external bundle and follows the Factory adaptation in
+   `reference/egm-planning.md`; consume its canonical personas and standards,
+   and use fresh reviewers without parent conversation history. If fresh
+   delegation is unavailable, label the review incomplete rather than simulate
+   an independent review in the author context. For any provider, reuse a
+   complete, internally consistent supplied specification when the user has
+   explicitly asked to proceed: record `spec-provided` and avoid repeating
+   discovery. Create and validate a committed specification/plan handoff for
+   Superpowers or EGM before team planning; native planning may opt into the same
+   contract without changing the legacy native lifecycle. Planning reports are
+   inputs, not authenticated approvals. Startup Factory retains execution,
+   worktrees, dispatch, mandatory review, integration, and release authority.
 6. **Select review authority before launching anyone.** Use exactly one profile:
    - **Single-agent:** one agent may implement and self-review, but must label the
      result as self-review. Never emit a mandatory board-approval marker or claim
