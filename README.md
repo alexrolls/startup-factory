@@ -39,7 +39,7 @@ Startup Factory does not replace your coding agent, repository, project-manageme
 - [Bring your own agents, tracker, and stack](#bring-your-own-agents-tracker-and-stack)
 - [Choose how much autonomy you want](#choose-how-much-autonomy-you-want)
 - [Safety is part of the architecture](#safety-is-part-of-the-architecture)
-- [What's new](#whats-new-in-022)
+- [What's new](#whats-new-in-040)
 - [Documentation](#documentation)
 - [Project status](#project-status)
 - [Contributing](#contributing)
@@ -422,6 +422,49 @@ Command resolution per role: an explicit `<ROLE>_CMD` value is used; `<ROLE>_CMD
 
 The contract is intentionally thin: provide the prompt, let the agent read and edit files within its assigned boundary, capture the result, and trust the exit status. Adding another compatible CLI should not require rewriting the orchestration core.
 
+### Requirements and specification planning
+
+Choose `PLANNING_PROVIDER=auto|native|superpowers|egm` in
+[`config/planning.config.md`](config/planning.config.md). The default `auto`
+preserves the existing behavior: enabled Superpowers intake for Claude Code,
+native Factory planning for other runtimes. Explicit selection overrides the
+legacy `USE_SUPERPOWERS` flag and fails visibly if its prerequisites are missing.
+
+EGM can help shape a brief, draft a specification and plan, and challenge them
+with fresh document-comprehension and implementation-readiness reviewers. To opt
+in, obtain a reviewed complete checkout of
+[`google/elephant-goldfish-model`](https://github.com/google/elephant-goldfish-model)
+outside the project, then set these keys in the existing planning config:
+
+```text
+PLANNING_PROVIDER=egm
+EGM_PLUGIN_ROOT=/absolute/tools/egm
+EGM_SPEC_ROOT=docs/egm/specs
+EGM_PLAN_ROOT=docs/egm/plans
+```
+
+From a source checkout, check the prerequisites and bind the final committed
+planning inputs with:
+
+```bash
+python3 bin/planning.py preflight --runtime codex
+bash bin/launch-team.sh planning-handoff full-stack \
+  docs/egm/specs/export.md docs/egm/plans/export.md brainstormed codex
+```
+
+For an installed skill, use its `bin/` path. Pass `deepseek-harness`, `claude`, or
+`other` for those planning sessions. This is a portable Factory adaptation using
+EGM's complete canonical bundle and the host's actual fresh-agent tools;
+DeepSeek Harness is not claimed as an upstream native EGM plugin integration.
+Local preflight does not prove a live model workflow or reviewer isolation.
+
+The [planning guide](reference/planning.md) covers provider selection, supplied
+specifications, native handoffs, and compatibility. The
+[EGM guide](reference/egm-planning.md) supplies setup and the compact review
+workflow; the [Superpowers guide](reference/superpowers-planning.md) preserves the
+Claude integration. Startup Factory retains task shaping, authenticated design
+and review gates, execution, worktrees, dispatch, integration, and release.
+
 ### Project-management tools
 
 | Tracker | Best for | Adapter |
@@ -498,6 +541,22 @@ Read the full contracts before enabling unattended or production operation:
 - [`reference/automation.md`](reference/automation.md)
 - [`reference/deployment.md`](reference/deployment.md)
 - [`reference/orchestration.md`](reference/orchestration.md)
+
+## What's new in 0.4.0
+
+This release adds optional EGM-assisted requirements and specification planning
+for Codex, Claude Code, DeepSeek Harness, and compatible file-reading agents.
+Choose `PLANNING_PROVIDER=egm` and configure a complete external EGM bundle;
+the default `auto` keeps existing planning behavior.
+
+The shared planning handoff binds committed specifications and plans to their
+provider and source revision, including the EGM resource digest. Native planning
+can use the same handoff, and existing Superpowers handoffs remain compatible.
+Startup Factory continues to own task execution, authenticated reviews,
+integration, and release. See the [EGM setup guide](reference/egm-planning.md).
+
+Local validation covers resource checks, handoffs, and composed instructions;
+live model execution and reviewer isolation must be qualified for each host.
 
 ## What's new in 0.2.3
 
@@ -764,6 +823,8 @@ reviews, integration, or releases.
 | [`reference/quickstart.md`](reference/quickstart.md) | External-runner prerequisites and the unproven benchmark path for a governed, non-production team delivery |
 | [`SKILL.md`](SKILL.md) | The operational front door and supported user requests |
 | [`reference/lifecycle.md`](reference/lifecycle.md) | Planning, starting, reviewing, finalizing, blocking, automation, and release scenarios |
+| [`reference/planning.md`](reference/planning.md) | Native, Superpowers, and EGM intake, committed planning handoffs, and compatibility |
+| [`reference/egm-planning.md`](reference/egm-planning.md) | Complete EGM bundle setup, portable requirements/specification flow, and fresh reviewer limits |
 | [`reference/orchestration.md`](reference/orchestration.md) | Task packets, worktrees, mailboxes, dispatch, gates, attempts, and integration |
 | [`reference/delivery-profiles.md`](reference/delivery-profiles.md) | Monotonic micro, standard, and high-risk routing and invariant authority boundaries |
 | [`extensions/integration-packs/README.md`](extensions/integration-packs/README.md) | Pack schema, two-root setup model, preview/apply/doctor flow, and extension contract |
@@ -786,7 +847,10 @@ reviews, integration, or releases.
 | [`adapters/`](adapters/) | Shipped project-management adapters and the custom adapter template |
 | [GitHub Releases](https://github.com/alexrolls/startup-factory/releases) | Version history and release notes |
 
-Claude Code users can optionally connect [`obra/superpowers`](https://github.com/obra/superpowers) for planning intake. Startup Factory still owns task execution, worktrees, dispatch, review, integration, and release. See [`reference/superpowers-planning.md`](reference/superpowers-planning.md).
+Choose optional [Superpowers](reference/superpowers-planning.md) or
+[EGM-assisted](reference/egm-planning.md) planning through the shared
+[planning provider contract](reference/planning.md). Startup Factory owns task
+execution, worktrees, dispatch, mandatory review, integration, and release.
 
 ## Project status
 

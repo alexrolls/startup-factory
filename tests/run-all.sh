@@ -95,6 +95,7 @@ TEST_INVENTORY=(
   "python|tests/retrospective-test.py|smoke|core"
   "python|tests/product-acceptance-test.py|smoke|core"
   "python|tests/superpowers-planning-test.py|smoke|core"
+  "python|tests/planning-provider-test.py|smoke|core"
   "python|tests/review-evidence-test.py|smoke|core"
   "python|tests/broker-evidence-test.py|smoke|core"
   "python|tests/recovery-validation-test.py|smoke|core"

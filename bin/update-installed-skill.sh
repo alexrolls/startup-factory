@@ -720,6 +720,7 @@ for required_file in \
   bin/process-lifecycle.py \
   bin/publication-supervisor.py \
   bin/superpowers-planning.py \
+  bin/planning.py \
   bin/pm-agent.py \
   bin/policy-check.py \
   bin/release-feature.py \
@@ -754,6 +755,8 @@ for required_file in \
   reference/deployment.md \
   reference/guardrails.md \
   reference/superpowers-planning.md \
+  reference/planning.md \
+  reference/egm-planning.md \
   roles/senior-security-engineer.md \
   roles/team-lead.md \
   src/startup_factory_cli/__init__.py \

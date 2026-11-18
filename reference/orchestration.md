@@ -28,7 +28,8 @@ Three principles rule everything:
 <TEAMWORK_ROOT>/<team>/
 ├── prompts/<role>.md            # full gate-role startup prompts
 ├── prompts/tasks/<instance>.md  # lean prompt for one task attempt
-├── planning/superpowers-handoff.json # optional digest-bound Claude planning intake
+├── planning/handoff.json            # optional digest-bound EGM or native planning intake
+├── planning/superpowers-handoff.json # legacy-compatible Superpowers intake; use only one handoff
 ├── mailbox/<role>/NNN-<from>.md # incoming messages for <role>, numbered, append-only
 ├── heartbeats/<instance>        # semantic heartbeat; authenticated lifecycle supplies identity
 ├── pids/<role>.pid              # non-authoritative `managed`/`unmanaged` UI marker + log location

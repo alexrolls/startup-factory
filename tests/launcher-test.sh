@@ -825,6 +825,60 @@ claude_planning_prompt="$(STARTUP_FACTORY_LLM_RUNTIME=claude "$LAUNCH" compose p
 check "Claude handoff consumer receives Superpowers planning boundary" \
   grep -q "Claude + obra/superpowers planning" "$claude_planning_prompt"
 
+# -- EGM planning resources and handoffs work across runtime families ----------
+cp "$PLANNING_CFG" "$TMP/planning-before-egm.md"
+python3 - "$SKILL_DIR/bin/planning.py" "$TMP/egm-plugin" "$PLANNING_CFG" <<'PY'
+import json
+from pathlib import Path
+import runpy
+import sys
+
+module = runpy.run_path(sys.argv[1])
+bundle = Path(sys.argv[2])
+for relative in module["EGM_REQUIRED_FILES"]:
+    path = bundle / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# Offline EGM resource fixture\n", encoding="utf-8")
+(bundle / "plugin.json").write_text(json.dumps({"name": "egm", "version": "0.1.1"}))
+Path(sys.argv[3]).write_text(
+    'PLANNING_PROVIDER=egm\nUSE_SUPERPOWERS=true\n'
+    f'EGM_PLUGIN_ROOT="{bundle}"\n', encoding="utf-8"
+)
+PY
+for runtime in claude other; do
+  egm_prompt="$(STARTUP_FACTORY_LLM_RUNTIME="$runtime" "$LAUNCH" compose "egm-$runtime" FEAT-EGM team-lead)"
+  check "EGM $runtime prompt carries verified bundle" grep -q "EGM bundle: $TMP/egm-plugin" "$egm_prompt"
+  check "EGM $runtime prompt includes portable planning workflow" grep -q "portable adaptation" "$egm_prompt"
+  if grep -q "Claude + obra/superpowers planning" "$egm_prompt"; then
+    echo "FAIL: EGM $runtime prompt also enabled Superpowers"; FAILURES=$((FAILURES+1))
+  else
+    echo "ok: EGM $runtime prompt selects one planning provider"
+  fi
+done
+mkdir -p docs/egm/specs docs/egm/plans
+printf '# EGM specification\n' > docs/egm/specs/launcher.md
+printf '# EGM implementation plan\n' > docs/egm/plans/launcher.md
+git add docs/egm/specs/launcher.md docs/egm/plans/launcher.md
+git commit -qm 'EGM planning inputs'
+egm_handoff="$("$LAUNCH" planning-handoff egm-handoff docs/egm/specs/launcher.md docs/egm/plans/launcher.md spec-provided codex)"
+check "EGM handoff records provider and producing runtime" \
+  python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); assert m["provider"] == "egm" and m["runtime"] == "codex" and m["executionOwner"] == "startup-factory"' "$egm_handoff"
+egm_consumer="$("$LAUNCH" compose egm-handoff FEAT-EGM team-lead)"
+check "EGM handoff reaches a non-Claude consumer" grep -q "docs/egm/specs/launcher.md" "$egm_consumer"
+printf '\nChanged review criterion\n' >> "$TMP/egm-plugin/agents/comprehension.md"
+if "$LAUNCH" compose egm-handoff FEAT-EGM team-lead >/dev/null 2>&1; then
+  echo "FAIL: changed EGM resources left handoff usable"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: changed EGM resources invalidate the handoff"
+fi
+rm "$TMP/egm-plugin/agents/comprehension.md"
+if "$LAUNCH" compose egm-missing FEAT-EGM team-lead >/dev/null 2>&1; then
+  echo "FAIL: incomplete EGM bundle produced a planning prompt"; FAILURES=$((FAILURES+1))
+else
+  echo "ok: incomplete EGM bundle prevents prompt composition"
+fi
+cp "$TMP/planning-before-egm.md" "$PLANNING_CFG"
+
 # -- agent child environment strips tracker/cloud/host credentials ------------
 cat > env-probe.sh <<'EOF'
 #!/usr/bin/env bash

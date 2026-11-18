@@ -14,7 +14,7 @@
 #   launch-team.sh compose       <team> <featureId> <role> [preset]  # write the composed startup prompt, print its path — no spawn (harness mode)
 #   launch-team.sh compose-review <team> <featureId> <role> <taskId> [preset]  # lean one-package review prompt — no spawn
 #   launch-team.sh compose-task  <team> <featureId> <role> <taskId> [attempt] [preset]
-#   launch-team.sh planning-handoff <team> <spec-path> <plan-path> [brainstormed|spec-provided]  # bind planning inputs
+#   launch-team.sh planning-handoff <team> <spec-path> <plan-path> [brainstormed|spec-provided] [runtime]  # bind planning inputs
 #   launch-team.sh worktree      <team> <featureId> <role> <taskId> [attempt]
 #   launch-team.sh worktree-remove <team> <role> <taskId> [attempt]
 #   launch-team.sh validate-board [config-path]                  # validate board config JSON
@@ -74,6 +74,7 @@ LAUNCH_LANE_LOCK_INSTANCE=""
 TEAM_FENCE_DIR=""
 TEAM_FENCE_PID=""
 SUPERPOWERS_ENABLED=""
+PLANNING_PROVIDER=""
 TMUX_BIN=""
 TMUX_BIN_IDENTITY=""
 DOCTOR_RESULT_WORKSPACE=""
@@ -2006,12 +2007,30 @@ key_is_null() { # key_is_null KEY -> 0 if the config sets KEY explicitly to null
 
 validate_planning_config() {
   local planning_json
-  planning_json="$(python3 "$SKILL_DIR/bin/superpowers-planning.py" \
+  planning_json="$(python3 "$SKILL_DIR/bin/planning.py" \
     --config "$PLANNING_CONFIG" show-config)" \
     || die "invalid config/planning.config.md"
+  PLANNING_PROVIDER="$(printf '%s' "$planning_json" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["provider"])')" \
+    || die "could not read planning provider"
   SUPERPOWERS_ENABLED="$(printf '%s' "$planning_json" | python3 -c \
-    'import json,sys; print("true" if json.load(sys.stdin)["enabled"] else "false")')" \
+    'import json,sys; c=json.load(sys.stdin); print("true" if c["provider"] == "superpowers" or (c["provider"] == "auto" and c["superpowersEnabled"]) else "false")')" \
     || die "could not read config/planning.config.md"
+}
+
+planning_handoff_path() { # existing neutral or legacy handoff; never choose silently between two
+  local dir="$1" neutral legacy
+  neutral="$(team_path "$dir" planning/handoff.json)" || die "unsafe planning handoff path"
+  legacy="$(team_path "$dir" planning/superpowers-handoff.json)" || die "unsafe planning handoff path"
+  if { [ -e "$neutral" ] || [ -L "$neutral" ]; } \
+      && { [ -e "$legacy" ] || [ -L "$legacy" ]; }; then
+    die "team has both neutral and legacy planning handoffs; retire the superseded handoff before continuing"
+  fi
+  if [ -e "$neutral" ] || [ -L "$neutral" ]; then
+    printf '%s\n' "$neutral"
+  else
+    printf '%s\n' "$legacy"
+  fi
 }
 
 meaningful_command() { # true when any argument is meaningful (matches pm-agent.py)
@@ -2433,18 +2452,18 @@ preflight() { # preflight <team> <featureId> — fail before five agents do
   write_test="$(team_path "$dir" preflight/.write-test)" || die "unsafe preflight path"
   utc_file="$(team_path "$dir" preflight/utc.txt)" || die "unsafe preflight path"
   tool_prefix="$(team_path "$dir" preflight/tool-prefix.txt)" || die "unsafe preflight path"
-  planning_handoff="$(team_path "$dir" planning/superpowers-handoff.json)" || die "unsafe planning handoff path"
+  planning_handoff="$(planning_handoff_path "$dir")" || die "invalid planning handoff paths"
   validate_board >/dev/null
   mkdir -p "$preflight_dir" 2>/dev/null || die "preflight: cannot create workspace $dir"
   ( : > "$write_test" && rm "$write_test" ) \
     || die "preflight: workspace not writable: $dir"
   date -u +%Y-%m-%dT%H:%M:%SZ > "$utc_file"
-  if [ "$SUPERPOWERS_ENABLED" = true ] \
+  if { [ "$PLANNING_PROVIDER" != auto ] || [ "$SUPERPOWERS_ENABLED" = true ]; } \
       && { [ -e "$planning_handoff" ] || [ -L "$planning_handoff" ]; }; then
-    python3 "$SKILL_DIR/bin/superpowers-planning.py" \
+    python3 "$SKILL_DIR/bin/planning.py" \
       --config "$PLANNING_CONFIG" validate-handoff \
       --repo "$REPO_ROOT" --handoff "$planning_handoff" --team "$team" >/dev/null \
-      || die "preflight FAILED — the Claude/Superpowers planning handoff is stale or invalid"
+      || die "preflight FAILED — the planning handoff is stale or invalid"
   fi
   local _adapter="$TRACKER_ADAPTER"
   if is_mcp_only "$_adapter"; then
@@ -2876,7 +2895,7 @@ compose_prompt() { # compose_prompt <team> <featureId> <role> [preset] [runtime]
     validate_review_board_independence "$preset"
   fi
   local dir out prompts mailbox heartbeats pids utc_file tool_prefix planning_handoff
-  local planning_json="" planning_spec="" planning_plan=""
+  local planning_json="" planning_spec="" planning_plan="" egm_json="" egm_root="" egm_digest=""
   dir="$(teamroot "$team")" || die "unsafe team workspace"
   prompts="$(team_path "$dir" prompts)" || die "unsafe prompts path"
   mailbox="$(team_path "$dir" "mailbox/$role")" || die "unsafe mailbox path"
@@ -2885,15 +2904,22 @@ compose_prompt() { # compose_prompt <team> <featureId> <role> [preset] [runtime]
   out="$(team_path "$dir" "prompts/$role.md")" || die "unsafe prompt path"
   utc_file="$(team_path "$dir" preflight/utc.txt)" || die "unsafe preflight path"
   tool_prefix="$(team_path "$dir" preflight/tool-prefix.txt)" || die "unsafe preflight path"
-  planning_handoff="$(team_path "$dir" planning/superpowers-handoff.json)" || die "unsafe planning handoff path"
-  if [ "$SUPERPOWERS_ENABLED" = true ] \
+  planning_handoff="$(planning_handoff_path "$dir")" || die "invalid planning handoff paths"
+  if { [ "$PLANNING_PROVIDER" != auto ] || [ "$SUPERPOWERS_ENABLED" = true ]; } \
       && { [ -e "$planning_handoff" ] || [ -L "$planning_handoff" ]; }; then
-    planning_json="$(python3 "$SKILL_DIR/bin/superpowers-planning.py" \
+    planning_json="$(python3 "$SKILL_DIR/bin/planning.py" \
       --config "$PLANNING_CONFIG" validate-handoff \
       --repo "$REPO_ROOT" --handoff "$planning_handoff" --team "$team")" \
-      || die "the Claude/Superpowers planning handoff is stale or invalid"
+      || die "the planning handoff is stale or invalid"
     planning_spec="$(printf '%s' "$planning_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["spec"]["path"])')"
     planning_plan="$(printf '%s' "$planning_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["plan"]["path"])')"
+  fi
+  if [ "$PLANNING_PROVIDER" = egm ]; then
+    egm_json="$(python3 "$SKILL_DIR/bin/planning.py" \
+      --config "$PLANNING_CONFIG" preflight --runtime "$runtime" --repo "$REPO_ROOT")" \
+      || die "EGM planning resources are missing or invalid"
+    egm_root="$(printf '%s' "$egm_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["egmRoot"])')"
+    egm_digest="$(printf '%s' "$egm_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["resourceDigest"])')"
   fi
   local brief; brief="$(role_brief "$role")"
   [ -n "$brief" ] || die "unknown role: $role (no brief in roles/ or teams/roles/)"
@@ -2909,6 +2935,11 @@ compose_prompt() { # compose_prompt <team> <featureId> <role> [preset] [runtime]
     echo "- Skill directory: $SKILL_DIR (adapter + PM config live here)"
     echo "- Team workspace: $dir"
     echo "- LLM runtime family: $runtime"
+    echo "- Planning provider: $PLANNING_PROVIDER"
+    if [ -n "$egm_root" ]; then
+      echo "- EGM bundle: $egm_root"
+      echo "- EGM resource digest: $egm_digest"
+    fi
     if [ -s "$utc_file" ]; then
       echo "- Preflight UTC pin: $(cat "$utc_file") — generate every timestamp with: date -u +%Y-%m-%dT%H:%M:%SZ"
     fi
@@ -2948,6 +2979,10 @@ compose_prompt() { # compose_prompt <team> <featureId> <role> [preset] [runtime]
       echo
       echo "---"
       cat "$SKILL_DIR/reference/superpowers-planning.md"
+    elif [ "$PLANNING_PROVIDER" = egm ]; then
+      echo
+      echo "---"
+      cat "$SKILL_DIR/reference/egm-planning.md"
     fi
     if [ -f "$SKILL_DIR/config/statuses.config.json" ]; then
       echo
@@ -4110,22 +4145,37 @@ esac
 
 case "${1:-}" in
   planning-handoff)
-    [ $# -ge 4 ] && [ $# -le 5 ] \
-      || die "usage: planning-handoff <team> <spec-path> <plan-path> [brainstormed|spec-provided]"
+    [ $# -ge 4 ] && [ $# -le 6 ] \
+      || die "usage: planning-handoff <team> <spec-path> <plan-path> [brainstormed|spec-provided] [runtime]"
     validate_team_id "$2"
     intake="${5:-brainstormed}"
     case "$intake" in brainstormed|spec-provided) ;; *) die "invalid planning intake: $intake" ;; esac
-    [ "$SUPERPOWERS_ENABLED" = true ] \
-      || die "Superpowers planning is disabled by USE_SUPERPOWERS=false"
+    planning_runtime="${6:-claude}"
+    if [ "$PLANNING_PROVIDER" = auto ] && [ "$SUPERPOWERS_ENABLED" != true ]; then
+      die "legacy planning handoff is disabled by USE_SUPERPOWERS=false; select PLANNING_PROVIDER=native for an explicit native handoff"
+    fi
+    selected_provider="$(python3 "$SKILL_DIR/bin/planning.py" \
+      --config "$PLANNING_CONFIG" show-config --runtime "$planning_runtime" \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["selectedProvider"])')" \
+      || die "could not select planning provider"
     dir="$(teamroot "$2")" || die "unsafe team workspace"
-    handoff="$(team_path "$dir" planning/superpowers-handoff.json)" || die "unsafe planning handoff path"
+    if [ "$selected_provider" = superpowers ]; then
+      handoff="$(team_path "$dir" planning/superpowers-handoff.json)" || die "unsafe planning handoff path"
+    else
+      handoff="$(team_path "$dir" planning/handoff.json)" || die "unsafe planning handoff path"
+    fi
+    previous_handoff="$(planning_handoff_path "$dir")" || die "invalid planning handoff paths"
+    if [ "$previous_handoff" != "$handoff" ] \
+        && { [ -e "$previous_handoff" ] || [ -L "$previous_handoff" ]; }; then
+      die "team has a different planning handoff; retire the superseded handoff or use a new team"
+    fi
     mkdir -p "$(dirname "$handoff")"
-    python3 "$SKILL_DIR/bin/superpowers-planning.py" \
+    python3 "$SKILL_DIR/bin/planning.py" \
       --config "$PLANNING_CONFIG" create-handoff \
       --repo "$REPO_ROOT" --team "$2" --spec "$3" --plan "$4" --output "$handoff" \
-      --intake "$intake" >/dev/null \
-      || die "could not create the Claude/Superpowers planning handoff"
-    python3 "$SKILL_DIR/bin/superpowers-planning.py" \
+      --intake "$intake" --runtime "$planning_runtime" >/dev/null \
+      || die "could not create the planning handoff"
+    python3 "$SKILL_DIR/bin/planning.py" \
       --config "$PLANNING_CONFIG" validate-handoff \
       --repo "$REPO_ROOT" --handoff "$handoff" --team "$2" --require-head >/dev/null \
       || die "created planning handoff did not validate"

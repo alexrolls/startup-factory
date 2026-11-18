@@ -2,12 +2,19 @@
 
 Use this workflow only when all of the following are true:
 
-1. `USE_SUPERPOWERS=true` in `config/planning.config.md`.
+1. The resolved provider is `superpowers`: either explicit
+   `PLANNING_PROVIDER=superpowers`, or `PLANNING_PROVIDER=auto` (also the default
+   when absent) with `USE_SUPERPOWERS=true` on Claude Code.
 2. The current runtime is Claude Code.
-3. `bin/superpowers-planning.py preflight --runtime claude` succeeds.
+3. `bin/planning.py preflight --runtime claude` succeeds.
 
-Non-Claude runtimes and projects with the flag disabled use the native Startup
-Factory lifecycle without emulating or copying Superpowers.
+In `auto` mode, non-Claude runtimes and projects with the legacy flag disabled
+use native Startup Factory planning without emulating or copying Superpowers.
+Explicit `superpowers` remains a Claude-only Factory adapter and fails on other
+runtimes. Upstream Superpowers supports additional hosts, including Codex; this
+Factory adapter does not claim to integrate those hosts. Use `native` or the
+portable `egm` adapter when appropriate. See `reference/planning.md` for provider
+selection, artifact roots, and compatibility.
 
 The launcher recognizes a direct `claude` command automatically. If a configured
 command invokes Claude through a wrapper, mark that command template explicitly:
@@ -57,7 +64,7 @@ finishers from operating on the same [feature].
 1. Run the Claude plugin preflight:
 
    ```bash
-   python3 bin/superpowers-planning.py preflight --runtime claude
+   python3 bin/planning.py preflight --runtime claude
    ```
 
 2. Select and record one intake:
@@ -78,7 +85,7 @@ finishers from operating on the same [feature].
    digest-bound handoff:
 
    ```bash
-   bin/launch-team.sh planning-handoff <team> <spec-path> <plan-path> <brainstormed|spec-provided>
+   bin/launch-team.sh planning-handoff <team> <spec-path> <plan-path> <brainstormed|spec-provided> claude
    ```
 
 5. Use the specification and plan as planning inputs, not unquestioned
@@ -92,6 +99,12 @@ finishers from operating on the same [feature].
 The handoff binds the exact committed specification, plan, plugin id, repository
 commit, and execution owner. If either document changes, recreate the handoff
 and repeat the affected planning approvals.
+
+`bin/superpowers-planning.py` remains the compatibility entry point for existing
+callers. Existing valid schema-v2 Claude/Superpowers handoffs remain usable when
+that provider is selected; do not relabel one as EGM or native. New integrations
+should use `bin/planning.py`. Changing the provider or artifact content requires
+a new handoff for the selected provider.
 
 ## Claude task-worker methods
 
